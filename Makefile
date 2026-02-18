@@ -27,8 +27,8 @@ RED    := \033[0;31m
 RESET  := \033[0m
 
 # ── Source files ───────────────────────────────────────────────────
-HL_SRCS := hl.c guest.c elf.c syscall.c stack.c
-HL_HDRS := guest.h elf.h syscall.h stack.h
+HL_SRCS := hl.c guest.c elf.c syscall.c syscall_proc.c stack.c
+HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_proc.h stack.h
 
 # C test programs (built with musl cross-compiler, static)
 TEST_C_SRCS := $(wildcard test/*.c)
@@ -134,6 +134,9 @@ test-all: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-ls test/; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-roundtrip; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-comprehensive; \
+	printf "\n$(BLUE)── Process tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-exec $(BUILD_DIR)/echo-test exec-works; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-fork; \
 	printf "\n$(BLUE)── Syscall coverage tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-file-ops; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-sysinfo; \

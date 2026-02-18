@@ -176,6 +176,81 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
     return -1;
 }
 
+/* ---------- guest_reset ---------- */
+
+void guest_reset(guest_t *g) {
+    /* Zero everything from ELF_DEFAULT_BASE to guest_size.
+     * This covers ELF segments, brk, stack, and mmap regions.
+     * The page table pool (PT_POOL_BASE..PT_POOL_END) and shim
+     * (SHIM_BASE..SHIM_DATA_BASE+2MB) are also zeroed since they
+     * will be rebuilt. Only the first 64KB (below PT_POOL_BASE)
+     * is left untouched (unused area). */
+    memset((uint8_t *)g->host_base + PT_POOL_BASE, 0,
+           g->guest_size - PT_POOL_BASE);
+
+    /* Reset allocation state */
+    g->pt_pool_next = PT_POOL_BASE;
+    g->brk_base = BRK_BASE_DEFAULT;
+    g->brk_current = BRK_BASE_DEFAULT;
+    g->mmap_next = MMAP_BASE;
+    g->mmap_end = MMAP_INITIAL_END;
+    g->ttbr0 = 0;
+    g->need_tlbi = 0;
+}
+
+/* ---------- Used region enumeration ---------- */
+
+int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
+                           used_region_t *out, int max) {
+    int n = 0;
+
+    /* Page table pool */
+    if (n < max && g->pt_pool_next > PT_POOL_BASE) {
+        out[n].offset = PT_POOL_BASE;
+        out[n].size = g->pt_pool_next - PT_POOL_BASE;
+        n++;
+    }
+
+    /* Shim code */
+    if (n < max && shim_size > 0) {
+        out[n].offset = SHIM_BASE;
+        out[n].size = shim_size;
+        n++;
+    }
+
+    /* Shim data/stack (full 2MB block) */
+    if (n < max) {
+        out[n].offset = SHIM_DATA_BASE;
+        out[n].size = BLOCK_2MB;
+        n++;
+    }
+
+    /* ELF + brk region: from ELF_DEFAULT_BASE to brk_current.
+     * We don't track the exact ELF load range, but static musl binaries
+     * always load at or above ELF_DEFAULT_BASE (0x400000). */
+    if (n < max && g->brk_current > ELF_DEFAULT_BASE) {
+        out[n].offset = ELF_DEFAULT_BASE;
+        out[n].size = g->brk_current - ELF_DEFAULT_BASE;
+        n++;
+    }
+
+    /* Stack (2MB block) */
+    if (n < max) {
+        out[n].offset = STACK_BASE;
+        out[n].size = STACK_TOP - STACK_BASE;
+        n++;
+    }
+
+    /* mmap region (only the used portion) */
+    if (n < max && g->mmap_next > MMAP_BASE) {
+        out[n].offset = MMAP_BASE;
+        out[n].size = g->mmap_next - MMAP_BASE;
+        n++;
+    }
+
+    return n;
+}
+
 /* ---------- Page table builder ---------- */
 
 /* Build block descriptor for a 2MB block at the given GPA with perms. */

@@ -4,10 +4,12 @@ Run static aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.fram
 
 ## Architecture
 
-- **hl.c** — Main entry point. CLI, VM setup, vCPU loop (~580 lines).
-- **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap.
+- **hl.c** — Main entry point. CLI (incl. --fork-child), VM setup (~400 lines).
+- **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset.
 - **elf.c/h** — ELF64 parser and loader for static aarch64-linux binaries.
-- **syscall.c/h** — Linux syscall dispatch and handlers (~90 syscalls).
+- **syscall.c/h** — Linux syscall dispatch and ~100 handlers (~2300 lines).
+- **syscall_internal.h** — Shared declarations for syscall module helpers.
+- **syscall_proc.c/h** — Process syscalls: execve, clone/fork (IPC), wait4, vCPU loop (~1250 lines).
 - **stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 - **vm.c** — Legacy proof-of-concept host driver (kept in archive/).
@@ -52,18 +54,19 @@ Only `bad_exception` vectors may clobber X5 (they halt, so no preservation neede
 ```
 make hl          # build + codesign hl
 make test-hello  # build and run assembly hello world
-make test-all    # run full test suite (17 tests)
+make test-all    # run full test suite (19 tests)
 make clean       # remove _build/
 ```
 
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
 
-## Implemented Syscalls (~90 total)
+## Implemented Syscalls (~110 total)
 
 **Basic I/O:**
 write(64), read(63), readv(65), writev(66), openat(56), close(57),
-ioctl(29), lseek(62), fstat(80), newfstatat(79), pread64(67), pwrite64(68)
+ioctl(29) [TIOCGWINSZ, TCGETS, TCSETS], lseek(62), fstat(80),
+newfstatat(79), pread64(67), pwrite64(68)
 
 **Process/Memory:**
 exit(93), exit_group(94), brk(214), mmap(222), munmap(215), mprotect(226),
@@ -73,14 +76,21 @@ clock_gettime(113), gettimeofday(169), nanosleep(101), clock_nanosleep(115),
 rt_sigaction(134), rt_sigprocmask(135), umask(166)
 
 **Filesystem:**
-getcwd(17), chdir(49), faccessat(48), readlinkat(78), unlinkat(35),
-mkdirat(34), renameat2(276), getdents64(61), dup(23), dup3(24),
-fcntl(25), pipe2(59), ftruncate(46), statfs(43), fstatfs(44)
+getcwd(17), chdir(49), fchdir(50), faccessat(48), readlinkat(78),
+unlinkat(35), mkdirat(34), renameat2(276), getdents64(61), dup(23),
+dup3(24), fcntl(25), pipe2(59), ftruncate(46), truncate(45),
+statfs(43), fstatfs(44), statx(291), flock(32), close_range(436)
 
 **File manipulation (Batch 1):**
 mknodat(33), symlinkat(36), linkat(37), fchmod(52), fchmodat(53),
 fchownat(54), fchown(55), utimensat(88), futex(98), set_robust_list(99),
 sigaltstack(132)
+
+**Process management:**
+execve(221), execveat(281), clone(220), wait4(260),
+setuid(146), setgid(144), setreuid(145), setregid(143),
+setresuid(147), getresuid(148), setresgid(149), getresgid(150),
+setpriority(140), getpriority(141)
 
 **Process/system info (Batch 2):**
 sched_getaffinity(123), getpgid(155), getgroups(158), getrusage(165),
@@ -88,14 +98,33 @@ prctl(167), getppid(173), sysinfo(179), prlimit64(261)
 
 **I/O optimization + sync (Batch 3):**
 fallocate(47), sendfile(71), sync(81), fsync(82), fdatasync(83),
-sched_yield(124), copy_file_range(285)
+sched_yield(124), copy_file_range(285), splice(76), vmsplice(75)
 
 **Signals + I/O multiplexing (Batch 4):**
 pselect6(72), ppoll(73), kill(129), tgkill(131), rt_sigsuspend(133),
 rt_sigpending(136), rt_sigreturn(139), setpgid(154), setsid(157)
 
-**Networking stubs (return -ENOSYS):**
-socket(198), bind(200), listen(201), connect(203), accept(204)
+**Timers:**
+setitimer(103), getitimer(102)
+
+**Stubs (return -ENOSYS):**
+socket(198), bind(200), listen(201), connect(203), accept(204),
+tee(77), timerfd_create(85), timerfd_settime(86), timerfd_gettime(87),
+epoll_create1(20), epoll_ctl(21), epoll_pwait(22),
+inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28),
+waitid(95)
+
+## Fork/Clone Architecture
+
+macOS HVF allows only one VM per process. Fork is implemented via:
+1. Parent creates socketpair(AF_UNIX, SOCK_STREAM)
+2. Parent posix_spawn()s new `hl --fork-child <fd>` process
+3. Parent serializes VM state over IPC: header + registers + memory
+   regions (only used regions, not full 4GB) + FD table (via SCM_RIGHTS)
+   + cwd + umask + sentinel
+4. Child receives state, creates own VM, restores registers, enters
+   vCPU loop with X0=0 (child return from clone)
+5. Parent records child in process table, returns child PID
 
 ## Key errno Translation
 

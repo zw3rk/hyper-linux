@@ -15,21 +15,30 @@
 /* Sorted numerically for easy lookup.
  * Reference: include/uapi/asm-generic/unistd.h in Linux source. */
 #define SYS_getcwd          17
+#define SYS_epoll_create1   20
+#define SYS_epoll_ctl       21
+#define SYS_epoll_pwait     22
 #define SYS_dup             23
 #define SYS_dup3            24
 #define SYS_fcntl           25
 #define SYS_ioctl           29
+#define SYS_inotify_init1   26
+#define SYS_inotify_add_watch 27
+#define SYS_inotify_rm_watch 28
+#define SYS_flock           32
 #define SYS_mknodat         33
 #define SYS_mkdirat         34
 #define SYS_unlinkat        35
 #define SYS_symlinkat       36
 #define SYS_linkat          37
+#define SYS_truncate        45
 #define SYS_statfs          43
 #define SYS_fstatfs         44
 #define SYS_ftruncate       46
 #define SYS_fallocate       47
 #define SYS_faccessat       48
 #define SYS_chdir           49
+#define SYS_fchdir          50
 #define SYS_fchmod          52
 #define SYS_fchmodat        53
 #define SYS_fchownat        54
@@ -45,21 +54,30 @@
 #define SYS_writev          66
 #define SYS_pread64         67
 #define SYS_pwrite64        68
+#define SYS_splice          76
+#define SYS_tee             77
+#define SYS_vmsplice        75
 #define SYS_sendfile        71
 #define SYS_pselect6        72
 #define SYS_ppoll           73
 #define SYS_readlinkat      78
 #define SYS_newfstatat      79
 #define SYS_fstat           80
+#define SYS_timerfd_create  85
+#define SYS_timerfd_settime 86
+#define SYS_timerfd_gettime 87
 #define SYS_sync            81
 #define SYS_fsync           82
 #define SYS_fdatasync       83
 #define SYS_utimensat       88
 #define SYS_exit            93
 #define SYS_exit_group      94
+#define SYS_waitid          95
 #define SYS_set_tid_address 96
 #define SYS_futex           98
 #define SYS_set_robust_list 99
+#define SYS_getitimer       102
+#define SYS_setitimer       103
 #define SYS_nanosleep       101
 #define SYS_clock_gettime   113
 #define SYS_clock_nanosleep 115
@@ -73,6 +91,16 @@
 #define SYS_rt_sigprocmask  135
 #define SYS_rt_sigpending   136
 #define SYS_rt_sigreturn    139
+#define SYS_setpriority     140
+#define SYS_getpriority     141
+#define SYS_setregid        143
+#define SYS_setgid          144
+#define SYS_setreuid        145
+#define SYS_setuid          146
+#define SYS_setresuid       147
+#define SYS_getresuid       148
+#define SYS_setresgid       149
+#define SYS_getresgid       150
 #define SYS_setpgid         154
 #define SYS_getpgid         155
 #define SYS_setsid          157
@@ -95,15 +123,21 @@
 #define SYS_listen          201
 #define SYS_connect         203
 #define SYS_accept          204
+#define SYS_clone           220
+#define SYS_execve          221
 #define SYS_brk             214
 #define SYS_munmap          215
 #define SYS_mmap            222
 #define SYS_mprotect        226
 #define SYS_madvise         233
+#define SYS_wait4           260
 #define SYS_prlimit64       261
 #define SYS_renameat2       276
 #define SYS_getrandom       278
+#define SYS_execveat        281
 #define SYS_copy_file_range 285
+#define SYS_statx           291
+#define SYS_close_range     436
 
 /* ---------- Linux errno values ---------- */
 #define LINUX_EPERM       1
@@ -113,6 +147,7 @@
 #define LINUX_EIO         5
 #define LINUX_ENXIO       6
 #define LINUX_E2BIG       7
+#define LINUX_ENOEXEC     8
 #define LINUX_EBADF       9
 #define LINUX_EAGAIN     11   /* Also EWOULDBLOCK */
 #define LINUX_ENOMEM     12
@@ -143,10 +178,16 @@
 #define LINUX_ENOTEMPTY  39
 #define LINUX_ELOOP      40
 #define LINUX_ENOPROTOOPT 92
+#define LINUX_ECHILD     10
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EOVERFLOW  75
 
+/* ---------- Linux FD flags ---------- */
+#define LINUX_FD_CLOEXEC   1
+
 /* ---------- Linux ioctl constants ---------- */
+#define LINUX_TCGETS     0x5401
+#define LINUX_TCSETS     0x5402
 #define LINUX_TIOCGWINSZ 0x5413
 
 /* ---------- Linux open flags ---------- */
@@ -314,6 +355,56 @@ typedef struct {
     int16_t  revents;
 } linux_pollfd_t;
 
+/* ---------- Linux struct statx (aarch64) ---------- */
+typedef struct {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    /* struct statx_timestamp: tv_sec(8) + tv_nsec(4) + __reserved(4) */
+    int64_t  stx_atime_sec;
+    uint32_t stx_atime_nsec;
+    uint32_t __atime_pad;
+    int64_t  stx_btime_sec;
+    uint32_t stx_btime_nsec;
+    uint32_t __btime_pad;
+    int64_t  stx_ctime_sec;
+    uint32_t stx_ctime_nsec;
+    uint32_t __ctime_pad;
+    int64_t  stx_mtime_sec;
+    uint32_t stx_mtime_nsec;
+    uint32_t __mtime_pad;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t __spare2[13];
+} linux_statx_t;
+
+/* statx mask bits */
+#define STATX_TYPE        0x0001U
+#define STATX_MODE        0x0002U
+#define STATX_NLINK       0x0004U
+#define STATX_UID         0x0008U
+#define STATX_GID         0x0010U
+#define STATX_ATIME       0x0020U
+#define STATX_MTIME       0x0040U
+#define STATX_CTIME       0x0080U
+#define STATX_INO         0x0100U
+#define STATX_SIZE        0x0200U
+#define STATX_BLOCKS      0x0400U
+#define STATX_BASIC_STATS 0x07FFU
+#define STATX_BTIME       0x0800U
+
 /* ---------- FD table ---------- */
 #define FD_TABLE_SIZE 256
 
@@ -321,11 +412,13 @@ typedef struct {
 #define FD_STDIO    1
 #define FD_REGULAR  2
 #define FD_DIR      3
+#define FD_PIPE     4
 
 typedef struct {
-    int   type;     /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
-    int   host_fd;  /* Underlying macOS file descriptor */
-    void *dir;      /* DIR* for FD_DIR entries (NULL otherwise) */
+    int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
+    int   host_fd;     /* Underlying macOS file descriptor */
+    int   linux_flags; /* Linux open flags (for CLOEXEC tracking) */
+    void *dir;         /* DIR* for FD_DIR entries (NULL otherwise) */
 } fd_entry_t;
 
 /* ---------- API ---------- */

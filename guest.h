@@ -113,4 +113,21 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
  * Returns 0 on success, -1 on failure. */
 int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms);
 
+/* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and
+ * resets page table pool, brk, and mmap allocation state. Preserves the
+ * host_base mapping and VM/vCPU handles. */
+void guest_reset(guest_t *g);
+
+/* A used memory region for fork state transfer */
+typedef struct {
+    uint64_t offset;  /* Offset from host_base (0-based) */
+    uint64_t size;    /* Size in bytes */
+} used_region_t;
+
+/* Enumerate used memory regions for fork state transfer.
+ * Writes up to max entries into out[]. Returns the count written.
+ * shim_size is the shim binary size (needed to determine shim region). */
+int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
+                           used_region_t *out, int max);
+
 #endif /* GUEST_H */

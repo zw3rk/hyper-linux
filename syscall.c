@@ -9,6 +9,8 @@
  * the result back.
  */
 #include "syscall.h"
+#include "syscall_internal.h"
+#include "syscall_proc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +30,12 @@
 #include <sys/sysctl.h>
 #include <signal.h>
 #include <poll.h>
+#include <termios.h>
 #include <sched.h>
 #include <mach/mach.h>
 
 /* ---------- FD table ---------- */
-static fd_entry_t fd_table[FD_TABLE_SIZE];
+fd_entry_t fd_table[FD_TABLE_SIZE];
 
 /* ---------- Signal stubs ---------- */
 /* We store signal actions but never deliver signals. */
@@ -52,7 +55,7 @@ void syscall_init(void) {
 /* ---------- FD helpers ---------- */
 
 /* Allocate the lowest available FD. Returns -1 if table is full. */
-static int fd_alloc(int type, int host_fd) {
+int fd_alloc(int type, int host_fd) {
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) {
             fd_table[i].type = type;
@@ -64,7 +67,7 @@ static int fd_alloc(int type, int host_fd) {
 }
 
 /* Allocate a specific FD slot. Returns -1 if out of range. */
-static int fd_alloc_at(int fd, int type, int host_fd) {
+int fd_alloc_at(int fd, int type, int host_fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -1;
     if (fd_table[fd].type != FD_CLOSED) {
         close(fd_table[fd].host_fd);
@@ -75,7 +78,7 @@ static int fd_alloc_at(int fd, int type, int host_fd) {
 }
 
 /* Look up a guest FD. Returns host FD or -1 if invalid. */
-static int fd_to_host(int guest_fd) {
+int fd_to_host(int guest_fd) {
     if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE)
         return -1;
     if (fd_table[guest_fd].type == FD_CLOSED)
@@ -88,7 +91,7 @@ static int fd_to_host(int guest_fd) {
 /* Convert macOS errno to the equivalent Linux errno value.
  * macOS and Linux errno values diverge starting around errno 35.
  * Returns the negative Linux errno for direct use as a syscall return. */
-static int64_t linux_errno(void) {
+int64_t linux_errno(void) {
     int e = errno;
 
     /* Values 1-34 are mostly identical between macOS and Linux, with
@@ -133,7 +136,7 @@ static int64_t linux_errno(void) {
 
 /* Translate Linux AT_* flags to macOS equivalents.
  * Linux and macOS use different values for AT_SYMLINK_NOFOLLOW etc. */
-static int translate_at_flags(int linux_flags) {
+int translate_at_flags(int linux_flags) {
     int mac_flags = 0;
     if (linux_flags & LINUX_AT_SYMLINK_NOFOLLOW)
         mac_flags |= AT_SYMLINK_NOFOLLOW;
@@ -146,13 +149,13 @@ static int translate_at_flags(int linux_flags) {
 }
 
 /* Resolve dirfd: translate LINUX_AT_FDCWD and guest FDs */
-static int resolve_dirfd(int dirfd) {
+int resolve_dirfd(int dirfd) {
     if (dirfd == LINUX_AT_FDCWD) return AT_FDCWD;
     return fd_to_host(dirfd);
 }
 
 /* ---------- Linux open flags translation ---------- */
-static int translate_open_flags(int linux_flags) {
+int translate_open_flags(int linux_flags) {
     int flags = 0;
     int accmode = linux_flags & 3;
     if (accmode == LINUX_O_RDONLY) flags |= O_RDONLY;
@@ -319,6 +322,7 @@ static int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
         close(host_fd);
         return -LINUX_ENOMEM;
     }
+    fd_table[guest_fd].linux_flags = linux_flags;
 
     /* For directories, create a DIR* for subsequent getdents64 calls */
     if (is_dir) {
@@ -400,16 +404,92 @@ static int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
     return 0;
 }
 
-static int64_t sys_ioctl(int fd, uint64_t request) {
+/* Linux struct winsize (same layout as macOS) */
+typedef struct {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+} linux_winsize_t;
+
+/* Linux struct termios (aarch64): c_iflag..c_lflag are uint32_t,
+ * c_line is uint8_t, c_cc has 19 entries, then speed fields.
+ * macOS termios layout differs, so we translate field by field. */
+typedef struct {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[19];
+    uint32_t c_ispeed;  /* input speed (not in POSIX, but Linux has it) */
+    uint32_t c_ospeed;  /* output speed */
+} linux_termios_t;
+
+static int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
-    /* Only stub TIOCGWINSZ for terminal queries */
-    if (request == LINUX_TIOCGWINSZ) {
-        return -LINUX_ENOTTY;
+    switch (request) {
+    case LINUX_TIOCGWINSZ: {
+        /* Get terminal window size */
+        struct winsize ws;
+        if (ioctl(host_fd, TIOCGWINSZ, &ws) < 0)
+            return -LINUX_ENOTTY;
+        linux_winsize_t lws = {
+            .ws_row = ws.ws_row,
+            .ws_col = ws.ws_col,
+            .ws_xpixel = ws.ws_xpixel,
+            .ws_ypixel = ws.ws_ypixel,
+        };
+        if (guest_write(g, arg, &lws, sizeof(lws)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
     }
 
-    return -LINUX_ENOTTY;
+    case LINUX_TCGETS: {
+        /* Get terminal attributes */
+        struct termios t;
+        if (tcgetattr(host_fd, &t) < 0)
+            return -LINUX_ENOTTY;
+        linux_termios_t lt = {0};
+        lt.c_iflag = (uint32_t)t.c_iflag;
+        lt.c_oflag = (uint32_t)t.c_oflag;
+        lt.c_cflag = (uint32_t)t.c_cflag;
+        lt.c_lflag = (uint32_t)t.c_lflag;
+        /* Copy cc values (min of both sizes) */
+        for (int i = 0; i < 19 && i < NCCS; i++)
+            lt.c_cc[i] = t.c_cc[i];
+        lt.c_ispeed = (uint32_t)cfgetispeed(&t);
+        lt.c_ospeed = (uint32_t)cfgetospeed(&t);
+        if (guest_write(g, arg, &lt, sizeof(lt)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
+    case LINUX_TCSETS: {
+        /* Set terminal attributes */
+        linux_termios_t lt;
+        if (guest_read(g, arg, &lt, sizeof(lt)) < 0)
+            return -LINUX_EFAULT;
+        struct termios t;
+        tcgetattr(host_fd, &t); /* Get current as base */
+        t.c_iflag = lt.c_iflag;
+        t.c_oflag = lt.c_oflag;
+        t.c_cflag = lt.c_cflag;
+        t.c_lflag = lt.c_lflag;
+        for (int i = 0; i < 19 && i < NCCS; i++)
+            t.c_cc[i] = lt.c_cc[i];
+        cfsetispeed(&t, lt.c_ispeed);
+        cfsetospeed(&t, lt.c_ospeed);
+        if (tcsetattr(host_fd, TCSANOW, &t) < 0)
+            return linux_errno();
+        return 0;
+    }
+
+    default:
+        return -LINUX_ENOTTY;
+    }
 }
 
 static int64_t sys_uname(guest_t *g, uint64_t buf_gva) {
@@ -603,8 +683,8 @@ static int64_t sys_dup(int oldfd) {
     return guest_fd;
 }
 
-static int64_t sys_dup3(int oldfd, int newfd, int flags) {
-    (void)flags;
+static int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
+    if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     int host_fd = fd_to_host(oldfd);
     if (host_fd < 0) return -LINUX_EBADF;
     if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
@@ -613,19 +693,34 @@ static int64_t sys_dup3(int oldfd, int newfd, int flags) {
     if (new_host_fd < 0) return linux_errno();
 
     fd_alloc_at(newfd, fd_table[oldfd].type, new_host_fd);
+    /* O_CLOEXEC in dup3 flags sets CLOEXEC on new fd */
+    fd_table[newfd].linux_flags = (linux_flags & LINUX_O_CLOEXEC);
     return newfd;
 }
 
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
+    if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
     /* Linux F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 */
     switch (cmd) {
+    case 0: { /* F_DUPFD */
+        int new_host = dup(host_fd);
+        if (new_host < 0) return linux_errno();
+        int gfd = fd_alloc(fd_table[fd].type, new_host);
+        if (gfd < 0) { close(new_host); return -LINUX_ENOMEM; }
+        fd_table[gfd].linux_flags = fd_table[fd].linux_flags & ~LINUX_O_CLOEXEC;
+        return gfd;
+    }
     case 1: /* F_GETFD */
-        return fcntl(host_fd, F_GETFD);
+        return (fd_table[fd].linux_flags & LINUX_O_CLOEXEC) ? LINUX_FD_CLOEXEC : 0;
     case 2: /* F_SETFD */
-        return fcntl(host_fd, F_SETFD, (int)arg);
+        if ((int)arg & LINUX_FD_CLOEXEC)
+            fd_table[fd].linux_flags |= LINUX_O_CLOEXEC;
+        else
+            fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
+        return 0;
     case 3: /* F_GETFL */
         return fcntl(host_fd, F_GETFL);
     case 4: /* F_SETFL */
@@ -667,21 +762,24 @@ static int64_t sys_chdir(guest_t *g, uint64_t path_gva) {
     return 0;
 }
 
-static int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int flags) {
-    (void)flags;
+static int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags) {
     int host_fds[2];
     if (pipe(host_fds) < 0)
         return linux_errno();
 
     int guest_fds[2];
-    guest_fds[0] = fd_alloc(FD_REGULAR, host_fds[0]);
-    guest_fds[1] = fd_alloc(FD_REGULAR, host_fds[1]);
+    guest_fds[0] = fd_alloc(FD_PIPE, host_fds[0]);
+    guest_fds[1] = fd_alloc(FD_PIPE, host_fds[1]);
 
     if (guest_fds[0] < 0 || guest_fds[1] < 0) {
         close(host_fds[0]);
         close(host_fds[1]);
         return -LINUX_ENOMEM;
     }
+
+    /* Propagate O_CLOEXEC if set in flags */
+    fd_table[guest_fds[0]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
+    fd_table[guest_fds[1]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
 
     int32_t fds[2] = { guest_fds[0], guest_fds[1] };
     if (guest_write(g, fds_gva, fds, sizeof(fds)) < 0)
@@ -1510,6 +1608,245 @@ static int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
     return ret;
 }
 
+/* ---------- Quick-win syscalls ---------- */
+
+static int64_t sys_fchdir(int fd) {
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (fchdir(host_fd) < 0)
+        return linux_errno();
+    return 0;
+}
+
+static int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length) {
+    char path[4096];
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+    if (truncate(path, length) < 0)
+        return linux_errno();
+    return 0;
+}
+
+static int64_t sys_close_range(unsigned int first, unsigned int last,
+                                unsigned int flags) {
+    (void)flags;
+    if (first > last || last >= (unsigned)FD_TABLE_SIZE) {
+        if (last >= (unsigned)FD_TABLE_SIZE) last = FD_TABLE_SIZE - 1;
+    }
+    for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type != FD_CLOSED) {
+            if (fd_table[i].dir) {
+                closedir((DIR *)fd_table[i].dir);
+                fd_table[i].dir = NULL;
+            }
+            if (fd_table[i].type != FD_STDIO)
+                close(fd_table[i].host_fd);
+            fd_table[i].type = FD_CLOSED;
+            fd_table[i].host_fd = -1;
+            fd_table[i].linux_flags = 0;
+        }
+    }
+    return 0;
+}
+
+static int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
+                          int flags, unsigned int mask, uint64_t statxbuf_gva) {
+    (void)mask;
+    char path[4096];
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+
+    int host_dirfd = resolve_dirfd(dirfd);
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+
+    int mac_flags = translate_at_flags(flags);
+    struct stat mac_st;
+    if (fstatat(host_dirfd, path, &mac_st, mac_flags) < 0)
+        return linux_errno();
+
+    /* Translate struct stat → struct statx */
+    linux_statx_t sx;
+    memset(&sx, 0, sizeof(sx));
+    sx.stx_mask = STATX_BASIC_STATS;
+    sx.stx_blksize = (uint32_t)mac_st.st_blksize;
+    sx.stx_nlink = (uint32_t)mac_st.st_nlink;
+    sx.stx_uid = mac_st.st_uid;
+    sx.stx_gid = mac_st.st_gid;
+    sx.stx_mode = (uint16_t)mac_st.st_mode;
+    sx.stx_ino = mac_st.st_ino;
+    sx.stx_size = mac_st.st_size;
+    sx.stx_blocks = mac_st.st_blocks;
+    sx.stx_atime_sec = mac_st.st_atimespec.tv_sec;
+    sx.stx_atime_nsec = (uint32_t)mac_st.st_atimespec.tv_nsec;
+    sx.stx_mtime_sec = mac_st.st_mtimespec.tv_sec;
+    sx.stx_mtime_nsec = (uint32_t)mac_st.st_mtimespec.tv_nsec;
+    sx.stx_ctime_sec = mac_st.st_ctimespec.tv_sec;
+    sx.stx_ctime_nsec = (uint32_t)mac_st.st_ctimespec.tv_nsec;
+    sx.stx_btime_sec = mac_st.st_birthtimespec.tv_sec;
+    sx.stx_btime_nsec = (uint32_t)mac_st.st_birthtimespec.tv_nsec;
+    sx.stx_mask |= STATX_BTIME;
+    sx.stx_rdev_major = (uint32_t)(mac_st.st_rdev >> 24);
+    sx.stx_rdev_minor = (uint32_t)(mac_st.st_rdev & 0xFFFFFF);
+    sx.stx_dev_major = (uint32_t)(mac_st.st_dev >> 24);
+    sx.stx_dev_minor = (uint32_t)(mac_st.st_dev & 0xFFFFFF);
+
+    if (guest_write(g, statxbuf_gva, &sx, sizeof(sx)) < 0)
+        return -LINUX_EFAULT;
+
+    return 0;
+}
+
+/* ---------- splice/tee/vmsplice emulation ---------- */
+
+/* splice: emulate by reading from in_fd and writing to out_fd */
+static int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
+                           int fd_out, uint64_t off_out_gva,
+                           size_t len, unsigned int flags) {
+    (void)flags;
+    int host_in = fd_to_host(fd_in);
+    int host_out = fd_to_host(fd_out);
+    if (host_in < 0 || host_out < 0) return -LINUX_EBADF;
+
+    /* Handle offsets */
+    int64_t off_in = -1, off_out = -1;
+    if (off_in_gva) {
+        if (guest_read(g, off_in_gva, &off_in, 8) < 0)
+            return -LINUX_EFAULT;
+    }
+    if (off_out_gva) {
+        if (guest_read(g, off_out_gva, &off_out, 8) < 0)
+            return -LINUX_EFAULT;
+    }
+
+    /* Emulate with read/write loop using a host-side buffer */
+    size_t chunk = len > 65536 ? 65536 : len;
+    uint8_t *buf = malloc(chunk);
+    if (!buf) return -LINUX_ENOMEM;
+
+    size_t total = 0;
+    while (total < len) {
+        size_t n = (len - total) > chunk ? chunk : (len - total);
+        ssize_t r = (off_in >= 0) ? pread(host_in, buf, n, off_in)
+                                  : read(host_in, buf, n);
+        if (r <= 0) break;
+        if (off_in >= 0) off_in += r;
+
+        size_t written = 0;
+        while (written < (size_t)r) {
+            ssize_t w = (off_out >= 0)
+                ? pwrite(host_out, buf + written, r - written, off_out)
+                : write(host_out, buf + written, r - written);
+            if (w <= 0) { free(buf); goto done; }
+            written += w;
+            if (off_out >= 0) off_out += w;
+        }
+        total += r;
+    }
+
+done:
+    free(buf);
+
+    /* Write back updated offsets */
+    if (off_in_gva && off_in >= 0)
+        guest_write(g, off_in_gva, &off_in, 8);
+    if (off_out_gva && off_out >= 0)
+        guest_write(g, off_out_gva, &off_out, 8);
+
+    return total > 0 ? (int64_t)total : linux_errno();
+}
+
+/* vmsplice: emulate as writev to the pipe fd */
+static int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
+                              unsigned long nr_segs, unsigned int flags) {
+    (void)flags;
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (nr_segs > 64) nr_segs = 64;
+
+    size_t total = 0;
+    for (unsigned long i = 0; i < nr_segs; i++) {
+        linux_iovec_t liov;
+        if (guest_read(g, iov_gva + i * sizeof(linux_iovec_t),
+                       &liov, sizeof(liov)) < 0)
+            return -LINUX_EFAULT;
+
+        void *src = guest_ptr(g, liov.iov_base);
+        if (!src) return -LINUX_EFAULT;
+
+        ssize_t w = write(host_fd, src, liov.iov_len);
+        if (w < 0) return total > 0 ? (int64_t)total : linux_errno();
+        total += w;
+        if ((size_t)w < liov.iov_len) break;
+    }
+
+    return (int64_t)total;
+}
+
+/* tee: copy data between two pipes without consuming it.
+ * Full emulation would need MSG_PEEK on pipe — just return -EINVAL
+ * since it's rarely used. */
+static int64_t sys_tee(int fd_in, int fd_out, size_t len, unsigned int flags) {
+    (void)fd_in; (void)fd_out; (void)len; (void)flags;
+    return -LINUX_EINVAL;
+}
+
+/* ---------- setitimer/getitimer ---------- */
+
+/* Linux struct itimerval (same layout as macOS on LP64) */
+typedef struct {
+    linux_timeval_t it_interval;
+    linux_timeval_t it_value;
+} linux_itimerval_t;
+
+static int64_t sys_setitimer(guest_t *g, int which,
+                              uint64_t new_gva, uint64_t old_gva) {
+    linux_itimerval_t lnew;
+    if (guest_read(g, new_gva, &lnew, sizeof(lnew)) < 0)
+        return -LINUX_EFAULT;
+
+    struct itimerval nval = {
+        .it_interval = { .tv_sec = (long)lnew.it_interval.tv_sec,
+                         .tv_usec = (int)lnew.it_interval.tv_usec },
+        .it_value    = { .tv_sec = (long)lnew.it_value.tv_sec,
+                         .tv_usec = (int)lnew.it_value.tv_usec },
+    };
+
+    struct itimerval oval;
+    if (setitimer(which, &nval, old_gva ? &oval : NULL) < 0)
+        return linux_errno();
+
+    if (old_gva) {
+        linux_itimerval_t lold = {
+            .it_interval = { .tv_sec = oval.it_interval.tv_sec,
+                             .tv_usec = oval.it_interval.tv_usec },
+            .it_value    = { .tv_sec = oval.it_value.tv_sec,
+                             .tv_usec = oval.it_value.tv_usec },
+        };
+        if (guest_write(g, old_gva, &lold, sizeof(lold)) < 0)
+            return -LINUX_EFAULT;
+    }
+
+    return 0;
+}
+
+static int64_t sys_getitimer(guest_t *g, int which, uint64_t val_gva) {
+    struct itimerval oval;
+    if (getitimer(which, &oval) < 0)
+        return linux_errno();
+
+    linux_itimerval_t lval = {
+        .it_interval = { .tv_sec = oval.it_interval.tv_sec,
+                         .tv_usec = oval.it_interval.tv_usec },
+        .it_value    = { .tv_sec = oval.it_value.tv_sec,
+                         .tv_usec = oval.it_value.tv_usec },
+    };
+
+    if (guest_write(g, val_gva, &lval, sizeof(lval)) < 0)
+        return -LINUX_EFAULT;
+
+    return 0;
+}
+
 /* ---------- Main dispatch ---------- */
 
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
@@ -1572,7 +1909,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_pwrite64(g, (int)x0, x1, x2, (int64_t)x3);
         break;
     case SYS_ioctl:
-        result = sys_ioctl((int)x0, x1);
+        result = sys_ioctl(g, (int)x0, x1, x2);
         break;
     case SYS_fstat:
         result = sys_fstat(g, (int)x0, x1);
@@ -1581,7 +1918,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_newfstatat(g, (int)x0, x1, x2, (int)x3);
         break;
     case SYS_set_tid_address:
-        result = 1; /* return PID=1 */
+        result = proc_get_pid();
         break;
     case SYS_clock_gettime:
         result = sys_clock_gettime(g, (int)x0, x1);
@@ -1600,10 +1937,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_uname(g, x0);
         break;
     case SYS_getpid:
-        result = 1;
+        result = proc_get_pid();
         break;
     case SYS_gettid:
-        result = 1;
+        result = proc_get_pid();
         break;
     case SYS_brk:
         result = sys_brk(g, x0);
@@ -1694,6 +2031,9 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_chdir:
         result = sys_chdir(g, x0);
         break;
+    case SYS_fchdir:
+        result = sys_fchdir((int)x0);
+        break;
     case SYS_pipe2:
         result = sys_pipe2(g, x0, (int)x1);
         break;
@@ -1751,7 +2091,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_sched_getaffinity(g, (int)x0, x1, x2);
         break;
     case SYS_getpgid:
-        result = 1;  /* Same as PID */
+        result = proc_get_pid();
         break;
     case SYS_getgroups:
         result = sys_getgroups(g, (int)x0, x1);
@@ -1767,7 +2107,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             result = -LINUX_ENOSYS;
         break;
     case SYS_getppid:
-        result = 0;  /* No parent process */
+        result = proc_get_ppid();
         break;
     case SYS_sysinfo:
         result = sys_sysinfo(g, x0);
@@ -1809,17 +2149,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_pselect6:
         result = sys_pselect6(g, (int)x0, x1, x2, x3, x4);
         break;
-    case SYS_kill:
-        /* pid==1 (our PID) with sig 0 is a process existence check */
-        if ((int)x0 == 1 && (int)x1 == 0) result = 0;
-        else if ((int)x0 == 1) result = 0;  /* Self-signal: ignore */
+    case SYS_kill: {
+        int64_t our_pid = proc_get_pid();
+        if ((int)x0 == our_pid && (int)x1 == 0) result = 0;
+        else if ((int)x0 == our_pid) result = 0;
         else result = -LINUX_ESRCH;
         break;
-    case SYS_tgkill:
-        /* tid==1 (our TID): self-signal, ignore */
-        if ((int)x1 == 1) result = 0;
+    }
+    case SYS_tgkill: {
+        int64_t our_pid = proc_get_pid();
+        if ((int)x1 == our_pid) result = 0;
         else result = -LINUX_ESRCH;
         break;
+    }
     case SYS_rt_sigsuspend:
         result = -LINUX_EINTR;  /* Return immediately (no signals) */
         break;
@@ -1838,7 +2180,123 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = 0;  /* Stub: process groups not meaningful */
         break;
     case SYS_setsid:
-        result = 1;  /* Return PID as session ID */
+        result = proc_get_pid();
+        break;
+
+    /* ---- Quick-win syscalls ---- */
+    case SYS_truncate:
+        result = sys_truncate(g, x0, (int64_t)x1);
+        break;
+    case SYS_flock:
+        /* flock is a no-op stub (advisory locking not critical) */
+        result = 0;
+        break;
+    case SYS_setuid:
+    case SYS_setgid:
+    case SYS_setreuid:
+    case SYS_setregid:
+    case SYS_setresuid:
+    case SYS_setresgid:
+        result = 0;  /* Stub: pretend success */
+        break;
+    case SYS_getresuid: {
+        /* Write {1000,1000,1000} to guest pointers */
+        uint32_t uid = 1000;
+        if (x0) guest_write(g, x0, &uid, 4);
+        if (x1) guest_write(g, x1, &uid, 4);
+        if (x2) guest_write(g, x2, &uid, 4);
+        result = 0;
+        break;
+    }
+    case SYS_getresgid: {
+        uint32_t gid = 1000;
+        if (x0) guest_write(g, x0, &gid, 4);
+        if (x1) guest_write(g, x1, &gid, 4);
+        if (x2) guest_write(g, x2, &gid, 4);
+        result = 0;
+        break;
+    }
+    case SYS_setpriority:
+        result = 0;  /* Stub: pretend success */
+        break;
+    case SYS_getpriority:
+        result = 20;  /* Default nice value */
+        break;
+    case SYS_close_range:
+        result = sys_close_range((unsigned int)x0, (unsigned int)x1,
+                                  (unsigned int)x2);
+        break;
+    case SYS_statx:
+        result = sys_statx(g, (int)x0, x1, (int)x2, (unsigned int)x3, x4);
+        break;
+
+    /* ---- Process management ---- */
+    case SYS_execve:
+        result = sys_execve(vcpu, g, x0, x1, x2, verbose);
+        if (result == SYSCALL_EXEC_HAPPENED)
+            return SYSCALL_EXEC_HAPPENED;
+        break;
+    case SYS_execveat:
+        /* execveat with AT_EMPTY_PATH + fd is complex; stub with execve
+         * semantics when dirfd is AT_FDCWD */
+        if ((int)x0 == LINUX_AT_FDCWD) {
+            result = sys_execve(vcpu, g, x1, x2, x3, verbose);
+            if (result == SYSCALL_EXEC_HAPPENED)
+                return SYSCALL_EXEC_HAPPENED;
+        } else {
+            result = -LINUX_ENOSYS;
+        }
+        break;
+    case SYS_clone:
+        result = sys_clone(vcpu, g, x0, x1, x2, x3, x4, verbose);
+        break;
+    case SYS_wait4:
+        result = sys_wait4(g, (int)x0, x1, (int)x2, x3);
+        break;
+    case SYS_waitid:
+        /* Minimal stub: translate to wait4 semantics for common cases */
+        result = -LINUX_ENOSYS;
+        break;
+
+    /* ---- Splice/tee/vmsplice emulation ---- */
+    case SYS_splice:
+        result = sys_splice(g, (int)x0, x1, (int)x2, x3, (size_t)x4,
+                             (unsigned int)x5);
+        break;
+    case SYS_vmsplice:
+        result = sys_vmsplice(g, (int)x0, x1, (unsigned long)x2,
+                               (unsigned int)x3);
+        break;
+    case SYS_tee:
+        result = sys_tee((int)x0, (int)x1, (size_t)x2, (unsigned int)x3);
+        break;
+
+    /* ---- Timer syscalls ---- */
+    case SYS_setitimer:
+        result = sys_setitimer(g, (int)x0, x1, x2);
+        break;
+    case SYS_getitimer:
+        result = sys_getitimer(g, (int)x0, x1);
+        break;
+    case SYS_timerfd_create:
+    case SYS_timerfd_settime:
+    case SYS_timerfd_gettime:
+        /* timerfd requires kqueue-based emulation — stub for now */
+        result = -LINUX_ENOSYS;
+        break;
+
+    /* ---- epoll stubs (would need kqueue translation) ---- */
+    case SYS_epoll_create1:
+    case SYS_epoll_ctl:
+    case SYS_epoll_pwait:
+        result = -LINUX_ENOSYS;
+        break;
+
+    /* ---- inotify stubs ---- */
+    case SYS_inotify_init1:
+    case SYS_inotify_add_watch:
+    case SYS_inotify_rm_watch:
+        result = -LINUX_ENOSYS;
         break;
 
     default:
