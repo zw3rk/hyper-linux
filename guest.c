@@ -4,9 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
- * A single 512MB slab is mapped RWX to Hypervisor.framework. The guest's
- * own page tables (built here) enforce per-region permissions using 2MB
- * block descriptors, which are mandatory for transparent misaligned access.
+ * A 4GB address space is reserved via mmap(MAP_ANON). macOS demand-pages
+ * physical memory on first touch, so only used pages consume RAM. The slab
+ * is mapped RWX to Hypervisor.framework. The guest's own page tables
+ * (built here) enforce per-region permissions using 2MB block descriptors,
+ * which are mandatory for transparent misaligned access. Page tables can be
+ * extended at runtime via guest_extend_page_tables().
  *
  * Page table format: AArch64 4KB granule, 3-level (L0 -> L1 -> L2).
  *   L0 entry covers 512GB — one entry pointing to L1
@@ -74,18 +77,24 @@ int guest_init(guest_t *g, uint64_t size) {
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
 
-    /* Allocate page-aligned host memory */
-    if (posix_memalign(&g->host_base, getpagesize(), size) != 0) {
-        perror("guest: posix_memalign");
+    /* Reserve address space via mmap(MAP_ANON). macOS demand-pages this:
+     * physical pages are allocated only on first touch, so reserving 4GB
+     * costs nothing until pages are actually used. Do NOT memset — that
+     * would touch all 4GB and defeat demand paging. */
+    g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                        MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g->host_base == MAP_FAILED) {
+        perror("guest: mmap");
+        g->host_base = NULL;
         return -1;
     }
-    memset(g->host_base, 0, size);
 
     /* Create Hypervisor VM and map the entire slab at GUEST_IPA_BASE */
     hv_return_t ret = hv_vm_create(NULL);
     if (ret != HV_SUCCESS) {
         fprintf(stderr, "guest: hv_vm_create failed: %d\n", (int)ret);
-        free(g->host_base);
+        munmap(g->host_base, size);
+        g->host_base = NULL;
         return -1;
     }
 
@@ -94,7 +103,8 @@ int guest_init(guest_t *g, uint64_t size) {
     if (ret != HV_SUCCESS) {
         fprintf(stderr, "guest: hv_vm_map failed: %d\n", (int)ret);
         hv_vm_destroy();
-        free(g->host_base);
+        munmap(g->host_base, size);
+        g->host_base = NULL;
         return -1;
     }
 
@@ -108,7 +118,7 @@ void guest_destroy(guest_t *g) {
     }
     hv_vm_destroy();
     if (g->host_base) {
-        free(g->host_base);
+        munmap(g->host_base, g->guest_size);
         g->host_base = NULL;
     }
 }
@@ -262,6 +272,69 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
         }
     }
 
-    /* Return the IPA of the L0 table (for TTBR0) */
-    return base + l0_gpa;
+    /* Store TTBR0 for later use by guest_extend_page_tables */
+    uint64_t ttbr0 = base + l0_gpa;
+    g->ttbr0 = ttbr0;
+    return ttbr0;
+}
+
+/* Extend page tables to cover [start, end) with 2MB block descriptors.
+ * Walks the existing L0→L1 structure (from g->ttbr0) and allocates new
+ * L2 tables as needed. This is safe to call while the vCPU is paused
+ * (during HVC #5 handling). Sets g->need_tlbi so the shim flushes the
+ * TLB before returning to EL0. */
+int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms) {
+    uint64_t base = g->ipa_base;
+
+    /* Navigate to L0 table */
+    uint64_t l0_gpa_off = g->ttbr0 - base;
+    uint64_t *l0 = pt_at(g, l0_gpa_off);
+
+    /* L0 index (same as initial build — all addresses in one 512GB slot) */
+    unsigned l0_idx = (unsigned)(base / (512ULL * BLOCK_1GB));
+    if (!(l0[l0_idx] & PT_VALID)) {
+        fprintf(stderr, "guest: L0[%u] not valid in extend\n", l0_idx);
+        return -1;
+    }
+
+    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t l1_gpa_off = l1_ipa - base;
+    uint64_t *l1 = pt_at(g, l1_gpa_off);
+
+    /* Walk 2MB blocks in [start, end) */
+    uint64_t addr_start = ALIGN_2MB_DOWN(start);
+    uint64_t addr_end = ALIGN_2MB_UP(end);
+
+    for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MB) {
+        uint64_t ipa = base + addr;
+
+        unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
+        if (l1_idx >= 512) {
+            fprintf(stderr, "guest: IPA 0x%llx out of L1 range in extend\n",
+                    (unsigned long long)ipa);
+            return -1;
+        }
+
+        /* Ensure L1 entry points to an L2 table */
+        if (!(l1[l1_idx] & PT_VALID)) {
+            uint64_t l2_gpa = pt_alloc_page(g);
+            if (!l2_gpa) return -1;
+            l1[l1_idx] = (base + l2_gpa) | PT_VALID | PT_TABLE;
+        }
+
+        /* Navigate to L2 table */
+        uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t l2_gpa_off = l2_ipa - base;
+        uint64_t *l2 = pt_at(g, l2_gpa_off);
+
+        unsigned l2_idx = (unsigned)((ipa % BLOCK_1GB) / BLOCK_2MB);
+
+        /* Only map if not already mapped */
+        if (!(l2[l2_idx] & PT_BLOCK)) {
+            l2[l2_idx] = make_block_desc(ipa, perms);
+        }
+    }
+
+    g->need_tlbi = 1;
+    return 0;
 }

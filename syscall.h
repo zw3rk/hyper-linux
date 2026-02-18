@@ -12,38 +12,98 @@
 #include "elf.h"
 
 /* ---------- Linux aarch64 syscall numbers ---------- */
-#define SYS_getcwd       17
-#define SYS_dup          23
-#define SYS_dup3         24
-#define SYS_fcntl        25
-#define SYS_ioctl        29
-#define SYS_faccessat    48
-#define SYS_chdir        49
-#define SYS_openat       56
-#define SYS_close        57
-#define SYS_pipe2        59
-#define SYS_getdents64   61
-#define SYS_lseek        62
-#define SYS_read         63
-#define SYS_write        64
-#define SYS_writev       66
-#define SYS_readlinkat   78
-#define SYS_newfstatat   79
-#define SYS_fstat        80
-#define SYS_exit         93
-#define SYS_exit_group   94
+/* Sorted numerically for easy lookup.
+ * Reference: include/uapi/asm-generic/unistd.h in Linux source. */
+#define SYS_getcwd          17
+#define SYS_dup             23
+#define SYS_dup3            24
+#define SYS_fcntl           25
+#define SYS_ioctl           29
+#define SYS_mknodat         33
+#define SYS_mkdirat         34
+#define SYS_unlinkat        35
+#define SYS_symlinkat       36
+#define SYS_linkat          37
+#define SYS_statfs          43
+#define SYS_fstatfs         44
+#define SYS_ftruncate       46
+#define SYS_fallocate       47
+#define SYS_faccessat       48
+#define SYS_chdir           49
+#define SYS_fchmod          52
+#define SYS_fchmodat        53
+#define SYS_fchownat        54
+#define SYS_fchown          55
+#define SYS_openat          56
+#define SYS_close           57
+#define SYS_pipe2           59
+#define SYS_getdents64      61
+#define SYS_lseek           62
+#define SYS_read            63
+#define SYS_write           64
+#define SYS_readv           65
+#define SYS_writev          66
+#define SYS_pread64         67
+#define SYS_pwrite64        68
+#define SYS_sendfile        71
+#define SYS_pselect6        72
+#define SYS_ppoll           73
+#define SYS_readlinkat      78
+#define SYS_newfstatat      79
+#define SYS_fstat           80
+#define SYS_sync            81
+#define SYS_fsync           82
+#define SYS_fdatasync       83
+#define SYS_utimensat       88
+#define SYS_exit            93
+#define SYS_exit_group      94
 #define SYS_set_tid_address 96
-#define SYS_clock_gettime 113
-#define SYS_rt_sigaction  134
-#define SYS_rt_sigprocmask 135
-#define SYS_uname        160
-#define SYS_getpid       172
-#define SYS_gettid       178
-#define SYS_brk          214
-#define SYS_munmap       215
-#define SYS_mmap         222
-#define SYS_mprotect     226
-#define SYS_getrandom    278
+#define SYS_futex           98
+#define SYS_set_robust_list 99
+#define SYS_nanosleep       101
+#define SYS_clock_gettime   113
+#define SYS_clock_nanosleep 115
+#define SYS_sched_getaffinity 123
+#define SYS_sched_yield     124
+#define SYS_kill            129
+#define SYS_tgkill          131
+#define SYS_sigaltstack     132
+#define SYS_rt_sigsuspend   133
+#define SYS_rt_sigaction    134
+#define SYS_rt_sigprocmask  135
+#define SYS_rt_sigpending   136
+#define SYS_rt_sigreturn    139
+#define SYS_setpgid         154
+#define SYS_getpgid         155
+#define SYS_setsid          157
+#define SYS_getgroups       158
+#define SYS_uname           160
+#define SYS_getrusage       165
+#define SYS_umask           166
+#define SYS_prctl           167
+#define SYS_gettimeofday    169
+#define SYS_getpid          172
+#define SYS_getppid         173
+#define SYS_getuid          174
+#define SYS_geteuid         175
+#define SYS_getgid          176
+#define SYS_getegid         177
+#define SYS_gettid          178
+#define SYS_sysinfo         179
+#define SYS_socket          198
+#define SYS_bind            200
+#define SYS_listen          201
+#define SYS_connect         203
+#define SYS_accept          204
+#define SYS_brk             214
+#define SYS_munmap          215
+#define SYS_mmap            222
+#define SYS_mprotect        226
+#define SYS_madvise         233
+#define SYS_prlimit64       261
+#define SYS_renameat2       276
+#define SYS_getrandom       278
+#define SYS_copy_file_range 285
 
 /* ---------- Linux errno values ---------- */
 #define LINUX_EPERM       1
@@ -51,15 +111,40 @@
 #define LINUX_ESRCH       3
 #define LINUX_EINTR       4
 #define LINUX_EIO         5
+#define LINUX_ENXIO       6
+#define LINUX_E2BIG       7
 #define LINUX_EBADF       9
+#define LINUX_EAGAIN     11   /* Also EWOULDBLOCK */
 #define LINUX_ENOMEM     12
 #define LINUX_EACCES     13
 #define LINUX_EFAULT     14
+#define LINUX_EBUSY      16
+#define LINUX_EEXIST     17
+#define LINUX_EXDEV      18
+#define LINUX_ENODEV     19
 #define LINUX_ENOTDIR    20
+#define LINUX_EISDIR     21
 #define LINUX_EINVAL     22
+#define LINUX_ENFILE     23
+#define LINUX_EMFILE     24
 #define LINUX_ENOTTY     25
-#define LINUX_ENOSYS     38
+#define LINUX_ETXTBSY    26
+#define LINUX_EFBIG      27
+#define LINUX_ENOSPC     28
+#define LINUX_ESPIPE     29
+#define LINUX_EROFS      30
+#define LINUX_EMLINK     31
+#define LINUX_EPIPE      32
 #define LINUX_ERANGE     34
+#define LINUX_EDEADLK    35
+#define LINUX_ENAMETOOLONG 36
+#define LINUX_ENOLCK     37
+#define LINUX_ENOSYS     38
+#define LINUX_ENOTEMPTY  39
+#define LINUX_ELOOP      40
+#define LINUX_ENOPROTOOPT 92
+#define LINUX_EOPNOTSUPP 95
+#define LINUX_EOVERFLOW  75
 
 /* ---------- Linux ioctl constants ---------- */
 #define LINUX_TIOCGWINSZ 0x5413
@@ -73,11 +158,28 @@
 #define LINUX_O_TRUNC    0x0200
 #define LINUX_O_APPEND   0x0400
 #define LINUX_O_NONBLOCK 0x0800
-#define LINUX_O_CLOEXEC  0x80000
-#define LINUX_O_DIRECTORY 0x10000
+/* aarch64-linux open flag values (from asm-generic/fcntl.h).
+ * Note: these differ from x86_64-linux values! */
+#define LINUX_O_DIRECTORY  0x4000   /* 040000 octal */
+#define LINUX_O_NOFOLLOW   0x8000   /* 0100000 octal */
+#define LINUX_O_DIRECT     0x10000  /* 0200000 octal */
+#define LINUX_O_LARGEFILE  0x20000  /* 0400000 octal — ignored on LP64 */
+#define LINUX_O_CLOEXEC    0x80000  /* 02000000 octal */
 
 /* ---------- Linux AT_* constants ---------- */
-#define LINUX_AT_FDCWD   (-100)
+#define LINUX_AT_FDCWD             (-100)
+#define LINUX_AT_SYMLINK_NOFOLLOW  0x100
+#define LINUX_AT_REMOVEDIR         0x200
+#define LINUX_AT_SYMLINK_FOLLOW    0x400
+#define LINUX_AT_EMPTY_PATH        0x1000
+
+/* ---------- Linux futex operations ---------- */
+#define LINUX_FUTEX_WAIT  0
+#define LINUX_FUTEX_WAKE  1
+
+/* ---------- Linux prctl operations ---------- */
+#define LINUX_PR_SET_NAME  15
+#define LINUX_PR_GET_NAME  16
 
 /* ---------- Linux mmap flags ---------- */
 #define LINUX_PROT_NONE  0x0
@@ -132,11 +234,85 @@ typedef struct {
     int64_t tv_nsec;
 } linux_timespec_t;
 
+/* ---------- Linux struct timeval (aarch64) ---------- */
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_usec;
+} linux_timeval_t;
+
+/* ---------- Linux struct statfs (aarch64) ---------- */
+typedef struct {
+    int64_t  f_type;
+    int64_t  f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen;
+    int64_t  f_frsize;
+    int64_t  f_flags;
+    int64_t  f_spare[4];
+} linux_statfs_t;
+
 /* ---------- Linux iovec ---------- */
 typedef struct {
     uint64_t iov_base;  /* Guest pointer */
     uint64_t iov_len;
 } linux_iovec_t;
+
+/* ---------- Linux struct sysinfo ---------- */
+typedef struct {
+    int64_t  uptime;
+    uint64_t loads[3];       /* 1, 5, 15 minute load averages × 65536 */
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t pad2;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+    char     _f[4];          /* Padding to 64 bytes on LP64 */
+} linux_sysinfo_t;
+
+/* ---------- Linux struct rusage ---------- */
+typedef struct {
+    linux_timeval_t ru_utime;
+    linux_timeval_t ru_stime;
+    int64_t ru_maxrss;
+    int64_t ru_ixrss;
+    int64_t ru_idrss;
+    int64_t ru_isrss;
+    int64_t ru_minflt;
+    int64_t ru_majflt;
+    int64_t ru_nswap;
+    int64_t ru_inblock;
+    int64_t ru_oublock;
+    int64_t ru_msgsnd;
+    int64_t ru_msgrcv;
+    int64_t ru_nsignals;
+    int64_t ru_nvcsw;
+    int64_t ru_nivcsw;
+} linux_rusage_t;
+
+/* ---------- Linux struct rlimit64 ---------- */
+typedef struct {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+} linux_rlimit64_t;
+
+/* ---------- Linux struct pollfd ---------- */
+typedef struct {
+    int32_t  fd;
+    int16_t  events;
+    int16_t  revents;
+} linux_pollfd_t;
 
 /* ---------- FD table ---------- */
 #define FD_TABLE_SIZE 256
@@ -147,25 +323,10 @@ typedef struct {
 #define FD_DIR      3
 
 typedef struct {
-    int type;     /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
-    int host_fd;  /* Underlying macOS file descriptor */
+    int   type;     /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
+    int   host_fd;  /* Underlying macOS file descriptor */
+    void *dir;      /* DIR* for FD_DIR entries (NULL otherwise) */
 } fd_entry_t;
-
-/* ---------- Auxiliary vector types ---------- */
-#define AT_NULL    0
-#define AT_PHDR    3
-#define AT_PHENT   4
-#define AT_PHNUM   5
-#define AT_PAGESZ  6
-#define AT_ENTRY   9
-#define AT_UID     11
-#define AT_EUID    12
-#define AT_GID     13
-#define AT_EGID    14
-#define AT_HWCAP   16
-#define AT_CLKTCK  17
-#define AT_RANDOM  25
-#define AT_PLATFORM 45
 
 /* ---------- API ---------- */
 
@@ -176,11 +337,5 @@ void syscall_init(void);
  * Writes result back to X0. Sets *exit_code if the process should exit.
  * Returns 0 to continue, 1 to exit. */
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose);
-
-/* Build a Linux-compatible initial stack at the given stack_top.
- * Returns the initial SP (stack pointer) to pass to the guest. */
-uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
-                           int argc, const char **argv,
-                           const elf_info_t *elf_info);
 
 #endif /* SYSCALL_H */

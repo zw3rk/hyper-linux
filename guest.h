@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
- * host buffer). The entire 512MB region is mapped as a single RWX slab to
+ * host buffer). A 4GB address space is reserved via mmap(MAP_ANON) (macOS
+ * demand-pages physical memory on first touch). The slab is mapped RWX to
  * Hypervisor.framework; fine-grained permissions are enforced by the guest's
- * own page tables built from mem_region descriptors.
+ * own page tables built from mem_region descriptors. Page tables can be
+ * extended at runtime (e.g. when mmap/brk grows beyond initial mappings).
  */
 #ifndef GUEST_H
 #define GUEST_H
@@ -16,18 +18,19 @@
 #include <stddef.h>
 
 /* ---------- Memory layout constants ---------- */
-#define GUEST_MEM_SIZE   0x20000000ULL  /* 512MB total guest memory */
-#define PT_POOL_BASE     0x00010000ULL  /* Page table pool start */
-#define PT_POOL_END      0x00100000ULL  /* Page table pool end (960KB) */
-#define SHIM_BASE        0x00100000ULL  /* Shim code (2MB block, RX) */
-#define SHIM_DATA_BASE   0x00200000ULL  /* Shim stack/data (2MB block, RW) */
-#define ELF_DEFAULT_BASE 0x00400000ULL  /* Typical ELF load base */
-#define BRK_BASE_DEFAULT 0x01000000ULL  /* Default brk start (16MB) */
-#define STACK_TOP        0x08000000ULL  /* Stack grows down from here */
-#define STACK_BASE       0x07E00000ULL  /* Bottom of 2MB stack block */
-#define MMAP_BASE        0x10000000ULL  /* mmap region start (256MB) */
-#define MMAP_END         0x20000000ULL  /* mmap region end = guest size */
-#define BLOCK_2MB        (2ULL * 1024 * 1024)
+#define GUEST_MEM_SIZE       0x100000000ULL  /* 4GB total guest address space */
+#define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
+#define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
+#define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
+#define SHIM_DATA_BASE       0x00200000ULL   /* Shim stack/data (2MB block, RW) */
+#define ELF_DEFAULT_BASE     0x00400000ULL   /* Typical ELF load base */
+#define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
+#define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
+#define STACK_BASE           0x07E00000ULL   /* Bottom of 2MB stack block */
+#define MMAP_BASE            0x10000000ULL   /* mmap region start */
+#define MMAP_INITIAL_END     0x20000000ULL   /* Initial pre-mapped mmap region (512MB) */
+#define MMAP_END             0x100000000ULL  /* Max mmap region end (4GB) */
+#define BLOCK_2MB            (2ULL * 1024 * 1024)
 
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.
  * All guest physical addresses = GUEST_IPA_BASE + offset.
@@ -61,6 +64,9 @@ typedef struct {
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
     uint64_t    mmap_next;    /* Next available mmap address */
+    uint64_t    mmap_end;     /* Current page-table-covered mmap limit */
+    uint64_t    ttbr0;        /* TTBR0 value (IPA of L0 page table) */
+    int         need_tlbi;    /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t   vcpu;         /* vCPU handle */
     hv_vcpu_exit_t *exit;     /* vCPU exit info */
 } guest_t;
@@ -100,5 +106,11 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max);
  * Uses 2MB block descriptors. Returns the TTBR0 value (GPA of L0 table),
  * or 0 on failure. */
 uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n);
+
+/* Extend page tables to cover a new address range [start, end) with 2MB
+ * block descriptors. Reuses the existing L0→L1 table structure and
+ * allocates new L2 tables as needed. Sets g->need_tlbi = 1.
+ * Returns 0 on success, -1 on failure. */
+int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms);
 
 #endif /* GUEST_H */

@@ -9,7 +9,7 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl sign clean test-hello help
+.PHONY: all hl sign clean test-hello test-all help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -27,14 +27,18 @@ RED    := \033[0;31m
 RESET  := \033[0m
 
 # ── Source files ───────────────────────────────────────────────────
-HL_SRCS := hl.c guest.c elf.c syscall.c
-HL_HDRS := guest.h elf.h syscall.h
+HL_SRCS := hl.c guest.c elf.c syscall.c stack.c
+HL_HDRS := guest.h elf.h syscall.h stack.h
+
+# C test programs (built with musl cross-compiler, static)
+TEST_C_SRCS := $(wildcard test/*.c)
+TEST_C_BINS := $(patsubst test/%.c,$(BUILD_DIR)/%,$(TEST_C_SRCS))
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
 
-## Build everything (hl + test binaries)
-all: hl test-hello
+## Build everything (hl + all test binaries)
+all: hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
 
 # ── Build directory ────────────────────────────────────────────────
 $(BUILD_DIR):
@@ -74,16 +78,68 @@ $(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 
 # ── Test binaries ──────────────────────────────────────────────────
 
-## Build and run the assembly hello world test
-test-hello: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
-	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
-	$(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
-
+# Assembly hello world (uses custom linker script)
 $(BUILD_DIR)/test-hello: test/hello.S test/simple.ld | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Cross-assembling$(RESET) test/hello.S\n"
 	$(CROSS)as -o $(BUILD_DIR)/test-hello.o test/hello.S
 	@printf "$(GREEN)▸ Cross-linking$(RESET) test-hello\n"
 	$(CROSS)ld -T test/simple.ld -o $@ $(BUILD_DIR)/test-hello.o
+
+# Pattern rule: build static musl binaries from test/*.c
+$(BUILD_DIR)/%: test/%.c | $(BUILD_DIR)
+	@printf "$(GREEN)▸ Cross-compiling$(RESET) $<\n"
+	$(CROSS)gcc -static -O2 -o $@ $<
+
+# ── Test targets ──────────────────────────────────────────────────
+
+## Build and run the assembly hello world test
+test-hello: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
+	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
+	$(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
+
+## Run all tests
+test-all: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
+	@printf "\n$(BLUE)━━━ Running test suite ━━━$(RESET)\n\n"
+	@pass=0; fail=0; \
+	run_test() { \
+		name=$$(basename "$$2"); \
+		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
+		if output=$$($$@ 2>&1); then \
+			printf "$(GREEN)✓ PASS$(RESET)\n"; \
+			pass=$$((pass + 1)); \
+		else \
+			rc=$$?; \
+			if [ "$$expected_rc" != "" ] && [ "$$rc" = "$$expected_rc" ]; then \
+				printf "$(GREEN)✓ PASS$(RESET) (exit $$rc)\n"; \
+				pass=$$((pass + 1)); \
+			else \
+				printf "$(RED)✗ FAIL$(RESET) (exit $$rc)\n"; \
+				printf "  %s\n" "$$output" | head -5; \
+				fail=$$((fail + 1)); \
+			fi; \
+		fi; \
+	}; \
+	printf "$(BLUE)── Assembly tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello; \
+	printf "\n$(BLUE)── C tests (musl static) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/hello-musl; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/hello-write; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/echo-test hello world; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-argc a b c; \
+	expected_rc=42 run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-complex; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-fileio CLAUDE.md; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-string; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-cat test/hello.S; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-ls test/; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-roundtrip; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-comprehensive; \
+	printf "\n$(BLUE)── Syscall coverage tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-file-ops; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-sysinfo; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-io-opt; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-poll; \
+	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
 
 # ── Legacy vm target (preserved) ──────────────────────────────────
 

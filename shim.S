@@ -298,9 +298,18 @@ handle_svc_0:
      *   1. Read X8 (syscall nr) and X0-X5 (args)
      *   2. Execute the syscall
      *   3. Write result to X0
-     *   4. Resume vCPU (we continue at eret) */
+     *   4. Set X8 to non-zero if page tables were modified (TLBI needed)
+     *   5. Resume vCPU (we continue below) */
     hvc #5
 
+    /* If the host modified page tables (X8 != 0), flush the TLB.
+     * X8 is the syscall number register — the Linux ABI marks it
+     * clobbered across SVC, so callers never expect it preserved. */
+    cbz x8, 1f
+    tlbi vmalle1is
+    dsb ish
+    isb
+1:
     /* Return to EL0 — X0 now holds the syscall return value,
      * X1-X30 retain their original EL0 values. */
     eret

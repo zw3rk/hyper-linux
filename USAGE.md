@@ -3,57 +3,91 @@
 ## Prerequisites
 
 - macOS on Apple Silicon (aarch64-darwin)
-- Xcode command-line tools (for `as`, `clang`, `codesign`)
-- GNU binutils via nix (`objcopy` for binary blob creation)
+- Nix with flakes (provides cross-compiler and tools)
 
-## Build & Run
+## Quick Start
 
 ```bash
-# Show available targets
-make help
+# Enter development shell
+nix develop
 
-# Build and run (default ad-hoc signing)
-make run
+# Build the hl executable
+make hl
 
-# Build with developer signing identity
-make run SIGN_IDENTITY="Apple Development: Your Name (XXXXXXXXXX)"
+# Run a static aarch64-linux ELF binary
+_build/hl ./my-program [args...]
 
-# Build only (no run)
-make all
+# Run with verbose syscall tracing
+_build/hl -v ./my-program
 
-# Clean build artifacts
-make clean
+# Run with custom timeout (default 10s)
+_build/hl -t 30 ./my-program
+```
+
+## Build Targets
+
+```bash
+make help              # Show all targets
+make hl                # Build + codesign hl
+make test-hello        # Build and run assembly hello world
+make test-all          # Run full test suite (13 tests)
+make all               # Build everything (hl + all test binaries)
+make clean             # Remove _build/
+```
+
+## Running Programs
+
+```bash
+# Assembly hello world
+_build/hl _build/test-hello
+
+# Musl C hello world
+_build/hl _build/hello-musl
+
+# Echo arguments
+_build/hl _build/echo-test hello world
+
+# Read a file (first 3 lines + line count)
+_build/hl _build/test-fileio CLAUDE.md
+
+# List a directory
+_build/hl _build/test-ls test/
+
+# Cat a file
+_build/hl _build/test-cat test/hello.S
+```
+
+## Cross-Compiling Test Programs
+
+```bash
+# Inside nix develop shell:
+aarch64-unknown-linux-musl-gcc -static -O2 -o _build/myprog test/myprog.c
+
+# For math functions, add -lm:
+aarch64-unknown-linux-musl-gcc -static -O2 -o _build/math test/math.c -lm
+
+# Test binaries are also built automatically by `make all`
 ```
 
 ## Build Artifacts
 
 All outputs go to `_build/`:
-- `_build/vm` — Host hypervisor executable
-- `_build/shim.o`, `_build/shim.bin` — EL1 kernel shim
-- `_build/user.o`, `_build/user.bin` — EL0 test code
+- `_build/hl` — Host hypervisor ELF executor
+- `_build/shim.o`, `_build/shim.bin`, `_build/shim_blob.h` — EL1 kernel shim
+- `_build/test-*`, `_build/hello-*`, `_build/echo-*` — Cross-compiled test binaries
 
-## How It Works
+## CLI Options
 
-1. `vm.c` allocates 16MB guest memory at GPA 0x80000000
-2. Sets up 3-level page tables (L0 -> L1 -> L2) with 2MB block mappings
-3. Loads `shim.bin` at guest base, `user.bin` at offset 0x4000
-4. Creates vCPU, sets PC to guest base, CPSR to EL1h (0x3c5)
-5. Shim configures system registers via HVC #4 calls to host
-6. Shim enables MMU, sets up exception vectors, ERETs to EL0
-7. User code runs: unaligned access, SIMD, SVC calls
-8. SVC handled by shim's exception vectors, HVC forwarded to host
+| Option | Description |
+|--------|-------------|
+| `-v`, `--verbose` | Print syscall trace to stderr |
+| `-t N`, `--timeout N` | Set execution timeout in seconds (default: 10) |
+| `--` | End of hl options (pass `-v` as argument to guest) |
 
 ## Troubleshooting
 
 - **HV_DENIED (-85377017)**: Missing Hypervisor entitlement. Check `entitlements.plist`
-  and signing with `codesign -d --entitlements - _build/vm`.
-- **Hang on vcpu_run**: Usually MMU misconfiguration. Check page table setup in vm.c.
-- **objcopy not found**: Ensure nix is installed. The Makefile uses `nix shell nixpkgs#binutils`.
-
-## Finding Your Signing Identity
-
-```bash
-security find-identity -v -p codesigning
-```
-
-Ad-hoc signing (`-`) works for local development.
+  and signing with `codesign -d --entitlements - _build/hl`.
+- **Unimplemented syscall N**: Run with `-v` to see full args. Add handler in syscall.c.
+- **objcopy not found**: Use `nix develop` shell — it provides binutils.
+- **Timeout (exit 124)**: Program runs too long. Use `-t 60` for a longer timeout.
