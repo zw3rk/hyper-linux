@@ -1,0 +1,6 @@
+_build/
+archive/
+*.o
+*.bin
+.direnv/
+result
