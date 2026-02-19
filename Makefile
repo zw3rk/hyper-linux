@@ -9,7 +9,7 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl sign clean test-hello test-all help
+.PHONY: all hl sign clean test-hello test-all test-coreutils test-busybox help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -27,8 +27,12 @@ RED    := \033[0;31m
 RESET  := \033[0m
 
 # ── Source files ───────────────────────────────────────────────────
-HL_SRCS := hl.c guest.c elf.c syscall.c syscall_proc.c stack.c
-HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_proc.h stack.h
+HL_SRCS := hl.c guest.c elf.c syscall.c syscall_fs.c syscall_io.c \
+           syscall_time.c syscall_sys.c syscall_proc.c syscall_signal.c \
+           syscall_net.c stack.c
+HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_fs.h \
+           syscall_io.h syscall_time.h syscall_sys.h syscall_proc.h \
+           syscall_signal.h syscall_net.h stack.h
 
 # C test programs (built with musl cross-compiler, static)
 TEST_C_SRCS := $(wildcard test/*.c)
@@ -137,12 +141,43 @@ test-all: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
 	printf "\n$(BLUE)── Process tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-exec $(BUILD_DIR)/echo-test exec-works; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-fork; \
+	printf "\n$(BLUE)── Signal tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-signal; \
+	printf "\n$(BLUE)── Socket tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-file-ops; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-sysinfo; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-io-opt; \
 	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-poll; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
+
+# ── Coreutils integration test ───────────────────────────────────
+
+# Path to static aarch64-linux-musl coreutils bin directory.
+# Auto-detected from GUEST_COREUTILS env var (set by nix develop); override with COREUTILS_BIN=...
+COREUTILS_BIN ?= $(GUEST_COREUTILS)/bin
+
+## Run GNU coreutils 9.9 integration tests (104 tools)
+test-coreutils: $(BUILD_DIR)/hl
+	@if [ ! -d "$(COREUTILS_BIN)" ]; then \
+		printf "$(RED)✗ Coreutils not found.$(RESET) Build first:\n"; \
+		printf "  nix build --impure --expr 'let nixpkgs = import <nixpkgs> {}; in nixpkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.coreutils'\n"; \
+		exit 1; \
+	fi
+	@bash test/test-coreutils.sh $(BUILD_DIR)/hl $(COREUTILS_BIN)
+
+# ── Busybox integration test ─────────────────────────────────────
+
+BUSYBOX_BIN ?= $(GUEST_BUSYBOX)/bin/busybox
+
+## Run busybox applet smoke tests
+test-busybox: $(BUILD_DIR)/hl
+	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ Busybox not found in PATH.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-busybox.sh $(BUILD_DIR)/hl $(BUSYBOX_BIN)
 
 # ── Legacy vm target (preserved) ──────────────────────────────────
 

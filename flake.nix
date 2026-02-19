@@ -16,8 +16,16 @@
         (pkgs.darwinMinVersionHook "15.0")
       ];
 
-      # Cross-compiler for building aarch64-linux test binaries
-      crossCC = pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc;
+      # Cross packages for aarch64-linux-musl
+      crossPkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
+      crossCC = crossPkgs.stdenv.cc;
+      crossStatic = crossPkgs.pkgsStatic;
+
+      # Static aarch64-linux test binaries for hl
+      guestBins = {
+        coreutils = crossStatic.coreutils;
+        busybox   = crossStatic.busybox;
+      };
 
     in {
       devShells.${system}.default = pkgs.mkShell {
@@ -30,11 +38,20 @@
           crossCC        # aarch64-unknown-linux-musl-{as,ld,gcc}
         ] ++ darwinBuildInputs;
 
+        # Guest binaries are NOT added to PATH (they're aarch64-linux ELFs!).
+        # Instead, expose as env vars for Makefile/test scripts.
+        GUEST_COREUTILS = "${guestBins.coreutils}";
+        GUEST_BUSYBOX   = "${guestBins.busybox}";
+
         shellHook = ''
           echo "hl development environment"
           echo "  make help        — show available targets"
           echo "  make hl          — build the hl executable"
           echo "  make test-hello  — build and run assembly hello world"
+          echo ""
+          echo "Guest binaries (aarch64-linux-musl, static):"
+          echo "  coreutils: $GUEST_COREUTILS/bin/"
+          echo "  busybox:   $GUEST_BUSYBOX/bin/"
         '';
       };
 

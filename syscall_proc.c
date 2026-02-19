@@ -10,6 +10,7 @@
  */
 #include "syscall_proc.h"
 #include "syscall_internal.h"
+#include "syscall_signal.h"
 #include "stack.h"
 
 #include <stdio.h>
@@ -23,7 +24,10 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
+#include <sys/param.h>
 #include <mach-o/dyld.h>
 
 /* ---------- HV_CHECK macro (shared with hl.c) ---------- */
@@ -44,6 +48,9 @@ static int64_t parent_pid = 0;
 /* Shim blob reference (set by proc_set_shim from hl.c) */
 static const unsigned char *shim_blob_ptr = NULL;
 static unsigned int shim_blob_size = 0;
+
+/* Current ELF binary path for /proc/self/exe emulation */
+static char elf_path[4096] = {0};
 
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
@@ -69,6 +76,259 @@ int64_t proc_get_ppid(void) {
 void proc_set_shim(const unsigned char *blob, unsigned int len) {
     shim_blob_ptr = blob;
     shim_blob_size = len;
+}
+
+void proc_set_elf_path(const char *path) {
+    if (path) {
+        /* Resolve to absolute path if relative */
+        if (path[0] == '/') {
+            strncpy(elf_path, path, sizeof(elf_path) - 1);
+        } else {
+            char cwd[4096];
+            if (getcwd(cwd, sizeof(cwd))) {
+                snprintf(elf_path, sizeof(elf_path), "%s/%s", cwd, path);
+            } else {
+                strncpy(elf_path, path, sizeof(elf_path) - 1);
+            }
+        }
+        elf_path[sizeof(elf_path) - 1] = '\0';
+    } else {
+        elf_path[0] = '\0';
+    }
+}
+
+const char *proc_get_elf_path(void) {
+    return elf_path[0] ? elf_path : NULL;
+}
+
+/* ---------- /proc and /dev emulation ---------- */
+
+/* Create a synthetic file from a buffer. Returns a host fd positioned at
+ * the start, or -1 on failure. Caller owns the returned fd. */
+static int proc_synthetic_fd(const void *data, size_t len) {
+    /* Use a pipe: write data into write end, return read end */
+    int fds[2];
+    if (pipe(fds) < 0) return -1;
+
+    /* Write all data (may need multiple writes for large data) */
+    const uint8_t *p = data;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = write(fds[1], p, remaining);
+        if (n <= 0) { close(fds[0]); close(fds[1]); return -1; }
+        p += n;
+        remaining -= n;
+    }
+    close(fds[1]);  /* Close write end so reads see EOF */
+    return fds[0];
+}
+
+int proc_intercept_open(const char *path, int linux_flags, int mode) {
+    (void)mode;
+    (void)linux_flags;
+
+    /* /dev/null → host /dev/null */
+    if (strcmp(path, "/dev/null") == 0) {
+        int fd = open("/dev/null", O_RDWR);
+        return fd >= 0 ? fd : -1;
+    }
+
+    /* /dev/zero → host /dev/zero */
+    if (strcmp(path, "/dev/zero") == 0) {
+        int fd = open("/dev/zero", O_RDONLY);
+        return fd >= 0 ? fd : -1;
+    }
+
+    /* /dev/urandom, /dev/random → host /dev/urandom */
+    if (strcmp(path, "/dev/urandom") == 0 ||
+        strcmp(path, "/dev/random") == 0) {
+        int fd = open("/dev/urandom", O_RDONLY);
+        return fd >= 0 ? fd : -1;
+    }
+
+    /* /dev/tty → host /dev/tty */
+    if (strcmp(path, "/dev/tty") == 0) {
+        int fd = open("/dev/tty", O_RDWR);
+        return fd >= 0 ? fd : -1;
+    }
+
+    /* /dev/stdin → dup(0), /dev/stdout → dup(1), /dev/stderr → dup(2) */
+    if (strcmp(path, "/dev/stdin") == 0)  return dup(STDIN_FILENO);
+    if (strcmp(path, "/dev/stdout") == 0) return dup(STDOUT_FILENO);
+    if (strcmp(path, "/dev/stderr") == 0) return dup(STDERR_FILENO);
+
+    /* /dev/fd/N → dup(N) */
+    if (strncmp(path, "/dev/fd/", 8) == 0) {
+        int n = atoi(path + 8);
+        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host(n);
+        if (host_fd < 0) { errno = EBADF; return -1; }
+        return dup(host_fd);
+    }
+
+    /* /proc/cpuinfo → synthetic file with CPU count */
+    if (strcmp(path, "/proc/cpuinfo") == 0) {
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu < 1) ncpu = 1;
+        char buf[4096];
+        int off = 0;
+        for (int i = 0; i < ncpu && off < (int)sizeof(buf) - 256; i++) {
+            off += snprintf(buf + off, sizeof(buf) - off,
+                "processor\t: %d\n"
+                "BogoMIPS\t: 48.00\n"
+                "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics\n"
+                "CPU implementer\t: 0x61\n"
+                "CPU architecture: 8\n"
+                "CPU variant\t: 0x1\n"
+                "CPU part\t: 0x022\n"
+                "CPU revision\t: 1\n\n", i);
+        }
+        return proc_synthetic_fd(buf, off);
+    }
+
+    /* /proc/self/status → synthetic process status */
+    if (strcmp(path, "/proc/self/status") == 0) {
+        char buf[1024];
+        int len = snprintf(buf, sizeof(buf),
+            "Name:\thl\n"
+            "State:\tR (running)\n"
+            "Tgid:\t%lld\n"
+            "Pid:\t%lld\n"
+            "PPid:\t%lld\n"
+            "Uid:\t1000\t1000\t1000\t1000\n"
+            "Gid:\t1000\t1000\t1000\t1000\n",
+            (long long)guest_pid,
+            (long long)guest_pid,
+            (long long)parent_pid);
+        return proc_synthetic_fd(buf, len);
+    }
+
+    /* /proc/self/maps → empty (minimal) */
+    if (strcmp(path, "/proc/self/maps") == 0) {
+        return proc_synthetic_fd("", 0);
+    }
+
+    /* /proc/uptime → synthetic uptime in seconds.
+     * Uses sysctl(KERN_BOOTTIME), same as sys_sysinfo() in syscall_sys.c.
+     * Idle time is 0 (no meaningful macOS equivalent). */
+    if (strcmp(path, "/proc/uptime") == 0) {
+        struct timeval boottime;
+        size_t bt_len = sizeof(boottime);
+        int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+        if (sysctl(mib, 2, &boottime, &bt_len, NULL, 0) < 0)
+            return -1;
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        double uptime = (double)(now.tv_sec - boottime.tv_sec)
+                      + (double)(now.tv_usec - boottime.tv_usec) / 1e6;
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf), "%.2f 0.00\n", uptime);
+        return proc_synthetic_fd(buf, len);
+    }
+
+    /* /proc/loadavg → synthetic load averages.
+     * Musl's getloadavg() reads /proc/loadavg, so GNU uptime needs this. */
+    if (strcmp(path, "/proc/loadavg") == 0) {
+        double loadavg[3] = {0};
+        getloadavg(loadavg, 3);
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf), "%.2f %.2f %.2f 1/1 %lld\n",
+                           loadavg[0], loadavg[1], loadavg[2],
+                           (long long)guest_pid);
+        return proc_synthetic_fd(buf, len);
+    }
+
+    /* /var/run/utmp, /run/utmp → synthetic utmp with current user.
+     * Creates one USER_PROCESS record for who, users, pinky. */
+    if (strcmp(path, "/var/run/utmp") == 0 ||
+        strcmp(path, "/run/utmp") == 0) {
+        _Static_assert(sizeof(linux_utmpx_t) == 400,
+                       "linux_utmpx_t size mismatch");
+        linux_utmpx_t entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.ut_type = LINUX_USER_PROCESS;
+        entry.ut_pid = (int32_t)guest_pid;
+        strncpy(entry.ut_line, "pts/0", LINUX_UT_LINESIZE);
+        strncpy(entry.ut_id, "0", 4);
+        const char *user = getenv("USER");
+        if (!user) user = "user";
+        strncpy(entry.ut_user, user, LINUX_UT_NAMESIZE - 1);
+        strncpy(entry.ut_host, "localhost", LINUX_UT_HOSTSIZE - 1);
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        entry.ut_tv_sec = now.tv_sec;
+        entry.ut_tv_usec = now.tv_usec;
+        return proc_synthetic_fd(&entry, sizeof(entry));
+    }
+
+    /* /proc/self/fd/N → open the target of the fd (readlink-style) */
+    if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+        int n = atoi(path + 14);
+        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host(n);
+        if (host_fd < 0) { errno = EBADF; return -1; }
+        return dup(host_fd);
+    }
+
+    /* /etc/passwd → synthetic passwd with root + current user */
+    if (strcmp(path, "/etc/passwd") == 0) {
+        char buf[512];
+        int len = snprintf(buf, sizeof(buf),
+            "root:x:0:0:root:/root:/bin/sh\n"
+            "user:x:1000:1000:user:/home/user:/bin/sh\n");
+        return proc_synthetic_fd(buf, len);
+    }
+
+    /* /etc/group → synthetic group file */
+    if (strcmp(path, "/etc/group") == 0) {
+        char buf[512];
+        int len = snprintf(buf, sizeof(buf),
+            "root:x:0:\n"
+            "staff:x:20:\n"
+            "user:x:1000:\n");
+        return proc_synthetic_fd(buf, len);
+    }
+
+    return -2;  /* Not intercepted */
+}
+
+int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
+    /* /proc/self/exe → path of current ELF binary */
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        const char *exe = proc_get_elf_path();
+        if (!exe) { errno = ENOENT; return -1; }
+        size_t len = strlen(exe);
+        if (len > bufsiz) len = bufsiz;
+        memcpy(buf, exe, len);
+        return (int)len;
+    }
+
+    /* /proc/self/cwd → getcwd() */
+    if (strcmp(path, "/proc/self/cwd") == 0) {
+        char cwd[4096];
+        if (!getcwd(cwd, sizeof(cwd))) return -1;
+        size_t len = strlen(cwd);
+        if (len > bufsiz) len = bufsiz;
+        memcpy(buf, cwd, len);
+        return (int)len;
+    }
+
+    /* /proc/self/fd/N → path of host fd (via fcntl F_GETPATH on macOS) */
+    if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+        int n = atoi(path + 14);
+        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host(n);
+        if (host_fd < 0) { errno = EBADF; return -1; }
+
+        char fdpath[MAXPATHLEN];
+        if (fcntl(host_fd, F_GETPATH, fdpath) < 0) { errno = ENOENT; return -1; }
+        size_t len = strlen(fdpath);
+        if (len > bufsiz) len = bufsiz;
+        memcpy(buf, fdpath, len);
+        return (int)len;
+    }
+
+    return -2;  /* Not intercepted */
 }
 
 /* ---------- execve implementation ---------- */
@@ -283,13 +543,20 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, 0);
     }
 
-    /* Signal TLB invalidation needed */
-    g->need_tlbi = 1;
+    /* Tell the shim to invalidate TLB after we rebuilt page tables.
+     * Set X8=1 directly because SYSCALL_EXEC_HAPPENED bypasses the
+     * normal X8 TLBI signaling in syscall_dispatch(). The shim checks
+     * X8 after HVC #5 return: if non-zero, it runs TLBI VMALLE1IS. */
+    hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
+    g->need_tlbi = 0;
 
     if (verbose) {
         fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx\n",
                 path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa);
     }
+
+    /* Update ELF path for /proc/self/exe after successful exec */
+    proc_set_elf_path(path);
 
     free(argv_buf);
     free(envp_buf);
@@ -615,6 +882,40 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     if (cwd[0] != '\0') chdir(cwd);
     umask((mode_t)umask_val);
 
+    /* Step 6b: Read signal state */
+    signal_state_t sig;
+    if (ipc_read_all(ipc_fd, &sig, sizeof(sig)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read signal state\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    signal_set_state(&sig);
+
+    /* Step 6c: Read shim blob (needed for exec in child) */
+    uint32_t shim_size;
+    if (ipc_read_all(ipc_fd, &shim_size, sizeof(shim_size)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read shim size\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (shim_size > 0) {
+        unsigned char *shim = malloc(shim_size);
+        if (!shim) {
+            fprintf(stderr, "hl: fork-child: shim alloc failed\n");
+            guest_destroy(&g);
+            return 1;
+        }
+        if (ipc_read_all(ipc_fd, shim, shim_size) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read shim blob\n");
+            free(shim);
+            guest_destroy(&g);
+            return 1;
+        }
+        proc_set_shim(shim, shim_size);
+        /* Note: shim memory is leaked intentionally — it must outlive the
+         * process since proc_set_shim stores a pointer, not a copy. */
+    }
+
     /* Step 7: Read sentinel */
     uint32_t sentinel;
     if (ipc_read_all(ipc_fd, &sentinel, sizeof(sentinel)) < 0 ||
@@ -634,52 +935,46 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     g.vcpu = vcpu;
     g.exit = vexit;
 
-    /* Restore system registers */
+    /* Restore system registers. For fork children, we enable the MMU
+     * directly via hv_vcpu_set_sys_reg (rather than going through the
+     * shim entry point) because:
+     * 1. The page tables are already set up (copied from parent via IPC)
+     * 2. The shim entry zeros ALL GPRs before ERET, which would destroy
+     *    callee-saved registers (X19-X28, FP, LR) that the guest expects
+     *    preserved across the clone() syscall
+     * 3. We can restore the exact parent GPR state and only set X0=0 */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, regs.vbar_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, regs.mair_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, regs.tcr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs.ttbr0_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, regs.sctlr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs.cpacr_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs.elr_el1));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs.spsr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
 
-    /* The child process is already in EL1 (svc_handler context), about to
-     * return from the clone syscall. Set PC to the shim's ERET point.
-     * The shim restores registers from the EL1 stack and ERETs to EL0.
-     *
-     * However, since we're starting from a fresh vCPU, we need to enter
-     * through the shim entry point to enable the MMU first. The shim
-     * will ERET to ELR_EL1 which points back to the guest's clone
-     * return point. */
-    uint64_t shim_ipa = guest_ipa(&g, SHIM_BASE);
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, shim_ipa));
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5)); /* EL1h */
-
-    /* Zero all GPRs first */
-    for (int i = 0; i < 31; i++)
-        HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, 0));
-
-    /* X0 = SCTLR value with MMU enable (shim reads this for HVC #4) */
+    /* Enable MMU directly (page tables already in guest memory from IPC).
+     * SCTLR must include MMU-enable (M), caches (C, I), and RES1 bits. */
     uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I;
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, sctlr_with_mmu));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
 
-    /* The ELR_EL1 is set to the clone return point. After the shim enables
-     * the MMU and ERETs, the guest resumes at that point with X0=0 (child). */
+    /* Restore all 31 GPRs from parent state, then override X0=0 (child
+     * clone return value). This preserves X1-X30 exactly as they were when
+     * the parent called clone(), which is required by the Linux syscall ABI
+     * (especially callee-saved X19-X28, FP=X29, LR=X30). */
+    for (int i = 0; i < 31; i++)
+        HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, regs.x[i]));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, 0)); /* Child gets 0 from clone */
 
-    /* Set the child's return value: X0=0.
-     * ELR_EL1 already points to the return address. We need SP_EL0 to be
-     * the guest's SP. The shim will ERET to ELR_EL1 with X0=0. But the
-     * shim entry zeroes X0 before ERET. We need ELR_EL1 to point to the
-     * clone return site, and the guest X0 must be 0.
-     * Since the shim zeros all regs and ERETs, the guest will get X0=0
-     * automatically. This is exactly what we want for the child. */
+    /* Start at the clone return point in EL0 (not the shim entry).
+     * ELR_EL1 points to the guest's clone return site. SPSR_EL1 has
+     * the saved EL0 state. We set PC/CPSR for EL0t execution. */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs.elr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs.spsr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, regs.elr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
 
     proc_init();
-    proc_set_shim(NULL, 0); /* Child doesn't need shim blob for later execs yet */
+    /* proc_set_shim was called above from IPC data (step 6c) */
 
     if (verbose)
         fprintf(stderr, "hl: fork-child: entering vCPU loop\n");
@@ -919,6 +1214,26 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         return -LINUX_ENOMEM;
     }
 
+    /* Signal state */
+    const signal_state_t *sig = signal_get_state();
+    if (ipc_write_all(ipc_fd, sig, sizeof(signal_state_t)) < 0) {
+        close(ipc_fd);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Shim blob (needed for child exec) */
+    uint32_t shim_size_u32 = shim_blob_size;
+    if (ipc_write_all(ipc_fd, &shim_size_u32, sizeof(shim_size_u32)) < 0) {
+        close(ipc_fd);
+        return -LINUX_ENOMEM;
+    }
+    if (shim_blob_size > 0 && shim_blob_ptr) {
+        if (ipc_write_all(ipc_fd, shim_blob_ptr, shim_blob_size) < 0) {
+            close(ipc_fd);
+            return -LINUX_ENOMEM;
+        }
+    }
+
     /* Sentinel */
     uint32_t sentinel = IPC_MAGIC_SENTINEL;
     if (ipc_write_all(ipc_fd, &sentinel, sizeof(sentinel)) < 0) {
@@ -1035,12 +1350,114 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                     guest_write(g, status_gva, &linux_status, 4);
                 }
                 proc_table[i].active = 0;
+                /* Queue SIGCHLD for parent process */
+                signal_queue(LINUX_SIGCHLD);
                 return gpid;
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
             return linux_errno();
         }
+    }
+
+    return -LINUX_ECHILD;
+}
+
+/* ---------- sys_waitid ---------- */
+
+/* Linux siginfo_t field offsets on aarch64 (LP64) */
+#define SIGINFO_SIZE         128
+#define SIGINFO_OFF_SIGNO      0   /* int32_t si_signo */
+#define SIGINFO_OFF_ERRNO      4   /* int32_t si_errno */
+#define SIGINFO_OFF_CODE       8   /* int32_t si_code */
+#define SIGINFO_OFF_PID       16   /* pid_t (int32_t) */
+#define SIGINFO_OFF_UID       20   /* uid_t (uint32_t) */
+#define SIGINFO_OFF_STATUS    24   /* int32_t si_status */
+
+/* si_code values for SIGCHLD */
+#define CLD_EXITED   1
+#define CLD_KILLED   2
+#define CLD_DUMPED   3
+
+/* waitid idtype values */
+#define P_ALL  0
+#define P_PID  1
+#define P_PGID 2
+
+int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                   uint64_t infop_gva, int options) {
+    /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2 */
+    int mac_options = 0;
+    if (options & 1) mac_options |= WNOHANG;
+    if (options & 2) mac_options |= WUNTRACED;
+    /* WEXITED (4) is implied by waitpid */
+
+    /* Convert idtype+id to a waitpid-compatible pid argument */
+    pid_t wait_pid;
+    switch (idtype) {
+    case P_ALL:  wait_pid = -1; break;
+    case P_PID:  wait_pid = (pid_t)id; break;
+    case P_PGID: wait_pid = -(pid_t)id; break;
+    default:     return -LINUX_EINVAL;
+    }
+
+    /* Search process table for matching entry */
+    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+        if (!proc_table[i].active) continue;
+
+        /* Match: P_ALL matches any, P_PID matches guest_pid */
+        if (idtype == P_PID && proc_table[i].guest_pid != wait_pid)
+            continue;
+
+        int status;
+        pid_t ret;
+
+        if (proc_table[i].exited) {
+            /* Already reaped (from CLONE_VFORK wait) */
+            status = proc_table[i].exit_status;
+            ret = proc_table[i].host_pid;
+        } else {
+            ret = waitpid(proc_table[i].host_pid, &status, mac_options);
+            if (ret == 0) return 0; /* WNOHANG, child not yet exited */
+            if (ret < 0) return linux_errno();
+        }
+
+        /* Fill siginfo_t in guest memory */
+        if (infop_gva) {
+            uint8_t si[SIGINFO_SIZE];
+            memset(si, 0, sizeof(si));
+
+            int32_t signo = LINUX_SIGCHLD;
+            int32_t si_code;
+            int32_t si_status;
+
+            if (WIFEXITED(status)) {
+                si_code = CLD_EXITED;
+                si_status = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
+                si_status = WTERMSIG(status);
+            } else {
+                si_code = CLD_EXITED;
+                si_status = 0;
+            }
+
+            memcpy(si + SIGINFO_OFF_SIGNO, &signo, 4);
+            memcpy(si + SIGINFO_OFF_CODE, &si_code, 4);
+            int32_t gpid32 = (int32_t)proc_table[i].guest_pid;
+            memcpy(si + SIGINFO_OFF_PID, &gpid32, 4);
+            uint32_t uid = 0;
+            memcpy(si + SIGINFO_OFF_UID, &uid, 4);
+            memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
+
+            guest_write(g, infop_gva, si, SIGINFO_SIZE);
+        }
+
+        /* Don't remove from table if WNOWAIT is set */
+        if (!(options & 0x01000000))
+            proc_table[i].active = 0;
+
+        return 0; /* waitid returns 0 on success */
     }
 
     return -LINUX_ECHILD;
@@ -1079,7 +1496,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         }
         iter++;
 
-        /* Arm per-iteration timeout */
+        /* Arm per-iteration timeout (hl's own safety timeout).
+         * Guest ITIMER_REAL is emulated internally by signal_check_timer()
+         * rather than using host setitimer, because macOS shares alarm()
+         * and setitimer(ITIMER_REAL) as the same underlying timer. */
         alarm((unsigned)timeout_sec);
 
         HV_CHECK(hv_vcpu_run(vcpu));
@@ -1132,6 +1552,17 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         running = 0;
                     /* ret == SYSCALL_EXEC_HAPPENED: exec replaced the process,
                      * X0 already set by sys_execve, just continue loop */
+
+                    /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
+                    signal_check_timer();
+
+                    /* Deliver pending signals after each syscall */
+                    if (running && signal_pending()) {
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        if (sig_ret < 0)
+                            running = 0; /* Default TERM/CORE disposition */
+                        /* sig_ret == 1: signal delivered to handler, continue */
+                    }
                     break;
                 }
 

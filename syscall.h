@@ -31,6 +31,7 @@
 #define SYS_unlinkat        35
 #define SYS_symlinkat       36
 #define SYS_linkat          37
+#define SYS_renameat        38
 #define SYS_truncate        45
 #define SYS_statfs          43
 #define SYS_fstatfs         44
@@ -119,10 +120,21 @@
 #define SYS_gettid          178
 #define SYS_sysinfo         179
 #define SYS_socket          198
+#define SYS_socketpair      199
 #define SYS_bind            200
 #define SYS_listen          201
+#define SYS_accept          202
 #define SYS_connect         203
-#define SYS_accept          204
+#define SYS_getsockname     204
+#define SYS_getpeername     205
+#define SYS_sendto          206
+#define SYS_recvfrom        207
+#define SYS_setsockopt      208
+#define SYS_getsockopt      209
+#define SYS_shutdown        210
+#define SYS_sendmsg         211
+#define SYS_recvmsg         212
+#define SYS_accept4         242
 #define SYS_clone           220
 #define SYS_execve          221
 #define SYS_brk             214
@@ -137,6 +149,29 @@
 #define SYS_execveat        281
 #define SYS_copy_file_range 285
 #define SYS_statx           291
+/* xattr syscalls */
+#define SYS_lgetxattr       9
+#define SYS_lsetxattr       6
+#define SYS_getxattr        8
+#define SYS_setxattr         5
+#define SYS_listxattr       11
+#define SYS_llistxattr      12
+#define SYS_removexattr     14
+#define SYS_lremovexattr    15
+#define SYS_fgetxattr       16
+#define SYS_fsetxattr       7
+#define SYS_flistxattr      13
+#define SYS_fremovexattr    18
+/* chroot */
+#define SYS_chroot          51
+/* misc */
+#define SYS_sethostname     161
+#define SYS_memfd_create    279
+#define SYS_mlock           228
+#define SYS_munlock         229
+#define SYS_msync           227
+#define SYS_mincore         232
+#define SYS_clone3          435
 #define SYS_close_range     436
 
 /* ---------- Linux errno values ---------- */
@@ -181,14 +216,39 @@
 #define LINUX_ECHILD     10
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EOVERFLOW  75
+#define LINUX_ECONNREFUSED 111
+#define LINUX_ECONNRESET   104
+#define LINUX_ECONNABORTED 103
+#define LINUX_EISCONN      106
+#define LINUX_ENOTCONN     107
+#define LINUX_EADDRINUSE   98
+#define LINUX_EADDRNOTAVAIL 99
+#define LINUX_ENETUNREACH  101
+#define LINUX_EHOSTUNREACH 113
+#define LINUX_EINPROGRESS  115
+#define LINUX_EALREADY     114
+#define LINUX_EAFNOSUPPORT 97
+#define LINUX_EMSGSIZE     90
+#define LINUX_ENOTSOCK     88
+#define LINUX_EDESTADDRREQ 89
+#define LINUX_EPROTOTYPE   91
+#define LINUX_ETIMEDOUT    110
 
 /* ---------- Linux FD flags ---------- */
 #define LINUX_FD_CLOEXEC   1
 
 /* ---------- Linux ioctl constants ---------- */
-#define LINUX_TCGETS     0x5401
-#define LINUX_TCSETS     0x5402
-#define LINUX_TIOCGWINSZ 0x5413
+#define LINUX_TCGETS      0x5401
+#define LINUX_TCSETS      0x5402
+#define LINUX_TCSETSW     0x5403
+#define LINUX_TCSETSF     0x5404
+#define LINUX_TIOCGPGRP   0x540F
+#define LINUX_TIOCSPGRP   0x5410
+#define LINUX_TIOCSCTTY   0x540E
+#define LINUX_TIOCGWINSZ  0x5413
+#define LINUX_FIONREAD    0x541B
+#define LINUX_TIOCNOTTY   0x5422
+#define LINUX_TIOCGSID    0x5429
 
 /* ---------- Linux open flags ---------- */
 #define LINUX_O_RDONLY   0x0000
@@ -348,6 +408,33 @@ typedef struct {
     uint64_t rlim_max;
 } linux_rlimit64_t;
 
+/* ---------- Linux struct utmpx (aarch64 LP64) ---------- */
+/* Matches musl's struct utmpx layout. Used for /var/run/utmp synthesis.
+ * On LP64: short=2, int=4, long=8, sizeof(struct timeval)=16.
+ * sizeof(linux_utmpx_t) == 400 (396 data + 4 trailing padding). */
+#define LINUX_UT_LINESIZE 32
+#define LINUX_UT_NAMESIZE 32
+#define LINUX_UT_HOSTSIZE 256
+#define LINUX_USER_PROCESS 7
+
+typedef struct {
+    int16_t  ut_type;                       /*   0: 2 */
+    int16_t  __ut_pad1;                     /*   2: 2 */
+    int32_t  ut_pid;                        /*   4: 4 */
+    char     ut_line[LINUX_UT_LINESIZE];    /*   8: 32 */
+    char     ut_id[4];                      /*  40: 4 */
+    char     ut_user[LINUX_UT_NAMESIZE];    /*  44: 32 */
+    char     ut_host[LINUX_UT_HOSTSIZE];    /*  76: 256 */
+    int16_t  ut_exit_term;                  /* 332: 2 */
+    int16_t  ut_exit_exit;                  /* 334: 2 */
+    int64_t  ut_session;                    /* 336: 8 */
+    int64_t  ut_tv_sec;                     /* 344: 8 */
+    int64_t  ut_tv_usec;                    /* 352: 8 */
+    uint32_t ut_addr_v6[4];                 /* 360: 16 */
+    char     __ut_reserved[20];              /* 376: 20 */
+    /* sizeof = 396, padded to 400 for 8-byte alignment */
+} linux_utmpx_t;
+
 /* ---------- Linux struct pollfd ---------- */
 typedef struct {
     int32_t  fd;
@@ -406,13 +493,16 @@ typedef struct {
 #define STATX_BTIME       0x0800U
 
 /* ---------- FD table ---------- */
-#define FD_TABLE_SIZE 256
+#define FD_TABLE_SIZE 1024
 
 #define FD_CLOSED   0
 #define FD_STDIO    1
 #define FD_REGULAR  2
 #define FD_DIR      3
 #define FD_PIPE     4
+#define FD_SOCKET   5
+#define FD_EPOLL    6
+#define FD_TIMERFD  7
 
 typedef struct {
     int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */

@@ -20,6 +20,9 @@ extern fd_entry_t fd_table[FD_TABLE_SIZE];
 /* Allocate the lowest available FD. Returns -1 if table is full. */
 int fd_alloc(int type, int host_fd);
 
+/* Allocate the lowest available FD >= minfd. Returns -1 if none available. */
+int fd_alloc_from(int minfd, int type, int host_fd);
+
 /* Allocate a specific FD slot. Returns -1 if out of range. */
 int fd_alloc_at(int fd, int type, int host_fd);
 
@@ -39,5 +42,12 @@ int translate_at_flags(int linux_flags);
 
 /* Translate Linux open flags to macOS equivalents. */
 int translate_open_flags(int linux_flags);
+
+/* ---------- Guest memory helpers (from guest.h, used by net module) ---------- */
+/* These are already declared in guest.h but listed here for reference:
+ *   void *guest_ptr(guest_t *g, uint64_t gva)
+ *   int guest_read(guest_t *g, uint64_t gva, void *buf, size_t len)
+ *   int guest_write(guest_t *g, uint64_t gva, const void *buf, size_t len)
+ */
 
 #endif /* SYSCALL_INTERNAL_H */

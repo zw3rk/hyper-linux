@@ -290,6 +290,7 @@ int main(int argc, const char **argv) {
     syscall_init();
     proc_init();
     proc_set_shim(shim_bin, shim_bin_len);
+    proc_set_elf_path(elf_path);
     extern const char **environ;
     uint64_t sp = build_linux_stack(&g, STACK_TOP,
                                     guest_argc, guest_argv,

@@ -27,6 +27,13 @@ int64_t proc_get_ppid(void);
  * Avoids #including shim_blob.h in this module. */
 void proc_set_shim(const unsigned char *blob, unsigned int len);
 
+/* Store the current ELF binary path for /proc/self/exe emulation.
+ * Called from hl.c at startup and after execve. */
+void proc_set_elf_path(const char *path);
+
+/* Get the stored ELF binary path. Returns NULL if not set. */
+const char *proc_get_elf_path(void);
+
 /* ---------- execve ---------- */
 
 /* Return value from syscall_dispatch: 2 means "exec happened, skip X0 write" */
@@ -68,6 +75,23 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 /* Wait for child process. Returns child guest PID or negative errno. */
 int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                   int options, uint64_t rusage_gva);
+
+/* waitid: wait for child process using idtype/id semantics.
+ * Fills siginfo_t at infop_gva on success. */
+int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                   uint64_t infop_gva, int options);
+
+/* ---------- /proc and /dev emulation ---------- */
+
+/* Intercept openat for /proc and /dev paths.
+ * Returns a host fd on match (caller should fd_alloc it), -1 on error
+ * with errno set, or -2 if the path is not intercepted (fall through). */
+int proc_intercept_open(const char *path, int linux_flags, int mode);
+
+/* Intercept readlinkat for /proc paths.
+ * Returns the link length on match, -1 on error, or -2 if not
+ * intercepted (fall through to real readlinkat). */
+int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz);
 
 /* ---------- vCPU run loop ---------- */
 

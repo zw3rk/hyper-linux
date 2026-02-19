@@ -7,9 +7,15 @@ Run static aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.fram
 - **hl.c** — Main entry point. CLI (incl. --fork-child), VM setup (~400 lines).
 - **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset.
 - **elf.c/h** — ELF64 parser and loader for static aarch64-linux binaries.
-- **syscall.c/h** — Linux syscall dispatch and ~100 handlers (~2300 lines).
+- **syscall.c/h** — Core infrastructure (FD table, errno/flag translation, brk/mmap) + dispatch switch (~900 lines).
 - **syscall_internal.h** — Shared declarations for syscall module helpers.
-- **syscall_proc.c/h** — Process syscalls: execve, clone/fork (IPC), wait4, vCPU loop (~1250 lines).
+- **syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
+- **syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select (~610 lines).
+- **syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer (~190 lines).
+- **syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
+- **syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
+- **syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
+- **syscall_proc.c/h** — Process syscalls: execve, clone/fork (IPC), wait4, vCPU loop (~1520 lines).
 - **stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 - **vm.c** — Legacy proof-of-concept host driver (kept in archive/).
@@ -61,7 +67,7 @@ make clean       # remove _build/
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
 
-## Implemented Syscalls (~110 total)
+## Implemented Syscalls (~130 total)
 
 **Basic I/O:**
 write(64), read(63), readv(65), writev(66), openat(56), close(57),
@@ -107,12 +113,58 @@ rt_sigpending(136), rt_sigreturn(139), setpgid(154), setsid(157)
 **Timers:**
 setitimer(103), getitimer(102)
 
+**Extended ioctls:**
+TCSETSW(0x5403), TCSETSF(0x5404), TIOCGPGRP(0x540F), TIOCSPGRP(0x5410),
+TIOCSCTTY(0x540E), FIONREAD(0x541B), TIOCNOTTY(0x5422), TIOCGSID(0x5429)
+
+**xattr syscalls:**
+getxattr(8), lgetxattr(9), setxattr(5), lsetxattr(6),
+listxattr(11), llistxattr(12), removexattr(14), lremovexattr(15),
+fgetxattr(16), fsetxattr(7), flistxattr(13), fremovexattr(18)
+
+**Filesystem (additional):**
+chroot(51), memfd_create(279)
+
+**/proc and /dev emulation (intercepted in openat/readlinkat):**
+/proc/self/exe, /proc/self/cwd, /proc/self/fd/N, /proc/cpuinfo,
+/proc/self/status, /proc/self/maps, /proc/uptime, /proc/loadavg,
+/var/run/utmp, /run/utmp, /dev/null, /dev/zero,
+/dev/urandom, /dev/random, /dev/tty, /dev/stdin, /dev/stdout,
+/dev/stderr, /dev/fd/N
+
+**Stubs (return 0):**
+mlock(228), munlock(229), msync(227)
+
+**Networking (syscall_net.c):**
+socket(198), socketpair(199), bind(200), listen(201), accept(202),
+connect(203), getsockname(204), getpeername(205), sendto(206),
+recvfrom(207), setsockopt(208), getsockopt(209), shutdown(210),
+sendmsg(211), recvmsg(212), accept4(242)
+
 **Stubs (return -ENOSYS):**
-socket(198), bind(200), listen(201), connect(203), accept(204),
 tee(77), timerfd_create(85), timerfd_settime(86), timerfd_gettime(87),
 epoll_create1(20), epoll_ctl(21), epoll_pwait(22),
 inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28),
-waitid(95)
+waitid(95), mincore(232), clone3(435)
+
+**Stubs (return -EPERM):**
+sethostname(161)
+
+## Signal Delivery
+
+Signals are fully implemented in `syscall_signal.c/.h`. The signal frame
+matches Linux `arch/arm64/kernel/signal.c:setup_rt_frame()` layout so that
+musl's `__restore_rt` → `rt_sigreturn` (SYS 139) correctly restores state.
+
+Key points:
+- `signal_deliver()` builds `linux_rt_sigframe_t` on guest stack, redirects
+  vCPU PC to handler, sets X0=signum, X30=sa_restorer
+- `signal_rt_sigreturn()` restores all 31 GPRs + SP + PC + PSTATE from frame
+- SIGPIPE queued automatically when write/writev/pwrite64 returns EPIPE
+- Guest ITIMER_REAL is emulated internally (not forwarded to host setitimer)
+  because macOS shares alarm() and setitimer(ITIMER_REAL) as the same timer,
+  and hl needs alarm() for its per-iteration vCPU timeout
+- `signal_check_timer()` called from vCPU loop after each syscall
 
 ## Fork/Clone Architecture
 
@@ -121,9 +173,10 @@ macOS HVF allows only one VM per process. Fork is implemented via:
 2. Parent posix_spawn()s new `hl --fork-child <fd>` process
 3. Parent serializes VM state over IPC: header + registers + memory
    regions (only used regions, not full 4GB) + FD table (via SCM_RIGHTS)
-   + cwd + umask + sentinel
-4. Child receives state, creates own VM, restores registers, enters
-   vCPU loop with X0=0 (child return from clone)
+   + cwd + umask + signal state + shim blob + sentinel
+4. Child receives state, creates own VM, restores registers directly
+   into EL0 (bypasses shim _start to preserve callee-saved GPRs),
+   enters vCPU loop with X0=0 (child return from clone)
 5. Parent records child in process table, returns child PID
 
 ## Key errno Translation
@@ -165,6 +218,13 @@ auxv), not after pushing argc. Total entries = 33 + argc + envc; if odd,
 push one padding word before auxv. Post-push masking (`sp &= ~15`) breaks
 because it creates a gap between SP and argc.
 
+## mmap Notes
+
+MAP_SHARED is treated as MAP_PRIVATE (copy-on-write). Since the guest
+is single-process, shared vs private semantics are equivalent. This
+enables tools like `sort` on large files that use file-backed shared
+mappings.
+
 ## Memory Layout
 
 ```
@@ -194,3 +254,21 @@ modification, the host sets X8=1 and g->need_tlbi=0. The shim checks X8
 after HVC #5: if non-zero, it executes `TLBI VMALLE1IS; DSB ISH; ISB`
 before ERET. X8 (syscall number register) is clobbered by the Linux ABI,
 so callers never expect it preserved.
+
+**IMPORTANT: SYSCALL_EXEC_HAPPENED bypasses X8 TLBI logic.** When
+sys_execve returns SYSCALL_EXEC_HAPPENED, it bypasses the normal
+syscall_dispatch() epilogue that sets X8 for TLBI. Therefore, sys_execve
+sets X8=1 directly via hv_vcpu_set_reg() — do NOT rely on g->need_tlbi
+for exec. Any future code path that returns SYSCALL_EXEC_HAPPENED and
+needs TLBI must set X8 explicitly.
+
+## Socket Networking
+
+Socket syscalls are translated in `syscall_net.c/.h`. Key translations:
+- **AF_INET6**: Linux=10, macOS=30
+- **sockaddr**: Linux has no `sa_len` byte; macOS does. All sockaddr
+  conversions go through `linux_to_mac_sockaddr()`/`mac_to_linux_sockaddr()`
+- **Socket type flags**: Linux OR's SOCK_NONBLOCK(0x800) and
+  SOCK_CLOEXEC(0x80000) into the type argument; must extract before socket()
+- **SOL_SOCKET options**: SO_TYPE, SO_SNDBUF, SO_RCVBUF etc. have different
+  numeric values on Linux vs macOS
