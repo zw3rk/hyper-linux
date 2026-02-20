@@ -7,39 +7,75 @@
 
   outputs = { self, nixpkgs }:
     let
-      system = "aarch64-darwin";
-      pkgs = nixpkgs.legacyPackages.${system};
+      darwinSystem = "aarch64-darwin";
+      darwinPkgs = nixpkgs.legacyPackages.${darwinSystem};
+
+      # Cross-compilation uses x86_64-linux as build platform.  Nix auto-
+      # dispatches these derivations to a configured remote linux builder
+      # when building on aarch64-darwin.
+      linuxSystem = "x86_64-linux";
+      linuxPkgs = nixpkgs.legacyPackages.${linuxSystem};
+      crossPkgs = linuxPkgs.pkgsCross.aarch64-multiplatform-musl;
 
       # Darwin SDK for Hypervisor.framework
       darwinBuildInputs = [
-        pkgs.apple-sdk_15
-        (pkgs.darwinMinVersionHook "15.0")
+        darwinPkgs.apple-sdk_15
+        (darwinPkgs.darwinMinVersionHook "15.0")
       ];
 
-      # Cross packages for aarch64-linux-musl
-      crossPkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
-      crossCC = crossPkgs.stdenv.cc;
-      crossStatic = crossPkgs.pkgsStatic;
+      # Static aarch64-linux-musl test binaries, built on x86_64-linux
+      testBinaries = crossPkgs.stdenv.mkDerivation {
+        pname = "hl-test-binaries";
+        version = "0.1.0";
+        src = ./test;
 
-      # Static aarch64-linux test binaries for hl
+        dontConfigure = true;
+        dontFixup = true;  # don't strip/patchelf — these are cross binaries
+
+        buildPhase = ''
+          # Assembly hello world (custom linker script)
+          $AS -o hello.o hello.S
+          $LD -T simple.ld -o test-hello hello.o
+
+          # All C test programs (static musl)
+          for f in *.c; do
+            name="''${f%.c}"
+            $CC -static -O2 -o "$name" "$f"
+          done
+        '';
+
+        installPhase = ''
+          mkdir -p $out/bin
+          cp test-hello $out/bin/
+          for f in *.c; do
+            name="''${f%.c}"
+            [ -f "$name" ] && cp "$name" $out/bin/
+          done
+        '';
+      };
+
+      # Static aarch64-linux-musl guest tool binaries
       guestBins = {
-        coreutils = crossStatic.coreutils;
-        busybox   = crossStatic.busybox;
+        coreutils = crossPkgs.pkgsStatic.coreutils;
+        busybox   = crossPkgs.pkgsStatic.busybox;
       };
 
     in {
-      devShells.${system}.default = pkgs.mkShell {
+      # Test binaries package (built on x86_64-linux)
+      packages.${linuxSystem}.test-binaries = testBinaries;
+
+      devShells.${darwinSystem}.default = darwinPkgs.mkShell {
         name = "hl-dev";
 
         buildInputs = [
-          pkgs.gnumake
-          pkgs.binutils  # objcopy for shim.bin
-          pkgs.lldb
-          crossCC        # aarch64-unknown-linux-musl-{as,ld,gcc}
+          darwinPkgs.gnumake
+          darwinPkgs.binutils  # objcopy for shim.bin
+          darwinPkgs.lldb
         ] ++ darwinBuildInputs;
 
-        # Guest binaries are NOT added to PATH (they're aarch64-linux ELFs!).
-        # Instead, expose as env vars for Makefile/test scripts.
+        # Pre-built guest binaries (dispatched to x86_64-linux builder).
+        # NOT added to PATH — they're aarch64-linux ELFs.
+        GUEST_TEST_BINARIES = "${testBinaries}";
         GUEST_COREUTILS = "${guestBins.coreutils}";
         GUEST_BUSYBOX   = "${guestBins.busybox}";
 
@@ -47,22 +83,23 @@
           echo "hl development environment"
           echo "  make help        — show available targets"
           echo "  make hl          — build the hl executable"
-          echo "  make test-hello  — build and run assembly hello world"
+          echo "  make test-all    — run full test suite"
           echo ""
-          echo "Guest binaries (aarch64-linux-musl, static):"
-          echo "  coreutils: $GUEST_COREUTILS/bin/"
-          echo "  busybox:   $GUEST_BUSYBOX/bin/"
+          echo "Guest binaries (aarch64-linux-musl, built on x86_64-linux):"
+          echo "  test binaries: $GUEST_TEST_BINARIES/bin/"
+          echo "  coreutils:     $GUEST_COREUTILS/bin/"
+          echo "  busybox:       $GUEST_BUSYBOX/bin/"
         '';
       };
 
-      packages.${system}.default = pkgs.stdenv.mkDerivation {
+      packages.${darwinSystem}.default = darwinPkgs.stdenv.mkDerivation {
         pname = "hl";
         version = "0.1.0";
         src = ./.;
 
         nativeBuildInputs = [
-          pkgs.gnumake
-          pkgs.binutils
+          darwinPkgs.gnumake
+          darwinPkgs.binutils
         ] ++ darwinBuildInputs;
 
         buildInputs = darwinBuildInputs;
@@ -76,7 +113,7 @@
           cp _build/hl $out/bin/hl
         '';
 
-        meta = with pkgs.lib; {
+        meta = with darwinPkgs.lib; {
           description = "Run static aarch64-linux ELF binaries on macOS Apple Silicon";
           platforms = [ "aarch64-darwin" ];
           license = licenses.asl20;

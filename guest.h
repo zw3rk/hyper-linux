@@ -55,6 +55,25 @@ typedef struct {
     int      perms;      /* MEM_PERM_* flags */
 } mem_region_t;
 
+/* ---------- Semantic region tracking ---------- */
+
+/* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.).
+ * Sufficient for all practical static binaries; dynamic linking may need
+ * more, at which point this can be increased. */
+#define GUEST_MAX_REGIONS 256
+
+/* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
+ * Distinct from mem_region_t which is used purely for page table construction.
+ * Regions are kept sorted by start address in guest_t.regions[]. */
+typedef struct {
+    uint64_t start;       /* GVA start (page-aligned) */
+    uint64_t end;         /* GVA end (exclusive, page-aligned) */
+    int      prot;        /* LINUX_PROT_* flags */
+    int      flags;       /* LINUX_MAP_* flags (for /proc/self/maps display) */
+    uint64_t offset;      /* File offset (for /proc/self/maps display) */
+    char     name[64];    /* Label: "[heap]", "[stack]", ELF path, etc. */
+} guest_region_t;
+
 /* ---------- Guest state ---------- */
 typedef struct {
     void       *host_base;    /* Host pointer to allocated guest memory */
@@ -69,6 +88,9 @@ typedef struct {
     int         need_tlbi;    /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t   vcpu;         /* vCPU handle */
     hv_vcpu_exit_t *exit;     /* vCPU exit info */
+    /* Semantic region tracking for munmap/mprotect/proc-self-maps */
+    guest_region_t regions[GUEST_MAX_REGIONS];
+    int            nregions;  /* Number of active regions */
 } guest_t;
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */
@@ -129,5 +151,30 @@ typedef struct {
  * shim_size is the shim binary size (needed to determine shim region). */
 int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
                            used_region_t *out, int max);
+
+/* ---------- Semantic region tracking API ---------- */
+
+/* Add a region to the sorted tracking array. Overlapping regions are NOT
+ * merged — each call adds a distinct entry. If the array is full the
+ * call is silently ignored (non-fatal; only /proc/self/maps loses data).
+ * Returns 0 on success, -1 if the region table is full. */
+int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
+                     int prot, int flags, uint64_t offset,
+                     const char *name);
+
+/* Remove all region coverage in [start, end). Regions fully contained are
+ * deleted; partially overlapping regions are trimmed or split. */
+void guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
+
+/* Find the region containing addr. Returns a pointer to the region (inside
+ * the guest_t regions array) or NULL if addr is not in any tracked region. */
+const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr);
+
+/* Update protection bits for all region coverage in [start, end).
+ * Splits regions at boundaries as needed. */
+void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
+
+/* Clear all tracked regions. Used by execve before re-adding new regions. */
+void guest_region_clear(guest_t *g);
 
 #endif /* GUEST_H */

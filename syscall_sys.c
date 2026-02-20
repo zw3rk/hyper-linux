@@ -62,7 +62,7 @@ int64_t sys_getrandom(guest_t *g, uint64_t buf_gva, uint64_t buflen,
 }
 
 int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size) {
-    char cwd[4096];
+    char cwd[LINUX_PATH_MAX];
     if (!getcwd(cwd, sizeof(cwd)))
         return linux_errno();
 

@@ -1,0 +1,770 @@
+/* fork_ipc.c — Fork/clone IPC for hl
+ *
+ * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Implements clone via posix_spawn + IPC state transfer. macOS HVF allows
+ * only one VM per process, so fork spawns a new hl process and serializes
+ * the full VM state (registers, memory, FDs) over a socketpair.
+ */
+#include "fork_ipc.h"
+#include "syscall_proc.h"    /* proc_get_pid, proc_set_identity, proc_alloc_pid, proc_register_child, proc_mark_child_exited, proc_set_shim, proc_get_shim_blob, proc_get_shim_size, proc_init */
+#include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
+#include "syscall.h"         /* syscall_init, FD_CLOSED, FD_STDIO, etc. */
+#include "syscall_signal.h"  /* signal_get_state, signal_set_state, signal_state_t */
+#include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <mach-o/dyld.h>
+
+/* ---------- HV_CHECK macro (duplicated from hl.c — short, avoids coupling) ---------- */
+#define HV_CHECK(call) do {                                        \
+    hv_return_t _r = (call);                                       \
+    if (_r != HV_SUCCESS) {                                        \
+        fprintf(stderr, "hl: %s failed: %d\n", #call, (int)_r);   \
+        exit(1);                                                   \
+    }                                                              \
+} while (0)
+
+/* ---------- IPC Protocol for fork ---------- */
+
+/* Magic values for IPC frame delimiters */
+#define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
+#define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
+
+/* IPC header: sent first over socketpair */
+typedef struct {
+    uint32_t magic;
+    int64_t  child_pid;
+    int64_t  parent_pid;
+    /* Guest state */
+    uint64_t brk_base;
+    uint64_t brk_current;
+    uint64_t mmap_next;
+    uint64_t mmap_end;
+    uint64_t pt_pool_next;
+    uint64_t ttbr0;
+} ipc_header_t;
+
+/* IPC register state */
+typedef struct {
+    uint64_t elr_el1;
+    uint64_t sp_el0;
+    uint64_t spsr_el1;
+    uint64_t vbar_el1;
+    uint64_t ttbr0_el1;
+    uint64_t sctlr_el1;
+    uint64_t tcr_el1;
+    uint64_t mair_el1;
+    uint64_t cpacr_el1;
+    uint64_t tpidr_el0;
+    uint64_t sp_el1;
+    uint64_t x[31];
+} ipc_registers_t;
+
+/* IPC memory region header */
+typedef struct {
+    uint64_t offset;
+    uint64_t size;
+} ipc_region_header_t;
+
+/* IPC FD entry */
+typedef struct {
+    int32_t guest_fd;
+    int32_t type;
+    int32_t linux_flags;
+    int32_t pad;
+} ipc_fd_entry_t;
+
+/* ---------- IPC I/O helpers ---------- */
+
+/* Write exactly len bytes to fd (retry on EINTR/short writes) */
+static int ipc_write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+/* Read exactly len bytes from fd (retry on EINTR/short reads) */
+static int ipc_read_all(int fd, void *buf, size_t len) {
+    uint8_t *p = buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+/* Send file descriptors via SCM_RIGHTS ancillary message */
+static int send_fds(int sock, const int *fds, int count) {
+    if (count <= 0) return 0;
+
+    /* Send the count first as regular data */
+    char dummy = 'F';
+    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+
+    size_t cmsg_size = CMSG_SPACE(count * sizeof(int));
+    uint8_t *cmsg_buf = calloc(1, cmsg_size);
+    if (!cmsg_buf) return -1;
+
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = cmsg_size;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(count * sizeof(int));
+    memcpy(CMSG_DATA(cmsg), fds, count * sizeof(int));
+
+    ssize_t ret = sendmsg(sock, &msg, 0);
+    free(cmsg_buf);
+    return ret < 0 ? -1 : 0;
+}
+
+/* Receive file descriptors via SCM_RIGHTS ancillary message */
+static int recv_fds(int sock, int *fds, int max_count, int *out_count) {
+    char dummy;
+    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+
+    size_t cmsg_size = CMSG_SPACE(max_count * sizeof(int));
+    uint8_t *cmsg_buf = calloc(1, cmsg_size);
+    if (!cmsg_buf) return -1;
+
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = cmsg_size;
+
+    ssize_t ret = recvmsg(sock, &msg, 0);
+    if (ret < 0) {
+        free(cmsg_buf);
+        return -1;
+    }
+
+    *out_count = 0;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS) {
+        int n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        if (n > max_count) n = max_count;
+        memcpy(fds, CMSG_DATA(cmsg), n * sizeof(int));
+        *out_count = n;
+    }
+
+    free(cmsg_buf);
+    return 0;
+}
+
+/* ---------- fork_child_main ---------- */
+
+/* Constants needed for vCPU setup (duplicated from hl.c since we can't
+ * include shim_blob.h here -- the shim is received via IPC) */
+#define SCTLR_M   (1ULL << 0)
+#define SCTLR_C   (1ULL << 2)
+#define SCTLR_I   (1ULL << 12)
+#define SCTLR_RES1 ((1ULL << 29) | (1ULL << 28) | (1ULL << 23) | \
+                     (1ULL << 22) | (1ULL << 20) | (1ULL << 11) | \
+                     (1ULL <<  8) | (1ULL <<  7))
+
+int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+    /* Step 1: Read IPC header */
+    ipc_header_t hdr;
+    if (ipc_read_all(ipc_fd, &hdr, sizeof(hdr)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read header\n");
+        return 1;
+    }
+    if (hdr.magic != IPC_MAGIC_HEADER) {
+        fprintf(stderr, "hl: fork-child: bad magic 0x%x\n", hdr.magic);
+        return 1;
+    }
+
+    if (verbose)
+        fprintf(stderr, "hl: fork-child: pid=%lld ppid=%lld\n",
+                (long long)hdr.child_pid, (long long)hdr.parent_pid);
+
+    /* Set process identity via accessor (static state lives in syscall_proc.c) */
+    proc_set_identity(hdr.child_pid, hdr.parent_pid);
+
+    /* Step 2: Create guest VM */
+    guest_t g;
+    if (guest_init(&g, GUEST_MEM_SIZE) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to init guest\n");
+        return 1;
+    }
+
+    /* Restore guest allocation state */
+    g.brk_base = hdr.brk_base;
+    g.brk_current = hdr.brk_current;
+    g.mmap_next = hdr.mmap_next;
+    g.mmap_end = hdr.mmap_end;
+    g.pt_pool_next = hdr.pt_pool_next;
+
+    /* Step 3: Read registers */
+    ipc_registers_t regs;
+    if (ipc_read_all(ipc_fd, &regs, sizeof(regs)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read registers\n");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    /* Step 4: Read memory regions */
+    uint32_t num_regions;
+    if (ipc_read_all(ipc_fd, &num_regions, sizeof(num_regions)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read region count\n");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    if (verbose)
+        fprintf(stderr, "hl: fork-child: receiving %u memory regions\n",
+                num_regions);
+
+    for (uint32_t i = 0; i < num_regions; i++) {
+        ipc_region_header_t rhdr;
+        if (ipc_read_all(ipc_fd, &rhdr, sizeof(rhdr)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read region header\n");
+            guest_destroy(&g);
+            return 1;
+        }
+
+        if (rhdr.offset + rhdr.size > g.guest_size) {
+            fprintf(stderr, "hl: fork-child: region out of bounds\n");
+            guest_destroy(&g);
+            return 1;
+        }
+
+        /* Read region data in chunks */
+        uint8_t *dst = (uint8_t *)g.host_base + rhdr.offset;
+        size_t remaining = rhdr.size;
+        while (remaining > 0) {
+            size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
+            if (ipc_read_all(ipc_fd, dst, chunk) < 0) {
+                fprintf(stderr, "hl: fork-child: failed to read region data\n");
+                guest_destroy(&g);
+                return 1;
+            }
+            dst += chunk;
+            remaining -= chunk;
+        }
+
+        if (verbose)
+            fprintf(stderr, "hl: fork-child: region %u: offset=0x%llx size=0x%llx\n",
+                    i, (unsigned long long)rhdr.offset,
+                    (unsigned long long)rhdr.size);
+    }
+
+    /* Step 5: Read FD table */
+    uint32_t num_fds;
+    if (ipc_read_all(ipc_fd, &num_fds, sizeof(num_fds)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read fd count\n");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    /* Initialize our FD table */
+    syscall_init();
+
+    if (num_fds > 0) {
+        ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(ipc_fd_entry_t));
+        if (!fd_entries) {
+            guest_destroy(&g);
+            return 1;
+        }
+
+        if (ipc_read_all(ipc_fd, fd_entries, num_fds * sizeof(ipc_fd_entry_t)) < 0) {
+            free(fd_entries);
+            guest_destroy(&g);
+            return 1;
+        }
+
+        /* Receive host FDs via SCM_RIGHTS */
+        int *host_fds = calloc(num_fds, sizeof(int));
+        if (!host_fds) {
+            free(fd_entries);
+            guest_destroy(&g);
+            return 1;
+        }
+
+        int received_count = 0;
+        if (recv_fds(ipc_fd, host_fds, (int)num_fds, &received_count) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to receive fds\n");
+            free(host_fds);
+            free(fd_entries);
+            guest_destroy(&g);
+            return 1;
+        }
+
+        /* Populate fd_table */
+        for (uint32_t i = 0; i < num_fds; i++) {
+            int gfd = fd_entries[i].guest_fd;
+            if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
+
+            if (fd_entries[i].type == FD_STDIO) {
+                /* stdio fds are already set up by syscall_init */
+                fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+            } else if ((int)i < received_count) {
+                fd_table[gfd].type = fd_entries[i].type;
+                fd_table[gfd].host_fd = host_fds[i];
+                fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+            }
+        }
+
+        free(host_fds);
+        free(fd_entries);
+    }
+
+    /* Step 6: Read process info (cwd + umask) */
+    char cwd[LINUX_PATH_MAX];
+    uint32_t umask_val;
+    if (ipc_read_all(ipc_fd, cwd, sizeof(cwd)) < 0 ||
+        ipc_read_all(ipc_fd, &umask_val, sizeof(umask_val)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read process info\n");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    if (cwd[0] != '\0') chdir(cwd);
+    umask((mode_t)umask_val);
+
+    /* Step 6b: Read semantic region tracking */
+    uint32_t num_guest_regions;
+    if (ipc_read_all(ipc_fd, &num_guest_regions, sizeof(num_guest_regions)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read region count\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (num_guest_regions > GUEST_MAX_REGIONS)
+        num_guest_regions = GUEST_MAX_REGIONS;
+    if (num_guest_regions > 0) {
+        if (ipc_read_all(ipc_fd, g.regions,
+                         num_guest_regions * sizeof(guest_region_t)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read regions\n");
+            guest_destroy(&g);
+            return 1;
+        }
+    }
+    g.nregions = (int)num_guest_regions;
+
+    /* Step 6c: Read signal state (shifted to accommodate region tracking) */
+    signal_state_t sig;
+    if (ipc_read_all(ipc_fd, &sig, sizeof(sig)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read signal state\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    signal_set_state(&sig);
+
+    /* Step 6d: Read shim blob (needed for exec in child) */
+    uint32_t shim_size;
+    if (ipc_read_all(ipc_fd, &shim_size, sizeof(shim_size)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read shim size\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (shim_size > 0) {
+        unsigned char *shim = malloc(shim_size);
+        if (!shim) {
+            fprintf(stderr, "hl: fork-child: shim alloc failed\n");
+            guest_destroy(&g);
+            return 1;
+        }
+        if (ipc_read_all(ipc_fd, shim, shim_size) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read shim blob\n");
+            free(shim);
+            guest_destroy(&g);
+            return 1;
+        }
+        proc_set_shim(shim, shim_size);
+        /* Note: shim memory is leaked intentionally -- it must outlive the
+         * process since proc_set_shim stores a pointer, not a copy. */
+    }
+
+    /* Step 7: Read sentinel */
+    uint32_t sentinel;
+    if (ipc_read_all(ipc_fd, &sentinel, sizeof(sentinel)) < 0 ||
+        sentinel != IPC_MAGIC_SENTINEL) {
+        fprintf(stderr, "hl: fork-child: bad sentinel\n");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    /* Close IPC socket */
+    close(ipc_fd);
+
+    /* Step 8: Create vCPU and set up registers */
+    hv_vcpu_t vcpu;
+    hv_vcpu_exit_t *vexit;
+    HV_CHECK(hv_vcpu_create(&vcpu, &vexit, NULL));
+    g.vcpu = vcpu;
+    g.exit = vexit;
+
+    /* Restore system registers. For fork children, we enable the MMU
+     * directly via hv_vcpu_set_sys_reg (rather than going through the
+     * shim entry point) because:
+     * 1. The page tables are already set up (copied from parent via IPC)
+     * 2. The shim entry zeros ALL GPRs before ERET, which would destroy
+     *    callee-saved registers (X19-X28, FP, LR) that the guest expects
+     *    preserved across the clone() syscall
+     * 3. We can restore the exact parent GPR state and only set X0=0 */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, regs.vbar_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, regs.mair_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, regs.tcr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs.ttbr0_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs.cpacr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
+
+    /* Enable MMU directly (page tables already in guest memory from IPC).
+     * SCTLR must include MMU-enable (M), caches (C, I), and RES1 bits. */
+    uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I;
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
+
+    /* Restore all 31 GPRs from parent state, then override X0=0 (child
+     * clone return value). This preserves X1-X30 exactly as they were when
+     * the parent called clone(), which is required by the Linux syscall ABI
+     * (especially callee-saved X19-X28, FP=X29, LR=X30). */
+    for (int i = 0; i < 31; i++)
+        HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, regs.x[i]));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, 0)); /* Child gets 0 from clone */
+
+    /* Start at the clone return point in EL0 (not the shim entry).
+     * ELR_EL1 points to the guest's clone return site. SPSR_EL1 has
+     * the saved EL0 state. We set PC/CPSR for EL0t execution. */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, regs.elr_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, regs.spsr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, regs.elr_el1));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+
+    proc_init();
+    /* proc_set_shim was called above from IPC data (step 6c) */
+
+    if (verbose)
+        fprintf(stderr, "hl: fork-child: entering vCPU loop\n");
+
+    /* Step 9: Enter vCPU run loop */
+    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
+
+    guest_destroy(&g);
+    return exit_code;
+}
+
+/* ---------- sys_clone ---------- */
+
+/* Linux clone flags */
+#define LINUX_CLONE_VM       0x00000100
+#define LINUX_CLONE_VFORK    0x00004000
+#define LINUX_SIGCHLD        17
+
+int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+                  uint64_t child_stack, uint64_t ptid_gva,
+                  uint64_t tls, uint64_t ctid_gva, int verbose) {
+    (void)child_stack;
+    (void)ptid_gva;
+    (void)tls;
+    (void)ctid_gva;
+
+    /* We only support fork-like clone (SIGCHLD) and posix_spawn-like
+     * clone (CLONE_VM|CLONE_VFORK|SIGCHLD) */
+    int is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
+
+    if (verbose)
+        fprintf(stderr, "hl: clone(flags=0x%llx, vfork=%d)\n",
+                (unsigned long long)flags, is_vfork);
+
+    /* Step 1: Create socketpair for IPC */
+    int sock_fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
+        fprintf(stderr, "hl: clone: socketpair failed: %s\n", strerror(errno));
+        return -LINUX_ENOMEM;
+    }
+
+    /* Step 2: Find our own executable path */
+    char self_path[LINUX_PATH_MAX];
+    uint32_t path_len = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &path_len) != 0) {
+        fprintf(stderr, "hl: clone: _NSGetExecutablePath failed\n");
+        close(sock_fds[0]);
+        close(sock_fds[1]);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Step 3: Spawn child hl process */
+    char fd_str[32];
+    snprintf(fd_str, sizeof(fd_str), "%d", sock_fds[1]);
+
+    /* Build child argv: [hl_path, [--verbose,] --fork-child, fd, NULL] */
+    char *child_argv[6];
+    int ci = 0;
+    child_argv[ci++] = self_path;
+    if (verbose) child_argv[ci++] = "--verbose";
+    child_argv[ci++] = "--fork-child";
+    child_argv[ci++] = fd_str;
+    child_argv[ci] = NULL;
+
+    /* Set up file actions to keep sock_fds[1] open in child */
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+
+    /* Set up spawn attributes */
+    posix_spawnattr_t spawn_attr;
+    posix_spawnattr_init(&spawn_attr);
+
+    extern char **environ;
+    pid_t child_host_pid;
+    int spawn_ret = posix_spawn(&child_host_pid, self_path, &file_actions,
+                                 &spawn_attr, child_argv, environ);
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&spawn_attr);
+
+    if (spawn_ret != 0) {
+        fprintf(stderr, "hl: clone: posix_spawn failed: %s\n",
+                strerror(spawn_ret));
+        close(sock_fds[0]);
+        close(sock_fds[1]);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Close child's end of socketpair in parent */
+    close(sock_fds[1]);
+    int ipc_sock = sock_fds[0];
+
+    /* Step 4: Assign guest PID to child */
+    int64_t child_guest_pid = proc_alloc_pid();
+
+    /* Step 5: Serialize state to child */
+
+    /* Header */
+    ipc_header_t hdr = {
+        .magic = IPC_MAGIC_HEADER,
+        .child_pid = child_guest_pid,
+        .parent_pid = proc_get_pid(),
+        .brk_base = g->brk_base,
+        .brk_current = g->brk_current,
+        .mmap_next = g->mmap_next,
+        .mmap_end = g->mmap_end,
+        .pt_pool_next = g->pt_pool_next,
+        .ttbr0 = g->ttbr0,
+    };
+    if (ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
+        fprintf(stderr, "hl: clone: failed to send header\n");
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Registers -- capture current vCPU state */
+    ipc_registers_t regs = {0};
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &regs.elr_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &regs.sp_el0);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &regs.spsr_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, &regs.vbar_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &regs.ttbr0_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &regs.sctlr_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &regs.tcr_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, &regs.mair_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &regs.cpacr_el1);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, &regs.tpidr_el0);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &regs.sp_el1);
+    for (int i = 0; i < 31; i++)
+        hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &regs.x[i]);
+
+    if (ipc_write_all(ipc_sock, &regs, sizeof(regs)) < 0) {
+        fprintf(stderr, "hl: clone: failed to send registers\n");
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Memory regions */
+    #define MAX_USED_REGIONS 16
+    used_region_t used[MAX_USED_REGIONS];
+    unsigned int shim_sz = proc_get_shim_size();
+    int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
+    uint32_t num_regions = (uint32_t)nregions;
+    if (ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    for (int i = 0; i < nregions; i++) {
+        ipc_region_header_t rhdr = {
+            .offset = used[i].offset,
+            .size = used[i].size,
+        };
+        if (ipc_write_all(ipc_sock, &rhdr, sizeof(rhdr)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+
+        /* Send region data in 1MB chunks */
+        uint8_t *src = (uint8_t *)g->host_base + used[i].offset;
+        size_t remaining = used[i].size;
+        while (remaining > 0) {
+            size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
+            if (ipc_write_all(ipc_sock, src, chunk) < 0) {
+                close(ipc_sock);
+                return -LINUX_ENOMEM;
+            }
+            src += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS */
+    int open_fds[FD_TABLE_SIZE];
+    ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
+    int host_fds_to_send[FD_TABLE_SIZE];
+    uint32_t num_fds = 0;
+    int num_host_fds = 0;
+
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type != FD_CLOSED) {
+            fd_entries[num_fds].guest_fd = i;
+            fd_entries[num_fds].type = fd_table[i].type;
+            fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
+            fd_entries[num_fds].pad = 0;
+
+            if (fd_table[i].type != FD_STDIO) {
+                /* Dup the fd so child gets its own copy */
+                int duped = dup(fd_table[i].host_fd);
+                if (duped >= 0) {
+                    host_fds_to_send[num_host_fds++] = duped;
+                }
+            } else {
+                /* For stdio, send the actual fd (0, 1, 2) */
+                host_fds_to_send[num_host_fds++] = fd_table[i].host_fd;
+            }
+
+            open_fds[num_fds] = i;
+            num_fds++;
+        }
+    }
+
+    if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    if (num_fds > 0) {
+        if (ipc_write_all(ipc_sock, fd_entries, num_fds * sizeof(ipc_fd_entry_t)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+
+        /* Send host FDs via SCM_RIGHTS */
+        if (send_fds(ipc_sock, host_fds_to_send, num_host_fds) < 0) {
+            fprintf(stderr, "hl: clone: failed to send fds via SCM_RIGHTS\n");
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+
+        /* Close duped fds in parent */
+        for (int i = 0; i < num_host_fds; i++) {
+            if (fd_entries[i].type != FD_STDIO)
+                close(host_fds_to_send[i]);
+        }
+    }
+
+    /* Process info: cwd + umask */
+    char cwd[LINUX_PATH_MAX] = {0};
+    getcwd(cwd, sizeof(cwd));
+    mode_t cur_umask = umask(0);
+    umask(cur_umask);
+    uint32_t umask_val = (uint32_t)cur_umask;
+
+    if (ipc_write_all(ipc_sock, cwd, sizeof(cwd)) < 0 ||
+        ipc_write_all(ipc_sock, &umask_val, sizeof(umask_val)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Semantic region tracking */
+    uint32_t num_guest_regions = (uint32_t)g->nregions;
+    if (ipc_write_all(ipc_sock, &num_guest_regions, sizeof(num_guest_regions)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    if (num_guest_regions > 0) {
+        if (ipc_write_all(ipc_sock, g->regions,
+                          num_guest_regions * sizeof(guest_region_t)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    /* Signal state */
+    const signal_state_t *sig = signal_get_state();
+    if (ipc_write_all(ipc_sock, sig, sizeof(signal_state_t)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Shim blob (needed for child exec) */
+    const unsigned char *shim_ptr = proc_get_shim_blob();
+    uint32_t shim_size_u32 = proc_get_shim_size();
+    if (ipc_write_all(ipc_sock, &shim_size_u32, sizeof(shim_size_u32)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    if (shim_size_u32 > 0 && shim_ptr) {
+        if (ipc_write_all(ipc_sock, shim_ptr, shim_size_u32) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    /* Sentinel */
+    uint32_t sentinel = IPC_MAGIC_SENTINEL;
+    if (ipc_write_all(ipc_sock, &sentinel, sizeof(sentinel)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    close(ipc_sock);
+
+    /* Step 6: Record child in process table */
+    proc_register_child(child_host_pid, child_guest_pid);
+
+    /* Step 7: For CLONE_VFORK, wait until child exits or execs.
+     * Since we can't detect exec, just wait for child to exit for now.
+     * This is correct for posix_spawn: child execs immediately. */
+    if (is_vfork) {
+        int status;
+        waitpid(child_host_pid, &status, 0);
+
+        /* Mark as exited in process table */
+        proc_mark_child_exited(child_host_pid, status);
+    }
+
+    if (verbose)
+        fprintf(stderr, "hl: clone: child pid=%lld (host=%d)\n",
+                (long long)child_guest_pid, child_host_pid);
+
+    return child_guest_pid;
+}

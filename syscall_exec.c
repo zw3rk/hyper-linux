@@ -1,0 +1,277 @@
+/* syscall_exec.c — execve syscall handler for hl
+ *
+ * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Implements execve: reads path/argv/envp from guest memory, closes
+ * CLOEXEC fds, resets the guest VM, reloads the shim and new ELF,
+ * rebuilds page tables, and restarts at the new entry point.
+ */
+#include "syscall_exec.h"
+#include "syscall_proc.h"    /* proc_set_elf_path, proc_get_shim_blob, proc_get_shim_size, SYSCALL_EXEC_HAPPENED */
+#include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
+#include "syscall.h"         /* FD_CLOSED, FD_STDIO, LINUX_O_CLOEXEC, etc. */
+#include "guest.h"           /* guest_t, guest_reset, guest_build_page_tables, etc. */
+#include "elf.h"             /* elf_load, elf_map_segments */
+#include "stack.h"           /* build_linux_stack */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <dirent.h>
+
+/* Read a NULL-terminated pointer array from guest memory.
+ * Each pointer in the array is a 64-bit GVA pointing to a string.
+ * Returns the count of entries (excluding the NULL terminator),
+ * or -1 on error. Strings are copied into the provided buffer. */
+static int read_string_array(guest_t *g, uint64_t array_gva,
+                             char **out, int max_count,
+                             char *str_buf, size_t str_buf_size) {
+    size_t str_off = 0;
+    int count = 0;
+
+    for (int i = 0; i < max_count; i++) {
+        uint64_t ptr;
+        if (guest_read(g, array_gva + i * 8, &ptr, 8) < 0)
+            return -1;
+        if (ptr == 0) break; /* NULL terminator */
+
+        char *dst = str_buf + str_off;
+        size_t remaining = str_buf_size - str_off;
+        if (remaining < 2) return -1; /* Buffer full */
+
+        if (guest_read_str(g, ptr, dst, remaining) < 0)
+            return -1;
+
+        out[count] = dst;
+        str_off += strlen(dst) + 1;
+        count++;
+    }
+
+    return count;
+}
+
+int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
+                   uint64_t path_gva, uint64_t argv_gva, uint64_t envp_gva,
+                   int verbose) {
+    /* Step 1: Read path from guest memory */
+    char path[LINUX_PATH_MAX];
+    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+        return -LINUX_EFAULT;
+
+    if (verbose)
+        fprintf(stderr, "hl: execve(\"%s\")\n", path);
+
+    /* Step 2: Read argv[] and envp[] from guest memory */
+    #define MAX_ARGS 256
+    #define MAX_ENVS 4096
+    #define STR_BUF_SIZE (256 * 1024)
+
+    char *argv[MAX_ARGS + 1];
+    char *envp[MAX_ENVS + 1];
+    char *argv_buf = malloc(STR_BUF_SIZE);
+    char *envp_buf = malloc(STR_BUF_SIZE);
+    if (!argv_buf || !envp_buf) {
+        free(argv_buf);
+        free(envp_buf);
+        return -LINUX_ENOMEM;
+    }
+
+    int argc = read_string_array(g, argv_gva, argv, MAX_ARGS,
+                                  argv_buf, STR_BUF_SIZE);
+    if (argc < 0) {
+        free(argv_buf); free(envp_buf);
+        return -LINUX_EFAULT;
+    }
+    argv[argc] = NULL;
+
+    int envc = 0;
+    if (envp_gva != 0) {
+        envc = read_string_array(g, envp_gva, envp, MAX_ENVS,
+                                  envp_buf, STR_BUF_SIZE);
+        if (envc < 0) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_EFAULT;
+        }
+    }
+    envp[envc] = NULL;
+
+    /* Step 3: Verify path is a valid aarch64-linux ELF */
+    elf_info_t elf_info;
+    if (elf_load(path, &elf_info) < 0) {
+        free(argv_buf); free(envp_buf);
+        return -LINUX_ENOENT;
+    }
+
+    /* Step 4: Close CLOEXEC fds */
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type != FD_CLOSED &&
+            (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
+            if (fd_table[i].dir) {
+                closedir((DIR *)fd_table[i].dir);
+                fd_table[i].dir = NULL;
+            }
+            if (fd_table[i].type != FD_STDIO)
+                close(fd_table[i].host_fd);
+            fd_table[i].type = FD_CLOSED;
+            fd_table[i].host_fd = -1;
+            fd_table[i].linux_flags = 0;
+        }
+    }
+
+    /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
+    guest_reset(g);
+
+    /* Step 6: Reload shim into guest */
+    const unsigned char *shim_ptr = proc_get_shim_blob();
+    unsigned int shim_size = proc_get_shim_size();
+    if (shim_ptr && shim_size > 0) {
+        memcpy((uint8_t *)g->host_base + SHIM_BASE, shim_ptr, shim_size);
+    }
+
+    /* Step 7: Load new ELF segments into guest memory */
+    if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size) < 0) {
+        fprintf(stderr, "hl: execve: failed to map ELF segments for %s\n", path);
+        free(argv_buf); free(envp_buf);
+        return -LINUX_ENOEXEC;
+    }
+
+    /* Set brk base after the highest loaded segment */
+    uint64_t brk_start = (elf_info.load_max + 4095) & ~4095ULL;
+    if (brk_start < BRK_BASE_DEFAULT)
+        brk_start = BRK_BASE_DEFAULT;
+    g->brk_base = brk_start;
+    g->brk_current = brk_start;
+
+    /* Step 8: Rebuild page tables */
+    #define MAX_REGIONS 16
+    mem_region_t regions[MAX_REGIONS];
+    int nregions = 0;
+
+    /* Shim code (RX) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = SHIM_BASE,
+        .gpa_end   = SHIM_BASE + shim_size,
+        .perms     = MEM_PERM_RX
+    };
+
+    /* Shim data/stack (RW) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = SHIM_DATA_BASE,
+        .gpa_end   = SHIM_DATA_BASE + BLOCK_2MB,
+        .perms     = MEM_PERM_RW
+    };
+
+    /* ELF segments */
+    for (int i = 0; i < elf_info.num_segments; i++) {
+        if (nregions >= MAX_REGIONS) break;
+        int perms = MEM_PERM_R;
+        if (elf_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
+        if (elf_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
+        regions[nregions++] = (mem_region_t){
+            .gpa_start = elf_info.segments[i].gpa,
+            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+            .perms     = perms
+        };
+    }
+
+    /* brk region (RW) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = g->brk_base,
+        .gpa_end   = MMAP_BASE,
+        .perms     = MEM_PERM_RW
+    };
+
+    /* Stack (RW) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = STACK_BASE,
+        .gpa_end   = STACK_TOP,
+        .perms     = MEM_PERM_RW
+    };
+
+    /* mmap region (RW) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = MMAP_BASE,
+        .gpa_end   = MMAP_INITIAL_END,
+        .perms     = MEM_PERM_RW
+    };
+    g->mmap_end = MMAP_INITIAL_END;
+
+    uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
+    if (!ttbr0) {
+        fprintf(stderr, "hl: execve: failed to build page tables\n");
+        free(argv_buf); free(envp_buf);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Step 8b: Record semantic regions (cleared by guest_reset) */
+    guest_region_add(g, SHIM_BASE, SHIM_BASE + shim_size,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE,
+                     0, "[shim]");
+    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MB,
+                     LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE,
+                     0, "[shim-data]");
+    for (int i = 0; i < elf_info.num_segments; i++) {
+        int seg_prot = LINUX_PROT_READ;
+        if (elf_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
+        if (elf_info.segments[i].flags & PF_X) seg_prot |= LINUX_PROT_EXEC;
+        guest_region_add(g, elf_info.segments[i].gpa,
+                         elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+                         seg_prot, LINUX_MAP_PRIVATE,
+                         elf_info.segments[i].offset, path);
+    }
+    guest_region_add(g, STACK_BASE, STACK_TOP,
+                     LINUX_PROT_READ | LINUX_PROT_WRITE,
+                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                     0, "[stack]");
+
+    /* Step 9: Build new stack with new argv/envp */
+    const char **argv_const = (const char **)argv;
+    const char **envp_const = (const char **)envp;
+    uint64_t sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
+                                     envp_const, &elf_info);
+
+    /* Step 10: Set vCPU state for new process */
+    uint64_t entry_ipa = guest_ipa(g, elf_info.entry);
+    uint64_t sp_ipa    = guest_ipa(g, sp);
+
+    /* Write TTBR0 to vCPU */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, ttbr0);
+
+    /* Set ELR_EL1 to new entry point */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa);
+
+    /* Set SP_EL0 to new stack */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa);
+
+    /* SPSR_EL1: EL0t, AArch64 */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0);
+
+    /* Zero all general purpose registers */
+    for (int i = 0; i < 31; i++) {
+        hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, 0);
+    }
+
+    /* Tell the shim to invalidate TLB after we rebuilt page tables.
+     * Set X8=1 directly because SYSCALL_EXEC_HAPPENED bypasses the
+     * normal X8 TLBI signaling in syscall_dispatch(). The shim checks
+     * X8 after HVC #5 return: if non-zero, it runs TLBI VMALLE1IS. */
+    hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
+    g->need_tlbi = 0;
+
+    if (verbose) {
+        fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx\n",
+                path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa);
+    }
+
+    /* Update ELF path for /proc/self/exe after successful exec */
+    proc_set_elf_path(path);
+
+    free(argv_buf);
+    free(envp_buf);
+
+    return SYSCALL_EXEC_HAPPENED;
+}

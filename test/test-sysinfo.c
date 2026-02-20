@@ -6,16 +6,12 @@
  * Tests: sysinfo, getrusage, getgroups, prlimit64, getppid, sched_getaffinity
  */
 #define _GNU_SOURCE  /* Required for cpu_set_t, CPU_ZERO, CPU_COUNT on musl */
-#include <stdio.h>
+#include "test-harness.h"
 #include <string.h>
 #include <unistd.h>
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
 #include <sched.h>
-
-#define TEST(name) printf("  %-30s ", name)
-#define PASS()     do { printf("OK\n"); passes++; } while(0)
-#define FAIL(msg)  do { printf("FAIL: %s\n", msg); fails++; } while(0)
 
 int main(void) {
     int passes = 0, fails = 0;

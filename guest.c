@@ -196,6 +196,9 @@ void guest_reset(guest_t *g) {
     g->mmap_end = MMAP_INITIAL_END;
     g->ttbr0 = 0;
     g->need_tlbi = 0;
+
+    /* Clear semantic region tracking (will be re-populated after exec) */
+    guest_region_clear(g);
 }
 
 /* ---------- Used region enumeration ---------- */
@@ -249,6 +252,168 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
     }
 
     return n;
+}
+
+/* ---------- Semantic region tracking ---------- */
+
+int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
+                     int prot, int flags, uint64_t offset,
+                     const char *name) {
+    if (g->nregions >= GUEST_MAX_REGIONS) return -1;
+
+    /* Find insertion point (keep sorted by start address) */
+    int i = g->nregions;
+    while (i > 0 && g->regions[i - 1].start > start) {
+        g->regions[i] = g->regions[i - 1];
+        i--;
+    }
+
+    guest_region_t *r = &g->regions[i];
+    r->start  = start;
+    r->end    = end;
+    r->prot   = prot;
+    r->flags  = flags;
+    r->offset = offset;
+    if (name) {
+        strncpy(r->name, name, sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    } else {
+        r->name[0] = '\0';
+    }
+    g->nregions++;
+    return 0;
+}
+
+void guest_region_remove(guest_t *g, uint64_t start, uint64_t end) {
+    int i = 0;
+    while (i < g->nregions) {
+        guest_region_t *r = &g->regions[i];
+
+        /* No overlap: region is entirely before the removal range */
+        if (r->end <= start) { i++; continue; }
+
+        /* No overlap: region is entirely after the removal range */
+        if (r->start >= end) break; /* sorted, so done */
+
+        /* Full containment: remove the entire region */
+        if (r->start >= start && r->end <= end) {
+            memmove(&g->regions[i], &g->regions[i + 1],
+                    (g->nregions - i - 1) * sizeof(guest_region_t));
+            g->nregions--;
+            continue; /* don't increment i */
+        }
+
+        /* Partial overlap: removal range cuts the beginning */
+        if (r->start >= start && r->start < end && r->end > end) {
+            uint64_t trimmed = end - r->start;
+            r->offset += trimmed;
+            r->start = end;
+            i++;
+            continue;
+        }
+
+        /* Partial overlap: removal range cuts the end */
+        if (r->start < start && r->end > start && r->end <= end) {
+            r->end = start;
+            i++;
+            continue;
+        }
+
+        /* Split: removal range is entirely inside the region */
+        if (r->start < start && r->end > end) {
+            /* Need to split into two regions: [r->start, start) and [end, r->end) */
+            if (g->nregions >= GUEST_MAX_REGIONS) {
+                /* Can't split — just trim to [r->start, start) and lose the tail */
+                r->end = start;
+                i++;
+                continue;
+            }
+            /* Make room for the new region after i */
+            memmove(&g->regions[i + 2], &g->regions[i + 1],
+                    (g->nregions - i - 1) * sizeof(guest_region_t));
+
+            /* Right half: [end, old_end) */
+            guest_region_t *right = &g->regions[i + 1];
+            *right = *r;  /* Copy attributes */
+            right->offset += (end - r->start);
+            right->start = end;
+
+            /* Left half: [r->start, start) — just trim end */
+            r->end = start;
+
+            g->nregions++;
+            i += 2; /* skip both halves */
+            continue;
+        }
+
+        i++;
+    }
+}
+
+const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr) {
+    /* Binary search in sorted array */
+    int lo = 0, hi = g->nregions - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (addr < g->regions[mid].start) {
+            hi = mid - 1;
+        } else if (addr >= g->regions[mid].end) {
+            lo = mid + 1;
+        } else {
+            return &g->regions[mid];
+        }
+    }
+    return NULL;
+}
+
+void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
+    /* Walk regions overlapping [start, end), split at boundaries, update prot */
+    for (int i = 0; i < g->nregions; i++) {
+        guest_region_t *r = &g->regions[i];
+        if (r->end <= start) continue;
+        if (r->start >= end) break;
+
+        /* If region extends before start, split at start */
+        if (r->start < start) {
+            if (g->nregions >= GUEST_MAX_REGIONS) continue;
+            memmove(&g->regions[i + 1], &g->regions[i],
+                    (g->nregions - i) * sizeof(guest_region_t));
+            g->nregions++;
+            /* Left half keeps original prot */
+            g->regions[i].end = start;
+            /* Right half will be processed next iteration */
+            g->regions[i + 1].offset += (start - g->regions[i + 1].start);
+            g->regions[i + 1].start = start;
+            i++; /* advance to the right half */
+            r = &g->regions[i];
+        }
+
+        /* If region extends past end, split at end */
+        if (r->end > end) {
+            if (g->nregions >= GUEST_MAX_REGIONS) {
+                /* Can't split, just update what we have */
+                r->prot = prot;
+                continue;
+            }
+            memmove(&g->regions[i + 1], &g->regions[i],
+                    (g->nregions - i) * sizeof(guest_region_t));
+            g->nregions++;
+            /* Left half: [r->start, end) with new prot */
+            g->regions[i].end = end;
+            g->regions[i].prot = prot;
+            /* Right half: [end, old_end) keeps original prot */
+            g->regions[i + 1].offset += (end - g->regions[i + 1].start);
+            g->regions[i + 1].start = end;
+            break; /* done, right half is past our range */
+        }
+
+        /* Region fully within [start, end): just update prot */
+        r->prot = prot;
+    }
+}
+
+void guest_region_clear(guest_t *g) {
+    g->nregions = 0;
 }
 
 /* ---------- Page table builder ---------- */

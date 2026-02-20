@@ -171,6 +171,8 @@
 #define SYS_munlock         229
 #define SYS_msync           227
 #define SYS_mincore         232
+#define SYS_eventfd2        19
+#define SYS_signalfd4       74
 #define SYS_clone3          435
 #define SYS_close_range     436
 
@@ -503,6 +505,8 @@ typedef struct {
 #define FD_SOCKET   5
 #define FD_EPOLL    6
 #define FD_TIMERFD  7
+#define FD_EVENTFD  8
+#define FD_SIGNALFD 9
 
 typedef struct {
     int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */

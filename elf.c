@@ -111,6 +111,7 @@ int elf_load(const char *path, elf_info_t *info) {
             }
 
             info->segments[seg_count].gpa    = ph->p_vaddr;
+            info->segments[seg_count].offset = ph->p_offset;
             info->segments[seg_count].filesz = ph->p_filesz;
             info->segments[seg_count].memsz  = ph->p_memsz;
             info->segments[seg_count].flags  = ph->p_flags;

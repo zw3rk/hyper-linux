@@ -164,6 +164,9 @@ void signal_init(void);
 /* Queue a signal for delivery. */
 void signal_queue(int signum);
 
+/* Consume (clear) a pending signal. Used by signalfd reads. */
+void signal_consume(int signum);
+
 /* Check if any unblocked signal is pending. */
 int signal_pending(void);
 

@@ -217,7 +217,23 @@ printf "\n${BLUE}── Networking ──${RESET}\n"
 run_check  nslookup  "Address"              "example.com"
 run_check  wget      "Example"              "-q" "-O" "-" "http://example.com/"
 run_skip   ping      "needs raw socket / setuid"
-run_skip   nc        "stdin timing issues with piped input"
+# nc: use subshell+sleep to delay stdin EOF — prevents premature half-close
+applet="nc"
+name=$(printf "%-16s" "$applet")
+if output=$( (printf 'HEAD / HTTP/1.0\r\nHost: example.com\r\n\r\n'; sleep 2) \
+             | "$HL" "$BB" nc -w 3 example.com 80 2>&1 | head -5 ); then
+    rc=0
+else
+    rc=$?
+fi
+if echo "$output" | grep -q "HTTP"; then
+    printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
+    pass=$((pass + 1))
+else
+    printf "${YELLOW}▸${RESET} %s ${RED}✗ FAIL${RESET} (pattern 'HTTP' not found, rc=%d)\n" "$name" "$rc"
+    printf "  %.120s\n" "$output" | head -3
+    fail=$((fail + 1))
+fi
 run_skip   telnet    "needs interactive terminal"
 
 # ── Shell ────────────────────────────────────────────────────────

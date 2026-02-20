@@ -12,6 +12,12 @@
 
 #include "syscall.h"
 
+/* ---------- Named constants ---------- */
+
+/* Linux PATH_MAX (4096) — used for path buffer sizing in syscall handlers.
+ * Literal 4096 in guest.c/stack.c means actual page size, not this. */
+#define LINUX_PATH_MAX 4096
+
 /* ---------- FD table (owned by syscall.c) ---------- */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];
 

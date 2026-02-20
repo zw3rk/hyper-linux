@@ -15,7 +15,10 @@ Run static aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.fram
 - **syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
 - **syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
 - **syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
-- **syscall_proc.c/h** — Process syscalls: execve, clone/fork (IPC), wait4, vCPU loop (~1520 lines).
+- **syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop (~550 lines).
+- **proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
+- **syscall_exec.c/h** — execve: ELF reload, page table rebuild, vCPU restart (~260 lines).
+- **fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
 - **stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 - **vm.c** — Legacy proof-of-concept host driver (kept in archive/).
@@ -111,7 +114,8 @@ pselect6(72), ppoll(73), kill(129), tgkill(131), rt_sigsuspend(133),
 rt_sigpending(136), rt_sigreturn(139), setpgid(154), setsid(157)
 
 **Timers:**
-setitimer(103), getitimer(102)
+setitimer(103), getitimer(102), timerfd_create(85), timerfd_settime(86),
+timerfd_gettime(87)
 
 **Extended ioctls:**
 TCSETSW(0x5403), TCSETSF(0x5404), TIOCGPGRP(0x540F), TIOCSPGRP(0x5410),
@@ -141,11 +145,15 @@ connect(203), getsockname(204), getpeername(205), sendto(206),
 recvfrom(207), setsockopt(208), getsockopt(209), shutdown(210),
 sendmsg(211), recvmsg(212), accept4(242)
 
+**epoll (emulated via kqueue):**
+epoll_create1(20), epoll_ctl(21), epoll_pwait(22)
+
+**Process management (additional):**
+waitid(95)
+
 **Stubs (return -ENOSYS):**
-tee(77), timerfd_create(85), timerfd_settime(86), timerfd_gettime(87),
-epoll_create1(20), epoll_ctl(21), epoll_pwait(22),
-inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28),
-waitid(95), mincore(232), clone3(435)
+tee(77), inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28),
+mincore(232), clone3(435)
 
 **Stubs (return -EPERM):**
 sethostname(161)

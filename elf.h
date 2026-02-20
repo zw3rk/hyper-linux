@@ -101,6 +101,7 @@ typedef struct {
     int      num_segments;
     struct {
         uint64_t gpa;      /* Guest physical address */
+        uint64_t offset;   /* File offset (p_offset, for /proc/self/maps) */
         uint64_t filesz;   /* Bytes to load from file */
         uint64_t memsz;    /* Total memory size (filesz + bss) */
         int      flags;    /* PF_R, PF_W, PF_X */

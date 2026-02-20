@@ -5,18 +5,13 @@
  *
  * Tests: chmod, symlink, hardlink, utimensat, fchown, mknodat
  */
-#include <stdio.h>
+#include "test-harness.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <errno.h>
-
-#define TEST(name) printf("  %-30s ", name)
-#define PASS()     do { printf("OK\n"); passes++; } while(0)
-#define FAIL(msg)  do { printf("FAIL: %s\n", msg); fails++; } while(0)
 
 int main(void) {
     int passes = 0, fails = 0;

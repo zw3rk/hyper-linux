@@ -5,7 +5,7 @@
  *
  * Tests: ppoll, pselect, kill, signal ops
  */
-#include <stdio.h>
+#include "test-harness.h"
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -13,11 +13,6 @@
 #include <signal.h>
 #include <sys/select.h>
 #include <time.h>
-#include <errno.h>
-
-#define TEST(name) printf("  %-30s ", name)
-#define PASS()     do { printf("OK\n"); passes++; } while(0)
-#define FAIL(msg)  do { printf("FAIL: %s (errno=%d)\n", msg, errno); fails++; } while(0)
 
 int main(void) {
     int passes = 0, fails = 0;

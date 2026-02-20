@@ -9,15 +9,29 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl sign clean test-hello test-all test-coreutils test-busybox help
+.PHONY: all hl clean test-hello test-all test-coreutils test-busybox help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
 SIGN_IDENTITY ?= -
 BUILD_DIR := _build
 
-# Cross-compiler prefix for aarch64-linux test binaries
+# Cross-compiler prefix (only used when GUEST_TEST_BINARIES is unset)
 CROSS ?= aarch64-unknown-linux-musl-
+
+# Test binary directory: pre-built from nix or locally cross-compiled.
+# When GUEST_TEST_BINARIES is set (by nix develop), test binaries were
+# already built on x86_64-linux and are ready to use.  Otherwise fall
+# back to local cross-compilation via $(CROSS)gcc.
+ifdef GUEST_TEST_BINARIES
+  TEST_DIR  := $(GUEST_TEST_BINARIES)/bin
+  TEST_DEPS :=
+else
+  TEST_DIR  := $(BUILD_DIR)
+  TEST_C_SRCS := $(wildcard test/*.c)
+  TEST_C_BINS := $(patsubst test/%.c,$(BUILD_DIR)/%,$(TEST_C_SRCS))
+  TEST_DEPS := $(BUILD_DIR)/test-hello $(TEST_C_BINS)
+endif
 
 # Colors
 GREEN  := \033[0;32m
@@ -28,21 +42,21 @@ RESET  := \033[0m
 
 # ── Source files ───────────────────────────────────────────────────
 HL_SRCS := hl.c guest.c elf.c syscall.c syscall_fs.c syscall_io.c \
-           syscall_time.c syscall_sys.c syscall_proc.c syscall_signal.c \
-           syscall_net.c stack.c
+           syscall_poll.c syscall_fd.c \
+           syscall_time.c syscall_sys.c syscall_proc.c \
+           proc_emulation.c syscall_exec.c fork_ipc.c \
+           syscall_signal.c syscall_net.c stack.c
 HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_fs.h \
-           syscall_io.h syscall_time.h syscall_sys.h syscall_proc.h \
+           syscall_io.h syscall_poll.h syscall_fd.h \
+           syscall_time.h syscall_sys.h syscall_proc.h \
+           proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h
-
-# C test programs (built with musl cross-compiler, static)
-TEST_C_SRCS := $(wildcard test/*.c)
-TEST_C_BINS := $(patsubst test/%.c,$(BUILD_DIR)/%,$(TEST_C_SRCS))
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
 
 ## Build everything (hl + all test binaries)
-all: hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
+all: hl $(TEST_DEPS)
 
 # ── Build directory ────────────────────────────────────────────────
 $(BUILD_DIR):
@@ -80,8 +94,10 @@ $(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Signing$(RESET) hl\n"
 	codesign --entitlements $(ENTITLEMENTS) -f -s "$(SIGN_IDENTITY)" $@
 
-# ── Test binaries ──────────────────────────────────────────────────
+# ── Test binaries (local cross-compilation fallback) ─────────────
+# These rules are only used when GUEST_TEST_BINARIES is NOT set.
 
+ifndef GUEST_TEST_BINARIES
 # Assembly hello world (uses custom linker script)
 $(BUILD_DIR)/test-hello: test/hello.S test/simple.ld | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Cross-assembling$(RESET) test/hello.S\n"
@@ -93,16 +109,17 @@ $(BUILD_DIR)/test-hello: test/hello.S test/simple.ld | $(BUILD_DIR)
 $(BUILD_DIR)/%: test/%.c | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Cross-compiling$(RESET) $<\n"
 	$(CROSS)gcc -static -O2 -o $@ $<
+endif
 
 # ── Test targets ──────────────────────────────────────────────────
 
 ## Build and run the assembly hello world test
-test-hello: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
+test-hello: $(BUILD_DIR)/hl $(TEST_DEPS)
 	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
-	$(BUILD_DIR)/hl $(BUILD_DIR)/test-hello
+	$(BUILD_DIR)/hl $(TEST_DIR)/test-hello
 
 ## Run all tests
-test-all: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
+test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	@printf "\n$(BLUE)━━━ Running test suite ━━━$(RESET)\n\n"
 	@pass=0; fail=0; \
 	run_test() { \
@@ -124,32 +141,41 @@ test-all: $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello $(TEST_C_BINS)
 		fi; \
 	}; \
 	printf "$(BLUE)── Assembly tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-hello; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-hello; \
 	printf "\n$(BLUE)── C tests (musl static) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/hello-musl; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/hello-write; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/echo-test hello world; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-argc a b c; \
-	expected_rc=42 run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-complex; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-fileio CLAUDE.md; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-string; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-malloc; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-cat test/hello.S; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-ls test/; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-roundtrip; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-comprehensive; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/hello-musl; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/hello-write; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/echo-test hello world; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-argc a b c; \
+	expected_rc=42 run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-complex; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fileio CLAUDE.md; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-string; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cat test/hello.S; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-ls test/; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-roundtrip; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-comprehensive; \
 	printf "\n$(BLUE)── Process tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-exec $(BUILD_DIR)/echo-test exec-works; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-fork; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-exec $(TEST_DIR)/echo-test exec-works; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fork; \
 	printf "\n$(BLUE)── Signal tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-signal; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signal; \
 	printf "\n$(BLUE)── Socket tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-socket; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-file-ops; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-sysinfo; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-io-opt; \
-	run_test $(BUILD_DIR)/hl $(BUILD_DIR)/test-poll; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-file-ops; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-sysinfo; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-io-opt; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-poll; \
+	printf "\n$(BLUE)── I/O subsystem tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-eventfd; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signalfd; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-epoll; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-timerfd; \
+	printf "\n$(BLUE)── /proc and /dev emulation tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-proc; \
+	printf "\n$(BLUE)── Network tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-net; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
 
 # ── Coreutils integration test ───────────────────────────────────
@@ -179,16 +205,6 @@ test-busybox: $(BUILD_DIR)/hl
 	fi
 	@bash test/test-busybox.sh $(BUILD_DIR)/hl $(BUSYBOX_BIN)
 
-# ── Legacy vm target (preserved) ──────────────────────────────────
-
-## Build the legacy vm executable (original PoC)
-vm: $(BUILD_DIR)/vm
-	@printf "$(GREEN)✓ vm built$(RESET)\n"
-
-$(BUILD_DIR)/vm: vm.c | $(BUILD_DIR)
-	clang -o $@ vm.c -framework Hypervisor -arch arm64
-	codesign --entitlements $(ENTITLEMENTS) -f -s "$(SIGN_IDENTITY)" $@
-
 # ── Cleanup ────────────────────────────────────────────────────────
 
 ## Remove all build artifacts
@@ -211,5 +227,9 @@ help:
 		} \
 	} \
 	{ lastLine = $$0 }' $(MAKEFILE_LIST)
+ifdef GUEST_TEST_BINARIES
+	@printf "\n$(GREEN)Test binaries:$(RESET) pre-built from nix ($(TEST_DIR))\n"
+else
 	@printf "\n$(GREEN)Cross-compiler:$(RESET) CROSS=$(CROSS)\n"
 	@printf "  Override with: make test-hello CROSS=aarch64-linux-gnu-\n"
+endif

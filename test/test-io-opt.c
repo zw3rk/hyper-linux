@@ -6,19 +6,13 @@
  * Tests: sendfile, copy_file_range, fsync, fallocate
  */
 #define _GNU_SOURCE  /* Required for fallocate, copy_file_range */
-#include <stdio.h>
+#include "test-harness.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
-
-#define TEST(name) printf("  %-30s ", name)
-#define PASS()     do { printf("OK\n"); passes++; } while(0)
-#define FAIL(msg)  do { printf("FAIL: %s (errno=%d)\n", msg, errno); fails++; } while(0)
-
-#include <errno.h>
 
 int main(void) {
     int passes = 0, fails = 0;

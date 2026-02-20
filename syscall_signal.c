@@ -103,6 +103,11 @@ void signal_queue(int signum) {
     sig_state.pending |= sig_bit(signum);
 }
 
+void signal_consume(int signum) {
+    if (signum < 1 || signum > LINUX_NSIG) return;
+    sig_state.pending &= ~sig_bit(signum);
+}
+
 int signal_pending(void) {
     return (sig_state.pending & ~sig_state.blocked) != 0;
 }

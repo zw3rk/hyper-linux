@@ -9,7 +9,8 @@
 #include "syscall_fs.h"
 #include "syscall.h"
 #include "syscall_internal.h"
-#include "syscall_proc.h"
+#include "syscall_fd.h"
+#include "proc_emulation.h"
 #include "guest.h"
 
 #include <stdio.h>
@@ -76,12 +77,12 @@ typedef struct {
 
 int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
                    int linux_flags, int mode) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
     /* Intercept /proc and /dev paths before touching the host filesystem */
-    int intercepted = proc_intercept_open(path, linux_flags, mode);
+    int intercepted = proc_intercept_open(g, path, linux_flags, mode);
     if (intercepted >= 0) {
         /* Got a host fd from the intercept — allocate a guest fd for it */
         int guest_fd = fd_alloc(FD_REGULAR, intercepted);
@@ -154,6 +155,14 @@ int64_t sys_close(int fd) {
         fd_table[fd].dir = NULL;
     }
 
+    /* Clean up emulated I/O subsystem state (pipes, kqueues, counters) */
+    switch (fd_table[fd].type) {
+    case FD_EVENTFD:  eventfd_close(fd);  break;
+    case FD_SIGNALFD: signalfd_close(fd); break;
+    case FD_TIMERFD:  timerfd_close(fd);  break;
+    default: break;
+    }
+
     /* Don't actually close stdin/stdout/stderr on the host */
     if (fd_table[fd].type != FD_STDIO) {
         close(fd_table[fd].host_fd);
@@ -183,7 +192,7 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
 
 int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
                        uint64_t stat_gva, int flags) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -211,7 +220,7 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
 }
 
 int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -248,7 +257,7 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva) {
 int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
                   int flags, unsigned int mask, uint64_t statxbuf_gva) {
     (void)mask;
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -430,7 +439,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
 }
 
 int64_t sys_chdir(guest_t *g, uint64_t path_gva) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -449,7 +458,7 @@ int64_t sys_fchdir(int fd) {
 }
 
 int64_t sys_chroot(guest_t *g, uint64_t path_gva) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
     if (chroot(path) < 0)
@@ -497,12 +506,12 @@ int64_t sys_lseek(int fd, int64_t offset, int whence) {
 
 int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
                        uint64_t buf_gva, uint64_t bufsiz) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
     /* Intercept /proc paths (e.g. /proc/self/exe, /proc/self/fd/N) */
-    char link[4096];
+    char link[LINUX_PATH_MAX];
     int intercepted = proc_intercept_readlink(path, link, sizeof(link));
     if (intercepted >= 0) {
         size_t copy_len = (size_t)intercepted < bufsiz
@@ -535,7 +544,7 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
 }
 
 int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -555,7 +564,7 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
 }
 
 int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -576,7 +585,7 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
 int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                       int newdirfd, uint64_t newpath_gva, int flags) {
     (void)flags; /* Linux RENAME_NOREPLACE etc. — ignore for now */
-    char oldpath[4096], newpath[4096];
+    char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
     if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
         return -LINUX_EFAULT;
     if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
@@ -596,7 +605,7 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
 int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
                     int mode, int dev) {
     (void)dev;
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -623,7 +632,7 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
 
 int64_t sys_symlinkat(guest_t *g, uint64_t target_gva,
                       int dirfd, uint64_t linkpath_gva) {
-    char target[4096], linkpath[4096];
+    char target[LINUX_PATH_MAX], linkpath[LINUX_PATH_MAX];
     if (guest_read_str(g, target_gva, target, sizeof(target)) < 0)
         return -LINUX_EFAULT;
     if (guest_read_str(g, linkpath_gva, linkpath, sizeof(linkpath)) < 0)
@@ -640,7 +649,7 @@ int64_t sys_symlinkat(guest_t *g, uint64_t target_gva,
 
 int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                    int newdirfd, uint64_t newpath_gva, int flags) {
-    char oldpath[4096], newpath[4096];
+    char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
     if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
         return -LINUX_EFAULT;
     if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
@@ -661,7 +670,7 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
 int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
                       int mode, int flags) {
     (void)flags;
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -690,7 +699,7 @@ int64_t sys_ftruncate(int fd, int64_t length) {
 }
 
 int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
     if (truncate(path, length) < 0)
@@ -710,7 +719,7 @@ int64_t sys_fchmod(int fd, uint32_t mode) {
 
 int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
                      uint32_t mode, int flags) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -736,7 +745,7 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
 
 int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
                      uint32_t owner, uint32_t group, int flags) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
@@ -765,7 +774,7 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
 
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (path_gva != 0) {
         if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
             return -LINUX_EFAULT;
@@ -858,7 +867,7 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
 
 int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
                       uint64_t list_gva, uint64_t size, int nofollow) {
-    char path[4096];
+    char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 

@@ -7,7 +7,9 @@
  * memory syscalls (brk/mmap), and the main dispatch switch. Individual
  * syscall handlers live in focused modules:
  *   syscall_fs.c   — filesystem operations
- *   syscall_io.c   — read/write, ioctl, splice, poll/select
+ *   syscall_io.c   — read/write, ioctl, splice, sendfile
+ *   syscall_poll.c — ppoll, pselect6, epoll (kqueue emulation)
+ *   syscall_fd.c   — eventfd, signalfd, timerfd (special FD types)
  *   syscall_time.c — clock, nanosleep, timers
  *   syscall_sys.c  — uname, getrandom, sysinfo, resource limits
  *   syscall_proc.c — fork/exec/wait, process management
@@ -18,9 +20,13 @@
 #include "syscall_internal.h"
 #include "syscall_fs.h"
 #include "syscall_io.h"
+#include "syscall_poll.h"
+#include "syscall_fd.h"
 #include "syscall_time.h"
 #include "syscall_sys.h"
 #include "syscall_proc.h"
+#include "syscall_exec.h"
+#include "fork_ipc.h"
 #include "syscall_signal.h"
 #include "syscall_net.h"
 
@@ -240,14 +246,27 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
                new_off - g->brk_current);
     }
 
+    uint64_t old_brk = g->brk_current;
     g->brk_current = new_off;
+
+    /* Update "[heap]" region tracking */
+    if (new_off > g->brk_base) {
+        /* Remove old heap region and add updated one */
+        guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
+        guest_region_add(g, g->brk_base, new_off,
+                         LINUX_PROT_READ | LINUX_PROT_WRITE,
+                         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                         0, "[heap]");
+    } else {
+        /* brk shrank back to base — remove heap region */
+        guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
+    }
+
     return (int64_t)guest_ipa(g, g->brk_current);
 }
 
 static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                         int prot, int flags, int fd, int64_t offset) {
-    (void)prot;
-
     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
 
     /* We handle all mmap variants. For file-backed MAP_SHARED, we fall
@@ -263,6 +282,8 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         uint64_t off = addr - g->ipa_base;
         if (off + length > g->guest_size) return -LINUX_ENOMEM;
         result_off = off;
+        /* Remove any existing region coverage in the fixed range */
+        guest_region_remove(g, result_off, result_off + length);
     } else {
         /* Bump allocator from mmap region */
         g->mmap_next = (g->mmap_next + 4095) & ~4095ULL;
@@ -290,6 +311,12 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         if (host_fd < 0) return -LINUX_EBADF;
         pread(host_fd, (uint8_t *)g->host_base + result_off, length, offset);
     }
+
+    /* Record the new region. Normalize flags for tracking. */
+    int track_flags = is_anon ? (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS)
+                              : LINUX_MAP_PRIVATE;
+    guest_region_add(g, result_off, result_off + length,
+                     prot, track_flags, is_anon ? 0 : (uint64_t)offset, NULL);
 
     /* Return IPA-based address to guest */
     return (int64_t)guest_ipa(g, result_off);
@@ -392,14 +419,39 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_mmap:
         result = sys_mmap(g, x0, x1, (int)x2, (int)x3, (int)x4, (int64_t)x5);
         break;
-    case SYS_munmap:
-        /* Stub: we don't actually unmap */
+    case SYS_munmap: {
+        /* Convert IPA-based addr to offset for region tracking */
+        uint64_t unmap_off = x0 - g->ipa_base;
+        uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
+        if (unmap_off + unmap_len <= g->guest_size) {
+            /* Zero the memory (security: prevent data leaks) */
+            memset((uint8_t *)g->host_base + unmap_off, 0, unmap_len);
+            /* Remove region tracking. Note: we cannot reclaim page table
+             * entries or HVF address space — only the tracking is updated.
+             * The bump allocator doesn't reuse freed mmap space. */
+            guest_region_remove(g, unmap_off, unmap_off + unmap_len);
+        }
         result = 0;
         break;
-    case SYS_mprotect:
-        /* Stub: we don't enforce per-page protection */
+    }
+    case SYS_mprotect: {
+        /* Convert IPA-based addr to offset for region tracking */
+        uint64_t mprot_off = x0 - g->ipa_base;
+        uint64_t mprot_len = (x1 + 4095) & ~4095ULL;
+        int mprot_prot = (int)x2;
+        if (mprot_off + mprot_len <= g->guest_size) {
+            /* Update region tracking with new protection bits.
+             * Note: actual page table permissions are not changed — Apple
+             * HVF enforces W^X and we use 2MB block descriptors which are
+             * too coarse for per-page mprotect. The guest page tables were
+             * built RW for data regions, and most mprotect calls (e.g.
+             * RELRO) are compatible with keeping the underlying RW. */
+            guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
+                                  mprot_prot);
+        }
         result = 0;
         break;
+    }
     case SYS_getrandom:
         result = sys_getrandom(g, x0, x1, (unsigned int)x2);
         break;
@@ -798,6 +850,14 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         break;
     case SYS_epoll_pwait:
         result = sys_epoll_pwait(g, (int)x0, x1, (int)x2, (int)x3, x4);
+        break;
+
+    /* ---- eventfd / signalfd ---- */
+    case SYS_eventfd2:
+        result = sys_eventfd2((unsigned int)x0, (int)x1);
+        break;
+    case SYS_signalfd4:
+        result = sys_signalfd4(g, (int)x0, x1, x2, (int)x3);
         break;
 
     /* ---- inotify stubs ---- */
