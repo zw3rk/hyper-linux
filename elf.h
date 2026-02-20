@@ -42,6 +42,7 @@
 /* Program header types */
 #define PT_NULL    0
 #define PT_LOAD    1
+#define PT_INTERP  3
 #define PT_NOTE    4
 #define PT_PHDR    6
 #define PT_GNU_STACK  0x6474e551
@@ -87,6 +88,7 @@ typedef struct {
 typedef struct {
     /* From ELF header */
     uint64_t entry;        /* e_entry: program entry point */
+    uint16_t e_type;       /* ET_EXEC or ET_DYN */
     uint16_t phnum;        /* Number of program headers */
     uint16_t phentsize;    /* Size of each program header */
 
@@ -96,6 +98,9 @@ typedef struct {
 
     /* Program headers location in guest memory (for AT_PHDR auxv) */
     uint64_t phdr_gpa;     /* GPA of program headers in guest memory */
+
+    /* PT_INTERP: dynamic linker path (empty if statically linked) */
+    char     interp_path[256];
 
     /* Segment details */
     int      num_segments;
@@ -118,7 +123,11 @@ int elf_load(const char *path, elf_info_t *info);
 
 /* Copy ELF segments into guest memory. Call after elf_load() and guest_init().
  * Also copies program headers into guest memory for AT_PHDR.
+ * load_base is added to all virtual addresses (0 for ET_EXEC at link addr,
+ * non-zero for ET_DYN loaded at a chosen base).
  * Returns 0 on success, -1 on failure. */
-int elf_map_segments(const elf_info_t *info, const char *path, void *guest_base, uint64_t guest_size);
+int elf_map_segments(const elf_info_t *info, const char *path,
+                     void *guest_base, uint64_t guest_size,
+                     uint64_t load_base);
 
 #endif /* ELF_H */

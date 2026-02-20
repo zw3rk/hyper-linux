@@ -10,7 +10,7 @@
  *   - Guest memory identity-mapped at GVA=GPA with 2MB block page tables.
  *   - Syscall handlers that translate Linux syscalls to macOS equivalents.
  *
- * Usage: hl [--verbose] [--timeout N] <elf-path> [args...]
+ * Usage: hl [--verbose] [--timeout N] [--sysroot PATH] <elf-path> [args...]
  */
 #include <Hypervisor/Hypervisor.h>
 #include <Hypervisor/hv_vcpu.h>
@@ -31,6 +31,33 @@
 #include "shim_blob.h"
 
 /* ---------- Helpers ---------- */
+
+/* Resolve interpreter path against a sysroot.  Tries three strategies:
+ *   1. sysroot + interp_path  (works for /lib/ld-musl-*.so.1)
+ *   2. sysroot + "/lib/" + basename(interp_path)  (handles nix store paths
+ *      like /nix/store/...-musl-1.2.5/lib/ld-musl-aarch64.so.1)
+ *   3. interp_path as-is  (no sysroot, or all fallbacks failed)
+ * Returns the resolved path in `out` (must be LINUX_PATH_MAX bytes). */
+static void resolve_interp(const char *sysroot, const char *interp_path,
+                            char *out, size_t out_sz) {
+    if (sysroot) {
+        /* Strategy 1: sysroot + full interp path */
+        snprintf(out, out_sz, "%s%s", sysroot, interp_path);
+        if (access(out, F_OK) == 0)
+            return;
+
+        /* Strategy 2: sysroot/lib/basename — handles nix store paths */
+        const char *base = strrchr(interp_path, '/');
+        base = base ? base + 1 : interp_path;
+        snprintf(out, out_sz, "%s/lib/%s", sysroot, base);
+        if (access(out, F_OK) == 0)
+            return;
+
+        /* Fall through to raw path */
+    }
+    strncpy(out, interp_path, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
 
 #define HV_CHECK(call) do {                                        \
     hv_return_t _r = (call);                                       \
@@ -94,6 +121,7 @@ int main(int argc, const char **argv) {
     int verbose = 0;
     int timeout_sec = 10;  /* Default: 10 second timeout */
     int fork_child_fd = -1; /* IPC fd for --fork-child mode */
+    const char *sysroot = NULL; /* Sysroot for dynamic linker resolution */
     int arg_start = 1;
 
     /* Parse hl options */
@@ -112,13 +140,17 @@ int main(int argc, const char **argv) {
                    arg_start + 1 < argc) {
             fork_child_fd = atoi(argv[arg_start + 1]);
             arg_start += 2;
+        } else if (strcmp(argv[arg_start], "--sysroot") == 0 &&
+                   arg_start + 1 < argc) {
+            sysroot = argv[arg_start + 1];
+            arg_start += 2;
         } else if (strcmp(argv[arg_start], "--") == 0) {
             arg_start++;
             break;
         } else {
             fprintf(stderr, "hl: unknown option: %s\n", argv[arg_start]);
             fprintf(stderr, "usage: hl [--verbose] [--timeout N] "
-                    "<elf-path> [args...]\n");
+                    "[--sysroot PATH] <elf-path> [args...]\n");
             return 1;
         }
     }
@@ -129,7 +161,7 @@ int main(int argc, const char **argv) {
 
     if (arg_start >= argc) {
         fprintf(stderr, "usage: hl [--verbose] [--timeout N] "
-                "<elf-path> [args...]\n");
+                "[--sysroot PATH] <elf-path> [args...]\n");
         return 1;
     }
 
@@ -161,18 +193,64 @@ int main(int argc, const char **argv) {
     }
 
     /* ---- Step 3: Load ELF segments into guest memory ---- */
-    if (elf_map_segments(&elf_info, elf_path, g.host_base, g.guest_size) < 0) {
+    /* PIE executables (ET_DYN) have virtual addresses starting near 0,
+     * which would overlap with the page table pool and shim. Load them
+     * at PIE_LOAD_BASE (0x400000) instead. ET_EXEC binaries already
+     * have absolute addresses (typically 0x400000+), so use base 0. */
+    uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+
+    if (elf_map_segments(&elf_info, elf_path,
+                         g.host_base, g.guest_size, elf_load_base) < 0) {
         fprintf(stderr, "hl: failed to map ELF segments\n");
         guest_destroy(&g);
         return 1;
     }
 
     /* Set brk base after the highest loaded segment */
-    uint64_t brk_start = (elf_info.load_max + 4095) & ~4095ULL;
+    uint64_t brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
     if (brk_start < BRK_BASE_DEFAULT)
         brk_start = BRK_BASE_DEFAULT;
     g.brk_base = brk_start;
     g.brk_current = brk_start;
+
+    /* ---- Step 3b: Load dynamic linker if PT_INTERP present ---- */
+    elf_info_t interp_info;
+    uint64_t interp_base = 0;
+    memset(&interp_info, 0, sizeof(interp_info));
+
+    if (elf_info.interp_path[0] != '\0') {
+        /* Resolve interpreter path, applying sysroot if set */
+        char interp_resolved[LINUX_PATH_MAX];
+        resolve_interp(sysroot, elf_info.interp_path,
+                       interp_resolved, sizeof(interp_resolved));
+
+        if (verbose)
+            fprintf(stderr, "hl: loading interpreter: %s\n", interp_resolved);
+
+        if (elf_load(interp_resolved, &interp_info) < 0) {
+            fprintf(stderr, "hl: failed to load interpreter: %s\n",
+                    interp_resolved);
+            guest_destroy(&g);
+            return 1;
+        }
+
+        /* Load interpreter at INTERP_LOAD_BASE (ET_DYN at chosen base) */
+        interp_base = INTERP_LOAD_BASE;
+        if (elf_map_segments(&interp_info, interp_resolved,
+                             g.host_base, g.guest_size, interp_base) < 0) {
+            fprintf(stderr, "hl: failed to map interpreter segments\n");
+            guest_destroy(&g);
+            return 1;
+        }
+
+        if (verbose) {
+            fprintf(stderr, "hl: interpreter loaded at base=0x%llx, "
+                    "entry=0x%llx, %d segments\n",
+                    (unsigned long long)interp_base,
+                    (unsigned long long)(interp_info.entry + interp_base),
+                    interp_info.num_segments);
+        }
+    }
 
     /* ---- Step 4: Load shim into guest at SHIM_BASE ---- */
     if (shim_bin_len > BLOCK_2MB) {
@@ -188,7 +266,7 @@ int main(int argc, const char **argv) {
     }
 
     /* ---- Step 5: Build page tables ---- */
-    #define MAX_REGIONS 16
+    #define MAX_REGIONS 32
     mem_region_t regions[MAX_REGIONS];
     int nregions = 0;
 
@@ -215,15 +293,31 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
 
-    /* ELF segments: map each based on its p_flags */
+    /* ELF segments: map each based on its p_flags.
+     * Segment GPAs from elf_load() are raw virtual addresses; add
+     * elf_load_base (non-zero for PIE) to match where elf_map_segments
+     * actually placed the data. */
     for (int i = 0; i < elf_info.num_segments; i++) {
         if (nregions >= MAX_REGIONS) break;
         int perms = MEM_PERM_R;
         if (elf_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
         if (elf_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
         regions[nregions++] = (mem_region_t){
-            .gpa_start = elf_info.segments[i].gpa,
-            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+            .gpa_start = elf_info.segments[i].gpa + elf_load_base,
+            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
+            .perms     = perms
+        };
+    }
+
+    /* Interpreter segments (if dynamic linking) */
+    for (int i = 0; i < interp_info.num_segments; i++) {
+        if (nregions >= MAX_REGIONS) break;
+        int perms = MEM_PERM_R;
+        if (interp_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
+        if (interp_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
+        regions[nregions++] = (mem_region_t){
+            .gpa_start = interp_info.segments[i].gpa + interp_base,
+            .gpa_end   = interp_info.segments[i].gpa + interp_info.segments[i].memsz + interp_base,
             .perms     = perms
         };
     }
@@ -242,7 +336,7 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
 
-    /* mmap region (RW, pre-mapped up to MMAP_INITIAL_END).
+    /* mmap RW region (pre-mapped up to MMAP_INITIAL_END).
      * Additional pages beyond this are mapped dynamically by
      * guest_extend_page_tables() when sys_mmap needs more space. */
     regions[nregions++] = (mem_region_t){
@@ -251,6 +345,17 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
     g.mmap_end = MMAP_INITIAL_END;
+
+    /* mmap RX region (separate 2MB blocks for PROT_EXEC allocations).
+     * Apple HVF enforces W^X on page table entries: a 2MB block can't be
+     * both writable and executable. Shared library text (PROT_EXEC) goes
+     * here, separate from RW data in the main mmap region above. */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = MMAP_RX_BASE,
+        .gpa_end   = MMAP_RX_INITIAL_END,
+        .perms     = MEM_PERM_RX
+    };
+    g.mmap_rx_end = MMAP_RX_INITIAL_END;
 
     uint64_t ttbr0 = guest_build_page_tables(&g, regions, nregions);
     if (!ttbr0) {
@@ -276,10 +381,28 @@ int main(int argc, const char **argv) {
         int prot = LINUX_PROT_READ;
         if (elf_info.segments[i].flags & PF_W) prot |= LINUX_PROT_WRITE;
         if (elf_info.segments[i].flags & PF_X) prot |= LINUX_PROT_EXEC;
-        guest_region_add(&g, elf_info.segments[i].gpa,
-                         elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+        guest_region_add(&g, elf_info.segments[i].gpa + elf_load_base,
+                         elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
                          prot, LINUX_MAP_PRIVATE,
                          elf_info.segments[i].offset, elf_realpath);
+    }
+
+    /* Interpreter semantic regions (if dynamic linking) */
+    if (interp_info.num_segments > 0) {
+        char interp_resolved[LINUX_PATH_MAX];
+        resolve_interp(sysroot, elf_info.interp_path,
+                       interp_resolved, sizeof(interp_resolved));
+
+        for (int i = 0; i < interp_info.num_segments; i++) {
+            int prot = LINUX_PROT_READ;
+            if (interp_info.segments[i].flags & PF_W) prot |= LINUX_PROT_WRITE;
+            if (interp_info.segments[i].flags & PF_X) prot |= LINUX_PROT_EXEC;
+            guest_region_add(&g,
+                             interp_info.segments[i].gpa + interp_base,
+                             interp_info.segments[i].gpa + interp_info.segments[i].memsz + interp_base,
+                             prot, LINUX_MAP_PRIVATE,
+                             interp_info.segments[i].offset, interp_resolved);
+        }
     }
 
     /* Heap starts at brk_base (initially empty, grows via sys_brk) */
@@ -330,15 +453,25 @@ int main(int argc, const char **argv) {
     proc_set_shim(shim_bin, shim_bin_len);
     proc_set_elf_path(elf_path);
     proc_set_cmdline(guest_argc, guest_argv);
+    if (sysroot)
+        proc_set_sysroot(sysroot);
     extern const char **environ;
     uint64_t sp = build_linux_stack(&g, STACK_TOP,
                                     guest_argc, guest_argv,
-                                    environ, &elf_info);
+                                    environ, &elf_info,
+                                    elf_load_base, interp_base);
+
+    /* Entry point: interpreter entry if dynamic, ELF entry if static.
+     * For PIE (ET_DYN), elf_info.entry is relative, needs elf_load_base. */
+    uint64_t entry_point = (interp_base != 0)
+        ? (interp_info.entry + interp_base)
+        : (elf_info.entry + elf_load_base);
 
     if (verbose) {
-        fprintf(stderr, "hl: SP=0x%llx, entry=0x%llx\n",
+        fprintf(stderr, "hl: SP=0x%llx, entry=0x%llx%s\n",
                 (unsigned long long)sp,
-                (unsigned long long)elf_info.entry);
+                (unsigned long long)entry_point,
+                interp_base ? " (via interpreter)" : "");
     }
 
     /* ---- Step 7: Create vCPU and configure registers ---- */
@@ -350,7 +483,7 @@ int main(int argc, const char **argv) {
 
     /* All guest-visible addresses are IPA-based: GUEST_IPA_BASE + offset */
     uint64_t shim_ipa  = guest_ipa(&g, SHIM_BASE);
-    uint64_t entry_ipa = guest_ipa(&g, elf_info.entry);
+    uint64_t entry_ipa = guest_ipa(&g, entry_point);
     uint64_t sp_ipa    = guest_ipa(&g, sp);
     uint64_t el1_sp    = guest_ipa(&g, SHIM_DATA_BASE + BLOCK_2MB);
 

@@ -9,7 +9,8 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl clean test-hello test-all test-coreutils test-busybox help
+.PHONY: all hl clean test-hello test-all test-coreutils test-busybox \
+       test-dynamic test-dynamic-coreutils help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -204,6 +205,33 @@ test-busybox: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@bash test/test-busybox.sh $(BUILD_DIR)/hl $(BUSYBOX_BIN)
+
+# ── Dynamic linking tests ────────────────────────────────────────
+
+# Musl sysroot with dynamic linker + libc.so (set by nix develop)
+SYSROOT_DIR ?= $(GUEST_SYSROOT)
+DYNAMIC_COREUTILS_BIN ?= $(GUEST_DYNAMIC_COREUTILS)/bin
+
+## Run dynamic linking smoke test (hello-dynamic via --sysroot)
+test-dynamic: $(BUILD_DIR)/hl
+	@if [ -z "$(SYSROOT_DIR)" ] || [ ! -d "$(SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ Sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) dynamic hello-dynamic (--sysroot)\n"
+	$(BUILD_DIR)/hl --sysroot $(SYSROOT_DIR) $(GUEST_DYNAMIC_TESTS)/bin/hello-dynamic
+
+## Run dynamically-linked coreutils tests (--sysroot)
+test-dynamic-coreutils: $(BUILD_DIR)/hl
+	@if [ -z "$(SYSROOT_DIR)" ] || [ ! -d "$(SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ Sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@if [ ! -d "$(DYNAMIC_COREUTILS_BIN)" ]; then \
+		printf "$(RED)✗ Dynamic coreutils not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-dynamic-coreutils.sh $(BUILD_DIR)/hl $(SYSROOT_DIR) $(DYNAMIC_COREUTILS_BIN)
 
 # ── Cleanup ────────────────────────────────────────────────────────
 

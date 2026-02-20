@@ -1,12 +1,12 @@
 # hyper-linux
 
-Run static aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.framework.
+Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.framework.
 
 ## Architecture
 
-- **hl.c** — Main entry point. CLI (incl. --fork-child), VM setup (~400 lines).
-- **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset.
-- **elf.c/h** — ELF64 parser and loader for static aarch64-linux binaries.
+- **hl.c** — Main entry point. CLI (incl. --fork-child, --sysroot), VM setup, interpreter loading (~500 lines).
+- **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset, region tracking.
+- **elf.c/h** — ELF64 parser/loader. PT_LOAD segments, PT_INTERP parsing, ET_DYN load_base support.
 - **syscall.c/h** — Core infrastructure (FD table, errno/flag translation, brk/mmap) + dispatch switch (~900 lines).
 - **syscall_internal.h** — Shared declarations for syscall module helpers.
 - **syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
@@ -63,12 +63,31 @@ Only `bad_exception` vectors may clobber X5 (they halt, so no preservation neede
 ```
 make hl          # build + codesign hl
 make test-hello  # build and run assembly hello world
-make test-all    # run full test suite (19 tests)
+make test-all    # run full test suite (27 tests)
 make clean       # remove _build/
 ```
 
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
+
+## Dynamic Linking
+
+hl supports dynamically-linked aarch64-linux ELF binaries via `--sysroot`:
+
+```
+hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
+```
+
+How it works:
+1. `elf_load()` parses PT_INTERP to find the interpreter path (e.g., `/lib/ld-musl-aarch64.so.1`)
+2. The interpreter is loaded as ET_DYN at `INTERP_LOAD_BASE` (0x40000000)
+3. `build_linux_stack()` passes `AT_BASE` (interpreter load address) and
+   `AT_EXECFN` (argv[0]) in the auxiliary vector
+4. Entry point is set to `interp_entry + load_base` (dynamic linker takes over)
+5. `sys_openat()` transparently redirects absolute paths through the sysroot:
+   when `--sysroot` is set, tries `<sysroot>/<path>` first for absolute paths
+
+The sysroot is inherited by fork children via IPC state transfer.
 
 ## Implemented Syscalls (~130 total)
 
@@ -243,7 +262,9 @@ mappings.
 0x01000000:                  brk base (16MB)
 0x07E00000  - 0x07FFFFFF:   Stack (2MB block, RW, grows down from 0x08000000)
 0x10000000  - 0x1FFFFFFF:   mmap region (initial 256MB, pre-mapped RW)
-0x20000000  - 0xFFFFFFFF:   mmap growth area (dynamically mapped on demand)
+0x20000000  - 0x3FFFFFFF:   mmap growth area
+0x40000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
+varies      - 0xFFFFFFFF:   Additional mmap growth area
 ```
 
 Total: 4GB address space reserved via mmap(MAP_ANON). macOS demand-pages

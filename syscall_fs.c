@@ -11,6 +11,7 @@
 #include "syscall_internal.h"
 #include "syscall_fd.h"
 #include "proc_emulation.h"
+#include "syscall_proc.h"   /* proc_get_sysroot */
 #include "guest.h"
 
 #include <stdio.h>
@@ -99,6 +100,32 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     }
     /* intercepted == -2: not intercepted, fall through to real openat */
 
+    /* Sysroot path resolution: when a sysroot is configured and the guest
+     * opens an absolute path, try sysroot+path first. This enables the
+     * dynamic linker to find shared libraries under the sysroot.
+     * Fallback: if sysroot+path doesn't exist but path looks like a shared
+     * library (under /lib/ or /nix/store/.../lib/), try sysroot/lib/basename.
+     * This handles nix store paths where PT_INTERP and DT_NEEDED encode
+     * full /nix/store/... paths. */
+    const char *open_path = path;
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *sr = proc_get_sysroot();
+    if (sr && path[0] == '/') {
+        snprintf(sysroot_buf, sizeof(sysroot_buf), "%s%s", sr, path);
+        if (access(sysroot_buf, F_OK) == 0) {
+            open_path = sysroot_buf;
+        } else {
+            /* Fallback: sysroot/lib/basename — handles nix store lib paths */
+            const char *base = strrchr(path, '/');
+            if (base) {
+                snprintf(sysroot_buf, sizeof(sysroot_buf),
+                         "%s/lib/%s", sr, base + 1);
+                if (access(sysroot_buf, F_OK) == 0)
+                    open_path = sysroot_buf;
+            }
+        }
+    }
+
     int host_dirfd;
     if (dirfd == LINUX_AT_FDCWD) {
         host_dirfd = AT_FDCWD;
@@ -108,7 +135,7 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     }
 
     int flags = translate_open_flags(linux_flags);
-    int host_fd = openat(host_dirfd, path, flags, mode);
+    int host_fd = openat(host_dirfd, open_path, flags, mode);
     if (host_fd < 0) return linux_errno();
 
     int is_dir = (linux_flags & LINUX_O_DIRECTORY) != 0;

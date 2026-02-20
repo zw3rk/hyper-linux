@@ -353,6 +353,16 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     if (cwd[0] != '\0') chdir(cwd);
     umask((mode_t)umask_val);
 
+    /* Step 6a: Read sysroot path */
+    char sysroot_ipc[LINUX_PATH_MAX];
+    if (ipc_read_all(ipc_fd, sysroot_ipc, sizeof(sysroot_ipc)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read sysroot\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (sysroot_ipc[0] != '\0')
+        proc_set_sysroot(sysroot_ipc);
+
     /* Step 6b: Read semantic region tracking */
     uint32_t num_guest_regions;
     if (ipc_read_all(ipc_fd, &num_guest_regions, sizeof(num_guest_regions)) < 0) {
@@ -700,6 +710,15 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     if (ipc_write_all(ipc_sock, cwd, sizeof(cwd)) < 0 ||
         ipc_write_all(ipc_sock, &umask_val, sizeof(umask_val)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Sysroot path (for dynamic linker library resolution) */
+    char sysroot_ipc[LINUX_PATH_MAX] = {0};
+    const char *sr = proc_get_sysroot();
+    if (sr) strncpy(sysroot_ipc, sr, sizeof(sysroot_ipc) - 1);
+    if (ipc_write_all(ipc_sock, sysroot_ipc, sizeof(sysroot_ipc)) < 0) {
         close(ipc_sock);
         return -LINUX_ENOMEM;
     }

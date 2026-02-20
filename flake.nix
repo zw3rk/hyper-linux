@@ -60,6 +60,39 @@
         busybox   = crossPkgs.pkgsStatic.busybox;
       };
 
+      # ── Dynamic linking test infrastructure ──────────────────────
+
+      # Musl sysroot: dynamic linker + libc.so in /lib/ layout
+      musl-sysroot = crossPkgs.runCommand "musl-sysroot" {} ''
+        mkdir -p $out/lib
+        cp -a ${crossPkgs.musl}/lib/ld-musl-aarch64.so.1 $out/lib/
+        cp -a ${crossPkgs.musl}/lib/libc.so $out/lib/
+      '';
+
+      # Dynamically-linked test binaries (linked against musl shared lib)
+      dynamicTestBinaries = crossPkgs.stdenv.mkDerivation {
+        pname = "hl-dynamic-test-binaries";
+        version = "0.1.0";
+        src = ./test;
+        dontConfigure = true;
+        dontFixup = true;
+        buildPhase = ''
+          $CC -O2 -o hello-dynamic hello-dynamic.c
+          # Verify it's actually dynamically linked
+          file hello-dynamic | grep -q "dynamically linked" || {
+            echo "ERROR: hello-dynamic is not dynamically linked!"
+            exit 1
+          }
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp hello-dynamic $out/bin/
+        '';
+      };
+
+      # Dynamically-linked coreutils (default musl, NOT pkgsStatic)
+      dynamicCoreutils = crossPkgs.coreutils;
+
     in {
       # Test binaries package (built on x86_64-linux)
       packages.${linuxSystem}.test-binaries = testBinaries;
@@ -79,6 +112,11 @@
         GUEST_COREUTILS = "${guestBins.coreutils}";
         GUEST_BUSYBOX   = "${guestBins.busybox}";
 
+        # Dynamic linking tests
+        GUEST_SYSROOT          = "${musl-sysroot}";
+        GUEST_DYNAMIC_TESTS    = "${dynamicTestBinaries}";
+        GUEST_DYNAMIC_COREUTILS = "${dynamicCoreutils}";
+
         shellHook = ''
           echo "hl development environment"
           echo "  make help        — show available targets"
@@ -89,6 +127,11 @@
           echo "  test binaries: $GUEST_TEST_BINARIES/bin/"
           echo "  coreutils:     $GUEST_COREUTILS/bin/"
           echo "  busybox:       $GUEST_BUSYBOX/bin/"
+          echo ""
+          echo "Dynamic linking tests:"
+          echo "  sysroot:       $GUEST_SYSROOT/lib/"
+          echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
+          echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
         '';
       };
 

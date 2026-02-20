@@ -24,12 +24,16 @@
 #define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
 #define SHIM_DATA_BASE       0x00200000ULL   /* Shim stack/data (2MB block, RW) */
 #define ELF_DEFAULT_BASE     0x00400000ULL   /* Typical ELF load base */
+#define PIE_LOAD_BASE        0x00400000ULL   /* PIE (ET_DYN) executable base (4MB) */
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
 #define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
 #define STACK_BASE           0x07E00000ULL   /* Bottom of 2MB stack block */
-#define MMAP_BASE            0x10000000ULL   /* mmap region start */
-#define MMAP_INITIAL_END     0x20000000ULL   /* Initial pre-mapped mmap region (512MB) */
-#define MMAP_END             0x100000000ULL  /* Max mmap region end (4GB) */
+#define MMAP_BASE            0x10000000ULL   /* mmap RW region start */
+#define MMAP_INITIAL_END     0x20000000ULL   /* Initial pre-mapped mmap RW end (256MB) */
+#define MMAP_RX_BASE         0x20000000ULL   /* mmap RX region start (for PROT_EXEC) */
+#define MMAP_RX_INITIAL_END  0x30000000ULL   /* Initial pre-mapped mmap RX end (256MB) */
+#define INTERP_LOAD_BASE     0x40000000ULL   /* Dynamic linker load base (1GB) */
+#define MMAP_END             0x40000000ULL   /* Max mmap region end (up to interp base) */
 #define BLOCK_2MB            (2ULL * 1024 * 1024)
 
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.
@@ -82,8 +86,10 @@ typedef struct {
     uint64_t    pt_pool_next; /* Next free page table page in pool */
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
-    uint64_t    mmap_next;    /* Next available mmap address */
-    uint64_t    mmap_end;     /* Current page-table-covered mmap limit */
+    uint64_t    mmap_next;    /* Next available RW mmap address */
+    uint64_t    mmap_end;     /* Current page-table-covered RW mmap limit */
+    uint64_t    mmap_rx_next; /* Next available RX mmap address (PROT_EXEC) */
+    uint64_t    mmap_rx_end;  /* Current page-table-covered RX mmap limit */
     uint64_t    ttbr0;        /* TTBR0 value (IPA of L0 page table) */
     int         need_tlbi;    /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t   vcpu;         /* vCPU handle */
@@ -134,6 +140,22 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
  * allocates new L2 tables as needed. Sets g->need_tlbi = 1.
  * Returns 0 on success, -1 on failure. */
 int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms);
+
+/* Split a 2MB block descriptor into 512 × 4KB L3 page descriptors.
+ * block_gpa must be within a currently-mapped 2MB block. The block's
+ * permissions are inherited by all 512 page entries. If the block is
+ * already split (L2 entry is a table descriptor), this is a no-op.
+ * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
+int guest_split_block(guest_t *g, uint64_t block_gpa);
+
+/* Update page table permissions for the range [start, end).
+ * If a 2MB block needs mixed permissions (only part of it is being
+ * updated), the block is automatically split into 4KB L3 pages first.
+ * If the entire 2MB block is being updated, the block descriptor is
+ * modified in place without splitting.
+ * perms is a MEM_PERM_R/W/X combination. Sets g->need_tlbi = 1.
+ * Returns 0 on success, -1 on failure. */
+int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
 
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and
  * resets page table pool, brk, and mmap allocation state. Preserves the

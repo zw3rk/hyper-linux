@@ -19,6 +19,7 @@
 #define AT_PHENT   4
 #define AT_PHNUM   5
 #define AT_PAGESZ  6
+#define AT_BASE    7
 #define AT_ENTRY   9
 #define AT_UID     11
 #define AT_EUID    12
@@ -27,14 +28,19 @@
 #define AT_HWCAP   16
 #define AT_CLKTCK  17
 #define AT_RANDOM  25
+#define AT_EXECFN  31
 #define AT_PLATFORM 45
 
 /* Build a Linux-compatible initial stack at the given stack_top.
  * Passes argc/argv and envp (NULL-terminated array of "KEY=val" strings).
+ * elf_load_base is the base address PIE executables were loaded at (0 for ET_EXEC).
+ * interp_base is the load base of the dynamic linker (0 if statically linked).
  * Returns the initial SP (stack pointer) to pass to the guest. */
 uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            int argc, const char **argv,
                            const char **envp,
-                           const elf_info_t *elf_info);
+                           const elf_info_t *elf_info,
+                           uint64_t elf_load_base,
+                           uint64_t interp_base);
 
 #endif /* STACK_H */

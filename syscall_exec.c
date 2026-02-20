@@ -132,15 +132,19 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         memcpy((uint8_t *)g->host_base + SHIM_BASE, shim_ptr, shim_size);
     }
 
-    /* Step 7: Load new ELF segments into guest memory */
-    if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size) < 0) {
+    /* Step 7: Load new ELF segments into guest memory.
+     * PIE (ET_DYN) binaries start near address 0 and would overlap with
+     * the shim; load them at PIE_LOAD_BASE instead. */
+    uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+    if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size,
+                         elf_load_base) < 0) {
         fprintf(stderr, "hl: execve: failed to map ELF segments for %s\n", path);
         free(argv_buf); free(envp_buf);
         return -LINUX_ENOEXEC;
     }
 
     /* Set brk base after the highest loaded segment */
-    uint64_t brk_start = (elf_info.load_max + 4095) & ~4095ULL;
+    uint64_t brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
     if (brk_start < BRK_BASE_DEFAULT)
         brk_start = BRK_BASE_DEFAULT;
     g->brk_base = brk_start;
@@ -165,15 +169,15 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RW
     };
 
-    /* ELF segments */
+    /* ELF segments (adjusted by elf_load_base for PIE) */
     for (int i = 0; i < elf_info.num_segments; i++) {
         if (nregions >= MAX_REGIONS) break;
         int perms = MEM_PERM_R;
         if (elf_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
         if (elf_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
         regions[nregions++] = (mem_region_t){
-            .gpa_start = elf_info.segments[i].gpa,
-            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+            .gpa_start = elf_info.segments[i].gpa + elf_load_base,
+            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
             .perms     = perms
         };
     }
@@ -192,13 +196,21 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RW
     };
 
-    /* mmap region (RW) */
+    /* mmap RW region */
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_BASE,
         .gpa_end   = MMAP_INITIAL_END,
         .perms     = MEM_PERM_RW
     };
     g->mmap_end = MMAP_INITIAL_END;
+
+    /* mmap RX region (for PROT_EXEC allocations) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = MMAP_RX_BASE,
+        .gpa_end   = MMAP_RX_INITIAL_END,
+        .perms     = MEM_PERM_RX
+    };
+    g->mmap_rx_end = MMAP_RX_INITIAL_END;
 
     uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
     if (!ttbr0) {
@@ -218,8 +230,8 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         int seg_prot = LINUX_PROT_READ;
         if (elf_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
         if (elf_info.segments[i].flags & PF_X) seg_prot |= LINUX_PROT_EXEC;
-        guest_region_add(g, elf_info.segments[i].gpa,
-                         elf_info.segments[i].gpa + elf_info.segments[i].memsz,
+        guest_region_add(g, elf_info.segments[i].gpa + elf_load_base,
+                         elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
                          seg_prot, LINUX_MAP_PRIVATE,
                          elf_info.segments[i].offset, path);
     }
@@ -232,10 +244,11 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     const char **argv_const = (const char **)argv;
     const char **envp_const = (const char **)envp;
     uint64_t sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
-                                     envp_const, &elf_info);
+                                     envp_const, &elf_info,
+                                     elf_load_base, 0);
 
     /* Step 10: Set vCPU state for new process */
-    uint64_t entry_ipa = guest_ipa(g, elf_info.entry);
+    uint64_t entry_ipa = guest_ipa(g, elf_info.entry + elf_load_base);
     uint64_t sp_ipa    = guest_ipa(g, sp);
 
     /* Write TTBR0 to vCPU */

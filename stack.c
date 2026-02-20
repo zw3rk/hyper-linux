@@ -30,7 +30,9 @@ static size_t write_str(guest_t *g, uint64_t gva, const char *s) {
 uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            int argc, const char **argv,
                            const char **envp,
-                           const elf_info_t *elf_info) {
+                           const elf_info_t *elf_info,
+                           uint64_t elf_load_base,
+                           uint64_t interp_base) {
     /*
      * Linux initial stack layout (growing from high to low):
      *   [ 16 random bytes for AT_RANDOM ]
@@ -87,21 +89,28 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
         write_str(g, str_ptr, argv[i]);
     }
 
+    /* AT_EXECFN: pointer to argv[0] string (write it near the top) */
+    uint64_t execfn_ptr = (argc > 0) ? arg_ptrs[0] : 0;
+
     /* Phase 2: Build the structured part of the stack.
      * Align str_ptr down to 16 bytes first. */
     str_ptr &= ~15ULL;
     uint64_t sp = str_ptr;
 
-    /* The structured area (auxv + envp + argv + argc) is pushed below
-     * the string area. SP must be 16-byte aligned AND point to argc.
-     * We cannot align after pushing (that creates a gap above argc).
-     * Instead, compute total entries and add padding here if needed.
+    /* Count auxv entries: base 14 + optional AT_BASE + AT_EXECFN = up to 16.
+     * Each auxv entry = 2 words. Plus AT_NULL = 2 words.
+     * Total words from auxv = (num_auxv_entries + 1) * 2.
+     * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) + argc(1).
      *
-     * 14 auxv pairs × 2 = 28, AT_NULL = 2, envp_null = 1,
-     * envp_ptrs = envc, argv_null = 1, argv_ptrs = argc, argc_val = 1.
-     * Total entries = 28 + 2 + 1 + envc + 1 + argc + 1 = 33 + argc + envc.
+     * Base auxv: 14 entries = 28 words, AT_NULL = 2 words.
+     * Optional: AT_BASE (if interp_base != 0) = +2, AT_EXECFN = +2.
+     * Total = 30 + 2(EXECFN) + 2(BASE if present) + 1 + envc + 1 + argc + 1
+     *       = 35 + argc + envc [+ 2 if interp_base != 0]
      * For 16-byte alignment: total must be even. */
-    if ((33 + argc + envc) & 1) {
+    int extra = 2;  /* AT_EXECFN always present */
+    if (interp_base != 0) extra += 2;  /* AT_BASE */
+    int total_entries = 33 + extra + argc + envc;
+    if (total_entries & 1) {
         push_u64(g, &sp, 0);  /* alignment padding */
     }
 
@@ -110,6 +119,7 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     push_u64(g, &sp, 0); push_u64(g, &sp, AT_NULL);
 
     push_u64(g, &sp, platform_ptr); push_u64(g, &sp, AT_PLATFORM);
+    push_u64(g, &sp, execfn_ptr); push_u64(g, &sp, AT_EXECFN);
     push_u64(g, &sp, random_ptr); push_u64(g, &sp, AT_RANDOM);
     push_u64(g, &sp, 100); push_u64(g, &sp, AT_CLKTCK);
 
@@ -122,11 +132,16 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_EUID);
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_UID);
 
-    push_u64(g, &sp, elf_info->entry); push_u64(g, &sp, AT_ENTRY);
+    push_u64(g, &sp, elf_info->entry + elf_load_base); push_u64(g, &sp, AT_ENTRY);
     push_u64(g, &sp, elf_info->phnum); push_u64(g, &sp, AT_PHNUM);
     push_u64(g, &sp, elf_info->phentsize); push_u64(g, &sp, AT_PHENT);
-    push_u64(g, &sp, elf_info->phdr_gpa); push_u64(g, &sp, AT_PHDR);
+    push_u64(g, &sp, elf_info->phdr_gpa + elf_load_base); push_u64(g, &sp, AT_PHDR);
     push_u64(g, &sp, 4096); push_u64(g, &sp, AT_PAGESZ);
+
+    /* AT_BASE: interpreter load base (only present for dynamic linking) */
+    if (interp_base != 0) {
+        push_u64(g, &sp, interp_base); push_u64(g, &sp, AT_BASE);
+    }
 
     /* envp: environment variable pointers + NULL terminator */
     push_u64(g, &sp, 0);  /* NULL terminator */

@@ -52,6 +52,9 @@ static char elf_path[LINUX_PATH_MAX] = {0};
 static char cmdline_buf[8192] = {0};
 static size_t cmdline_len = 0;
 
+/* Sysroot path for dynamic linker library resolution */
+static char sysroot_path[LINUX_PATH_MAX] = {0};
+
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
@@ -125,6 +128,23 @@ const char *proc_get_cmdline(size_t *len_out) {
     if (cmdline_len == 0) return NULL;
     if (len_out) *len_out = cmdline_len;
     return cmdline_buf;
+}
+
+void proc_set_sysroot(const char *path) {
+    if (path && path[0]) {
+        strncpy(sysroot_path, path, sizeof(sysroot_path) - 1);
+        sysroot_path[sizeof(sysroot_path) - 1] = '\0';
+        /* Strip trailing slash for consistent path joining */
+        size_t len = strlen(sysroot_path);
+        while (len > 1 && sysroot_path[len - 1] == '/')
+            sysroot_path[--len] = '\0';
+    } else {
+        sysroot_path[0] = '\0';
+    }
+}
+
+const char *proc_get_sysroot(void) {
+    return sysroot_path[0] ? sysroot_path : NULL;
 }
 
 void proc_set_identity(int64_t pid, int64_t ppid) {

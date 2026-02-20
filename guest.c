@@ -76,6 +76,7 @@ int guest_init(guest_t *g, uint64_t size) {
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
+    g->mmap_rx_next = MMAP_RX_BASE;
 
     /* Reserve address space via mmap(MAP_ANON). macOS demand-pages this:
      * physical pages are allocated only on first touch, so reserving 4GB
@@ -194,6 +195,8 @@ void guest_reset(guest_t *g) {
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
     g->mmap_end = MMAP_INITIAL_END;
+    g->mmap_rx_next = MMAP_RX_BASE;
+    g->mmap_rx_end = MMAP_RX_INITIAL_END;
     g->ttbr0 = 0;
     g->need_tlbi = 0;
 
@@ -578,3 +581,178 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
     g->need_tlbi = 1;
     return 0;
 }
+
+/* ---------- L3 page table splitting ---------- */
+
+/* L3 page descriptor: bits[1:0]=11 = valid page at level 3.
+ * This is distinct from L2 block descriptors (bits[1:0]=01). */
+#define PT_L3_PAGE (3ULL)
+
+/* Build a 4KB L3 page descriptor with the given permissions.
+ * Layout matches block descriptors (AF, SH, NS, MAIR, AP, XN)
+ * except bits[1:0]=11 instead of 01. */
+static uint64_t make_page_desc(uint64_t pa, int perms) {
+    uint64_t desc = (pa & 0xFFFFFFFFF000ULL) /* PA bits [47:12] */
+                  | PT_AF
+                  | PT_SH_ISH
+                  | PT_NS
+                  | PT_ATTR1
+                  | PT_L3_PAGE;
+
+    if (!(perms & MEM_PERM_X))
+        desc |= PT_UXN | PT_PXN;
+
+    if (perms & MEM_PERM_W)
+        desc |= PT_AP_RW_EL0;
+    else
+        desc |= PT_AP_RO;
+
+    return desc;
+}
+
+/* Extract MEM_PERM_* flags from a page table descriptor (block or page). */
+static int desc_to_perms(uint64_t desc) {
+    int perms = MEM_PERM_R;
+    if (!(desc & PT_UXN))
+        perms |= MEM_PERM_X;
+    if ((desc & (3ULL << 6)) == PT_AP_RW_EL0)
+        perms |= MEM_PERM_W;
+    return perms;
+}
+
+/* Navigate L0→L1→L2 to find the L2 entry for a given GPA offset.
+ * Returns a pointer to the L2 entry, or NULL if not mapped. */
+static uint64_t *find_l2_entry(guest_t *g, uint64_t gpa_offset) {
+    uint64_t base = g->ipa_base;
+    uint64_t ipa = base + gpa_offset;
+
+    uint64_t l0_gpa_off = g->ttbr0 - base;
+    uint64_t *l0 = pt_at(g, l0_gpa_off);
+
+    unsigned l0_idx = (unsigned)(base / (512ULL * BLOCK_1GB));
+    if (!(l0[l0_idx] & PT_VALID)) return NULL;
+
+    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t *l1 = pt_at(g, l1_ipa - base);
+
+    unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
+    if (l1_idx >= 512 || !(l1[l1_idx] & PT_VALID)) return NULL;
+
+    uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t *l2 = pt_at(g, l2_ipa - base);
+
+    unsigned l2_idx = (unsigned)((ipa % BLOCK_1GB) / BLOCK_2MB);
+    return &l2[l2_idx];
+}
+
+int guest_split_block(guest_t *g, uint64_t block_gpa) {
+    uint64_t base = g->ipa_base;
+    uint64_t block_start = ALIGN_2MB_DOWN(block_gpa);
+
+    uint64_t *l2_entry = find_l2_entry(g, block_start);
+    if (!l2_entry) return -1;
+
+    /* Already a table descriptor (previously split) — nothing to do */
+    if ((*l2_entry & 3) == 3) return 0;
+
+    /* Must be a valid block descriptor: bit[0]=1, bit[1]=0 */
+    if (!(*l2_entry & PT_BLOCK)) return -1;
+
+    /* Extract current block permissions */
+    int old_perms = desc_to_perms(*l2_entry);
+
+    /* Allocate a 4KB page for the L3 table (512 entries × 8 bytes) */
+    uint64_t l3_gpa = pt_alloc_page(g);
+    if (!l3_gpa) return -1;
+
+    uint64_t *l3 = pt_at(g, l3_gpa);
+
+    /* Fill all 512 L3 entries with 4KB page descriptors inheriting
+     * the block's original permissions. Each page covers 4KB of the
+     * 2MB block's address range. */
+    uint64_t block_ipa = base + block_start;
+    for (int i = 0; i < 512; i++) {
+        l3[i] = make_page_desc(block_ipa + (uint64_t)i * PAGE_SIZE, old_perms);
+    }
+
+    /* Replace the L2 block descriptor with a table descriptor pointing
+     * to the new L3 table. Format: bits[1:0]=11, bits[47:12]=L3 IPA */
+    *l2_entry = (base + l3_gpa) | PT_VALID | PT_TABLE;
+
+    g->need_tlbi = 1;
+    return 0;
+}
+
+int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
+    uint64_t base = g->ipa_base;
+
+    /* Page-align the range */
+    start = start & ~(PAGE_SIZE - 1);
+    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    for (uint64_t addr = start; addr < end; ) {
+        uint64_t *l2_entry = find_l2_entry(g, addr);
+        if (!l2_entry) {
+            /* Skip unmapped 2MB blocks */
+            addr = ALIGN_2MB_UP(addr + 1);
+            continue;
+        }
+
+        uint64_t block_start = ALIGN_2MB_DOWN(addr);
+        uint64_t block_end = block_start + BLOCK_2MB;
+
+        /* Not mapped at all: skip */
+        if (!(*l2_entry & 1)) {
+            addr = block_end;
+            continue;
+        }
+
+        /* Check if this is a 2MB block or already an L3 table */
+        if ((*l2_entry & 3) == 1) {
+            /* 2MB block descriptor */
+            int old_perms = desc_to_perms(*l2_entry);
+
+            /* If we're updating the entire 2MB block and permissions
+             * actually differ, just rewrite the block descriptor. */
+            if (start <= block_start && end >= block_end) {
+                if (old_perms != perms) {
+                    uint64_t ipa = base + block_start;
+                    *l2_entry = make_block_desc(ipa, perms);
+                    g->need_tlbi = 1;
+                }
+                addr = block_end;
+                continue;
+            }
+
+            /* Partial update: split the 2MB block into L3 pages first,
+             * then fall through to update individual pages below. */
+            if (old_perms != perms) {
+                if (guest_split_block(g, block_start) < 0) return -1;
+            } else {
+                /* Same permissions — no change needed */
+                addr = block_end;
+                continue;
+            }
+        }
+
+        /* L3 table: update individual 4KB page descriptors */
+        uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
+        uint64_t *l3 = pt_at(g, l3_ipa - base);
+
+        /* Update pages within this 2MB block that fall in [start, end) */
+        uint64_t page_start = (addr > block_start) ? addr : block_start;
+        uint64_t page_end = (end < block_end) ? end : block_end;
+
+        for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
+            unsigned l3_idx = (unsigned)(((base + pa) % BLOCK_2MB) / PAGE_SIZE);
+            uint64_t page_ipa = base + pa;
+            l3[l3_idx] = make_page_desc(page_ipa, perms);
+        }
+
+        g->need_tlbi = 1;
+        addr = page_end;
+    }
+
+    return 0;
+}
+

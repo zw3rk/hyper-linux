@@ -69,6 +69,7 @@ int elf_load(const char *path, elf_info_t *info) {
     }
 
     info->entry = ehdr.e_entry;
+    info->e_type = ehdr.e_type;
     info->phnum = ehdr.e_phnum;
     info->phentsize = ehdr.e_phentsize;
     info->load_min = UINT64_MAX;
@@ -97,10 +98,24 @@ int elf_load(const char *path, elf_info_t *info) {
         return -1;
     }
 
-    /* Parse PT_LOAD segments */
+    /* Parse program headers: PT_LOAD segments and PT_INTERP */
     int seg_count = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         elf64_phdr_t *ph = (elf64_phdr_t *)(ph_buf + i * ehdr.e_phentsize);
+
+        /* PT_INTERP: read the dynamic linker path from the file */
+        if (ph->p_type == PT_INTERP) {
+            size_t interp_len = ph->p_filesz;
+            if (interp_len > 0 && interp_len < sizeof(info->interp_path)) {
+                long saved_pos = ftell(f);
+                if (fseek(f, ph->p_offset, SEEK_SET) == 0) {
+                    size_t n = fread(info->interp_path, 1, interp_len, f);
+                    if (n == interp_len)
+                        info->interp_path[interp_len - 1] = '\0'; /* ensure NUL */
+                }
+                fseek(f, saved_pos, SEEK_SET);
+            }
+        }
 
         if (ph->p_type == PT_LOAD) {
             if (seg_count >= ELF_MAX_SEGMENTS) {
@@ -146,7 +161,8 @@ int elf_load(const char *path, elf_info_t *info) {
 }
 
 int elf_map_segments(const elf_info_t *info, const char *path,
-                     void *guest_base, uint64_t guest_size) {
+                     void *guest_base, uint64_t guest_size,
+                     uint64_t load_base) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         perror(path);
@@ -175,13 +191,14 @@ int elf_map_segments(const elf_info_t *info, const char *path,
         return -1;
     }
 
-    /* Copy program headers into guest memory at phdr_gpa
+    /* Copy program headers into guest memory at phdr_gpa + load_base
      * (needed for AT_PHDR auxv entry) */
-    if (info->phdr_gpa + ph_total <= guest_size) {
-        memcpy((uint8_t *)guest_base + info->phdr_gpa, ph_buf, ph_total);
+    uint64_t phdr_dest = info->phdr_gpa + load_base;
+    if (phdr_dest + ph_total <= guest_size) {
+        memcpy((uint8_t *)guest_base + phdr_dest, ph_buf, ph_total);
     }
 
-    /* Load each PT_LOAD segment */
+    /* Load each PT_LOAD segment (adjusted by load_base for ET_DYN) */
     int seg_idx = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum && seg_idx < info->num_segments; i++) {
         elf64_phdr_t *ph = (elf64_phdr_t *)(ph_buf + i * ehdr.e_phentsize);
@@ -189,7 +206,7 @@ int elf_map_segments(const elf_info_t *info, const char *path,
         if (ph->p_type != PT_LOAD)
             continue;
 
-        uint64_t gpa = ph->p_vaddr;
+        uint64_t gpa = ph->p_vaddr + load_base;
         uint64_t filesz = ph->p_filesz;
         uint64_t memsz = ph->p_memsz;
 

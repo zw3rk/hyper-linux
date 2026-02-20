@@ -268,6 +268,7 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
 static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                         int prot, int flags, int fd, int64_t offset) {
     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+    int needs_exec = (prot & LINUX_PROT_EXEC) != 0;
 
     /* We handle all mmap variants. For file-backed MAP_SHARED, we fall
      * back to MAP_PRIVATE semantics (copy-on-write). Since the guest
@@ -284,22 +285,55 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         result_off = off;
         /* Remove any existing region coverage in the fixed range */
         guest_region_remove(g, result_off, result_off + length);
+
+        /* Update page table permissions for the fixed range.
+         * MAP_FIXED may land in a region with different permissions
+         * (e.g., dynamic linker remapping .data RW over .text RX).
+         * This splits 2MB blocks into 4KB L3 pages as needed. */
+        int page_perms = MEM_PERM_R;
+        if (prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
+        if (prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
+        guest_update_perms(g, result_off, result_off + length, page_perms);
+    } else if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
+        /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
+         * Apple HVF enforces W^X on 2MB block page table entries, so
+         * executable mappings must be in separate 2MB blocks from writable
+         * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
+         * permission. */
+        g->mmap_rx_next = (g->mmap_rx_next + 4095) & ~4095ULL;
+        if (g->mmap_rx_next + length > MMAP_END) return -LINUX_ENOMEM;
+        result_off = g->mmap_rx_next;
+        g->mmap_rx_next += length;
     } else {
-        /* Bump allocator from mmap region */
+        /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region */
         g->mmap_next = (g->mmap_next + 4095) & ~4095ULL;
         if (g->mmap_next + length > MMAP_END) return -LINUX_ENOMEM;
         result_off = g->mmap_next;
         g->mmap_next += length;
     }
 
-    /* Extend page tables if we've grown beyond the currently-mapped region */
-    if (result_off + length > g->mmap_end) {
-        uint64_t new_end = (result_off + length + BLOCK_2MB - 1)
-                           & ~(BLOCK_2MB - 1);
-        if (new_end > MMAP_END) new_end = MMAP_END;
-        if (guest_extend_page_tables(g, g->mmap_end, new_end, MEM_PERM_RW) < 0)
-            return -LINUX_ENOMEM;
-        g->mmap_end = new_end;
+    /* Extend page tables if we've grown beyond the currently-mapped region.
+     * RX and RW regions have separate limits. */
+    if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
+        if (result_off + length > g->mmap_rx_end) {
+            uint64_t new_end = (result_off + length + BLOCK_2MB - 1)
+                               & ~(BLOCK_2MB - 1);
+            if (new_end > MMAP_END) new_end = MMAP_END;
+            if (guest_extend_page_tables(g, g->mmap_rx_end, new_end,
+                                          MEM_PERM_RX) < 0)
+                return -LINUX_ENOMEM;
+            g->mmap_rx_end = new_end;
+        }
+    } else {
+        if (result_off + length > g->mmap_end) {
+            uint64_t new_end = (result_off + length + BLOCK_2MB - 1)
+                               & ~(BLOCK_2MB - 1);
+            if (new_end > MMAP_END) new_end = MMAP_END;
+            if (guest_extend_page_tables(g, g->mmap_end, new_end,
+                                          MEM_PERM_RW) < 0)
+                return -LINUX_ENOMEM;
+            g->mmap_end = new_end;
+        }
     }
 
     /* Zero the mapped region */
@@ -440,14 +474,18 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         uint64_t mprot_len = (x1 + 4095) & ~4095ULL;
         int mprot_prot = (int)x2;
         if (mprot_off + mprot_len <= g->guest_size) {
-            /* Update region tracking with new protection bits.
-             * Note: actual page table permissions are not changed — Apple
-             * HVF enforces W^X and we use 2MB block descriptors which are
-             * too coarse for per-page mprotect. The guest page tables were
-             * built RW for data regions, and most mprotect calls (e.g.
-             * RELRO) are compatible with keeping the underlying RW. */
+            /* Update region tracking with new protection bits */
             guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
                                   mprot_prot);
+
+            /* Actually update page table permissions. For 2MB blocks that
+             * need mixed permissions (e.g., RELRO marking part of a block
+             * read-only), the block is split into 4KB L3 pages. */
+            int page_perms = MEM_PERM_R;
+            if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
+            if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
+            guest_update_perms(g, mprot_off, mprot_off + mprot_len,
+                               page_perms);
         }
         result = 0;
         break;

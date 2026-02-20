@@ -56,6 +56,14 @@ void proc_set_identity(int64_t pid, int64_t ppid);
 /* Allocate next guest PID (called from sys_clone). */
 int64_t proc_alloc_pid(void);
 
+/* Store the sysroot path for dynamic linker library resolution.
+ * When set, absolute library paths (e.g. /lib/libc.so) are prefixed
+ * with this path. Pass NULL to clear. */
+void proc_set_sysroot(const char *path);
+
+/* Get the stored sysroot path. Returns NULL if not set. */
+const char *proc_get_sysroot(void);
+
 /* ---------- execve ---------- */
 
 /* Return value from syscall_dispatch: 2 means "exec happened, skip X0 write" */

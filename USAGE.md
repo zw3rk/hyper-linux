@@ -82,7 +82,27 @@ All outputs go to `_build/`:
 |--------|-------------|
 | `-v`, `--verbose` | Print syscall trace to stderr |
 | `-t N`, `--timeout N` | Set execution timeout in seconds (default: 10) |
+| `--sysroot PATH` | Sysroot for dynamic linker library resolution |
 | `--` | End of hl options (pass `-v` as argument to guest) |
+
+## Dynamic Linking (Experimental)
+
+hl supports loading dynamically-linked aarch64-linux ELF binaries when
+a sysroot containing the dynamic linker and shared libraries is provided.
+
+```bash
+# Run a dynamically-linked musl binary with sysroot
+_build/hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
+
+# With verbose output to see interpreter loading
+_build/hl -v --sysroot /path/to/musl-sysroot ./my-dynamic-program
+```
+
+The `--sysroot` flag causes:
+1. The PT_INTERP interpreter (e.g., `/lib/ld-musl-aarch64.so.1`) to be
+   loaded from `<sysroot>/lib/ld-musl-aarch64.so.1`
+2. Absolute path `open()` calls to try `<sysroot>/<path>` first, enabling
+   the dynamic linker to find shared libraries under the sysroot
 
 ## Troubleshooting
 
