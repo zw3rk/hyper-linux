@@ -10,7 +10,8 @@
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
 .PHONY: all hl clean test-hello test-all test-coreutils test-busybox \
-       test-dynamic test-dynamic-coreutils test-perf test-multi-vcpu help
+       test-dynamic test-dynamic-coreutils test-perf test-multi-vcpu \
+       test-haskell help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -112,6 +113,11 @@ $(BUILD_DIR)/test-hello: test/hello.S test/simple.ld | $(BUILD_DIR)
 $(BUILD_DIR)/%: test/%.c | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Cross-compiling$(RESET) $<\n"
 	$(CROSS)gcc -static -O2 -o $@ $<
+
+# test-pthread needs -lpthread (musl static pthread support)
+$(BUILD_DIR)/test-pthread: test/test-pthread.c | $(BUILD_DIR)
+	@printf "$(GREEN)▸ Cross-compiling$(RESET) $< (with -lpthread)\n"
+	$(CROSS)gcc -static -O2 -o $@ $< -lpthread
 endif
 
 # ── Test targets ──────────────────────────────────────────────────
@@ -179,6 +185,9 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-proc; \
 	printf "\n$(BLUE)── Network tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-net; \
+	printf "\n$(BLUE)── Threading tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-thread; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
 
 # ── Coreutils integration test ───────────────────────────────────
@@ -244,6 +253,19 @@ test-perf: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@bash test/test-perf.sh $(BUILD_DIR)/hl $(COREUTILS_BIN)
+
+# ── Haskell test ──────────────────────────────────────────────────
+
+HASKELL_HELLO ?= $(GUEST_HASKELL_HELLO)/bin/hello-hyper
+
+## Run static Haskell hello world (GHC-produced aarch64-linux-musl ELF)
+test-haskell: $(BUILD_DIR)/hl
+	@if [ ! -x "$(HASKELL_HELLO)" ]; then \
+		printf "$(RED)✗ Haskell hello not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) Haskell hello-hyper\n"
+	$(BUILD_DIR)/hl $(HASKELL_HELLO)
 
 # ── Multi-vCPU validation test ─────────────────────────────────────
 

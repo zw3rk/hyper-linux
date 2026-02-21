@@ -161,7 +161,7 @@ int main(int argc, const char **argv) {
 
     /* ---- Step 2: Initialize guest memory and VM ---- */
     guest_t g;
-    if (guest_init(&g, GUEST_MEM_SIZE) < 0) {
+    if (guest_init(&g, 0 /* auto-detect from IPA */) < 0) {
         fprintf(stderr, "hl: failed to initialize guest\n");
         return 1;
     }
@@ -208,8 +208,8 @@ int main(int argc, const char **argv) {
             return 1;
         }
 
-        /* Load interpreter at INTERP_LOAD_BASE (ET_DYN at chosen base) */
-        interp_base = INTERP_LOAD_BASE;
+        /* Load interpreter at dynamic interp_base (computed from guest_size) */
+        interp_base = g.interp_base;
         if (elf_map_segments(&interp_info, interp_resolved,
                              g.host_base, g.guest_size, interp_base) < 0) {
             fprintf(stderr, "hl: failed to map interpreter segments\n");
@@ -296,10 +296,11 @@ int main(int argc, const char **argv) {
         };
     }
 
-    /* brk region (RW) */
+    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE; brk can grow
+     * beyond via dynamic page table extension in sys_brk. */
     regions[nregions++] = (mem_region_t){
         .gpa_start = g.brk_base,
-        .gpa_end   = MMAP_BASE,
+        .gpa_end   = MMAP_RX_BASE,
         .perms     = MEM_PERM_RW
     };
 
@@ -310,26 +311,30 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
 
-    /* mmap RW region (pre-mapped up to MMAP_INITIAL_END).
-     * Additional pages beyond this are mapped dynamically by
-     * guest_extend_page_tables() when sys_mmap needs more space. */
-    regions[nregions++] = (mem_region_t){
-        .gpa_start = MMAP_BASE,
-        .gpa_end   = MMAP_INITIAL_END,
-        .perms     = MEM_PERM_RW
-    };
-    g.mmap_end = MMAP_INITIAL_END;
-
     /* mmap RX region (separate 2MB blocks for PROT_EXEC allocations).
      * Apple HVF enforces W^X on page table entries: a 2MB block can't be
      * both writable and executable. Shared library text (PROT_EXEC) goes
-     * here, separate from RW data in the main mmap region above. */
+     * here, separate from RW data in the main mmap region. */
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_RX_BASE,
         .gpa_end   = MMAP_RX_INITIAL_END,
         .perms     = MEM_PERM_RX
     };
     g.mmap_rx_end = MMAP_RX_INITIAL_END;
+
+    /* mmap RW region (pre-mapped up to MMAP_INITIAL_END at 8GB+256MB).
+     * Starts at 8GB to match real Linux kernel address space layout where
+     * mmap regions are well above the program text/data/brk. Programs
+     * may assume mmap returns high addresses (e.g. for pointer tagging
+     * or address-space partitioning). Additional pages beyond
+     * MMAP_INITIAL_END are mapped dynamically by
+     * guest_extend_page_tables(). */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = MMAP_BASE,
+        .gpa_end   = MMAP_INITIAL_END,
+        .perms     = MEM_PERM_RW
+    };
+    g.mmap_end = MMAP_INITIAL_END;
 
     uint64_t ttbr0 = guest_build_page_tables(&g, regions, nregions);
     if (!ttbr0) {

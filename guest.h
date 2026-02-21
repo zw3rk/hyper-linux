@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
- * host buffer). A 32GB address space is reserved via mmap(MAP_ANON) (macOS
+ * host buffer). A 64GB address space is reserved via mmap(MAP_ANON) (macOS
  * demand-pages physical memory on first touch, so unused pages cost nothing).
  * The slab is mapped RWX to Hypervisor.framework; fine-grained permissions
  * are enforced by the guest's own page tables built from mem_region
@@ -19,7 +19,9 @@
 #include <stddef.h>
 
 /* ---------- Memory layout constants ---------- */
-#define GUEST_MEM_SIZE       0x800000000ULL  /* 32GB total guest address space (one L0 entry) */
+#define GUEST_MEM_SIZE_36BIT 0x1000000000ULL  /* 64GB: 36-bit IPA (HVF default) */
+#define GUEST_MEM_SIZE_40BIT 0x10000000000ULL /* 1TB: 40-bit IPA (macOS 15+) */
+#define GUEST_MEM_SIZE_DEFAULT GUEST_MEM_SIZE_36BIT /* Fallback if IPA query fails */
 #define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
 #define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
 #define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
@@ -29,12 +31,20 @@
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
 #define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
 #define STACK_BASE           0x07E00000ULL   /* Bottom of 2MB stack block */
-#define MMAP_BASE            0x10000000ULL   /* mmap RW region start */
-#define MMAP_INITIAL_END     0x20000000ULL   /* Initial pre-mapped mmap RW end (256MB) */
-#define MMAP_RX_BASE         0x20000000ULL   /* mmap RX region start (for PROT_EXEC) */
-#define MMAP_RX_INITIAL_END  0x30000000ULL   /* Initial pre-mapped mmap RX end (256MB) */
-#define INTERP_LOAD_BASE     0x200000000ULL  /* Dynamic linker load base (8GB) */
-#define MMAP_END             0x200000000ULL  /* Max mmap region end (8GB, up to interp base) */
+#define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
+                                              * Below 8GB — only code goes here, not
+                                              * subject to GHC's minimumAddress check. */
+#define MMAP_RX_INITIAL_END  0x20000000ULL   /* Initial pre-mapped mmap RX end (512MB) */
+#define MMAP_BASE            0x200000000ULL  /* mmap RW region start (8GB). Placed high to
+                                              * match real Linux mmap address space layout.
+                                              * Programs may assume mmap returns addresses
+                                              * well above text/data/brk (e.g. for pointer
+                                              * tagging or address-space partitioning). */
+#define MMAP_INITIAL_END     0x210000000ULL  /* Initial pre-mapped mmap RW end (8.25GB) */
+#define MMAP_END_DEFAULT     0xE00000000ULL  /* Default max mmap end for 36-bit IPA (56GB).
+                                              * PROT_NONE mmaps beyond the page-table-covered
+                                              * region cost nothing (no page tables, no zeroing). */
+#define INTERP_LOAD_DEFAULT  0xF00000000ULL  /* Default dynamic linker base for 36-bit IPA (60GB) */
 #define BLOCK_2MB            (2ULL * 1024 * 1024)
 
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.
@@ -63,9 +73,9 @@ typedef struct {
 /* ---------- Semantic region tracking ---------- */
 
 /* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.).
- * Sufficient for all practical static binaries; dynamic linking may need
- * more, at which point this can be increased. */
-#define GUEST_MAX_REGIONS 256
+ * GHC RTS creates many regions via mmap/mprotect on its PROT_NONE
+ * reservation; 1024 provides ample headroom. */
+#define GUEST_MAX_REGIONS 1024
 
 /* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
  * Distinct from mem_region_t which is used purely for page table construction.
@@ -82,14 +92,16 @@ typedef struct {
 /* ---------- Guest state ---------- */
 typedef struct {
     void       *host_base;    /* Host pointer to allocated guest memory */
-    uint64_t    guest_size;   /* Total size (GUEST_MEM_SIZE) */
+    uint64_t    guest_size;   /* Total size (determined by IPA capacity) */
     uint64_t    ipa_base;     /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
+    uint64_t    mmap_limit;   /* Max mmap address (computed from guest_size) */
+    uint64_t    interp_base;  /* Dynamic linker load base (computed from guest_size) */
     uint64_t    pt_pool_next; /* Next free page table page in pool */
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
-    uint64_t    mmap_next;    /* Next available RW mmap address */
+    uint64_t    mmap_next;    /* RW mmap high-water mark (for fork IPC state transfer) */
     uint64_t    mmap_end;     /* Current page-table-covered RW mmap limit */
-    uint64_t    mmap_rx_next; /* Next available RX mmap address (PROT_EXEC) */
+    uint64_t    mmap_rx_next; /* RX mmap high-water mark (for fork IPC state transfer) */
     uint64_t    mmap_rx_end;  /* Current page-table-covered RX mmap limit */
     uint64_t    ttbr0;        /* TTBR0 value (IPA of L0 page table) */
     int         need_tlbi;    /* Signal shim to flush TLB after page table changes */

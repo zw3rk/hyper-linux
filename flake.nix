@@ -37,10 +37,17 @@
           $AS -o hello.o hello.S
           $LD -T simple.ld -o test-hello hello.o
 
-          # All C test programs (static musl)
+          # All C test programs (static musl).
+          # Skip test-multi-vcpu.c — it's a native macOS binary (Hypervisor.framework).
           for f in *.c; do
             name="''${f%.c}"
-            $CC -static -O2 -o "$name" "$f"
+            [ "$name" = "test-multi-vcpu" ] && continue
+
+            # test-pthread needs -lpthread for musl static pthread support
+            extra_flags=""
+            [ "$name" = "test-pthread" ] && extra_flags="-lpthread"
+
+            $CC -static -O2 -o "$name" "$f" $extra_flags
           done
         '';
 
@@ -93,6 +100,21 @@
       # Dynamically-linked coreutils (default musl, NOT pkgsStatic)
       dynamicCoreutils = crossPkgs.coreutils;
 
+      # ── Haskell test binary ────────────────────────────────────────
+      # Static aarch64-linux-musl Haskell "Hello World" to verify hl
+      # can run GHC-produced ELF binaries.  Built via nixpkgs cross
+      # haskellPackages (GHC runs on x86_64-linux, targets aarch64-musl).
+      haskellHello = crossPkgs.haskellPackages.mkDerivation {
+        pname = "hello-hyper";
+        version = "0.1.0";
+        src = ./hello-hyper;
+        isExecutable = true;
+        isLibrary = false;
+        enableSharedExecutables = false;
+        enableSharedLibraries = false;
+        license = linuxPkgs.lib.licenses.asl20;
+      };
+
     in {
       # Test binaries package (built on x86_64-linux)
       packages.${linuxSystem}.test-binaries = testBinaries;
@@ -117,6 +139,9 @@
         GUEST_DYNAMIC_TESTS    = "${dynamicTestBinaries}";
         GUEST_DYNAMIC_COREUTILS = "${dynamicCoreutils}";
 
+        # Haskell test binary
+        GUEST_HASKELL_HELLO = "${haskellHello}";
+
         shellHook = ''
           echo "hl development environment"
           echo "  make help        — show available targets"
@@ -132,6 +157,9 @@
           echo "  sysroot:       $GUEST_SYSROOT/lib/"
           echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
           echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
+          echo ""
+          echo "Haskell test binary:"
+          echo "  hello-hyper:   $GUEST_HASKELL_HELLO/bin/hello-hyper"
         '';
       };
 

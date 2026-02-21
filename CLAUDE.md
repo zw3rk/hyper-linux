@@ -118,8 +118,12 @@ The `guest_update_perms()` function handles the full workflow: checking if a
 block needs splitting, splitting it, then updating individual L3 page entries.
 Whole-block permission changes are done in place without splitting.
 
-mmap uses dual bump allocators: PROT_EXEC allocations go to the RX region
-(MMAP_RX_BASE=0x20000000), others to the RW region (MMAP_BASE=0x10000000).
+mmap uses a gap-finding allocator that walks the sorted region array to find
+free address space. PROT_EXEC allocations go to the RX region
+(MMAP_RX_BASE=0x10000000), others to the RW region (MMAP_BASE=0x200000000).
+The RW region starts at 8GB to match real Linux kernel address space layout
+where mmap regions sit well above text/data/brk. Address hints are honored
+when possible.
 This ensures .text and .data land in different 2MB blocks when possible;
 L3 splitting handles the cases where they share a block.
 
@@ -190,7 +194,7 @@ chroot(51), memfd_create(279)
 /dev/stderr, /dev/fd/N
 
 **Stubs (return 0):**
-mlock(228), munlock(229), msync(227)
+mlock(228), munlock(229), msync(227), membarrier(283)
 
 **Networking (syscall_net.c):**
 socket(198), socketpair(199), bind(200), listen(201), accept(202),
@@ -295,16 +299,18 @@ mappings.
 0x000400000  - varies:        ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
 0x001000000:                  brk base (16MB)
 0x007E00000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
-0x010000000  - 0x01FFFFFFF:  mmap RW region (initial 256MB, pre-mapped RW)
-0x020000000  - 0x02FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
-0x030000000  - 0x1FFFFFFFF:  mmap growth area (RW or RX, up to 8GB)
-0x200000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
+0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
+0x020000000  - 0x1FFFFFFFF:  mmap RX growth area (up to MMAP_END)
+0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
+0x210000000  - 0xDFFFFFFFF:  mmap RW growth area (up to 56GB)
+0xF00000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
 ```
 
-Total: 32GB address space reserved via mmap(MAP_ANON) (fits in one L0 page
-table entry = 512GB). macOS demand-pages physical memory on first touch, so
-only used pages consume RAM. The initial 512MB region is pre-mapped in page
-tables; additional 2MB blocks are mapped dynamically by
+Total: 64GB address space reserved via mmap(MAP_ANON) (HVF max on Apple
+Silicon). macOS demand-pages physical memory on first touch, so only used
+pages consume RAM. The mmap RW region starts at 8GB to match real Linux
+kernel address space layout where mmap sits well above program segments.
+Additional 2MB blocks are mapped dynamically by
 guest_extend_page_tables() when sys_mmap/sys_brk exceeds the current limit.
 The shim flushes the TLB (via TLBI VMALLE1IS) when X8 is set non-zero after
 HVC #5 return.

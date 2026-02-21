@@ -1,0 +1,13 @@
+cabal-version:  2.4
+name:           hello-hyper
+version:        0.1.0
+synopsis:       Minimal Haskell test binary for hl
+license:        Apache-2.0
+author:         Moritz Angermann
+maintainer:     moritz@zw3rk.com
+
+executable hello-hyper
+  main-is:       Main.hs
+  build-depends: base >= 4.7 && < 5
+  default-language: Haskell2010
+  ghc-options:   -O2

@@ -165,7 +165,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             return -LINUX_ENOEXEC;
         }
 
-        interp_base = INTERP_LOAD_BASE;
+        interp_base = g->interp_base;
         if (elf_map_segments(&interp_info, interp_resolved,
                              g->host_base, g->guest_size, interp_base) < 0) {
             fprintf(stderr, "hl: execve: failed to map interpreter segments\n");
@@ -234,10 +234,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         };
     }
 
-    /* brk region (RW) */
+    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
     regions[nregions++] = (mem_region_t){
         .gpa_start = g->brk_base,
-        .gpa_end   = MMAP_BASE,
+        .gpa_end   = MMAP_RX_BASE,
         .perms     = MEM_PERM_RW
     };
 
@@ -248,14 +248,6 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RW
     };
 
-    /* mmap RW region */
-    regions[nregions++] = (mem_region_t){
-        .gpa_start = MMAP_BASE,
-        .gpa_end   = MMAP_INITIAL_END,
-        .perms     = MEM_PERM_RW
-    };
-    g->mmap_end = MMAP_INITIAL_END;
-
     /* mmap RX region (for PROT_EXEC allocations) */
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_RX_BASE,
@@ -263,6 +255,14 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RX
     };
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
+
+    /* mmap RW region (starts at 8GB to match real Linux layout) */
+    regions[nregions++] = (mem_region_t){
+        .gpa_start = MMAP_BASE,
+        .gpa_end   = MMAP_INITIAL_END,
+        .perms     = MEM_PERM_RW
+    };
+    g->mmap_end = MMAP_INITIAL_END;
 
     uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
     if (!ttbr0) {
@@ -347,9 +347,60 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
     g->need_tlbi = 0;
 
+    /* Force HVF to synchronize all register writes. Apple's Hypervisor
+     * framework may batch register updates; reading back each modified
+     * register ensures all preceding set_sys_reg/set_reg calls are
+     * committed before the next hv_vcpu_run(). Without this, the vCPU
+     * may resume with stale ELR_EL1/SPSR_EL1 from the pre-exec state,
+     * causing an undefined instruction at address 0x0. */
+    {
+        uint64_t _sync;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &_sync);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &_sync);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &_sync);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &_sync);
+        hv_vcpu_get_reg(vcpu, HV_REG_X8, &_sync);
+        (void)_sync;
+    }
+
     if (verbose) {
+        /* Read back key registers for debug verification */
+        uint64_t dbg_ttbr0, dbg_elr, dbg_sp0, dbg_spsr, dbg_vbar, dbg_sctlr;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &dbg_ttbr0);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &dbg_elr);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &dbg_sp0);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &dbg_spsr);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, &dbg_vbar);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &dbg_sctlr);
+        uint64_t dbg_x8;
+        hv_vcpu_get_reg(vcpu, HV_REG_X8, &dbg_x8);
+
         fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx\n",
                 path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa);
+        fprintf(stderr, "hl: execve: TTBR0=0x%llx ELR=0x%llx SP0=0x%llx "
+                "SPSR=0x%llx VBAR=0x%llx SCTLR=0x%llx X8=%llu\n",
+                (unsigned long long)dbg_ttbr0, (unsigned long long)dbg_elr,
+                (unsigned long long)dbg_sp0, (unsigned long long)dbg_spsr,
+                (unsigned long long)dbg_vbar, (unsigned long long)dbg_sctlr,
+                (unsigned long long)dbg_x8);
+
+        /* Dump L2 entries for the entry point's 2MB block */
+        uint64_t base = g->ipa_base;
+        uint64_t l0_off = dbg_ttbr0 - base;
+        uint64_t *l0 = (uint64_t *)((uint8_t *)g->host_base + l0_off);
+        if (l0[0] & 1) {
+            uint64_t l1_off = (l0[0] & 0xFFFFFFFFF000ULL) - base;
+            uint64_t *l1 = (uint64_t *)((uint8_t *)g->host_base + l1_off);
+            unsigned l1_idx = (unsigned)(entry_ipa / (1ULL << 30));
+            if (l1_idx < 512 && (l1[l1_idx] & 1)) {
+                uint64_t l2_off = (l1[l1_idx] & 0xFFFFFFFFF000ULL) - base;
+                uint64_t *l2 = (uint64_t *)((uint8_t *)g->host_base + l2_off);
+                unsigned l2_idx = (unsigned)((entry_ipa % (1ULL << 30)) / (2ULL << 20));
+                fprintf(stderr, "hl: execve: L1[%u]=0x%llx L2[%u]=0x%llx\n",
+                        l1_idx, (unsigned long long)l1[l1_idx],
+                        l2_idx, (unsigned long long)l2[l2_idx]);
+            }
+        }
     }
 
     /* Update ELF path for /proc/self/exe after successful exec */

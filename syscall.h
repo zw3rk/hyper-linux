@@ -167,6 +167,7 @@
 /* misc */
 #define SYS_sethostname     161
 #define SYS_memfd_create    279
+#define SYS_membarrier      283
 #define SYS_mlock           228
 #define SYS_munlock         229
 #define SYS_msync           227

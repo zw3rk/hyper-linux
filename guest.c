@@ -4,12 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
- * A 4GB address space is reserved via mmap(MAP_ANON). macOS demand-pages
- * physical memory on first touch, so only used pages consume RAM. The slab
- * is mapped RWX to Hypervisor.framework. The guest's own page tables
+ * The guest address space size is determined at runtime by querying the
+ * max IPA size via hv_vm_config_get_max_ipa_size(): 40-bit (1TB) on
+ * macOS 15+, falling back to 36-bit (64GB). The space is reserved via
+ * mmap(MAP_ANON); macOS demand-pages physical memory on first touch, so
+ * only used pages consume RAM. The slab is mapped RWX to
+ * Hypervisor.framework. The guest's own page tables
  * (built here) enforce per-region permissions using 2MB block descriptors,
  * which are mandatory for transparent misaligned access. Page tables can be
  * extended at runtime via guest_extend_page_tables().
+ *
+ * PROT_NONE mappings (used by GHC RTS for heap reservation) do NOT get
+ * page table entries — the translation fault is the correct behavior.
+ * Page tables are created on demand when mprotect changes PROT_NONE
+ * to an accessible permission.
  *
  * Page table format: AArch64 4KB granule, 3-level (L0 -> L1 -> L2).
  *   L0 entry covers 512GB — one entry pointing to L1
@@ -79,7 +87,6 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa) {
 
 int guest_init(guest_t *g, uint64_t size) {
     memset(g, 0, sizeof(*g));
-    g->guest_size = size;
     g->ipa_base = GUEST_IPA_BASE;
     g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -87,10 +94,36 @@ int guest_init(guest_t *g, uint64_t size) {
     g->mmap_next = MMAP_BASE;
     g->mmap_rx_next = MMAP_RX_BASE;
 
+    /* Query the maximum IPA size supported by the hardware/kernel.
+     * macOS 15+ on Apple Silicon reports 40 bits (1TB). Older versions
+     * or fallback yields 36 bits (64GB). This costs one extra level of
+     * stage-2 page tables in HVF but is kernel-internal — our guest
+     * page tables are unaffected. */
+    uint32_t max_ipa = 0;
+    hv_vm_config_get_max_ipa_size(&max_ipa);
+    if (max_ipa >= 40) max_ipa = 40;
+    else max_ipa = 36;
+
+    uint64_t ipa_capacity = 1ULL << max_ipa;
+
+    /* If caller provided an explicit size, clamp to IPA capacity.
+     * size==0 means "auto-detect from IPA". */
+    if (size == 0 || size > ipa_capacity)
+        size = ipa_capacity;
+    g->guest_size = size;
+
+    /* Compute dynamic layout limits from guest_size.
+     * interp_base: last 4GB (dynamic linker load address)
+     * mmap_limit:  last 8GB reserved (max mmap RW address)
+     * For 64GB:  interp=60GB, mmap_limit=56GB (matches old constants)
+     * For 1TB:   interp=1020GB, mmap_limit=1016GB */
+    g->interp_base = g->guest_size - 0x100000000ULL;
+    g->mmap_limit  = g->guest_size - 0x200000000ULL;
+
     /* Reserve address space via mmap(MAP_ANON). macOS demand-pages this:
-     * physical pages are allocated only on first touch, so reserving 4GB
-     * costs nothing until pages are actually used. Do NOT memset — that
-     * would touch all 4GB and defeat demand paging. */
+     * physical pages are allocated only on first touch, so reserving up
+     * to 1TB costs nothing until pages are actually used. Do NOT memset
+     * — that would touch all pages and defeat demand paging. */
     g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_ANON | MAP_PRIVATE, -1, 0);
     if (g->host_base == MAP_FAILED) {
@@ -99,10 +132,15 @@ int guest_init(guest_t *g, uint64_t size) {
         return -1;
     }
 
-    /* Create Hypervisor VM and map the entire slab at GUEST_IPA_BASE */
-    hv_return_t ret = hv_vm_create(NULL);
+    /* Create Hypervisor VM with the detected IPA size and map the
+     * entire slab at GUEST_IPA_BASE */
+    hv_vm_config_t config = hv_vm_config_create();
+    hv_vm_config_set_ipa_size(config, max_ipa);
+    hv_return_t ret = hv_vm_create(config);
+    os_release(config);
     if (ret != HV_SUCCESS) {
-        fprintf(stderr, "guest: hv_vm_create failed: %d\n", (int)ret);
+        fprintf(stderr, "guest: hv_vm_create failed: %d (ipa_bits=%u)\n",
+                (int)ret, max_ipa);
         munmap(g->host_base, size);
         g->host_base = NULL;
         return -1;
@@ -117,6 +155,9 @@ int guest_init(guest_t *g, uint64_t size) {
         g->host_base = NULL;
         return -1;
     }
+
+    fprintf(stderr, "guest: IPA size: %u bits (%lluGB)\n",
+            max_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)));
 
     return 0;
 }
@@ -189,14 +230,31 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
 /* ---------- guest_reset ---------- */
 
 void guest_reset(guest_t *g) {
-    /* Zero everything from ELF_DEFAULT_BASE to guest_size.
-     * This covers ELF segments, brk, stack, and mmap regions.
-     * The page table pool (PT_POOL_BASE..PT_POOL_END) and shim
-     * (SHIM_BASE..SHIM_DATA_BASE+2MB) are also zeroed since they
-     * will be rebuilt. Only the first 64KB (below PT_POOL_BASE)
-     * is left untouched (unused area). */
-    memset((uint8_t *)g->host_base + PT_POOL_BASE, 0,
-           g->guest_size - PT_POOL_BASE);
+    /* Zero only actually-used memory regions. With a potentially 1TB
+     * address space, memset of the entire range would fault in all
+     * demand-paged memory for no benefit. PROT_NONE regions (e.g., GHC's
+     * heap reservation) were never written to, so they're already in the
+     * MAP_ANON zero-fill-on-demand state. */
+
+    /* Zero tracked regions (ELF segments, heap, stack, mmap allocations).
+     * Skip PROT_NONE regions — they were never touched. */
+    for (int i = 0; i < g->nregions; i++) {
+        guest_region_t *r = &g->regions[i];
+        if (r->prot != 0 /* PROT_NONE */ && r->end > r->start) {
+            memset((uint8_t *)g->host_base + r->start, 0,
+                   r->end - r->start);
+        }
+    }
+
+    /* Zero page table pool (not tracked in region array) */
+    if (g->pt_pool_next > PT_POOL_BASE)
+        memset((uint8_t *)g->host_base + PT_POOL_BASE, 0,
+               g->pt_pool_next - PT_POOL_BASE);
+
+    /* Zero shim code + data (not tracked in region array by guest_reset
+     * callers — shim regions are added AFTER reset by the exec path) */
+    memset((uint8_t *)g->host_base + SHIM_BASE, 0,
+           SHIM_DATA_BASE + BLOCK_2MB - SHIM_BASE);
 
     /* Reset allocation state */
     g->pt_pool_next = PT_POOL_BASE;
@@ -256,7 +314,10 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
         n++;
     }
 
-    /* mmap region (only the used portion) */
+    /* mmap region (up to high-water mark). With the gap-finding allocator,
+     * mmap_next is a high-water mark — freed regions within this range may
+     * contain PROT_NONE pages (zero-fill, no cost to copy). This is
+     * conservative but correct for fork state transfer. */
     if (n < max && g->mmap_next > MMAP_BASE) {
         out[n].offset = MMAP_BASE;
         out[n].size = g->mmap_next - MMAP_BASE;
@@ -465,18 +526,11 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
 
     uint64_t *l0 = pt_at(g, l0_gpa);
 
-    /* L1 table — determine which L0 entry we need based on ipa_base.
-     * All our addresses are ipa_base + offset, so they fall in one L0 slot. */
-    uint64_t l1_gpa = pt_alloc_page(g);
-    if (!l1_gpa) return 0;
-
-    unsigned l0_idx = (unsigned)(base / (512ULL * BLOCK_1GB));
-    l0[l0_idx] = (base + l1_gpa) | PT_VALID | PT_TABLE;
-    uint64_t *l1 = pt_at(g, l1_gpa);
-
     /* For each region, determine which 2MB blocks need mapping.
      * Regions use offsets (0-based). We add ipa_base for IPA addresses
-     * in page table entries. The L1/L2 indices are relative to ipa_base. */
+     * in page table entries. L0/L1/L2 indices are derived from the IPA.
+     * For >512GB address spaces, addresses span multiple L0 entries
+     * (each covering 512GB), so L1 tables are allocated on demand. */
     for (int r = 0; r < n; r++) {
         uint64_t start = ALIGN_2MB_DOWN(regions[r].gpa_start);
         uint64_t end   = ALIGN_2MB_UP(regions[r].gpa_end);
@@ -485,6 +539,23 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
         for (uint64_t addr = start; addr < end; addr += BLOCK_2MB) {
             /* Compute IPA for this block */
             uint64_t ipa = base + addr;
+
+            /* L0 index: which 512GB slot this IPA falls in */
+            unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
+            if (l0_idx >= 512) {
+                fprintf(stderr, "guest: IPA 0x%llx out of L0 range\n",
+                        (unsigned long long)ipa);
+                continue;
+            }
+
+            /* Allocate L1 table on first access to each L0 slot */
+            if (!(l0[l0_idx] & PT_VALID)) {
+                uint64_t l1_gpa = pt_alloc_page(g);
+                if (!l1_gpa) return 0;
+                l0[l0_idx] = (base + l1_gpa) | PT_VALID | PT_TABLE;
+            }
+            uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+            uint64_t *l1 = pt_at(g, l1_ipa - base);
 
             /* L1 index within the 512GB L0 entry */
             unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
@@ -542,23 +613,25 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
     uint64_t l0_gpa_off = g->ttbr0 - base;
     uint64_t *l0 = pt_at(g, l0_gpa_off);
 
-    /* L0 index (same as initial build — all addresses in one 512GB slot) */
-    unsigned l0_idx = (unsigned)(base / (512ULL * BLOCK_1GB));
-    if (!(l0[l0_idx] & PT_VALID)) {
-        fprintf(stderr, "guest: L0[%u] not valid in extend\n", l0_idx);
-        return -1;
-    }
-
-    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
-    uint64_t l1_gpa_off = l1_ipa - base;
-    uint64_t *l1 = pt_at(g, l1_gpa_off);
-
     /* Walk 2MB blocks in [start, end) */
     uint64_t addr_start = ALIGN_2MB_DOWN(start);
     uint64_t addr_end = ALIGN_2MB_UP(end);
 
     for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MB) {
         uint64_t ipa = base + addr;
+
+        /* L0 index: which 512GB slot (>512GB addresses need L0[1]+) */
+        unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
+
+        /* Allocate L1 table on first access to each L0 slot */
+        if (!(l0[l0_idx] & PT_VALID)) {
+            uint64_t l1_gpa = pt_alloc_page(g);
+            if (!l1_gpa) return -1;
+            l0[l0_idx] = (base + l1_gpa) | PT_VALID | PT_TABLE;
+        }
+
+        uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t *l1 = pt_at(g, l1_ipa - base);
 
         unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
         if (l1_idx >= 512) {
@@ -576,8 +649,7 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
 
         /* Navigate to L2 table */
         uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t l2_gpa_off = l2_ipa - base;
-        uint64_t *l2 = pt_at(g, l2_gpa_off);
+        uint64_t *l2 = pt_at(g, l2_ipa - base);
 
         unsigned l2_idx = (unsigned)((ipa % BLOCK_1GB) / BLOCK_2MB);
 
@@ -638,7 +710,8 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t gpa_offset) {
     uint64_t l0_gpa_off = g->ttbr0 - base;
     uint64_t *l0 = pt_at(g, l0_gpa_off);
 
-    unsigned l0_idx = (unsigned)(base / (512ULL * BLOCK_1GB));
+    /* L0 index from actual IPA (not base), correct for >512GB */
+    unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
     if (!(l0[l0_idx] & PT_VALID)) return NULL;
 
     uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;

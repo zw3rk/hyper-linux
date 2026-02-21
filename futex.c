@@ -28,6 +28,9 @@
 /* ---------- Futex operations (from Linux uapi) ---------- */
 #define FUTEX_WAIT            0
 #define FUTEX_WAKE            1
+#define FUTEX_REQUEUE         3
+#define FUTEX_CMP_REQUEUE     4
+#define FUTEX_WAKE_OP         5
 #define FUTEX_WAIT_BITSET     9
 #define FUTEX_WAKE_BITSET    10
 #define FUTEX_PRIVATE_FLAG  128
@@ -201,12 +204,212 @@ static int64_t futex_wake(uint64_t uaddr, uint32_t val, uint32_t bitset) {
     return woken;
 }
 
+/* FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake val waiters at uaddr, then
+ * move up to val2 remaining waiters from uaddr to uaddr2.
+ *
+ * CMP_REQUEUE additionally checks *uaddr == val3 before proceeding;
+ * returns -EAGAIN if the comparison fails (stale wakeup avoidance).
+ *
+ * Musl uses FUTEX_REQUEUE (not CMP) in pthread_cond_timedwait.c for
+ * efficient condition variable broadcast — avoids thundering herd by
+ * moving waiters directly to the mutex futex instead of waking them all.
+ *
+ * Lock ordering: always acquire lower-indexed bucket first to avoid
+ * deadlock when source and destination hash to different buckets. */
+static int64_t futex_requeue(guest_t *g, uint64_t uaddr, uint32_t wake_count,
+                              uint32_t requeue_count, uint64_t uaddr2,
+                              int do_cmp, uint32_t expected) {
+    unsigned idx_src = futex_hash(uaddr);
+    unsigned idx_dst = futex_hash(uaddr2);
+    futex_bucket_t *b_src = &buckets[idx_src];
+    futex_bucket_t *b_dst = &buckets[idx_dst];
+
+    /* Lock both buckets in consistent order (lower index first) */
+    if (idx_src == idx_dst) {
+        pthread_mutex_lock(&b_src->lock);
+    } else if (idx_src < idx_dst) {
+        pthread_mutex_lock(&b_src->lock);
+        pthread_mutex_lock(&b_dst->lock);
+    } else {
+        pthread_mutex_lock(&b_dst->lock);
+        pthread_mutex_lock(&b_src->lock);
+    }
+
+    /* CMP_REQUEUE: atomically verify *uaddr == expected */
+    if (do_cmp) {
+        uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
+        if (!word) {
+            if (idx_src != idx_dst) pthread_mutex_unlock(&b_dst->lock);
+            pthread_mutex_unlock(&b_src->lock);
+            return -LINUX_EFAULT;
+        }
+        uint32_t current = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if (current != expected) {
+            if (idx_src != idx_dst) pthread_mutex_unlock(&b_dst->lock);
+            pthread_mutex_unlock(&b_src->lock);
+            return -LINUX_EAGAIN;
+        }
+    }
+
+    int woken = 0;
+    int requeued = 0;
+
+    /* Walk source bucket: wake up to wake_count, requeue up to requeue_count */
+    futex_waiter_t **pp = &b_src->head;
+    while (*pp) {
+        futex_waiter_t *w = *pp;
+        if (w->uaddr != uaddr) {
+            pp = &w->next;
+            continue;
+        }
+
+        if ((uint32_t)woken < wake_count) {
+            /* Wake this waiter */
+            w->woken = 1;
+            pthread_cond_signal(&w->cond);
+            woken++;
+            pp = &w->next;  /* waiter removes itself from list on wakeup */
+        } else if ((uint32_t)requeued < requeue_count) {
+            /* Requeue: remove from source, add to destination */
+            *pp = w->next;
+            w->uaddr = uaddr2;
+            w->next = b_dst->head;
+            b_dst->head = w;
+            requeued++;
+        } else {
+            break;  /* Both limits reached */
+        }
+    }
+
+    /* Unlock in reverse order */
+    if (idx_src == idx_dst) {
+        pthread_mutex_unlock(&b_src->lock);
+    } else if (idx_src < idx_dst) {
+        pthread_mutex_unlock(&b_dst->lock);
+        pthread_mutex_unlock(&b_src->lock);
+    } else {
+        pthread_mutex_unlock(&b_src->lock);
+        pthread_mutex_unlock(&b_dst->lock);
+    }
+
+    return woken + requeued;
+}
+
+/* FUTEX_WAKE_OP: atomically modify *uaddr2, wake val waiters at uaddr,
+ * then conditionally wake val2 waiters at uaddr2 based on the old value.
+ *
+ * The op argument encodes: operation on *uaddr2 and comparison predicate.
+ * Used by glibc's pthread_cond_signal; musl does NOT use this, but
+ * we implement it for compatibility with glibc-linked binaries.
+ *
+ * val3 encodes both the operation and comparison:
+ *   bits 28-31: op code (SET=0, ADD=1, OR=2, ANDN=3, XOR=4)
+ *   bits 24-27: cmp code (EQ=0, NE=1, LT=2, LE=3, GT=4, GE=5)
+ *   bits 12-23: op arg
+ *   bits  0-11: cmp arg */
+static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+                              uint64_t uaddr2, uint32_t val2, uint32_t val3) {
+    unsigned idx1 = futex_hash(uaddr);
+    unsigned idx2 = futex_hash(uaddr2);
+    futex_bucket_t *b1 = &buckets[idx1];
+    futex_bucket_t *b2 = &buckets[idx2];
+
+    /* Lock ordering */
+    if (idx1 == idx2) {
+        pthread_mutex_lock(&b1->lock);
+    } else if (idx1 < idx2) {
+        pthread_mutex_lock(&b1->lock);
+        pthread_mutex_lock(&b2->lock);
+    } else {
+        pthread_mutex_lock(&b2->lock);
+        pthread_mutex_lock(&b1->lock);
+    }
+
+    /* Decode operation and comparison from val3 */
+    unsigned wake_op   = (val3 >> 28) & 0xF;
+    unsigned wake_cmp  = (val3 >> 24) & 0xF;
+    unsigned op_arg    = (val3 >> 12) & 0xFFF;
+    unsigned cmp_arg   = val3 & 0xFFF;
+
+    /* Atomically modify *uaddr2 */
+    uint32_t *word2 = (uint32_t *)guest_ptr(g, uaddr2);
+    if (!word2) {
+        if (idx1 != idx2) pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+        return -LINUX_EFAULT;
+    }
+
+    uint32_t old_val;
+    uint32_t new_val;
+    old_val = __atomic_load_n(word2, __ATOMIC_SEQ_CST);
+
+    switch (wake_op) {
+    case 0: new_val = op_arg;             break;  /* SET */
+    case 1: new_val = old_val + op_arg;   break;  /* ADD */
+    case 2: new_val = old_val | op_arg;   break;  /* OR */
+    case 3: new_val = old_val & ~op_arg;  break;  /* ANDN */
+    case 4: new_val = old_val ^ op_arg;   break;  /* XOR */
+    default: new_val = old_val;           break;
+    }
+    __atomic_store_n(word2, new_val, __ATOMIC_SEQ_CST);
+
+    /* Wake up to val waiters at uaddr */
+    int woken = 0;
+    futex_waiter_t *w = b1->head;
+    while (w && (uint32_t)woken < val) {
+        if (w->uaddr == uaddr) {
+            w->woken = 1;
+            pthread_cond_signal(&w->cond);
+            woken++;
+        }
+        w = w->next;
+    }
+
+    /* Evaluate comparison predicate on old_val */
+    int cond_met = 0;
+    switch (wake_cmp) {
+    case 0: cond_met = (old_val == cmp_arg); break;  /* EQ */
+    case 1: cond_met = (old_val != cmp_arg); break;  /* NE */
+    case 2: cond_met = (old_val <  cmp_arg); break;  /* LT */
+    case 3: cond_met = (old_val <= cmp_arg); break;  /* LE */
+    case 4: cond_met = (old_val >  cmp_arg); break;  /* GT */
+    case 5: cond_met = (old_val >= cmp_arg); break;  /* GE */
+    default: break;
+    }
+
+    /* Conditionally wake up to val2 waiters at uaddr2 */
+    if (cond_met) {
+        w = b2->head;
+        int woken2 = 0;
+        while (w && (uint32_t)woken2 < val2) {
+            if (w->uaddr == uaddr2) {
+                w->woken = 1;
+                pthread_cond_signal(&w->cond);
+                woken2++;
+            }
+            w = w->next;
+        }
+        woken += woken2;
+    }
+
+    /* Unlock reverse order */
+    if (idx1 == idx2) {
+        pthread_mutex_unlock(&b1->lock);
+    } else if (idx1 < idx2) {
+        pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+    } else {
+        pthread_mutex_unlock(&b1->lock);
+        pthread_mutex_unlock(&b2->lock);
+    }
+
+    return woken;
+}
+
 /* ---------- Syscall entry point ---------- */
 
 int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
                   uint64_t timeout_gva, uint64_t uaddr2, uint32_t val3) {
-    (void)uaddr2;  /* REQUEUE not implemented */
-
     int cmd = op & FUTEX_CMD_MASK;
 
     switch (cmd) {
@@ -217,6 +420,21 @@ int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
     case FUTEX_WAKE:
         return futex_wake(uaddr, val, FUTEX_BITSET_MATCH_ANY);
 
+    case FUTEX_REQUEUE:
+        /* For REQUEUE, the timeout arg is repurposed as val2 (requeue count) */
+        return futex_requeue(g, uaddr, val, (uint32_t)timeout_gva,
+                              uaddr2, /*do_cmp=*/0, 0);
+
+    case FUTEX_CMP_REQUEUE:
+        /* Same repurposing of timeout → val2, plus compare against val3 */
+        return futex_requeue(g, uaddr, val, (uint32_t)timeout_gva,
+                              uaddr2, /*do_cmp=*/1, val3);
+
+    case FUTEX_WAKE_OP:
+        /* timeout arg repurposed as val2 (wake count for uaddr2) */
+        return futex_wake_op(g, uaddr, val, uaddr2,
+                              (uint32_t)timeout_gva, val3);
+
     case FUTEX_WAIT_BITSET:
         return futex_wait(g, uaddr, val, timeout_gva,
                           val3, /*is_absolute=*/1);
@@ -225,8 +443,8 @@ int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
         return futex_wake(uaddr, val, val3);
 
     default:
-        /* Unimplemented futex operation — return ENOSYS so musl knows
-         * to fall back (e.g., for FUTEX_CMP_REQUEUE). */
+        /* Unimplemented futex operation (PI futexes, robust futexes).
+         * Return ENOSYS so musl knows to fall back. */
         return -LINUX_ENOSYS;
     }
 }

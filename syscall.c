@@ -230,6 +230,37 @@ int translate_open_flags(int linux_flags) {
     return flags;
 }
 
+/* ---------- Gap-finding allocator for mmap ---------- */
+
+/* Find the first free gap of at least `length` bytes in the guest address
+ * space between min_addr and max_addr. Walks the sorted region array
+ * (guest_t.regions[]) — gaps between tracked regions form a natural free
+ * list. This replaces the bump allocator so that munmap'd space can be
+ * reused (critical for GHC's reserve-trim-reserve pattern).
+ *
+ * Returns the gap start offset (0-based), or UINT64_MAX if no gap found. */
+static uint64_t find_free_gap(const guest_t *g, uint64_t length,
+                               uint64_t min_addr, uint64_t max_addr) {
+    uint64_t gap_start = min_addr;
+
+    for (int i = 0; i < g->nregions; i++) {
+        /* Skip regions entirely before the current search position */
+        if (g->regions[i].end <= gap_start) continue;
+
+        /* If this region starts far enough after gap_start, we have a gap */
+        if (g->regions[i].start >= gap_start + length) return gap_start;
+
+        /* Region overlaps — advance past it */
+        gap_start = g->regions[i].end;
+        /* Page-align the next candidate position */
+        gap_start = (gap_start + 4095) & ~4095ULL;
+    }
+
+    /* Check trailing space after all regions */
+    if (gap_start + length <= max_addr) return gap_start;
+    return UINT64_MAX;  /* No suitable gap found */
+}
+
 /* ---------- Memory syscalls (tightly coupled to guest.h) ---------- */
 
 static int64_t sys_brk(guest_t *g, uint64_t addr) {
@@ -252,10 +283,10 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
     }
 
     /* Extend page tables if brk grows beyond currently-mapped region.
-     * The brk region is initially mapped up to MMAP_BASE; if it grows
+     * The brk region is initially mapped up to MMAP_RX_BASE; if it grows
      * past that, we need to extend dynamically. */
     uint64_t brk_pt_end = (g->brk_current + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
-    if (brk_pt_end < MMAP_BASE) brk_pt_end = MMAP_BASE;
+    if (brk_pt_end < MMAP_RX_BASE) brk_pt_end = MMAP_RX_BASE;
     if (new_off > brk_pt_end) {
         uint64_t new_end = (new_off + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
         if (guest_extend_page_tables(g, brk_pt_end, new_end, MEM_PERM_RW) < 0)
@@ -291,6 +322,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                         int prot, int flags, int fd, int64_t offset) {
     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
     int needs_exec = (prot & LINUX_PROT_EXEC) != 0;
+    int is_prot_none = (prot == LINUX_PROT_NONE);
 
     /* We handle all mmap variants. For file-backed MAP_SHARED, we fall
      * back to MAP_PRIVATE semantics (copy-on-write). Since the guest
@@ -308,58 +340,106 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         /* Remove any existing region coverage in the fixed range */
         guest_region_remove(g, result_off, result_off + length);
 
-        /* Update page table permissions for the fixed range.
-         * MAP_FIXED may land in a region with different permissions
-         * (e.g., dynamic linker remapping .data RW over .text RX).
-         * This splits 2MB blocks into 4KB L3 pages as needed. */
-        int page_perms = MEM_PERM_R;
-        if (prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
-        if (prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
-        guest_update_perms(g, result_off, result_off + length, page_perms);
+        if (!is_prot_none) {
+            /* Ensure page table entries exist for the fixed range.
+             * PROT_NONE reservations skip page table creation, so when
+             * MAP_FIXED commits pages within a PROT_NONE region (e.g.,
+             * GHC RTS mmap(MAP_FIXED, PROT_READ|PROT_WRITE) inside its
+             * PROT_NONE heap reservation), we must create L2 block
+             * descriptors first. guest_extend_page_tables is idempotent
+             * for already-mapped blocks. */
+            int page_perms = MEM_PERM_R;
+            if (prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
+            if (prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
+
+            uint64_t ext_start = result_off & ~(BLOCK_2MB - 1);
+            uint64_t ext_end = (result_off + length + BLOCK_2MB - 1)
+                               & ~(BLOCK_2MB - 1);
+            if (ext_end > g->guest_size) ext_end = g->guest_size;
+
+            if (guest_extend_page_tables(g, ext_start, ext_end,
+                                          page_perms) < 0)
+                return -LINUX_ENOMEM;
+
+            /* Fine-tune permissions for the exact range. Handles L3
+             * splitting when MAP_FIXED overlays different permissions
+             * onto an existing 2MB block (e.g., .data RW over .text RX). */
+            guest_update_perms(g, result_off, result_off + length, page_perms);
+
+            /* Zero the region for MAP_ANONYMOUS. Host memory is demand-
+             * paged MAP_ANON (zero on first touch), but previously-used
+             * pages may contain stale data from earlier mappings. */
+            if (is_anon)
+                memset((uint8_t *)g->host_base + result_off, 0, length);
+        }
     } else if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
         /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
          * Apple HVF enforces W^X on 2MB block page table entries, so
          * executable mappings must be in separate 2MB blocks from writable
          * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
          * permission. */
-        g->mmap_rx_next = (g->mmap_rx_next + 4095) & ~4095ULL;
-        if (g->mmap_rx_next + length > MMAP_END) return -LINUX_ENOMEM;
-        result_off = g->mmap_rx_next;
-        g->mmap_rx_next += length;
+        result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
+        if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+        /* High-water mark for fork IPC state transfer */
+        uint64_t rx_hwm = result_off + length;
+        if (rx_hwm > g->mmap_rx_next) g->mmap_rx_next = rx_hwm;
     } else {
-        /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region */
-        g->mmap_next = (g->mmap_next + 4095) & ~4095ULL;
-        if (g->mmap_next + length > MMAP_END) return -LINUX_ENOMEM;
-        result_off = g->mmap_next;
-        g->mmap_next += length;
+        /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region.
+         * Honor the address hint if provided and within bounds — GHC's
+         * block allocator needs the heap at a specific high address range
+         * (~264GB) for its MBlock map, and retries in a loop if it gets
+         * a low address instead. On real Linux, mmap tries the hint first
+         * and falls back to any suitable address. */
+        result_off = UINT64_MAX;
+        if (addr != 0) {
+            uint64_t hint_off = addr - g->ipa_base;
+            if (hint_off >= MMAP_BASE && hint_off + length <= g->mmap_limit)
+                result_off = find_free_gap(g, length, hint_off, g->mmap_limit);
+        }
+        if (result_off == UINT64_MAX)
+            result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
+        if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+        /* High-water mark for fork IPC state transfer */
+        uint64_t rw_hwm = result_off + length;
+        if (rw_hwm > g->mmap_next) g->mmap_next = rw_hwm;
     }
 
-    /* Extend page tables if we've grown beyond the currently-mapped region.
-     * RX and RW regions have separate limits. */
-    if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
-        if (result_off + length > g->mmap_rx_end) {
-            uint64_t new_end = (result_off + length + BLOCK_2MB - 1)
+    /* PROT_NONE mappings (e.g., GHC RTS heap reservation) don't need page
+     * table entries or zeroing. The guest sees a translation fault on access,
+     * which is the correct behavior for PROT_NONE. The host memory is
+     * demand-paged MAP_ANON, so untouched pages cost nothing.
+     * mprotect() later creates page table entries when portions become
+     * accessible (e.g., PROT_NONE → PROT_READ|PROT_WRITE). */
+    if (!is_prot_none && !(flags & LINUX_MAP_FIXED)) {
+        /* Extend page tables for this specific allocation range only.
+         * guest_extend_page_tables skips already-mapped blocks, so
+         * calling it on pre-mapped regions is a no-op. This avoids
+         * creating entries for PROT_NONE gaps between allocations. */
+        if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
+            uint64_t ext_start = result_off & ~(BLOCK_2MB - 1);
+            uint64_t ext_end = (result_off + length + BLOCK_2MB - 1)
                                & ~(BLOCK_2MB - 1);
-            if (new_end > MMAP_END) new_end = MMAP_END;
-            if (guest_extend_page_tables(g, g->mmap_rx_end, new_end,
+            if (ext_end > g->mmap_limit) ext_end = g->mmap_limit;
+            if (guest_extend_page_tables(g, ext_start, ext_end,
                                           MEM_PERM_RX) < 0)
                 return -LINUX_ENOMEM;
-            g->mmap_rx_end = new_end;
-        }
-    } else {
-        if (result_off + length > g->mmap_end) {
-            uint64_t new_end = (result_off + length + BLOCK_2MB - 1)
+            if (ext_end > g->mmap_rx_end)
+                g->mmap_rx_end = ext_end;
+        } else {
+            uint64_t ext_start = result_off & ~(BLOCK_2MB - 1);
+            uint64_t ext_end = (result_off + length + BLOCK_2MB - 1)
                                & ~(BLOCK_2MB - 1);
-            if (new_end > MMAP_END) new_end = MMAP_END;
-            if (guest_extend_page_tables(g, g->mmap_end, new_end,
+            if (ext_end > g->mmap_limit) ext_end = g->mmap_limit;
+            if (guest_extend_page_tables(g, ext_start, ext_end,
                                           MEM_PERM_RW) < 0)
                 return -LINUX_ENOMEM;
-            g->mmap_end = new_end;
+            if (ext_end > g->mmap_end)
+                g->mmap_end = ext_end;
         }
-    }
 
-    /* Zero the mapped region */
-    memset((uint8_t *)g->host_base + result_off, 0, length);
+        /* Zero the mapped region */
+        memset((uint8_t *)g->host_base + result_off, 0, length);
+    }
 
     /* For file-backed mmap, read file contents into the region */
     if (!is_anon && fd >= 0) {
@@ -515,12 +595,27 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
         pthread_mutex_lock(&mmap_lock);
         if (unmap_off + unmap_len <= g->guest_size) {
-            /* Zero the memory (security: prevent data leaks) */
-            memset((uint8_t *)g->host_base + unmap_off, 0, unmap_len);
-            /* Remove region tracking. Note: we cannot reclaim page table
-             * entries or HVF address space — only the tracking is updated.
-             * The bump allocator doesn't reuse freed mmap space. */
-            guest_region_remove(g, unmap_off, unmap_off + unmap_len);
+            /* Zero non-PROT_NONE portions (security: prevent data leaks).
+             * PROT_NONE regions were never written to (no page table entries),
+             * so the host pages are still in MAP_ANON zero-fill state.
+             * Zeroing a huge PROT_NONE range would fault in demand-paged
+             * memory for no benefit. */
+            uint64_t end = unmap_off + unmap_len;
+            for (int i = 0; i < g->nregions; i++) {
+                guest_region_t *r = &g->regions[i];
+                if (r->start >= end) break;
+                if (r->end <= unmap_off) continue;
+                if (r->prot == LINUX_PROT_NONE) continue;
+                /* Compute overlap of region with unmap range */
+                uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
+                uint64_t zend = (r->end < end) ? r->end : end;
+                memset((uint8_t *)g->host_base + zstart, 0, zend - zstart);
+            }
+            /* Remove region tracking. The gap-finding allocator will
+             * reuse this freed address space for future mmap calls.
+             * Note: page table entries are NOT reclaimed — only the
+             * semantic region tracking is updated. */
+            guest_region_remove(g, unmap_off, end);
         }
         pthread_mutex_unlock(&mmap_lock);
         result = 0;
@@ -537,14 +632,33 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
                                   mprot_prot);
 
-            /* Actually update page table permissions. For 2MB blocks that
-             * need mixed permissions (e.g., RELRO marking part of a block
-             * read-only), the block is split into 4KB L3 pages. */
-            int page_perms = MEM_PERM_R;
-            if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
-            if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
-            guest_update_perms(g, mprot_off, mprot_off + mprot_len,
-                               page_perms);
+            if (mprot_prot != LINUX_PROT_NONE) {
+                /* Non-PROT_NONE: ensure page table entries exist for this
+                 * range. PROT_NONE mmaps skip page table creation, so
+                 * mprotect must create them on demand (e.g., GHC RTS
+                 * reserves 256GB with PROT_NONE, then mprotects portions
+                 * to PROT_READ|PROT_WRITE for heap use). */
+                int page_perms = MEM_PERM_R;
+                if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
+                if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
+
+                /* Extend page tables for the range. This creates 2MB block
+                 * entries for any unmapped blocks. Already-mapped blocks
+                 * are skipped (idempotent). */
+                guest_extend_page_tables(g, mprot_off,
+                                          mprot_off + mprot_len, page_perms);
+
+                /* Update permissions. For blocks that already existed with
+                 * different perms, this sets the new permissions (splitting
+                 * 2MB blocks into 4KB L3 pages if needed for mixed perms). */
+                guest_update_perms(g, mprot_off, mprot_off + mprot_len,
+                                   page_perms);
+            }
+            /* PROT_NONE: only region tracking is updated (done above).
+             * Page table entries are NOT invalidated — a known limitation.
+             * The memory remains accessible in the page tables, but the
+             * region tracking correctly reflects PROT_NONE. This is safe
+             * because programs don't intentionally access PROT_NONE memory. */
         }
         pthread_mutex_unlock(&mmap_lock);
         result = 0;
@@ -715,10 +829,13 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                            x3, x4, (uint32_t)x5);
         break;
     case SYS_set_robust_list:
-        result = 0;  /* Stub: single-threaded, no robust futexes */
+        result = 0;  /* Stub: robust futex cleanup not implemented.
+                       * Musl calls this during pthread_create; returning 0
+                       * is safe as long as threads exit cleanly. */
         break;
     case SYS_sigaltstack:
-        result = 0;  /* Stub: no signal delivery */
+        result = 0;  /* Stub: alternate signal stack not tracked.
+                       * Signals are delivered on the guest's main stack. */
         break;
 
     /* ---- Batch 2: Process/system info ---- */
@@ -1038,6 +1155,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     }
     case SYS_mincore:
         result = -LINUX_ENOSYS;  /* Not meaningful in our model */
+        break;
+    case SYS_membarrier:
+        result = 0;  /* Stub: our single-process model with HVF vCPU
+                       * synchronization makes explicit membarrier
+                       * unnecessary. GHC RTS calls this during init. */
         break;
     case SYS_clone3:
         /* Modern musl might try clone3 first, then fall back to clone */

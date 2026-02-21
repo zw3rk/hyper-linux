@@ -50,6 +50,7 @@ typedef struct {
     int64_t  child_pid;
     int64_t  parent_pid;
     /* Guest state */
+    uint64_t guest_size;     /* IPA-derived address space size (child must match) */
     uint64_t brk_base;
     uint64_t brk_current;
     uint64_t mmap_next;
@@ -214,9 +215,9 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     /* Set process identity via accessor (static state lives in syscall_proc.c) */
     proc_set_identity(hdr.child_pid, hdr.parent_pid);
 
-    /* Step 2: Create guest VM */
+    /* Step 2: Create guest VM with the same size as parent */
     guest_t g;
-    if (guest_init(&g, GUEST_MEM_SIZE) < 0) {
+    if (guest_init(&g, hdr.guest_size) < 0) {
         fprintf(stderr, "hl: fork-child: failed to init guest\n");
         return 1;
     }
@@ -807,6 +808,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         .magic = IPC_MAGIC_HEADER,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
+        .guest_size = g->guest_size,
         .brk_base = g->brk_base,
         .brk_current = g->brk_current,
         .mmap_next = g->mmap_next,

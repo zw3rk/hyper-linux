@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Hash table of wait queues keyed by guest virtual address. Supports
- * FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, and FUTEX_WAKE_BITSET.
+ * FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET,
+ * FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, and FUTEX_WAKE_OP.
  * Each waiter has its own condition variable for precise wakeup.
  */
 #ifndef FUTEX_H
@@ -21,7 +22,7 @@ void futex_init(void);
  * uaddr: guest virtual address of the futex word
  * val:   expected value (WAIT) or max wakeups (WAKE)
  * timeout_gva: guest pointer to timespec (or 0 for no timeout)
- * uaddr2: second futex address (for REQUEUE, unused in MVP)
+ * uaddr2: second futex address (for REQUEUE/CMP_REQUEUE/WAKE_OP)
  * val3:  bitset (for WAIT_BITSET/WAKE_BITSET)
  * Returns 0 on success, negative Linux errno on failure. */
 int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,

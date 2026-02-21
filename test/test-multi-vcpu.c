@@ -493,9 +493,21 @@ static int vm_create(vm_state_t *vm) {
     if (vm->host_base == MAP_FAILED) return -1;
     vm->pt_next = PT_POOL_BASE;
 
-    hv_return_t ret = hv_vm_create(NULL);
+    /* Query max IPA size and configure VM (matches guest.c pattern).
+     * The test uses only 16MB, so any IPA size works — this is for
+     * API consistency with hl's production code path. */
+    uint32_t max_ipa = 0;
+    hv_vm_config_get_max_ipa_size(&max_ipa);
+    if (max_ipa >= 40) max_ipa = 40;
+    else max_ipa = 36;
+
+    hv_vm_config_t config = hv_vm_config_create();
+    hv_vm_config_set_ipa_size(config, max_ipa);
+    hv_return_t ret = hv_vm_create(config);
+    os_release(config);
     if (ret != HV_SUCCESS) {
-        fprintf(stderr, "  hv_vm_create failed: %d\n", (int)ret);
+        fprintf(stderr, "  hv_vm_create failed: %d (ipa_bits=%u)\n",
+                (int)ret, max_ipa);
         munmap(vm->host_base, GUEST_SIZE);
         return -1;
     }
