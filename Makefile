@@ -10,7 +10,7 @@
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
 .PHONY: all hl clean test-hello test-all test-coreutils test-busybox \
-       test-dynamic test-dynamic-coreutils help
+       test-dynamic test-dynamic-coreutils test-perf test-multi-vcpu help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -46,12 +46,14 @@ HL_SRCS := hl.c guest.c elf.c syscall.c syscall_fs.c syscall_io.c \
            syscall_poll.c syscall_fd.c \
            syscall_time.c syscall_sys.c syscall_proc.c \
            proc_emulation.c syscall_exec.c fork_ipc.c \
-           syscall_signal.c syscall_net.c stack.c
+           syscall_signal.c syscall_net.c stack.c \
+           thread.c futex.c
 HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_fs.h \
            syscall_io.h syscall_poll.h syscall_fd.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
-           syscall_signal.h syscall_net.h stack.h
+           syscall_signal.h syscall_net.h stack.h \
+           thread.h futex.h
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -232,6 +234,32 @@ test-dynamic-coreutils: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@bash test/test-dynamic-coreutils.sh $(BUILD_DIR)/hl $(SYSROOT_DIR) $(DYNAMIC_COREUTILS_BIN)
+
+# ── Performance benchmark ─────────────────────────────────────────
+
+## Run performance benchmarks (native vs hl, 10 iterations each)
+test-perf: $(BUILD_DIR)/hl
+	@if [ ! -d "$(COREUTILS_BIN)" ]; then \
+		printf "$(RED)✗ Coreutils not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-perf.sh $(BUILD_DIR)/hl $(COREUTILS_BIN)
+
+# ── Multi-vCPU validation test ─────────────────────────────────────
+
+## Build the multi-vCPU HVF validation test (native macOS binary)
+$(BUILD_DIR)/test-multi-vcpu: test/test-multi-vcpu.c $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
+	@printf "$(GREEN)▸ Compiling$(RESET) test-multi-vcpu (native)\n"
+	clang -O2 -Wall -Wextra -Wpedantic \
+		-I$(BUILD_DIR) \
+		-o $@ $< \
+		-framework Hypervisor -arch arm64
+	@printf "$(GREEN)▸ Signing$(RESET) test-multi-vcpu\n"
+	codesign --entitlements $(ENTITLEMENTS) -f -s "$(SIGN_IDENTITY)" $@
+
+## Run multi-vCPU validation tests (5 tests)
+test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
+	$(BUILD_DIR)/test-multi-vcpu
 
 # ── Cleanup ────────────────────────────────────────────────────────
 

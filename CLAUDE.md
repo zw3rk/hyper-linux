@@ -17,7 +17,7 @@ Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Sili
 - **syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
 - **syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop (~550 lines).
 - **proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
-- **syscall_exec.c/h** — execve: ELF reload, page table rebuild, vCPU restart (~260 lines).
+- **syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
 - **fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
 - **stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
@@ -36,7 +36,11 @@ Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Sili
   link address (e.g., 0x400000). Non-zero IPA base causes translation faults.
 - System registers CANNOT be set via MSR from guest (HCR_EL2.TSC=1 traps all
   MSR writes). Use HVC #4 to request host-side register writes.
-- Guest page tables MUST use 2MB block mappings for misaligned access support.
+- Guest page tables use 2MB block mappings by default. For regions needing
+  mixed permissions (e.g., shared library .text RX + .data RW in one 2MB
+  range), blocks are split into 512 × 4KB L3 page descriptors via
+  `guest_split_block()`. This is triggered automatically by MAP_FIXED
+  and mprotect when permissions differ from the existing block.
 - Only use HV_SYS_REG_* constants from Hypervisor.framework for register IDs.
 
 ## Exception Vector Critical Rule
@@ -88,6 +92,36 @@ How it works:
    when `--sysroot` is set, tries `<sysroot>/<path>` first for absolute paths
 
 The sysroot is inherited by fork children via IPC state transfer.
+`sys_execve` also loads the interpreter for dynamically-linked targets,
+so tools that execve dynamic children (env, nice, nohup) work correctly.
+`elf_resolve_interp()` in elf.c is shared between hl.c and syscall_exec.c.
+
+**Known limitation:** `timeout` fails — it uses fork/clone to create a
+child process with a timer, and the forked child inherits the dynamic
+linker state but the fork+exec path has issues in the interpreter space.
+
+## L3 Page Table Splitting
+
+Apple HVF enforces W^X on page table entries: a single entry cannot be both
+writable and executable. With 2MB L2 block descriptors, this means an entire
+2MB region must be either RW or RX. Shared libraries have both .text (RX)
+and .data (RW) segments that often fall within the same 2MB range.
+
+Solution: `guest_split_block()` in guest.c converts a 2MB L2 block descriptor
+into a table descriptor pointing to an L3 table with 512 × 4KB page entries.
+Each 4KB page can then have independent permissions. This is triggered by:
+- `sys_mmap` MAP_FIXED: when the fixed address lands in a block with different
+  permissions (e.g., dynamic linker overlaying .data RW onto library .text RX)
+- `sys_mprotect`: when changing permissions for a sub-block range (e.g., RELRO)
+
+The `guest_update_perms()` function handles the full workflow: checking if a
+block needs splitting, splitting it, then updating individual L3 page entries.
+Whole-block permission changes are done in place without splitting.
+
+mmap uses dual bump allocators: PROT_EXEC allocations go to the RX region
+(MMAP_RX_BASE=0x20000000), others to the RW region (MMAP_BASE=0x10000000).
+This ensures .text and .data land in different 2MB blocks when possible;
+L3 splitting handles the cases where they share a block.
 
 ## Implemented Syscalls (~130 total)
 
@@ -255,24 +289,25 @@ mappings.
 ## Memory Layout
 
 ```
-0x00010000  - 0x000FFFFF:   Page table pool (960KB)
-0x00100000  - 0x001FFFFF:   Shim code (2MB block, RX)
-0x00200000  - 0x003FFFFF:   Shim data/stack (2MB block, RW)
-0x00400000  - varies:        ELF LOAD segments
-0x01000000:                  brk base (16MB)
-0x07E00000  - 0x07FFFFFF:   Stack (2MB block, RW, grows down from 0x08000000)
-0x10000000  - 0x1FFFFFFF:   mmap region (initial 256MB, pre-mapped RW)
-0x20000000  - 0x3FFFFFFF:   mmap growth area
-0x40000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
-varies      - 0xFFFFFFFF:   Additional mmap growth area
+0x000010000  - 0x0000FFFFF:  Page table pool (960KB)
+0x000100000  - 0x0001FFFFF:  Shim code (2MB block, RX)
+0x000200000  - 0x0003FFFFF:  Shim data/stack (2MB block, RW)
+0x000400000  - varies:        ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
+0x001000000:                  brk base (16MB)
+0x007E00000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
+0x010000000  - 0x01FFFFFFF:  mmap RW region (initial 256MB, pre-mapped RW)
+0x020000000  - 0x02FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
+0x030000000  - 0x1FFFFFFFF:  mmap growth area (RW or RX, up to 8GB)
+0x200000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
 ```
 
-Total: 4GB address space reserved via mmap(MAP_ANON). macOS demand-pages
-physical memory on first touch, so only used pages consume RAM. The initial
-512MB region is pre-mapped in page tables; additional 2MB blocks are mapped
-dynamically by guest_extend_page_tables() when sys_mmap/sys_brk exceeds the
-current limit. The shim flushes the TLB (via TLBI VMALLE1IS) when X8 is
-set non-zero after HVC #5 return.
+Total: 32GB address space reserved via mmap(MAP_ANON) (fits in one L0 page
+table entry = 512GB). macOS demand-pages physical memory on first touch, so
+only used pages consume RAM. The initial 512MB region is pre-mapped in page
+tables; additional 2MB blocks are mapped dynamically by
+guest_extend_page_tables() when sys_mmap/sys_brk exceeds the current limit.
+The shim flushes the TLB (via TLBI VMALLE1IS) when X8 is set non-zero after
+HVC #5 return.
 
 ## Dynamic Page Table Extension (TLBI Protocol)
 
@@ -301,3 +336,112 @@ Socket syscalls are translated in `syscall_net.c/.h`. Key translations:
   SOCK_CLOEXEC(0x80000) into the type argument; must extract before socket()
 - **SOL_SOCKET options**: SO_TYPE, SO_SNDBUF, SO_RCVBUF etc. have different
   numeric values on Linux vs macOS
+
+## Multi-threading Architecture (Future)
+
+### HVF Multi-vCPU Support (VERIFIED)
+
+Apple's Hypervisor.framework API supports multiple vCPUs per VM — QEMU, UTM,
+and cloud-hypervisor all use this. Each vCPU is bound to the host thread that
+created it (all register/run ops must happen on that thread). Multiple vCPUs
+share the same guest physical memory via `hv_vm_map()`.
+
+**Verified in hl** via `test/test-multi-vcpu.c` (5/5 tests pass):
+
+| Test | Result | What it proves |
+|------|--------|----------------|
+| Dual vCPU creation | PASS | `hv_vcpu_create()` works twice in one VM |
+| Shared memory writes | PASS | Two vCPUs write to the same guest RAM concurrently |
+| Separate SP_EL1 stacks | PASS | Per-vCPU EL1 stacks work with concurrent SVCs |
+| Register preservation | PASS | Callee-saved regs (X19/X20) survive SVC with 2 vCPUs |
+| TLBI broadcast | PASS | `TLBI VMALLE1IS` from one vCPU invalidates the other's TLB |
+
+Our current architecture is strictly single-vCPU: `guest_t` holds one
+`hv_vcpu_t` and one `hv_vcpu_exit_t *`. Fork uses `posix_spawn` to create
+entirely separate macOS processes (each with its own VM) because processes
+don't share address space. Threading is fundamentally different — threads
+share memory, so they need multiple vCPUs in ONE VM.
+
+**Run validation:** `make test-multi-vcpu`
+
+### Minimum Viable Threading: clone(CLONE_THREAD) + futex
+
+**Thread table** (`syscall_proc.c`, ~80 LOC):
+```c
+typedef struct {
+    int64_t guest_tid;       /* Linux TID */
+    hv_vcpu_t vcpu;          /* HVF vCPU handle */
+    hv_vcpu_exit_t *vexit;   /* vCPU exit info */
+    pthread_t host_thread;   /* One macOS thread per guest thread */
+    uint64_t tpidr_el0;      /* Thread-local storage pointer */
+    int active;              /* Whether thread is running */
+} thread_entry_t;
+```
+
+**Futex implementation** (`futex.c/h`, ~400 LOC):
+- Hash table of futex addresses → wait queues
+- FUTEX_WAIT: compare guest word, then `pthread_cond_timedwait`
+- FUTEX_WAKE: signal N waiters via `pthread_cond_signal`
+- FUTEX_WAIT_BITSET, FUTEX_CMP_REQUEUE for pthread_mutex/cond
+
+**sys_clone with CLONE_THREAD** (`fork_ipc.c`, ~200 LOC):
+1. `hv_vcpu_create()` for new vCPU
+2. Set SP to `child_stack`, TPIDR_EL0 to `tls` arg
+3. Copy parent's GPRs, set X0=0 in child
+4. `pthread_create()` running `vcpu_run_loop()` for child vCPU
+5. Return child TID to parent
+
+**Shared state requiring locks** (~150 LOC across files):
+
+| Resource | Lock type | File |
+|----------|-----------|------|
+| mmap allocator (mmap_next, mmap_rx_next) | pthread_mutex | syscall.c |
+| brk allocator (brk_current) | pthread_mutex | syscall.c |
+| Page table pool (pt_pool_next) | pthread_mutex | guest.c |
+| FD table | pthread_rwlock | syscall.c |
+| Signal handlers | pthread_mutex | syscall_signal.c |
+
+**Shim: no changes needed** — each vCPU has its own register state; the
+SVC→HVC forwarding in shim.S is stateless per-CPU.
+
+### Challenges
+
+0. **guest_t is single-vCPU**: `guest_t` stores one `vcpu` and one `*exit`.
+   Threading requires either a thread table alongside `guest_t`, or
+   refactoring `guest_t` to separate VM state (shared) from vCPU state
+   (per-thread). Most syscall handlers take `guest_t *g` and read
+   `g->vcpu` — all of these would need to take a per-thread vCPU context.
+
+1. **Futex atomicity**: The compare-and-wait must be atomic w.r.t. guest
+   memory writes. Race between reading the futex word and enqueuing the
+   waiter requires careful locking.
+
+2. **Page table consistency**: One thread doing mmap while others execute.
+   After modifying page tables, must TLBI on ALL vCPUs (IPI-like broadcast).
+   HVF may handle this via hardware coherency, but needs verification.
+
+3. **Signal routing**: POSIX says process-directed signals go to any thread
+   that doesn't block them. Need per-thread signal masks and routing logic.
+
+4. **Thread exit + CLONE_CHILD_CLEARTID**: Must write 0 to `ctid` and do
+   FUTEX_WAKE — this is how `pthread_join` works.
+
+5. **exit_group**: Must terminate all threads, not just the caller.
+
+### Estimated Effort (~1100 LOC total)
+
+| Component | LOC | Complexity |
+|-----------|-----|------------|
+| Thread table + gettid | 80 | Low |
+| sys_clone CLONE_THREAD | 200 | Medium |
+| futex (WAIT/WAKE/WAIT_BITSET/CMP_REQUEUE) | 400 | High |
+| Locks on shared state | 150 | Low |
+| Per-thread signal masks | 150 | Medium |
+| exit_group + thread cleanup | 100 | Medium |
+
+### Deferred (not needed for MVP)
+
+- Robust futexes (set_robust_list) — cleanup on thread crash
+- PI futexes (priority inheritance) — real-time only
+- CPU affinity (sched_setaffinity) — single-socket Apple Silicon
+- clone3 — newer API, musl still uses clone()

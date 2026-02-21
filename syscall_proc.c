@@ -13,6 +13,8 @@
 #include "syscall_proc.h"
 #include "syscall_internal.h"
 #include "syscall_signal.h"
+#include "thread.h"
+#include "futex.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -58,6 +61,13 @@ static char sysroot_path[LINUX_PATH_MAX] = {0};
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
+static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Global flag for exit_group: signals all threads to terminate */
+volatile int exit_group_requested = 0;
+
+/* Exit code set by the thread that calls exit_group */
+int exit_group_code = 0;
 
 /* ---------- Public API ---------- */
 
@@ -66,6 +76,8 @@ void proc_init(void) {
     parent_pid = 0;
     next_guest_pid = 2;
     memset(proc_table, 0, sizeof(proc_table));
+    thread_init();
+    futex_init();
 }
 
 int64_t proc_get_pid(void) {
@@ -153,7 +165,10 @@ void proc_set_identity(int64_t pid, int64_t ppid) {
 }
 
 int64_t proc_alloc_pid(void) {
-    return next_guest_pid++;
+    pthread_mutex_lock(&pid_lock);
+    int64_t pid = next_guest_pid++;
+    pthread_mutex_unlock(&pid_lock);
+    return pid;
 }
 
 void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
@@ -567,6 +582,147 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     /* Clean up timeout */
     signal(SIGALRM, SIG_DFL);
     alarm(0);
+
+    return exit_code;
+}
+
+/* Worker-thread vCPU run loop. Unlike the main loop, workers do NOT
+ * use alarm() for timeout (SIGALRM is process-wide and would conflict).
+ * Instead, workers are terminated by exit_group setting exit_group_requested
+ * and calling hv_vcpus_exit() to cancel pending hv_vcpu_run calls. */
+int vcpu_run_loop_worker(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+                         guest_t *g, int verbose) {
+    int exit_code = 0;
+    int running = 1;
+
+    while (running) {
+        /* Check if another thread called exit_group */
+        if (exit_group_requested) {
+            exit_code = exit_group_code;
+            break;
+        }
+
+        HV_CHECK(hv_vcpu_run(vcpu));
+
+        /* Re-check after waking from hv_vcpu_run */
+        if (exit_group_requested) {
+            exit_code = exit_group_code;
+            break;
+        }
+
+        if (vexit->reason == HV_EXIT_REASON_EXCEPTION) {
+            uint32_t ec = (vexit->exception.syndrome >> 26) & 0x3F;
+
+            if (ec == 0x16) {
+                uint16_t imm = vexit->exception.syndrome & 0xFFFF;
+
+                switch (imm) {
+                case 5: {
+                    /* HVC #5: Linux syscall forwarding */
+                    int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
+                    if (ret == 1)
+                        running = 0;
+
+                    /* Check guest ITIMER_REAL expiry */
+                    signal_check_timer();
+
+                    /* Deliver pending signals after each syscall */
+                    if (running && signal_pending()) {
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        if (sig_ret < 0)
+                            running = 0;
+                    }
+                    break;
+                }
+
+                case 0: {
+                    /* HVC #0: Normal exit */
+                    uint64_t x0;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+                    exit_code = (int)x0;
+                    running = 0;
+                    break;
+                }
+
+                case 4: {
+                    /* HVC #4: Set system register */
+                    uint64_t reg_id, value;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &reg_id);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &value);
+
+                    hv_sys_reg_t hv_reg;
+                    switch ((int)reg_id) {
+                    case 0: hv_reg = HV_SYS_REG_VBAR_EL1; break;
+                    case 1: hv_reg = HV_SYS_REG_MAIR_EL1; break;
+                    case 2: hv_reg = HV_SYS_REG_TCR_EL1;  break;
+                    case 3: hv_reg = HV_SYS_REG_TTBR0_EL1; break;
+                    case 4: hv_reg = HV_SYS_REG_SCTLR_EL1; break;
+                    case 5: hv_reg = HV_SYS_REG_CPACR_EL1; break;
+                    case 6: hv_reg = HV_SYS_REG_ELR_EL1; break;
+                    case 7: hv_reg = HV_SYS_REG_SPSR_EL1; break;
+                    case 8: hv_reg = HV_SYS_REG_TTBR1_EL1; break;
+                    default:
+                        fprintf(stderr, "hl: worker HVC #4 unknown reg %llu\n",
+                                (unsigned long long)reg_id);
+                        exit_code = 128;
+                        running = 0;
+                        continue;
+                    }
+                    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, hv_reg, value));
+                    break;
+                }
+
+                case 2: {
+                    /* HVC #2: Bad exception */
+                    uint64_t x0, x1, x2, x3, x5;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X5, &x5);
+                    fprintf(stderr, "hl: worker exception vec=0x%03llx "
+                            "ESR=0x%llx FAR=0x%llx ELR=0x%llx SPSR=0x%llx\n",
+                            (unsigned long long)x5,
+                            (unsigned long long)x0,
+                            (unsigned long long)x1,
+                            (unsigned long long)x2,
+                            (unsigned long long)x3);
+                    exit_code = 128;
+                    running = 0;
+                    break;
+                }
+
+                default:
+                    fprintf(stderr, "hl: worker unexpected HVC #%u\n", imm);
+                    exit_code = 128;
+                    running = 0;
+                    break;
+                }
+            } else if (ec == 0x01) {
+                /* WFI/WFE trapped — just continue */
+            } else {
+                fprintf(stderr, "hl: worker unexpected exception EC=0x%x "
+                        "syndrome=0x%llx\n", ec,
+                        (unsigned long long)vexit->exception.syndrome);
+                exit_code = 128;
+                running = 0;
+            }
+        } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
+            /* Canceled by exit_group via hv_vcpus_exit */
+            if (exit_group_requested) {
+                exit_code = exit_group_code;
+            } else {
+                fprintf(stderr, "hl: worker vCPU canceled unexpectedly\n");
+                exit_code = 128;
+            }
+            break;
+        } else {
+            fprintf(stderr, "hl: worker unexpected exit reason 0x%x\n",
+                    vexit->reason);
+            exit_code = 128;
+            running = 0;
+        }
+    }
 
     return exit_code;
 }

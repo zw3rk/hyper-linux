@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -47,15 +48,23 @@
 
 /* ---------- Page table pool allocator ---------- */
 
+/* Protects the page table pool bump allocator. Multiple threads may
+ * trigger page table extension concurrently (via mmap/brk/mprotect). */
+static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Allocate a zeroed 4KB page from the page table pool.
- * Returns GPA of the page, or 0 on pool exhaustion. */
+ * Returns GPA of the page, or 0 on pool exhaustion.
+ * Caller must hold pt_lock or the higher-level mmap_lock. */
 static uint64_t pt_alloc_page(guest_t *g) {
+    pthread_mutex_lock(&pt_lock);
     if (g->pt_pool_next + PAGE_SIZE > PT_POOL_END) {
         fprintf(stderr, "guest: page table pool exhausted\n");
+        pthread_mutex_unlock(&pt_lock);
         return 0;
     }
     uint64_t gpa = g->pt_pool_next;
     g->pt_pool_next += PAGE_SIZE;
+    pthread_mutex_unlock(&pt_lock);
     /* Zero the page in host memory */
     memset((uint8_t *)g->host_base + gpa, 0, PAGE_SIZE);
     return gpa;

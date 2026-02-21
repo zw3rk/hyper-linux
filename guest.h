@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
- * host buffer). A 4GB address space is reserved via mmap(MAP_ANON) (macOS
- * demand-pages physical memory on first touch). The slab is mapped RWX to
- * Hypervisor.framework; fine-grained permissions are enforced by the guest's
- * own page tables built from mem_region descriptors. Page tables can be
- * extended at runtime (e.g. when mmap/brk grows beyond initial mappings).
+ * host buffer). A 32GB address space is reserved via mmap(MAP_ANON) (macOS
+ * demand-pages physical memory on first touch, so unused pages cost nothing).
+ * The slab is mapped RWX to Hypervisor.framework; fine-grained permissions
+ * are enforced by the guest's own page tables built from mem_region
+ * descriptors. Page tables can be extended at runtime (e.g. when mmap/brk
+ * grows beyond initial mappings).
  */
 #ifndef GUEST_H
 #define GUEST_H
@@ -18,7 +19,7 @@
 #include <stddef.h>
 
 /* ---------- Memory layout constants ---------- */
-#define GUEST_MEM_SIZE       0x100000000ULL  /* 4GB total guest address space */
+#define GUEST_MEM_SIZE       0x800000000ULL  /* 32GB total guest address space (one L0 entry) */
 #define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
 #define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
 #define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
@@ -32,8 +33,8 @@
 #define MMAP_INITIAL_END     0x20000000ULL   /* Initial pre-mapped mmap RW end (256MB) */
 #define MMAP_RX_BASE         0x20000000ULL   /* mmap RX region start (for PROT_EXEC) */
 #define MMAP_RX_INITIAL_END  0x30000000ULL   /* Initial pre-mapped mmap RX end (256MB) */
-#define INTERP_LOAD_BASE     0x40000000ULL   /* Dynamic linker load base (1GB) */
-#define MMAP_END             0x40000000ULL   /* Max mmap region end (up to interp base) */
+#define INTERP_LOAD_BASE     0x200000000ULL  /* Dynamic linker load base (8GB) */
+#define MMAP_END             0x200000000ULL  /* Max mmap region end (8GB, up to interp base) */
 #define BLOCK_2MB            (2ULL * 1024 * 1024)
 
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.

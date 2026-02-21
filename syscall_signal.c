@@ -18,10 +18,16 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/time.h>
 
-/* ---------- Signal state (module-level, single-process model) ---------- */
+/* ---------- Signal state (module-level, process-wide) ---------- */
 static signal_state_t sig_state;
+
+/* Protects signal actions array. Multiple threads may call rt_sigaction
+ * concurrently (e.g., during musl init). Pending/blocked masks are
+ * process-wide for the MVP; per-thread masks are deferred. */
+static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------- Guest ITIMER_REAL emulation ----------
  * We emulate the guest's ITIMER_REAL internally rather than forwarding to
@@ -237,21 +243,28 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
 
     int idx = signum - 1;
 
+    pthread_mutex_lock(&sig_lock);
+
     /* Return old action if requested */
     if (oldact_gva) {
         if (guest_write(g, oldact_gva, &sig_state.actions[idx],
-                        sizeof(linux_sigaction_t)) < 0)
+                        sizeof(linux_sigaction_t)) < 0) {
+            pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
+        }
     }
 
     /* Install new action if provided */
     if (act_gva) {
         linux_sigaction_t act;
-        if (guest_read(g, act_gva, &act, sizeof(act)) < 0)
+        if (guest_read(g, act_gva, &act, sizeof(act)) < 0) {
+            pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
+        }
         sig_state.actions[idx] = act;
     }
 
+    pthread_mutex_unlock(&sig_lock);
     return 0;
 }
 

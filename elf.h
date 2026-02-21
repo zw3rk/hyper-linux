@@ -130,4 +130,13 @@ int elf_map_segments(const elf_info_t *info, const char *path,
                      void *guest_base, uint64_t guest_size,
                      uint64_t load_base);
 
+/* Resolve a PT_INTERP path against a sysroot directory.
+ * Tries three strategies:
+ *   1. sysroot + interp_path  (standard /lib/ld-musl-*.so.1)
+ *   2. sysroot/lib/basename(interp_path)  (nix store paths)
+ *   3. interp_path as-is  (no sysroot or fallback)
+ * Writes the resolved path into out (must be at least out_sz bytes). */
+void elf_resolve_interp(const char *sysroot, const char *interp_path,
+                        char *out, size_t out_sz);
+
 #endif /* ELF_H */

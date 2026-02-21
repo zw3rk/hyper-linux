@@ -143,6 +143,45 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         return -LINUX_ENOEXEC;
     }
 
+    /* Step 7b: Load interpreter if the new binary is dynamically linked */
+    elf_info_t interp_info;
+    uint64_t interp_base = 0;
+    memset(&interp_info, 0, sizeof(interp_info));
+
+    if (elf_info.interp_path[0] != '\0') {
+        const char *sr = proc_get_sysroot();
+        char interp_resolved[LINUX_PATH_MAX];
+        elf_resolve_interp(sr, elf_info.interp_path,
+                           interp_resolved, sizeof(interp_resolved));
+
+        if (verbose)
+            fprintf(stderr, "hl: execve: loading interpreter: %s\n",
+                    interp_resolved);
+
+        if (elf_load(interp_resolved, &interp_info) < 0) {
+            fprintf(stderr, "hl: execve: failed to load interpreter: %s\n",
+                    interp_resolved);
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+
+        interp_base = INTERP_LOAD_BASE;
+        if (elf_map_segments(&interp_info, interp_resolved,
+                             g->host_base, g->guest_size, interp_base) < 0) {
+            fprintf(stderr, "hl: execve: failed to map interpreter segments\n");
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+
+        if (verbose) {
+            fprintf(stderr, "hl: execve: interpreter at base=0x%llx, "
+                    "entry=0x%llx, %d segments\n",
+                    (unsigned long long)interp_base,
+                    (unsigned long long)(interp_info.entry + interp_base),
+                    interp_info.num_segments);
+        }
+    }
+
     /* Set brk base after the highest loaded segment */
     uint64_t brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
     if (brk_start < BRK_BASE_DEFAULT)
@@ -151,7 +190,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     g->brk_current = brk_start;
 
     /* Step 8: Rebuild page tables */
-    #define MAX_REGIONS 16
+    #define MAX_REGIONS 32
     mem_region_t regions[MAX_REGIONS];
     int nregions = 0;
 
@@ -178,6 +217,19 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         regions[nregions++] = (mem_region_t){
             .gpa_start = elf_info.segments[i].gpa + elf_load_base,
             .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
+            .perms     = perms
+        };
+    }
+
+    /* Interpreter segments (if dynamically linked) */
+    for (int i = 0; i < interp_info.num_segments; i++) {
+        if (nregions >= MAX_REGIONS) break;
+        int perms = MEM_PERM_R;
+        if (interp_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
+        if (interp_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
+        regions[nregions++] = (mem_region_t){
+            .gpa_start = interp_info.segments[i].gpa + interp_base,
+            .gpa_end   = interp_info.segments[i].gpa + interp_info.segments[i].memsz + interp_base,
             .perms     = perms
         };
     }
@@ -235,20 +287,40 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                          seg_prot, LINUX_MAP_PRIVATE,
                          elf_info.segments[i].offset, path);
     }
+    /* Interpreter semantic regions */
+    if (interp_info.num_segments > 0) {
+        char interp_resolved[LINUX_PATH_MAX];
+        elf_resolve_interp(proc_get_sysroot(), elf_info.interp_path,
+                           interp_resolved, sizeof(interp_resolved));
+        for (int i = 0; i < interp_info.num_segments; i++) {
+            int seg_prot = LINUX_PROT_READ;
+            if (interp_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
+            if (interp_info.segments[i].flags & PF_X) seg_prot |= LINUX_PROT_EXEC;
+            guest_region_add(g, interp_info.segments[i].gpa + interp_base,
+                             interp_info.segments[i].gpa + interp_info.segments[i].memsz + interp_base,
+                             seg_prot, LINUX_MAP_PRIVATE,
+                             interp_info.segments[i].offset, interp_resolved);
+        }
+    }
     guest_region_add(g, STACK_BASE, STACK_TOP,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
 
-    /* Step 9: Build new stack with new argv/envp */
+    /* Step 9: Build new stack with new argv/envp.
+     * Pass interp_base so AT_BASE is set for the dynamic linker. */
     const char **argv_const = (const char **)argv;
     const char **envp_const = (const char **)envp;
     uint64_t sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
                                      envp_const, &elf_info,
-                                     elf_load_base, 0);
+                                     elf_load_base, interp_base);
 
-    /* Step 10: Set vCPU state for new process */
-    uint64_t entry_ipa = guest_ipa(g, elf_info.entry + elf_load_base);
+    /* Step 10: Set vCPU state for new process.
+     * Entry point: interpreter if dynamic, ELF entry if static. */
+    uint64_t entry_point = (interp_base != 0)
+        ? (interp_info.entry + interp_base)
+        : (elf_info.entry + elf_load_base);
+    uint64_t entry_ipa = guest_ipa(g, entry_point);
     uint64_t sp_ipa    = guest_ipa(g, sp);
 
     /* Write TTBR0 to vCPU */

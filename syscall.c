@@ -29,6 +29,8 @@
 #include "fork_ipc.h"
 #include "syscall_signal.h"
 #include "syscall_net.h"
+#include "futex.h"
+#include "thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,8 +39,20 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+
+/* ---------- Thread-safety locks ---------- */
+
+/* Protects mmap/brk bump allocators and page table extension. Multiple
+ * threads may call mmap/brk concurrently; without this lock they could
+ * get overlapping allocations or corrupt page table structures. */
+static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close).
+ * File descriptor operations from concurrent threads must be serialized. */
+static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------- FD table ---------- */
 fd_entry_t fd_table[FD_TABLE_SIZE];
@@ -57,37 +71,45 @@ void syscall_init(void) {
 
 /* Allocate the lowest available FD. Returns -1 if table is full. */
 int fd_alloc(int type, int host_fd) {
+    pthread_mutex_lock(&fd_lock);
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) {
             fd_table[i].type = type;
             fd_table[i].host_fd = host_fd;
+            pthread_mutex_unlock(&fd_lock);
             return i;
         }
     }
+    pthread_mutex_unlock(&fd_lock);
     return -1;
 }
 
 /* Allocate the lowest available FD >= minfd. Returns -1 if none available. */
 int fd_alloc_from(int minfd, int type, int host_fd) {
     if (minfd < 0) minfd = 0;
+    pthread_mutex_lock(&fd_lock);
     for (int i = minfd; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) {
             fd_table[i].type = type;
             fd_table[i].host_fd = host_fd;
+            pthread_mutex_unlock(&fd_lock);
             return i;
         }
     }
+    pthread_mutex_unlock(&fd_lock);
     return -1;
 }
 
 /* Allocate a specific FD slot. Returns -1 if out of range. */
 int fd_alloc_at(int fd, int type, int host_fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -1;
+    pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
         close(fd_table[fd].host_fd);
     }
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
+    pthread_mutex_unlock(&fd_lock);
     return fd;
 }
 
@@ -356,6 +378,17 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
     return (int64_t)guest_ipa(g, result_off);
 }
 
+/* ---------- exit_group helper ---------- */
+
+/* Callback for thread_for_each: force-exit each worker vCPU.
+ * Skips the calling thread (main thread, handled by should_exit). */
+static void thread_force_exit_cb(thread_entry_t *t, void *ctx) {
+    (void)ctx;
+    /* Don't force-exit our own vCPU — we handle that via should_exit */
+    if (t == current_thread) return;
+    hv_vcpus_exit(&t->vcpu, 1);
+}
+
 /* ---------- Main dispatch ---------- */
 
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
@@ -387,13 +420,27 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_write(g, (int)x0, x1, x2);
         break;
     case SYS_exit:
+        /* Per-thread exit: if multiple threads are active, only this one
+         * exits. CLONE_CHILD_CLEARTID cleanup is handled by the worker
+         * thread after vcpu_run_loop_worker returns. The main thread falls
+         * through to normal process exit. */
         *exit_code = (int)x0;
         should_exit = 1;
         break;
-    case SYS_exit_group:
+    case SYS_exit_group: {
+        /* Terminate all threads. Set the global flag and force-exit all
+         * worker vCPUs so they break out of hv_vcpu_run. */
+        exit_group_code = (int)x0;
+        exit_group_requested = 1;
+
+        /* Force-cancel all worker vCPUs. The main thread's vCPU is
+         * handled by the normal should_exit path below. */
+        thread_for_each(thread_force_exit_cb, NULL);
+
         *exit_code = (int)x0;
         should_exit = 1;
         break;
+    }
 
     /* ---- Tier 2: musl static hello world ---- */
     case SYS_read:
@@ -427,7 +474,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_newfstatat(g, (int)x0, x1, x2, (int)x3);
         break;
     case SYS_set_tid_address:
-        result = proc_get_pid();
+        if (current_thread) {
+            current_thread->clear_child_tid = x0;
+            result = current_thread->guest_tid;
+        } else {
+            result = proc_get_pid();
+        }
         break;
     case SYS_clock_gettime:
         result = sys_clock_gettime(g, (int)x0, x1);
@@ -445,18 +497,23 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = proc_get_pid();
         break;
     case SYS_gettid:
-        result = proc_get_pid();
+        result = current_thread ? current_thread->guest_tid : proc_get_pid();
         break;
     case SYS_brk:
+        pthread_mutex_lock(&mmap_lock);
         result = sys_brk(g, x0);
+        pthread_mutex_unlock(&mmap_lock);
         break;
     case SYS_mmap:
+        pthread_mutex_lock(&mmap_lock);
         result = sys_mmap(g, x0, x1, (int)x2, (int)x3, (int)x4, (int64_t)x5);
+        pthread_mutex_unlock(&mmap_lock);
         break;
     case SYS_munmap: {
         /* Convert IPA-based addr to offset for region tracking */
         uint64_t unmap_off = x0 - g->ipa_base;
         uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
+        pthread_mutex_lock(&mmap_lock);
         if (unmap_off + unmap_len <= g->guest_size) {
             /* Zero the memory (security: prevent data leaks) */
             memset((uint8_t *)g->host_base + unmap_off, 0, unmap_len);
@@ -465,6 +522,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
              * The bump allocator doesn't reuse freed mmap space. */
             guest_region_remove(g, unmap_off, unmap_off + unmap_len);
         }
+        pthread_mutex_unlock(&mmap_lock);
         result = 0;
         break;
     }
@@ -473,6 +531,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         uint64_t mprot_off = x0 - g->ipa_base;
         uint64_t mprot_len = (x1 + 4095) & ~4095ULL;
         int mprot_prot = (int)x2;
+        pthread_mutex_lock(&mmap_lock);
         if (mprot_off + mprot_len <= g->guest_size) {
             /* Update region tracking with new protection bits */
             guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
@@ -487,6 +546,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             guest_update_perms(g, mprot_off, mprot_off + mprot_len,
                                page_perms);
         }
+        pthread_mutex_unlock(&mmap_lock);
         result = 0;
         break;
     }
@@ -651,11 +711,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_utimensat(g, (int)x0, x1, x2, (int)x3);
         break;
     case SYS_futex:
-        /* Single-threaded stub: WAKE returns 0, WAIT returns -EAGAIN */
-        if (((int)x1 & 0x7F) == LINUX_FUTEX_WAKE)
-            result = 0;
-        else
-            result = -LINUX_EAGAIN;
+        result = sys_futex(g, x0, (int)x1, (uint32_t)x2,
+                           x3, x4, (uint32_t)x5);
         break;
     case SYS_set_robust_list:
         result = 0;  /* Stub: single-threaded, no robust futexes */
@@ -746,8 +803,14 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_tgkill: {
         int sig = (int)x2;
         int tid = (int)x1;
-        int64_t our_pid = proc_get_pid();
-        if (tid == (int)our_pid) {
+        /* Accept tgkill targeting any active thread in our process */
+        thread_entry_t *target = thread_find((int64_t)tid);
+        if (!target) {
+            /* Fall back to checking main PID for compatibility */
+            int64_t our_pid = proc_get_pid();
+            if (tid == (int)our_pid) target = current_thread;
+        }
+        if (target) {
             if (sig > 0) signal_queue(sig);
             result = 0;
         } else {

@@ -98,12 +98,33 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                    uint64_t infop_gva, int options);
 
+/* ---------- exit_group coordination ---------- */
+
+/* Global flag for exit_group: signals all threads to terminate.
+ * Set by the thread calling SYS_exit_group; checked by worker
+ * threads in their run loop to break out after hv_vcpu_run.
+ * Using volatile int instead of sig_atomic_t to avoid pulling in
+ * <signal.h> which defines sa_handler as a macro (conflicts with
+ * our linux_sigaction_t struct field). */
+extern volatile int exit_group_requested;
+
+/* Exit code set by the thread that calls exit_group, so workers
+ * can return the same code. */
+extern int exit_group_code;
+
 /* ---------- vCPU run loop ---------- */
 
 /* Run the vCPU execution loop. Returns the exit code.
  * This is extracted from hl.c main() so both normal execution
- * and fork-child mode can share the same loop logic. */
+ * and fork-child mode can share the same loop logic.
+ * When is_worker is non-zero, alarm() timeout is skipped (workers
+ * are terminated by exit_group via hv_vcpus_exit instead). */
 int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                   guest_t *g, int verbose, int timeout_sec);
+
+/* Worker-thread variant of vcpu_run_loop. Same as above but skips
+ * alarm() setup and checks exit_group_requested after each iteration. */
+int vcpu_run_loop_worker(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+                         guest_t *g, int verbose);
 
 #endif /* SYSCALL_PROC_H */

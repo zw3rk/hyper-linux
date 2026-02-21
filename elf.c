@@ -250,3 +250,24 @@ int elf_map_segments(const elf_info_t *info, const char *path,
     fclose(f);
     return 0;
 }
+
+void elf_resolve_interp(const char *sysroot, const char *interp_path,
+                        char *out, size_t out_sz) {
+    if (sysroot) {
+        /* Strategy 1: sysroot + full interp path */
+        snprintf(out, out_sz, "%s%s", sysroot, interp_path);
+        if (access(out, F_OK) == 0)
+            return;
+
+        /* Strategy 2: sysroot/lib/basename — handles nix store paths
+         * like /nix/store/...-musl-1.2.5/lib/ld-musl-aarch64.so.1 */
+        const char *base = strrchr(interp_path, '/');
+        base = base ? base + 1 : interp_path;
+        snprintf(out, out_sz, "%s/lib/%s", sysroot, base);
+        if (access(out, F_OK) == 0)
+            return;
+    }
+    /* Strategy 3: use interp_path as-is */
+    strncpy(out, interp_path, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}

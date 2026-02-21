@@ -13,6 +13,8 @@
 #include "syscall.h"         /* syscall_init, FD_CLOSED, FD_STDIO, etc. */
 #include "syscall_signal.h"  /* signal_get_state, signal_set_state, signal_state_t */
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
+#include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
+#include "futex.h"           /* futex_wake_one */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -489,17 +491,246 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
 /* ---------- sys_clone ---------- */
 
 /* Linux clone flags */
-#define LINUX_CLONE_VM       0x00000100
-#define LINUX_CLONE_VFORK    0x00004000
-#define LINUX_SIGCHLD        17
+#define LINUX_CLONE_VM             0x00000100
+#define LINUX_CLONE_VFORK          0x00004000
+#define LINUX_CLONE_THREAD         0x00010000
+#define LINUX_CLONE_SETTLS         0x00080000
+#define LINUX_CLONE_PARENT_SETTID  0x00100000
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
+#define LINUX_CLONE_CHILD_SETTID   0x01000000
+#define LINUX_SIGCHLD              17
+
+/* ---------- CLONE_THREAD: create a new guest thread in the same VM ---------- */
+
+/* Arguments passed to the worker pthread. Allocated by sys_clone_thread,
+ * freed by the worker after vCPU creation and register setup. */
+typedef struct {
+    thread_entry_t *thread;
+    guest_t        *guest;
+    int             verbose;
+    uint64_t        child_stack;
+    uint64_t        flags;
+    uint64_t        tls;
+    /* Parent system regs to copy into the new vCPU */
+    uint64_t        elr, spsr, vbar, ttbr0, sctlr, tcr, mair, cpacr;
+    uint64_t        tpidr;
+    uint64_t        gprs[31];
+    uint64_t        sp_el1;
+} thread_create_args_t;
+
+/* Forward declaration — worker entry runs after sys_clone_thread */
+static void *thread_create_and_run(void *arg);
+
+static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
+                                uint64_t flags, uint64_t child_stack,
+                                uint64_t ptid_gva, uint64_t tls,
+                                uint64_t ctid_gva, int verbose) {
+    /* Allocate guest TID */
+    int64_t child_tid = proc_alloc_pid();
+
+    /* Allocate thread table slot */
+    thread_entry_t *t = thread_alloc(child_tid);
+    if (!t) {
+        fprintf(stderr, "hl: clone_thread: thread table full\n");
+        return -LINUX_EAGAIN;
+    }
+
+    /* Allocate per-thread EL1 stack */
+    uint64_t child_sp_el1 = thread_alloc_sp_el1();
+    if (child_sp_el1 == 0) {
+        thread_deactivate(t);
+        return -LINUX_ENOMEM;
+    }
+    t->sp_el1 = child_sp_el1;
+
+    /* Capture parent register state before spawning worker.
+     * HVF binds vCPU to the creating thread, so the worker must call
+     * hv_vcpu_create itself. We pass all parent state via the args. */
+    uint64_t parent_elr, parent_spsr, parent_vbar, parent_ttbr0;
+    uint64_t parent_sctlr, parent_tcr, parent_mair, parent_cpacr;
+    uint64_t parent_tpidr;
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_ELR_EL1, &parent_elr);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_SPSR_EL1, &parent_spsr);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_VBAR_EL1, &parent_vbar);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TTBR0_EL1, &parent_ttbr0);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_SCTLR_EL1, &parent_sctlr);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TCR_EL1, &parent_tcr);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_MAIR_EL1, &parent_mair);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_CPACR_EL1, &parent_cpacr);
+    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TPIDR_EL0, &parent_tpidr);
+
+    uint64_t parent_gprs[31];
+    for (int i = 0; i < 31; i++)
+        hv_vcpu_get_reg(parent_vcpu, HV_REG_X0 + i, &parent_gprs[i]);
+
+    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    if (!tca) {
+        thread_deactivate(t);
+        return -LINUX_ENOMEM;
+    }
+
+    tca->thread      = t;
+    tca->guest       = g;
+    tca->verbose     = verbose;
+    tca->child_stack = child_stack;
+    tca->flags       = flags;
+    tca->tls         = tls;
+    tca->elr         = parent_elr;
+    tca->spsr        = parent_spsr;
+    tca->vbar        = parent_vbar;
+    tca->ttbr0       = parent_ttbr0;
+    tca->sctlr       = parent_sctlr;
+    tca->tcr         = parent_tcr;
+    tca->mair        = parent_mair;
+    tca->cpacr       = parent_cpacr;
+    tca->tpidr       = parent_tpidr;
+    memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
+    tca->sp_el1      = child_sp_el1;
+
+    /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        int32_t tid32 = (int32_t)child_tid;
+        guest_write(g, ptid_gva, &tid32, sizeof(tid32));
+    }
+
+    /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
+    if (flags & LINUX_CLONE_CHILD_CLEARTID) {
+        t->clear_child_tid = ctid_gva;
+    }
+
+    /* CLONE_CHILD_SETTID: write child TID to the child's ctid address.
+     * This writes into shared guest memory (visible to child thread). */
+    if (flags & LINUX_CLONE_CHILD_SETTID) {
+        int32_t tid32 = (int32_t)child_tid;
+        guest_write(g, ctid_gva, &tid32, sizeof(tid32));
+    }
+
+    /* Create the host pthread (detached — cleanup happens via
+     * CLONE_CHILD_CLEARTID + futex wake, not pthread_join) */
+    pthread_t host_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    int err = pthread_create(&host_thread, &attr, thread_create_and_run, tca);
+    pthread_attr_destroy(&attr);
+
+    if (err != 0) {
+        fprintf(stderr, "hl: clone_thread: pthread_create failed: %s\n",
+                strerror(err));
+        free(tca);
+        thread_deactivate(t);
+        return -LINUX_EAGAIN;
+    }
+
+    t->host_thread = host_thread;
+
+    if (verbose)
+        fprintf(stderr, "hl: clone_thread: child tid=%lld created\n",
+                (long long)child_tid);
+
+    return child_tid;
+}
+
+/* Worker pthread entry: creates the HVF vCPU on this thread (required by
+ * Apple HVF — vCPU is bound to the creating thread), configures all
+ * registers from parent state, then enters the run loop. On exit,
+ * performs CLONE_CHILD_CLEARTID cleanup (write 0 + FUTEX_WAKE). */
+static void *thread_create_and_run(void *arg) {
+    thread_create_args_t *tca = (thread_create_args_t *)arg;
+    thread_entry_t *t = tca->thread;
+    guest_t *g = tca->guest;
+
+    /* Create vCPU on THIS thread (HVF requirement) */
+    hv_vcpu_t vcpu;
+    hv_vcpu_exit_t *vexit;
+    hv_return_t r = hv_vcpu_create(&vcpu, &vexit, NULL);
+    if (r != HV_SUCCESS) {
+        fprintf(stderr, "hl: thread tid=%lld: hv_vcpu_create failed: %d\n",
+                (long long)t->guest_tid, (int)r);
+        free(tca);
+        thread_deactivate(t);
+        return NULL;
+    }
+
+    t->vcpu  = vcpu;
+    t->vexit = vexit;
+
+    /* Copy system registers from parent (shared page tables, same MMU config) */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1,  tca->tcr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
+
+    /* MMU already on — set SCTLR with M=1 directly (page tables exist) */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
+
+    /* Per-thread SP_EL1 (each vCPU needs its own EL1 exception stack) */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
+
+    /* SP_EL0 = child_stack (provided by clone caller) */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
+
+    /* TPIDR_EL0 = thread-local storage pointer (if CLONE_SETTLS) */
+    if (tca->flags & LINUX_CLONE_SETTLS) {
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tls));
+    } else {
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
+    }
+
+    /* ELR_EL1 = clone return point (same as parent) */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, tca->spsr));
+
+    /* Copy all 31 GPRs from parent, then set X0=0 (child clone return) */
+    for (int i = 0; i < 31; i++)
+        HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, tca->gprs[i]));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, 0));
+
+    /* Start at clone return point in EL0 (not shim entry) */
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, tca->elr));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+
+    int verbose = tca->verbose;
+    free(tca);
+
+    /* Set per-thread TLS pointer and enter worker run loop */
+    current_thread = t;
+
+    if (verbose)
+        fprintf(stderr, "hl: thread tid=%lld starting on vCPU\n",
+                (long long)t->guest_tid);
+
+    vcpu_run_loop_worker(vcpu, vexit, g, verbose);
+
+    /* CLONE_CHILD_CLEARTID: write 0 to the address and wake one waiter.
+     * This is how pthread_join works in musl — the joining thread does
+     * FUTEX_WAIT on this address until it becomes 0. */
+    if (t->clear_child_tid != 0) {
+        uint32_t zero = 0;
+        guest_write(g, t->clear_child_tid, &zero, sizeof(zero));
+        futex_wake_one(g, t->clear_child_tid);
+    }
+
+    if (verbose)
+        fprintf(stderr, "hl: thread tid=%lld exiting\n",
+                (long long)t->guest_tid);
+
+    hv_vcpu_destroy(vcpu);
+    thread_deactivate(t);
+
+    return NULL;
+}
 
 int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
                   uint64_t child_stack, uint64_t ptid_gva,
                   uint64_t tls, uint64_t ctid_gva, int verbose) {
-    (void)child_stack;
-    (void)ptid_gva;
-    (void)tls;
-    (void)ctid_gva;
+    /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
+    if (flags & LINUX_CLONE_THREAD) {
+        return sys_clone_thread(vcpu, g, flags, child_stack,
+                                ptid_gva, tls, ctid_gva, verbose);
+    }
 
     /* We only support fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD) */
