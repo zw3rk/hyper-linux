@@ -39,6 +39,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -48,69 +50,122 @@
 /* Protects mmap/brk bump allocators and page table extension. Multiple
  * threads may call mmap/brk concurrently; without this lock they could
  * get overlapping allocations or corrupt page table structures. */
-static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close).
  * File descriptor operations from concurrent threads must be serialized. */
-static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 
 /* ---------- FD table ---------- */
 fd_entry_t fd_table[FD_TABLE_SIZE];
+
+/* Bitmap for O(1) lowest-free-FD allocation. A set bit means the FD
+ * is free (FD_CLOSED). Using __builtin_ctzll on each word finds the
+ * lowest free FD in O(1) per word, vs O(FD_TABLE_SIZE) linear scan. */
+#define FD_BITMAP_WORDS (FD_TABLE_SIZE / 64)
+static uint64_t fd_free_bitmap[FD_BITMAP_WORDS];
+
+static inline void fd_bitmap_set_free(int fd) {
+    fd_free_bitmap[fd / 64] |= (1ULL << (fd % 64));
+}
+
+static inline void fd_bitmap_set_used(int fd) {
+    fd_free_bitmap[fd / 64] &= ~(1ULL << (fd % 64));
+}
 
 void syscall_init(void) {
     memset(fd_table, 0, sizeof(fd_table));
     signal_init();
 
+    /* Mark all FDs as free in bitmap */
+    memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
+
     /* Pre-open stdin/stdout/stderr */
     fd_table[0] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDIN_FILENO };
     fd_table[1] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDOUT_FILENO };
     fd_table[2] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDERR_FILENO };
+    fd_bitmap_set_used(0);
+    fd_bitmap_set_used(1);
+    fd_bitmap_set_used(2);
 }
 
 /* ---------- FD helpers ---------- */
 
+/* Find the lowest free FD >= minfd using the bitmap.
+ * Returns -1 if no free FD exists at or above minfd.
+ * Caller must hold fd_lock. */
+static int fd_bitmap_find_free(int minfd) {
+    if (minfd < 0) minfd = 0;
+    int word = minfd / 64;
+    int bit  = minfd % 64;
+
+    /* Check the partial first word (mask out bits below minfd) */
+    uint64_t masked = fd_free_bitmap[word] & (~0ULL << bit);
+    if (masked)
+        return word * 64 + __builtin_ctzll(masked);
+
+    /* Check remaining full words */
+    for (word++; word < FD_BITMAP_WORDS; word++) {
+        if (fd_free_bitmap[word])
+            return word * 64 + __builtin_ctzll(fd_free_bitmap[word]);
+    }
+    return -1;
+}
+
 /* Allocate the lowest available FD. Returns -1 if table is full. */
 int fd_alloc(int type, int host_fd) {
     pthread_mutex_lock(&fd_lock);
-    for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type == FD_CLOSED) {
-            fd_table[i].type = type;
-            fd_table[i].host_fd = host_fd;
-            pthread_mutex_unlock(&fd_lock);
-            return i;
-        }
+    int fd = fd_bitmap_find_free(0);
+    if (fd >= 0) {
+        fd_bitmap_set_used(fd);
+        fd_table[fd].type = type;
+        fd_table[fd].host_fd = host_fd;
     }
     pthread_mutex_unlock(&fd_lock);
-    return -1;
+    return fd;
 }
 
 /* Allocate the lowest available FD >= minfd. Returns -1 if none available. */
 int fd_alloc_from(int minfd, int type, int host_fd) {
-    if (minfd < 0) minfd = 0;
     pthread_mutex_lock(&fd_lock);
-    for (int i = minfd; i < FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type == FD_CLOSED) {
-            fd_table[i].type = type;
-            fd_table[i].host_fd = host_fd;
-            pthread_mutex_unlock(&fd_lock);
-            return i;
-        }
+    int fd = fd_bitmap_find_free(minfd);
+    if (fd >= 0) {
+        fd_bitmap_set_used(fd);
+        fd_table[fd].type = type;
+        fd_table[fd].host_fd = host_fd;
     }
     pthread_mutex_unlock(&fd_lock);
-    return -1;
+    return fd;
 }
 
-/* Allocate a specific FD slot. Returns -1 if out of range. */
+/* Allocate a specific FD slot. Properly cleans up any existing entry
+ * (including DIR* for directory FDs) before overwriting.
+ * Returns -1 if out of range. */
 int fd_alloc_at(int fd, int type, int host_fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -1;
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
+        /* Clean up type-specific resources before closing host fd */
+        if (fd_table[fd].dir) {
+            if (fd_table[fd].type == FD_DIR)
+                closedir((DIR *)fd_table[fd].dir);
+            else if (fd_table[fd].type == FD_EPOLL)
+                free(fd_table[fd].dir);
+        }
         close(fd_table[fd].host_fd);
     }
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
+    fd_table[fd].linux_flags = 0;
+    fd_table[fd].dir = NULL;
+    fd_bitmap_set_used(fd);
     pthread_mutex_unlock(&fd_lock);
     return fd;
+}
+
+void fd_mark_closed(int fd) {
+    fd_table[fd].type = FD_CLOSED;
+    fd_bitmap_set_free(fd);
 }
 
 /* Look up a guest FD. Returns host FD or -1 if invalid. */
@@ -239,8 +294,15 @@ int translate_open_flags(int linux_flags) {
  * reused (critical for GHC's reserve-trim-reserve pattern).
  *
  * Returns the gap start offset (0-based), or UINT64_MAX if no gap found. */
-static uint64_t find_free_gap(const guest_t *g, uint64_t length,
-                               uint64_t min_addr, uint64_t max_addr) {
+/* Cached gap-finder hints for mmap. After each successful allocation,
+ * the hint is set to the end of the allocation. This amortizes the
+ * O(n) region scan to O(1) for sequential allocations (common case).
+ * Reset to 0 on munmap when the freed region is before the hint. */
+static uint64_t mmap_rw_gap_hint = 0;
+static uint64_t mmap_rx_gap_hint = 0;
+
+static uint64_t find_free_gap_inner(const guest_t *g, uint64_t length,
+                                     uint64_t min_addr, uint64_t max_addr) {
     uint64_t gap_start = min_addr;
 
     for (int i = 0; i < g->nregions; i++) {
@@ -259,6 +321,32 @@ static uint64_t find_free_gap(const guest_t *g, uint64_t length,
     /* Check trailing space after all regions */
     if (gap_start + length <= max_addr) return gap_start;
     return UINT64_MAX;  /* No suitable gap found */
+}
+
+/* Find a free gap, trying the cached hint first. The hint is the
+ * position just past the last allocation in this region, so sequential
+ * allocations skip already-scanned entries. Falls back to a full scan
+ * from min_addr if the hint fails (e.g., after munmap creates a gap). */
+static uint64_t find_free_gap(const guest_t *g, uint64_t length,
+                               uint64_t min_addr, uint64_t max_addr) {
+    /* Select the appropriate hint for the address range */
+    uint64_t *hint = (min_addr < MMAP_BASE) ? &mmap_rx_gap_hint
+                                             : &mmap_rw_gap_hint;
+
+    /* Try cached hint first (only if within the valid range) */
+    if (*hint >= min_addr && *hint < max_addr) {
+        uint64_t result = find_free_gap_inner(g, length, *hint, max_addr);
+        if (result != UINT64_MAX) {
+            *hint = result + length;
+            return result;
+        }
+    }
+
+    /* Full scan from base */
+    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr);
+    if (result != UINT64_MAX)
+        *hint = result + length;
+    return result;
 }
 
 /* ---------- Memory syscalls (tightly coupled to guest.h) ---------- */
@@ -469,6 +557,26 @@ static void thread_force_exit_cb(thread_entry_t *t, void *ctx) {
     hv_vcpus_exit(&t->vcpu, 1);
 }
 
+/* Callback for thread_for_each: join each worker thread with a timeout.
+ * This allows CLONE_CHILD_CLEARTID futex wake to complete before the
+ * main thread exits. Skips the calling thread. */
+static void thread_join_workers_cb(thread_entry_t *t, void *ctx) {
+    (void)ctx;
+    if (t == current_thread) return;
+    if (!t->active) return;
+
+    /* Timed join: wait up to 100ms for each worker to finish.
+     * If it doesn't respond, we proceed anyway to avoid deadlock. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 100000000L; /* 100ms */
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_join(t->host_thread, NULL);
+}
+
 /* ---------- Main dispatch ---------- */
 
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
@@ -502,7 +610,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_exit:
         /* Per-thread exit: if multiple threads are active, only this one
          * exits. CLONE_CHILD_CLEARTID cleanup is handled by the worker
-         * thread after vcpu_run_loop_worker returns. The main thread falls
+         * thread after vcpu_run_loop returns. The main thread falls
          * through to normal process exit. */
         *exit_code = (int)x0;
         should_exit = 1;
@@ -516,6 +624,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         /* Force-cancel all worker vCPUs. The main thread's vCPU is
          * handled by the normal should_exit path below. */
         thread_for_each(thread_force_exit_cb, NULL);
+
+        /* Join worker threads to allow CLONE_CHILD_CLEARTID futex wake
+         * to complete before the process exits. Without this, the main
+         * thread may exit before workers finish their cleanup. */
+        thread_for_each(thread_join_workers_cb, NULL);
 
         *exit_code = (int)x0;
         should_exit = 1;
@@ -616,6 +729,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
              * Note: page table entries are NOT reclaimed — only the
              * semantic region tracking is updated. */
             guest_region_remove(g, unmap_off, end);
+
+            /* Reset gap-finder hints if freed space precedes them,
+             * so the next mmap will find the newly available gap. */
+            if (unmap_off < mmap_rw_gap_hint) mmap_rw_gap_hint = 0;
+            if (unmap_off < mmap_rx_gap_hint) mmap_rx_gap_hint = 0;
         }
         pthread_mutex_unlock(&mmap_lock);
         result = 0;
@@ -899,7 +1017,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_ppoll(g, x0, (uint32_t)x1, x2, x3);
         break;
     case SYS_pselect6:
-        result = sys_pselect6(g, (int)x0, x1, x2, x3, x4);
+        result = sys_pselect6(g, (int)x0, x1, x2, x3, x4, x5);
         break;
     case SYS_kill: {
         int sig = (int)x1;

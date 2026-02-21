@@ -188,6 +188,16 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	printf "\n$(BLUE)── Threading tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-thread; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-pthread; \
+	printf "\n$(BLUE)── Stress tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-stress; \
+	printf "\n$(BLUE)── Negative / error-path tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-negative; \
+	printf "\n$(BLUE)── Signal + thread tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signal-thread; \
+	printf "\n$(BLUE)── Fork edge cases ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fork-exec $(TEST_DIR)/echo-test; \
+	printf "\n$(BLUE)── O_CLOEXEC tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cloexec; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
 
 # ── Coreutils integration test ───────────────────────────────────

@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/event.h>
 
 /* ================================================================
@@ -44,6 +45,9 @@ static struct {
     int      kq_fd;         /* kqueue fd for this timer */
     uint64_t expirations;   /* Accumulated expiration count */
     int64_t  interval_ns;   /* Repeat interval (0 = one-shot) */
+    int64_t  initial_ns;    /* Initial value at arm time (for gettime) */
+    int64_t  arm_time_ns;   /* CLOCK_MONOTONIC time when timer was armed */
+    int      clockid;       /* Linux clock ID (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1) */
     int      armed;         /* 1 if timer is running */
 } timerfd_state[TIMERFD_MAX];
 
@@ -69,7 +73,6 @@ static int timerfd_alloc(void) {
 }
 
 int64_t sys_timerfd_create(int clockid, int flags) {
-    (void)clockid; /* We use kqueue timers, ignore clock source */
     timerfd_init_once();
 
     int kq = kqueue();
@@ -92,6 +95,9 @@ int64_t sys_timerfd_create(int clockid, int flags) {
     timerfd_state[slot].kq_fd = kq;
     timerfd_state[slot].expirations = 0;
     timerfd_state[slot].interval_ns = 0;
+    timerfd_state[slot].initial_ns = 0;
+    timerfd_state[slot].arm_time_ns = 0;
+    timerfd_state[slot].clockid = clockid;
     timerfd_state[slot].armed = 0;
 
     fd_table[gfd].linux_flags = (flags & LINUX_O_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
@@ -110,13 +116,22 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
     if (guest_read(g, new_value_gva, &its, sizeof(its)) < 0)
         return -LINUX_EFAULT;
 
-    /* Return old value if requested */
+    /* Return old value if requested (compute remaining time) */
     if (old_value_gva) {
         linux_itimerspec_t old = {0};
         if (timerfd_state[slot].armed) {
             old.it_interval_sec = timerfd_state[slot].interval_ns / 1000000000LL;
             old.it_interval_nsec = timerfd_state[slot].interval_ns % 1000000000LL;
-            /* it_value is approximation — we don't track remaining time */
+
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t now_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
+            int64_t elapsed = now_ns - timerfd_state[slot].arm_time_ns;
+            int64_t remaining = timerfd_state[slot].initial_ns - elapsed;
+            if (remaining > 0) {
+                old.it_value_sec = remaining / 1000000000LL;
+                old.it_value_nsec = remaining % 1000000000LL;
+            }
         }
         guest_write(g, old_value_gva, &old, sizeof(old));
     }
@@ -143,7 +158,13 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
             return linux_errno();
         timerfd_state[slot].armed = 1;
         timerfd_state[slot].interval_ns = interval_ns;
+        timerfd_state[slot].initial_ns = its.it_value_sec * 1000000000LL + its.it_value_nsec;
         timerfd_state[slot].expirations = 0;
+
+        /* Record arm time for gettime remaining-time calculation */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        timerfd_state[slot].arm_time_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
     }
 
     return 0;
@@ -157,9 +178,37 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva) {
     if (timerfd_state[slot].armed) {
         its.it_interval_sec = timerfd_state[slot].interval_ns / 1000000000LL;
         its.it_interval_nsec = timerfd_state[slot].interval_ns % 1000000000LL;
-        /* Remaining time is an approximation */
-        its.it_value_sec = 0;
-        its.it_value_nsec = 1; /* Non-zero to indicate armed */
+
+        /* Compute actual remaining time from arm time + initial value */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t now_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t elapsed = now_ns - timerfd_state[slot].arm_time_ns;
+        int64_t remaining;
+
+        if (timerfd_state[slot].interval_ns > 0) {
+            /* Repeating timer: remaining = interval - (elapsed % interval) */
+            int64_t total = timerfd_state[slot].initial_ns;
+            if (elapsed >= total) {
+                int64_t since_first = elapsed - total;
+                remaining = timerfd_state[slot].interval_ns
+                          - (since_first % timerfd_state[slot].interval_ns);
+            } else {
+                remaining = total - elapsed;
+            }
+        } else {
+            /* One-shot: remaining = initial - elapsed */
+            remaining = timerfd_state[slot].initial_ns - elapsed;
+        }
+
+        if (remaining <= 0) {
+            /* Timer already expired (one-shot) */
+            its.it_value_sec = 0;
+            its.it_value_nsec = 0;
+        } else {
+            its.it_value_sec = remaining / 1000000000LL;
+            its.it_value_nsec = remaining % 1000000000LL;
+        }
     }
     guest_write(g, curr_value_gva, &its, sizeof(its));
     return 0;

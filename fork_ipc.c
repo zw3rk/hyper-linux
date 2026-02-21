@@ -12,6 +12,7 @@
 #include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
 #include "syscall.h"         /* syscall_init, FD_CLOSED, FD_STDIO, etc. */
 #include "syscall_signal.h"  /* signal_get_state, signal_set_state, signal_state_t */
+#include "hv_util.h"         /* HV_CHECK, SCTLR_* constants */
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
 #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
 #include "futex.h"           /* futex_wake_one */
@@ -28,15 +29,6 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <mach-o/dyld.h>
-
-/* ---------- HV_CHECK macro (duplicated from hl.c — short, avoids coupling) ---------- */
-#define HV_CHECK(call) do {                                        \
-    hv_return_t _r = (call);                                       \
-    if (_r != HV_SUCCESS) {                                        \
-        fprintf(stderr, "hl: %s failed: %d\n", #call, (int)_r);   \
-        exit(1);                                                   \
-    }                                                              \
-} while (0)
 
 /* ---------- IPC Protocol for fork ---------- */
 
@@ -186,15 +178,6 @@ static int recv_fds(int sock, int *fds, int max_count, int *out_count) {
 }
 
 /* ---------- fork_child_main ---------- */
-
-/* Constants needed for vCPU setup (duplicated from hl.c since we can't
- * include shim_blob.h here -- the shim is received via IPC) */
-#define SCTLR_M   (1ULL << 0)
-#define SCTLR_C   (1ULL << 2)
-#define SCTLR_I   (1ULL << 12)
-#define SCTLR_RES1 ((1ULL << 29) | (1ULL << 28) | (1ULL << 23) | \
-                     (1ULL << 22) | (1ULL << 20) | (1ULL << 11) | \
-                     (1ULL <<  8) | (1ULL <<  7))
 
 int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     /* Step 1: Read IPC header */
@@ -550,19 +533,19 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
     uint64_t parent_elr, parent_spsr, parent_vbar, parent_ttbr0;
     uint64_t parent_sctlr, parent_tcr, parent_mair, parent_cpacr;
     uint64_t parent_tpidr;
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_ELR_EL1, &parent_elr);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_SPSR_EL1, &parent_spsr);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_VBAR_EL1, &parent_vbar);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TTBR0_EL1, &parent_ttbr0);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_SCTLR_EL1, &parent_sctlr);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TCR_EL1, &parent_tcr);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_MAIR_EL1, &parent_mair);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_CPACR_EL1, &parent_cpacr);
-    hv_vcpu_get_sys_reg(parent_vcpu, HV_SYS_REG_TPIDR_EL0, &parent_tpidr);
+    parent_elr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
+    parent_spsr   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
+    parent_vbar   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
+    parent_ttbr0  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
+    parent_sctlr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
+    parent_tcr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
+    parent_mair   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
+    parent_cpacr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
+    parent_tpidr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
 
     uint64_t parent_gprs[31];
     for (int i = 0; i < 31; i++)
-        hv_vcpu_get_reg(parent_vcpu, HV_REG_X0 + i, &parent_gprs[i]);
+        parent_gprs[i] = vcpu_get_gpr(parent_vcpu, (unsigned)i);
 
     thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
     if (!tca) {
@@ -703,7 +686,7 @@ static void *thread_create_and_run(void *arg) {
         fprintf(stderr, "hl: thread tid=%lld starting on vCPU\n",
                 (long long)t->guest_tid);
 
-    vcpu_run_loop_worker(vcpu, vexit, g, verbose);
+    vcpu_run_loop(vcpu, vexit, g, verbose, 0);
 
     /* CLONE_CHILD_CLEARTID: write 0 to the address and wake one waiter.
      * This is how pthread_join works in musl — the joining thread does
@@ -824,19 +807,19 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     /* Registers -- capture current vCPU state */
     ipc_registers_t regs = {0};
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &regs.elr_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &regs.sp_el0);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &regs.spsr_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, &regs.vbar_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &regs.ttbr0_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &regs.sctlr_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &regs.tcr_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, &regs.mair_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &regs.cpacr_el1);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, &regs.tpidr_el0);
-    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &regs.sp_el1);
+    regs.elr_el1   = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+    regs.sp_el0    = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
+    regs.spsr_el1  = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    regs.vbar_el1  = vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1);
+    regs.ttbr0_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR0_EL1);
+    regs.sctlr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SCTLR_EL1);
+    regs.tcr_el1   = vcpu_get_sysreg(vcpu, HV_SYS_REG_TCR_EL1);
+    regs.mair_el1  = vcpu_get_sysreg(vcpu, HV_SYS_REG_MAIR_EL1);
+    regs.cpacr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_CPACR_EL1);
+    regs.tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
+    regs.sp_el1    = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
     for (int i = 0; i < 31; i++)
-        hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &regs.x[i]);
+        regs.x[i] = vcpu_get_gpr(vcpu, (unsigned)i);
 
     if (ipc_write_all(ipc_sock, &regs, sizeof(regs)) < 0) {
         fprintf(stderr, "hl: clone: failed to send registers\n");
@@ -879,7 +862,10 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         }
     }
 
-    /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS */
+    /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS.
+     * Skip FDs with O_CLOEXEC set — these should not be inherited by the
+     * fork child, matching Linux semantics. (CLOEXEC is enforced in execve
+     * too, but fork should not leak CLOEXEC FDs to the child at all.) */
     int open_fds[FD_TABLE_SIZE];
     ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
     int host_fds_to_send[FD_TABLE_SIZE];
@@ -887,26 +873,32 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     int num_host_fds = 0;
 
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type != FD_CLOSED) {
-            fd_entries[num_fds].guest_fd = i;
-            fd_entries[num_fds].type = fd_table[i].type;
-            fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
-            fd_entries[num_fds].pad = 0;
+        if (fd_table[i].type == FD_CLOSED) continue;
 
-            if (fd_table[i].type != FD_STDIO) {
-                /* Dup the fd so child gets its own copy */
-                int duped = dup(fd_table[i].host_fd);
-                if (duped >= 0) {
-                    host_fds_to_send[num_host_fds++] = duped;
-                }
-            } else {
-                /* For stdio, send the actual fd (0, 1, 2) */
-                host_fds_to_send[num_host_fds++] = fd_table[i].host_fd;
+        /* Skip FDs marked O_CLOEXEC — not inherited across fork.
+         * Also check the host-side FD_CLOEXEC flag for consistency. */
+        if (fd_table[i].linux_flags & LINUX_O_CLOEXEC) continue;
+        if (fd_table[i].type != FD_STDIO &&
+            (fcntl(fd_table[i].host_fd, F_GETFD) & FD_CLOEXEC)) continue;
+
+        fd_entries[num_fds].guest_fd = i;
+        fd_entries[num_fds].type = fd_table[i].type;
+        fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
+        fd_entries[num_fds].pad = 0;
+
+        if (fd_table[i].type != FD_STDIO) {
+            /* Dup the fd so child gets its own copy */
+            int duped = dup(fd_table[i].host_fd);
+            if (duped >= 0) {
+                host_fds_to_send[num_host_fds++] = duped;
             }
-
-            open_fds[num_fds] = i;
-            num_fds++;
+        } else {
+            /* For stdio, send the actual fd (0, 1, 2) */
+            host_fds_to_send[num_host_fds++] = fd_table[i].host_fd;
         }
+
+        open_fds[num_fds] = i;
+        num_fds++;
     }
 
     if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {

@@ -16,7 +16,7 @@
 /* ---------- Thread table ---------- */
 
 static thread_entry_t thread_table[MAX_THREADS];
-static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 5 */
 
 /* Track the next SP_EL1 slot index. Slot 0 is the main thread (top of
  * shim data region); each subsequent thread gets the next 4KB down. */

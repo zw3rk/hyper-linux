@@ -201,6 +201,14 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize);
 const signal_state_t *signal_get_state(void);
 void signal_set_state(const signal_state_t *state);
 
+/* Save and restore blocked mask — for pselect6/ppoll signal mask atomicity.
+ * signal_save_blocked returns the current blocked mask.
+ * signal_set_blocked applies a new mask (respecting SIGKILL/SIGSTOP).
+ * signal_restore_blocked restores a previously saved mask. */
+uint64_t signal_save_blocked(void);
+void signal_set_blocked(uint64_t mask);
+void signal_restore_blocked(uint64_t saved);
+
 /* Get default disposition for a signal. */
 sig_disposition_t signal_default_disposition(int signum);
 

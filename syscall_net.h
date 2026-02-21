@@ -46,10 +46,21 @@
 #define LINUX_SO_SNDTIMEO   21
 #define LINUX_SO_ACCEPTCONN 30
 #define LINUX_SO_REUSEPORT  15
+#define LINUX_SO_RCVLOWAT   18
+#define LINUX_SO_SNDLOWAT   19
 
 /* ---------- Linux TCP level options ---------- */
 #define LINUX_IPPROTO_TCP    6
 #define LINUX_TCP_NODELAY    1
+#define LINUX_TCP_KEEPIDLE   4   /* → macOS TCP_KEEPALIVE */
+#define LINUX_TCP_KEEPINTVL  5
+#define LINUX_TCP_KEEPCNT    6
+
+/* ---------- Linux IP/IPv6 level options ---------- */
+#define LINUX_IPPROTO_IP     0
+#define LINUX_IPPROTO_IPV6  41
+#define LINUX_IP_TOS         1
+#define LINUX_IPV6_V6ONLY   26
 
 /* ---------- Linux shutdown() how values ---------- */
 #define LINUX_SHUT_RD   0

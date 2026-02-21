@@ -35,6 +35,11 @@ int fd_alloc_at(int fd, int type, int host_fd);
 /* Look up a guest FD. Returns host FD or -1 if invalid. */
 int fd_to_host(int guest_fd);
 
+/* Mark an FD slot as closed (set type = FD_CLOSED and update bitmap).
+ * Does NOT close the host FD or free type-specific resources (DIR*,
+ * epoll instance) — caller must do that first. */
+void fd_mark_closed(int fd);
+
 /* ---------- Translation helpers ---------- */
 
 /* Convert macOS errno to negative Linux errno. */

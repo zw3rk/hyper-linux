@@ -27,7 +27,7 @@ static signal_state_t sig_state;
 /* Protects signal actions array. Multiple threads may call rt_sigaction
  * concurrently (e.g., during musl init). Pending/blocked masks are
  * process-wide for the MVP; per-thread masks are deferred. */
-static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 4 */
 
 /* ---------- Guest ITIMER_REAL emulation ----------
  * We emulate the guest's ITIMER_REAL internally rather than forwarding to
@@ -106,16 +106,23 @@ void signal_init(void) {
 
 void signal_queue(int signum) {
     if (signum < 1 || signum > LINUX_NSIG) return;
+    pthread_mutex_lock(&sig_lock);
     sig_state.pending |= sig_bit(signum);
+    pthread_mutex_unlock(&sig_lock);
 }
 
 void signal_consume(int signum) {
     if (signum < 1 || signum > LINUX_NSIG) return;
+    pthread_mutex_lock(&sig_lock);
     sig_state.pending &= ~sig_bit(signum);
+    pthread_mutex_unlock(&sig_lock);
 }
 
 int signal_pending(void) {
-    return (sig_state.pending & ~sig_state.blocked) != 0;
+    pthread_mutex_lock(&sig_lock);
+    int result = (sig_state.pending & ~sig_state.blocked) != 0;
+    pthread_mutex_unlock(&sig_lock);
+    return result;
 }
 
 const signal_state_t *signal_get_state(void) {
@@ -124,6 +131,27 @@ const signal_state_t *signal_get_state(void) {
 
 void signal_set_state(const signal_state_t *state) {
     if (state) sig_state = *state;
+}
+
+uint64_t signal_save_blocked(void) {
+    pthread_mutex_lock(&sig_lock);
+    uint64_t saved = sig_state.blocked;
+    pthread_mutex_unlock(&sig_lock);
+    return saved;
+}
+
+void signal_set_blocked(uint64_t mask) {
+    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
+    pthread_mutex_lock(&sig_lock);
+    sig_state.blocked = mask & ~unmaskable;
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_restore_blocked(uint64_t saved) {
+    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
+    pthread_mutex_lock(&sig_lock);
+    sig_state.blocked = saved & ~unmaskable;
+    pthread_mutex_unlock(&sig_lock);
 }
 
 /* ---------- Guest ITIMER_REAL API ---------- */
@@ -275,17 +303,23 @@ int64_t signal_rt_sigprocmask(guest_t *g, int how,
                                uint64_t sigsetsize) {
     if (sigsetsize != 8) return -LINUX_EINVAL;
 
+    pthread_mutex_lock(&sig_lock);
+
     /* Return old mask if requested */
     if (oldset_gva) {
-        if (guest_write(g, oldset_gva, &sig_state.blocked, 8) < 0)
+        if (guest_write(g, oldset_gva, &sig_state.blocked, 8) < 0) {
+            pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
+        }
     }
 
     /* Apply new mask if provided */
     if (set_gva) {
         uint64_t set;
-        if (guest_read(g, set_gva, &set, 8) < 0)
+        if (guest_read(g, set_gva, &set, 8) < 0) {
+            pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
+        }
 
         /* Never allow blocking SIGKILL or SIGSTOP */
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
@@ -301,11 +335,13 @@ int64_t signal_rt_sigprocmask(guest_t *g, int how,
             sig_state.blocked = set;
             break;
         default:
+            pthread_mutex_unlock(&sig_lock);
             return -LINUX_EINVAL;
         }
         sig_state.blocked &= ~unmaskable;
     }
 
+    pthread_mutex_unlock(&sig_lock);
     return 0;
 }
 
@@ -319,6 +355,8 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva,
         uint64_t mask;
         if (guest_read(g, mask_gva, &mask, 8) < 0)
             return -LINUX_EFAULT;
+
+        pthread_mutex_lock(&sig_lock);
 
         /* Save original blocked mask for restoration after signal delivery */
         uint64_t saved_blocked = sig_state.blocked;
@@ -344,6 +382,8 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva,
             sig_state.saved_blocked = saved_blocked;
             sig_state.saved_blocked_valid = 1;
         }
+
+        pthread_mutex_unlock(&sig_lock);
     }
 
     /* Always return -EINTR. */
@@ -357,8 +397,11 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva,
     if (sigsetsize != 8) return -LINUX_EINVAL;
     if (!set_gva) return -LINUX_EFAULT;
 
+    pthread_mutex_lock(&sig_lock);
     /* Return signals that are pending AND blocked */
     uint64_t result = sig_state.pending & sig_state.blocked;
+    pthread_mutex_unlock(&sig_lock);
+
     if (guest_write(g, set_gva, &result, 8) < 0)
         return -LINUX_EFAULT;
     return 0;
@@ -386,8 +429,12 @@ static void build_fpsimd_context(uint8_t *reserved) {
 }
 
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+    pthread_mutex_lock(&sig_lock);
     uint64_t deliverable = sig_state.pending & ~sig_state.blocked;
-    if (deliverable == 0) return 0;
+    if (deliverable == 0) {
+        pthread_mutex_unlock(&sig_lock);
+        return 0;
+    }
 
     /* Find lowest pending unblocked signal */
     int signum = __builtin_ctzll(deliverable) + 1;
@@ -399,6 +446,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     /* Check handler type */
     if (act->sa_handler == LINUX_SIG_IGN) {
         /* Ignored — discard signal */
+        pthread_mutex_unlock(&sig_lock);
         return 0;
     }
 
@@ -409,10 +457,12 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         case SIG_DISP_TERM:
         case SIG_DISP_CORE:
             *exit_code = 128 + signum;
+            pthread_mutex_unlock(&sig_lock);
             return -1;  /* Terminate */
         case SIG_DISP_IGN:
         case SIG_DISP_CONT:
         case SIG_DISP_STOP:
+            pthread_mutex_unlock(&sig_lock);
             return 0;   /* Ignore (STOP/CONT not meaningful for us) */
         }
     }
@@ -468,6 +518,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     if (guest_write(g, frame_sp, &frame, sizeof(frame)) < 0) {
         /* Can't write frame — terminate with default disposition */
         *exit_code = 128 + signum;
+        pthread_mutex_unlock(&sig_lock);
         return -1;
     }
 
@@ -504,6 +555,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         act->sa_flags &= ~LINUX_SA_SIGINFO;
     }
 
+    pthread_mutex_unlock(&sig_lock);
     return 1;
 }
 
@@ -532,8 +584,10 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, frame.uc.uc_mcontext.pstate);
 
     /* Restore signal mask */
+    pthread_mutex_lock(&sig_lock);
     sig_state.blocked = frame.uc.uc_sigmask;
     sig_state.blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+    pthread_mutex_unlock(&sig_lock);
 
     /* Return SYSCALL_EXEC_HAPPENED to skip the normal X0 writeback,
      * since we've restored the entire register set. */

@@ -176,9 +176,12 @@ int64_t sys_close(int fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     if (fd_table[fd].type == FD_CLOSED) return -LINUX_EBADF;
 
-    /* Close DIR* if this was a directory fd */
+    /* Close type-specific resources stored in dir pointer */
     if (fd_table[fd].dir) {
-        closedir((DIR *)fd_table[fd].dir);
+        if (fd_table[fd].type == FD_DIR)
+            closedir((DIR *)fd_table[fd].dir);
+        else if (fd_table[fd].type == FD_EPOLL)
+            free(fd_table[fd].dir);  /* epoll_instance_t */
         fd_table[fd].dir = NULL;
     }
 
@@ -194,7 +197,7 @@ int64_t sys_close(int fd) {
     if (fd_table[fd].type != FD_STDIO) {
         close(fd_table[fd].host_fd);
     }
-    fd_table[fd].type = FD_CLOSED;
+    fd_mark_closed(fd);
     fd_table[fd].host_fd = -1;
     return 0;
 }
@@ -343,6 +346,18 @@ int64_t sys_dup(int oldfd) {
         return -LINUX_ENOMEM;
     }
 
+    /* Create a fresh DIR* for directory FDs (see sys_dup3 comment) */
+    if (fd_table[oldfd].type == FD_DIR) {
+        int dir_fd = dup(new_host_fd);
+        if (dir_fd >= 0) {
+            DIR *dir = fdopendir(dir_fd);
+            if (dir)
+                fd_table[guest_fd].dir = dir;
+            else
+                close(dir_fd);
+        }
+    }
+
     return guest_fd;
 }
 
@@ -355,9 +370,25 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
     int new_host_fd = dup(host_fd);
     if (new_host_fd < 0) return linux_errno();
 
+    /* fd_alloc_at cleans up old entry (incl. DIR* closedir) */
     fd_alloc_at(newfd, fd_table[oldfd].type, new_host_fd);
-    /* O_CLOEXEC in dup3 flags sets CLOEXEC on new fd */
     fd_table[newfd].linux_flags = (linux_flags & LINUX_O_CLOEXEC);
+
+    /* For directory FDs, create a fresh DIR* for the new entry.
+     * dup() only duplicates the kernel fd — the C library DIR*
+     * (used by our getdents64 emulation via readdir) must be
+     * created separately to maintain independent directory state. */
+    if (fd_table[oldfd].type == FD_DIR) {
+        int dir_fd = dup(new_host_fd);
+        if (dir_fd >= 0) {
+            DIR *dir = fdopendir(dir_fd);
+            if (dir)
+                fd_table[newfd].dir = dir;
+            else
+                close(dir_fd);
+        }
+    }
+
     return newfd;
 }
 
@@ -378,6 +409,17 @@ int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
         fd_table[gfd].linux_flags = fd_table[fd].linux_flags & ~LINUX_O_CLOEXEC;
         if (cmd == 1030)
             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+        /* Create fresh DIR* for directory FDs (see sys_dup3 comment) */
+        if (fd_table[fd].type == FD_DIR) {
+            int dir_fd = dup(new_host);
+            if (dir_fd >= 0) {
+                DIR *dir = fdopendir(dir_fd);
+                if (dir)
+                    fd_table[gfd].dir = dir;
+                else
+                    close(dir_fd);
+            }
+        }
         return gfd;
     }
     case 1: /* F_GETFD */
@@ -406,12 +448,15 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
     for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
         if (fd_table[i].type != FD_CLOSED) {
             if (fd_table[i].dir) {
-                closedir((DIR *)fd_table[i].dir);
+                if (fd_table[i].type == FD_DIR)
+                    closedir((DIR *)fd_table[i].dir);
+                else if (fd_table[i].type == FD_EPOLL)
+                    free(fd_table[i].dir);
                 fd_table[i].dir = NULL;
             }
             if (fd_table[i].type != FD_STDIO)
                 close(fd_table[i].host_fd);
-            fd_table[i].type = FD_CLOSED;
+            fd_mark_closed(i);
             fd_table[i].host_fd = -1;
             fd_table[i].linux_flags = 0;
         }

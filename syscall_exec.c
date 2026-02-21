@@ -116,7 +116,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             }
             if (fd_table[i].type != FD_STDIO)
                 close(fd_table[i].host_fd);
-            fd_table[i].type = FD_CLOSED;
+            fd_mark_closed(i);
             fd_table[i].host_fd = -1;
             fd_table[i].linux_flags = 0;
         }

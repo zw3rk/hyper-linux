@@ -16,7 +16,7 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
                   uint64_t timeout_gva, uint64_t sigmask_gva);
 int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
                      uint64_t writefds_gva, uint64_t exceptfds_gva,
-                     uint64_t timeout_gva);
+                     uint64_t timeout_gva, uint64_t sigmask_gva);
 
 /* epoll (emulated via kqueue) */
 int64_t sys_epoll_create1(int flags);

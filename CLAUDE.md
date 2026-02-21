@@ -300,20 +300,30 @@ mappings.
 0x001000000:                  brk base (16MB)
 0x007E00000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
 0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
-0x020000000  - 0x1FFFFFFFF:  mmap RX growth area (up to MMAP_END)
+0x020000000  - mmap_limit:    mmap RX growth area (up to g->mmap_limit)
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
-0x210000000  - 0xDFFFFFFFF:  mmap RW growth area (up to 56GB)
-0xF00000000  - varies:        Dynamic linker (INTERP_LOAD_BASE, if --sysroot)
+0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit)
+interp_base  - varies:        Dynamic linker (g->interp_base, if --sysroot)
 ```
 
-Total: 64GB address space reserved via mmap(MAP_ANON) (HVF max on Apple
-Silicon). macOS demand-pages physical memory on first touch, so only used
-pages consume RAM. The mmap RW region starts at 8GB to match real Linux
-kernel address space layout where mmap sits well above program segments.
-Additional 2MB blocks are mapped dynamically by
-guest_extend_page_tables() when sys_mmap/sys_brk exceeds the current limit.
-The shim flushes the TLB (via TLBI VMALLE1IS) when X8 is set non-zero after
-HVC #5 return.
+The address space size is determined at runtime by querying the max IPA
+(Intermediate Physical Address) size via `hv_vm_config_get_max_ipa_size()`:
+- **36-bit IPA (64GB)**: HVF default, mmap_limit=56GB, interp_base=60GB
+- **40-bit IPA (1TB)**: macOS 15+, mmap_limit=1016GB, interp_base=1020GB
+
+Both `mmap_limit` and `interp_base` are computed dynamically from
+`guest_size` and stored in `guest_t` (replacing the old compile-time
+`MMAP_END` and `INTERP_LOAD_BASE` constants). macOS demand-pages physical
+memory on first touch, so only used pages consume RAM. The mmap RW region
+starts at 8GB to match real Linux kernel address space layout. Additional
+2MB blocks are mapped dynamically by `guest_extend_page_tables()` when
+sys_mmap/sys_brk exceeds the current limit. The shim flushes the TLB
+(via TLBI VMALLE1IS) when X8 is set non-zero after HVC #5 return.
+
+For >512GB address spaces, the L0 page table needs multiple entries (each
+covering 512GB). The page table functions (`guest_build_page_tables`,
+`guest_extend_page_tables`, `find_l2_entry`) compute L0 index from the
+actual IPA and allocate L1 tables on demand per L0 slot.
 
 ## Dynamic Page Table Extension (TLBI Protocol)
 

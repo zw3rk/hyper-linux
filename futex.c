@@ -52,7 +52,8 @@ typedef struct futex_waiter {
     struct futex_waiter  *next;    /* Next waiter in same bucket */
 } futex_waiter_t;
 
-/* One bucket in the hash table. Protected by its own mutex. */
+/* One bucket in the hash table. Protected by its own mutex.
+ * Lock order: 7 (leaf locks, index-ordered when two acquired). */
 typedef struct {
     pthread_mutex_t lock;
     futex_waiter_t *head;   /* Linked list of waiters hashing to this bucket */

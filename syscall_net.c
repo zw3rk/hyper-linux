@@ -133,6 +133,8 @@ static int translate_sockopt(int linux_optname) {
     case LINUX_SO_SNDTIMEO:   return SO_SNDTIMEO;
     case LINUX_SO_ACCEPTCONN: return SO_ACCEPTCONN;
     case LINUX_SO_REUSEPORT:  return SO_REUSEPORT;
+    case LINUX_SO_RCVLOWAT:  return SO_RCVLOWAT;
+    case LINUX_SO_SNDLOWAT:  return SO_SNDLOWAT;
     default:                  return -1;
     }
 }
@@ -470,8 +472,19 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
         if (mac_optname < 0) return -LINUX_ENOPROTOOPT;
     } else if (level == LINUX_IPPROTO_TCP) {
         mac_level = IPPROTO_TCP;
-        if (optname == LINUX_TCP_NODELAY)
-            mac_optname = TCP_NODELAY;
+        switch (optname) {
+        case LINUX_TCP_NODELAY:  mac_optname = TCP_NODELAY; break;
+        case LINUX_TCP_KEEPIDLE: mac_optname = TCP_KEEPALIVE; break;
+        case LINUX_TCP_KEEPINTVL: mac_optname = 0x101; break; /* TCP_KEEPINTVL */
+        case LINUX_TCP_KEEPCNT:  mac_optname = 0x102; break;  /* TCP_KEEPCNT */
+        default: break;
+        }
+    } else if (level == LINUX_IPPROTO_IP) {
+        mac_level = IPPROTO_IP;
+        if (optname == LINUX_IP_TOS) mac_optname = IP_TOS;
+    } else if (level == LINUX_IPPROTO_IPV6) {
+        mac_level = IPPROTO_IPV6;
+        if (optname == LINUX_IPV6_V6ONLY) mac_optname = IPV6_V6ONLY;
     }
 
     uint8_t optval[256];
@@ -499,8 +512,19 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
         if (mac_optname < 0) return -LINUX_ENOPROTOOPT;
     } else if (level == LINUX_IPPROTO_TCP) {
         mac_level = IPPROTO_TCP;
-        if (optname == LINUX_TCP_NODELAY)
-            mac_optname = TCP_NODELAY;
+        switch (optname) {
+        case LINUX_TCP_NODELAY:  mac_optname = TCP_NODELAY; break;
+        case LINUX_TCP_KEEPIDLE: mac_optname = TCP_KEEPALIVE; break;
+        case LINUX_TCP_KEEPINTVL: mac_optname = 0x101; break;
+        case LINUX_TCP_KEEPCNT:  mac_optname = 0x102; break;
+        default: break;
+        }
+    } else if (level == LINUX_IPPROTO_IP) {
+        mac_level = IPPROTO_IP;
+        if (optname == LINUX_IP_TOS) mac_optname = IP_TOS;
+    } else if (level == LINUX_IPPROTO_IPV6) {
+        mac_level = IPPROTO_IPV6;
+        if (optname == LINUX_IPV6_V6ONLY) mac_optname = IPV6_V6ONLY;
     }
 
     uint32_t guest_optlen;
@@ -513,6 +537,16 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
 
     if (getsockopt(host_fd, mac_level, mac_optname, optval, &mac_optlen) < 0)
         return linux_errno();
+
+    /* SO_TYPE: macOS returns the raw socket type. On Linux, getsockopt
+     * SO_TYPE returns the base type without SOCK_NONBLOCK/SOCK_CLOEXEC
+     * flags, and the numeric values happen to match (SOCK_STREAM=1,
+     * SOCK_DGRAM=2, SOCK_RAW=3). Strip any flag bits for safety. */
+    if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
+        && mac_optlen >= (socklen_t)sizeof(int)) {
+        int *type_val = (int *)optval;
+        *type_val &= 0xF;  /* Keep only the base socket type */
+    }
 
     uint32_t write_len = (uint32_t)mac_optlen;
     if (write_len > guest_optlen) write_len = guest_optlen;

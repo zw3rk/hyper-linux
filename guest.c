@@ -58,7 +58,7 @@
 
 /* Protects the page table pool bump allocator. Multiple threads may
  * trigger page table extension concurrently (via mmap/brk/mprotect). */
-static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 
 /* Allocate a zeroed 4KB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
@@ -100,9 +100,9 @@ int guest_init(guest_t *g, uint64_t size) {
      * stage-2 page tables in HVF but is kernel-internal — our guest
      * page tables are unaffected. */
     uint32_t max_ipa = 0;
-    hv_vm_config_get_max_ipa_size(&max_ipa);
-    if (max_ipa >= 40) max_ipa = 40;
-    else max_ipa = 36;
+    hv_return_t ipa_ret = hv_vm_config_get_max_ipa_size(&max_ipa);
+    if (ipa_ret != HV_SUCCESS || max_ipa < 36) max_ipa = 36;
+    else if (max_ipa >= 40) max_ipa = 40;
 
     uint64_t ipa_capacity = 1ULL << max_ipa;
 
@@ -216,14 +216,18 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
     if (avail > max - 1)
         avail = max - 1;
 
-    size_t i;
-    for (i = 0; i < avail; i++) {
-        dst[i] = src[i];
-        if (src[i] == '\0')
-            return (int)i;
+    /* Scan for NUL terminator in the host-mapped buffer directly.
+     * Since guest memory is identity-mapped, we can use memchr on
+     * the host buffer instead of copying byte-by-byte. */
+    const void *nul = memchr(src, '\0', avail);
+    if (nul) {
+        size_t len = (const char *)nul - src;
+        memcpy(dst, src, len + 1); /* Include the NUL terminator */
+        return (int)len;
     }
     /* Unterminated within bounds */
-    dst[i] = '\0';
+    memcpy(dst, src, avail);
+    dst[avail] = '\0';
     return -1;
 }
 
@@ -329,6 +333,45 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
 
 /* ---------- Semantic region tracking ---------- */
 
+/* Check whether two adjacent regions can be merged. They must be
+ * contiguous in address space, have identical protection/flags/name,
+ * and have contiguous file offsets (so the merged region still
+ * represents a valid mapping). */
+static int regions_mergeable(const guest_region_t *a,
+                              const guest_region_t *b) {
+    return a->end == b->start
+        && a->prot == b->prot
+        && a->flags == b->flags
+        && a->offset + (a->end - a->start) == b->offset
+        && strcmp(a->name, b->name) == 0;
+}
+
+/* Try to merge region at index i with its right neighbor (i+1).
+ * Returns 1 if merged (nregions decremented), 0 otherwise. */
+static int try_merge_right(guest_t *g, int i) {
+    if (i + 1 >= g->nregions) return 0;
+    if (!regions_mergeable(&g->regions[i], &g->regions[i + 1])) return 0;
+
+    g->regions[i].end = g->regions[i + 1].end;
+    memmove(&g->regions[i + 1], &g->regions[i + 2],
+            (g->nregions - i - 2) * sizeof(guest_region_t));
+    g->nregions--;
+    return 1;
+}
+
+/* Try to merge region at index i with its left neighbor (i-1).
+ * Returns 1 if merged (nregions decremented, region now at i-1), 0 otherwise. */
+static int try_merge_left(guest_t *g, int i) {
+    if (i <= 0) return 0;
+    if (!regions_mergeable(&g->regions[i - 1], &g->regions[i])) return 0;
+
+    g->regions[i - 1].end = g->regions[i].end;
+    memmove(&g->regions[i], &g->regions[i + 1],
+            (g->nregions - i - 1) * sizeof(guest_region_t));
+    g->nregions--;
+    return 1;
+}
+
 int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
                      int prot, int flags, uint64_t offset,
                      const char *name) {
@@ -354,6 +397,13 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
         r->name[0] = '\0';
     }
     g->nregions++;
+
+    /* Try to merge with adjacent regions to reduce table pressure.
+     * Merge right first, then left (order matters: right merge doesn't
+     * change the index of the left neighbor). */
+    try_merge_right(g, i);
+    try_merge_left(g, i);
+
     return 0;
 }
 
@@ -440,7 +490,10 @@ const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr) {
 }
 
 void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
-    /* Walk regions overlapping [start, end), split at boundaries, update prot */
+    /* Walk regions overlapping [start, end), split at boundaries, update prot.
+     * Track the range of indices that were modified so we can merge afterward. */
+    int first_modified = -1, last_modified = -1;
+
     for (int i = 0; i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
         if (r->end <= start) continue;
@@ -464,8 +517,9 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
         /* If region extends past end, split at end */
         if (r->end > end) {
             if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Can't split, just update what we have */
                 r->prot = prot;
+                if (first_modified < 0) first_modified = i;
+                last_modified = i;
                 continue;
             }
             memmove(&g->regions[i + 1], &g->regions[i],
@@ -477,11 +531,27 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
             /* Right half: [end, old_end) keeps original prot */
             g->regions[i + 1].offset += (end - g->regions[i + 1].start);
             g->regions[i + 1].start = end;
+            if (first_modified < 0) first_modified = i;
+            last_modified = i;
             break; /* done, right half is past our range */
         }
 
         /* Region fully within [start, end): just update prot */
         r->prot = prot;
+        if (first_modified < 0) first_modified = i;
+        last_modified = i;
+    }
+
+    /* After updating prot, try to merge modified regions with neighbors.
+     * Work right-to-left so index shifts don't invalidate earlier indices. */
+    if (first_modified >= 0) {
+        /* Merge last modified with its right neighbor */
+        try_merge_right(g, last_modified);
+        /* Merge adjacent modified regions (right to left) */
+        for (int i = last_modified; i > first_modified; i--)
+            try_merge_left(g, i);
+        /* Merge first modified with its left neighbor */
+        try_merge_left(g, first_modified);
     }
 }
 

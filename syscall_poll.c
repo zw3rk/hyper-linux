@@ -9,8 +9,10 @@
 #include "syscall_poll.h"
 #include "syscall.h"
 #include "syscall_internal.h"
+#include "syscall_signal.h"
 #include "guest.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -66,9 +68,10 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
 
 int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
                      uint64_t writefds_gva, uint64_t exceptfds_gva,
-                     uint64_t timeout_gva) {
-    /* Simple implementation: only handle timeout-based sleeps and basic
-     * fd monitoring. For most coreutils, pselect is used for timed waits. */
+                     uint64_t timeout_gva, uint64_t sigmask_gva) {
+    /* pselect6 atomically sets the signal mask during the wait, then
+     * restores it. The sixth argument is a pointer to a struct:
+     *   { const sigset_t *ss; size_t ss_len; }   */
     if (nfds < 0 || nfds > FD_SETSIZE) return -LINUX_EINVAL;
 
     fd_set read_set, write_set, except_set;
@@ -113,12 +116,37 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         tsp = &ts;
     }
 
+    /* Apply signal mask atomically around the select.
+     * Linux pselect6 arg6 points to { sigset_t *ss; size_t ss_len }.
+     * Save the current blocked mask, apply the new one, do the select,
+     * then restore the original mask. */
+    uint64_t saved_blocked = 0;
+    int mask_applied = 0;
+    if (sigmask_gva) {
+        struct { uint64_t ss; uint64_t ss_len; } ssarg;
+        if (guest_read(g, sigmask_gva, &ssarg, sizeof(ssarg)) == 0
+            && ssarg.ss != 0 && ssarg.ss_len == 8) {
+            uint64_t new_mask;
+            if (guest_read(g, ssarg.ss, &new_mask, 8) == 0) {
+                saved_blocked = signal_save_blocked();
+                signal_set_blocked(new_mask);
+                mask_applied = 1;
+            }
+        }
+    }
+
     int ret = pselect(max_host_fd + 1,
                       readfds_gva ? &read_set : NULL,
                       writefds_gva ? &write_set : NULL,
                       exceptfds_gva ? &except_set : NULL,
                       tsp, NULL);
-    if (ret < 0) return linux_errno();
+    int save_errno = errno;
+
+    /* Restore original signal mask */
+    if (mask_applied)
+        signal_restore_blocked(saved_blocked);
+
+    if (ret < 0) { errno = save_errno; return linux_errno(); }
 
     /* Write back result fd_sets (zero then set bits for matching fds) */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
@@ -179,13 +207,19 @@ typedef struct {
     uint64_t data;
 } linux_epoll_event_t;
 
-/* Per-fd epoll registration data (stores user data for kevent→epoll
- * result translation). Indexed by guest fd. */
-static struct {
+/* Per-fd registration entry within an epoll instance. */
+typedef struct {
     uint32_t events;   /* Registered EPOLL* events mask */
     uint64_t data;     /* User data to return in epoll_wait */
-    int      active;   /* 1 if registered in some epoll instance */
-} epoll_regs[FD_TABLE_SIZE];
+    int      active;   /* 1 if registered in this instance */
+} epoll_reg_t;
+
+/* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance
+ * has its own registration table so multiple epoll instances watching
+ * the same FD don't overwrite each other's user data. */
+typedef struct {
+    epoll_reg_t regs[FD_TABLE_SIZE];
+} epoll_instance_t;
 
 int64_t sys_epoll_create1(int flags) {
     int kq = kqueue();
@@ -194,9 +228,14 @@ int64_t sys_epoll_create1(int flags) {
     if (flags & LINUX_EPOLL_CLOEXEC)
         fcntl(kq, F_SETFD, FD_CLOEXEC);
 
-    int gfd = fd_alloc(FD_EPOLL, kq);
-    if (gfd < 0) { close(kq); return -LINUX_EMFILE; }
+    /* Allocate per-instance registration table */
+    epoll_instance_t *inst = calloc(1, sizeof(epoll_instance_t));
+    if (!inst) { close(kq); return -LINUX_ENOMEM; }
 
+    int gfd = fd_alloc(FD_EPOLL, kq);
+    if (gfd < 0) { free(inst); close(kq); return -LINUX_EMFILE; }
+
+    fd_table[gfd].dir = inst;
     int lflags = 0;
     if (flags & LINUX_EPOLL_CLOEXEC) lflags |= LINUX_O_CLOEXEC;
     fd_table[gfd].linux_flags = lflags;
@@ -210,27 +249,32 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
     if (kq_fd < 0) return -LINUX_EBADF;
     if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
 
+    epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
+    if (!inst) return -LINUX_EINVAL;
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
+
+    epoll_reg_t *reg = &inst->regs[fd];
 
     if (op == LINUX_EPOLL_CTL_DEL) {
         /* Remove all filters for this fd */
         struct kevent changes[2];
         int nchanges = 0;
-        if (epoll_regs[fd].active) {
-            if (epoll_regs[fd].events & LINUX_EPOLLIN) {
+        if (reg->active) {
+            if (reg->events & LINUX_EPOLLIN) {
                 EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
             }
-            if (epoll_regs[fd].events & LINUX_EPOLLOUT) {
+            if (reg->events & LINUX_EPOLLOUT) {
                 EV_SET(&changes[nchanges], host_fd, EVFILT_WRITE,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
             }
             /* Ignore errors from EV_DELETE (fd might already be closed) */
             kevent(kq_fd, changes, nchanges, NULL, 0, NULL);
-            epoll_regs[fd].active = 0;
+            reg->active = 0;
         }
         return 0;
     }
@@ -241,14 +285,14 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
         return -LINUX_EFAULT;
 
     /* For MOD, remove old registrations first */
-    if (op == LINUX_EPOLL_CTL_MOD && epoll_regs[fd].active) {
+    if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
         struct kevent del[2];
         int ndel = 0;
-        if (epoll_regs[fd].events & LINUX_EPOLLIN) {
+        if (reg->events & LINUX_EPOLLIN) {
             EV_SET(&del[ndel], host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
             ndel++;
         }
-        if (epoll_regs[fd].events & LINUX_EPOLLOUT) {
+        if (reg->events & LINUX_EPOLLOUT) {
             EV_SET(&del[ndel], host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
             ndel++;
         }
@@ -281,10 +325,10 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
             return linux_errno();
     }
 
-    /* Store registration data */
-    epoll_regs[fd].events = ev.events;
-    epoll_regs[fd].data = ev.data;
-    epoll_regs[fd].active = 1;
+    /* Store registration data in per-instance table */
+    reg->events = ev.events;
+    reg->data = ev.data;
+    reg->active = 1;
 
     return 0;
 }
@@ -292,12 +336,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
 int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
                          int maxevents, int timeout_ms,
                          uint64_t sigmask_gva) {
-    (void)sigmask_gva; /* Signal mask not implemented (single-threaded) */
+    (void)sigmask_gva; /* Signal mask not yet supported for epoll_pwait */
 
     int kq_fd = fd_to_host(epfd);
     if (kq_fd < 0) return -LINUX_EBADF;
     if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
     if (maxevents <= 0) return -LINUX_EINVAL;
+
+    epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
+    if (!inst) return -LINUX_EINVAL;
 
     /* Convert timeout */
     struct timespec ts, *tsp = NULL;
@@ -322,13 +369,15 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
 
     for (int i = 0; i < nready && nout < maxevents; i++) {
         int gfd = (int)(uintptr_t)kevents[i].udata;
-        if (gfd < 0 || gfd >= FD_TABLE_SIZE || !epoll_regs[gfd].active)
+        if (gfd < 0 || gfd >= FD_TABLE_SIZE || !inst->regs[gfd].active)
             continue;
+
+        epoll_reg_t *reg = &inst->regs[gfd];
 
         /* Check if we already have an entry for this guest fd */
         int merged = 0;
         for (int j = 0; j < nout; j++) {
-            if (out[j].data == epoll_regs[gfd].data) {
+            if (out[j].data == reg->data) {
                 /* Same fd — merge events */
                 if (kevents[i].filter == EVFILT_READ)
                     out[j].events |= LINUX_EPOLLIN;
@@ -346,7 +395,7 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         if (!merged) {
             out[nout].events = 0;
             out[nout]._pad = 0;
-            out[nout].data = epoll_regs[gfd].data;
+            out[nout].data = reg->data;
             if (kevents[i].filter == EVFILT_READ)
                 out[nout].events |= LINUX_EPOLLIN;
             if (kevents[i].filter == EVFILT_WRITE)

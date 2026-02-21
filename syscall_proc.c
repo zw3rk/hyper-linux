@@ -13,9 +13,11 @@
 #include "syscall_proc.h"
 #include "syscall_internal.h"
 #include "syscall_signal.h"
+#include "hv_util.h"
 #include "thread.h"
 #include "futex.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,15 +30,6 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/sysctl.h>
-
-/* ---------- HV_CHECK macro (shared with hl.c, fork_ipc.c) ---------- */
-#define HV_CHECK(call) do {                                        \
-    hv_return_t _r = (call);                                       \
-    if (_r != HV_SUCCESS) {                                        \
-        fprintf(stderr, "hl: %s failed: %d\n", #call, (int)_r);   \
-        exit(1);                                                   \
-    }                                                              \
-} while (0)
 
 /* ---------- Process state ---------- */
 
@@ -61,13 +54,15 @@ static char sysroot_path[LINUX_PATH_MAX] = {0};
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
-static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
 
-/* Global flag for exit_group: signals all threads to terminate */
-volatile int exit_group_requested = 0;
+/* Global flag for exit_group: signals all threads to terminate.
+ * Atomic to avoid undefined behavior under C11 memory model when
+ * multiple threads read/write concurrently. */
+_Atomic int exit_group_requested = 0;
 
 /* Exit code set by the thread that calls exit_group */
-int exit_group_code = 0;
+_Atomic int exit_group_code = 0;
 
 /* ---------- Public API ---------- */
 
@@ -379,7 +374,7 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
 
 /* ---------- vCPU run loop ---------- */
 
-/* Global vCPU handle for the SIGALRM handler (unavoidable global state --
+/* Global vCPU handle for the SIGALRM handler (unavoidable global state —
  * signal handlers cannot receive context parameters). */
 static hv_vcpu_t g_timeout_vcpu;
 static volatile sig_atomic_t g_timed_out;
@@ -390,46 +385,77 @@ static void alarm_handler(int sig) {
     hv_vcpus_exit(&g_timeout_vcpu, 1);
 }
 
+/* Unified vCPU execution loop for both main and worker threads.
+ *
+ * When timeout_sec > 0 (main thread): uses alarm() for per-iteration
+ * safety timeout, logs with "hl:" prefix.
+ *
+ * When timeout_sec == 0 (worker thread): skips alarm() setup (SIGALRM
+ * is process-wide and would conflict). Workers are terminated by
+ * exit_group setting exit_group_requested and calling hv_vcpus_exit()
+ * to cancel pending hv_vcpu_run calls. Logs with "hl: worker" prefix.
+ *
+ * Both modes check exit_group_requested so the main thread also reacts
+ * to exit_group called by a worker. */
 int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                   guest_t *g, int verbose, int timeout_sec) {
     int exit_code = 0;
     int running = 1;
     int iter = 0;
+    const int is_main = (timeout_sec > 0);
+    const char *prefix = is_main ? "hl" : "hl: worker";
 
-    /* Set up timeout handling */
-    g_timeout_vcpu = vcpu;
-    g_timed_out = 0;
-    signal(SIGALRM, alarm_handler);
+    /* Main thread: set up alarm-based per-iteration timeout.
+     * Guest ITIMER_REAL is emulated internally by signal_check_timer()
+     * rather than using host setitimer, because macOS shares alarm()
+     * and setitimer(ITIMER_REAL) as the same underlying timer. */
+    if (is_main) {
+        g_timeout_vcpu = vcpu;
+        g_timed_out = 0;
+        signal(SIGALRM, alarm_handler);
+    }
 
     while (running) {
+        /* Check if another thread called exit_group */
+        if (atomic_load(&exit_group_requested)) {
+            exit_code = atomic_load(&exit_group_code);
+            break;
+        }
+
         if (verbose) {
             uint64_t pc;
             hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-            fprintf(stderr, "hl: [%d] vcpu_run PC=0x%llx\n",
-                    iter, (unsigned long long)pc);
+            fprintf(stderr, "%s: [%d] vcpu_run PC=0x%llx\n",
+                    prefix, iter, (unsigned long long)pc);
         }
         iter++;
 
-        /* Arm per-iteration timeout (hl's own safety timeout).
-         * Guest ITIMER_REAL is emulated internally by signal_check_timer()
-         * rather than using host setitimer, because macOS shares alarm()
-         * and setitimer(ITIMER_REAL) as the same underlying timer. */
-        alarm((unsigned)timeout_sec);
+        /* Main: arm per-iteration safety timeout */
+        if (is_main)
+            alarm((unsigned)timeout_sec);
 
         HV_CHECK(hv_vcpu_run(vcpu));
 
-        /* Disarm timeout */
-        alarm(0);
+        /* Main: disarm timeout */
+        if (is_main)
+            alarm(0);
 
-        /* Check for timeout */
-        if (g_timed_out) {
-            fprintf(stderr, "hl: vCPU execution timed out after %ds\n",
-                    timeout_sec);
+        /* Re-check exit_group after waking from hv_vcpu_run */
+        if (atomic_load(&exit_group_requested)) {
+            exit_code = atomic_load(&exit_group_code);
+            break;
+        }
+
+        /* Main: check for alarm timeout */
+        if (is_main && g_timed_out) {
+            fprintf(stderr, "%s: vCPU execution timed out after %ds\n",
+                    prefix, timeout_sec);
 
             uint64_t pc, cpsr;
             hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
             hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
-            fprintf(stderr, "hl: timeout state: PC=0x%llx CPSR=0x%llx\n",
+            fprintf(stderr, "%s: timeout state: PC=0x%llx CPSR=0x%llx\n",
+                    prefix,
                     (unsigned long long)pc, (unsigned long long)cpsr);
 
             uint64_t esr, far_reg, elr, sctlr_val;
@@ -437,8 +463,9 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_reg);
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &sctlr_val);
-            fprintf(stderr, "hl: ESR_EL1=0x%llx FAR_EL1=0x%llx "
+            fprintf(stderr, "%s: ESR_EL1=0x%llx FAR_EL1=0x%llx "
                     "ELR_EL1=0x%llx SCTLR_EL1=0x%llx\n",
+                    prefix,
                     (unsigned long long)esr,
                     (unsigned long long)far_reg,
                     (unsigned long long)elr,
@@ -456,7 +483,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 uint16_t imm = vexit->exception.syndrome & 0xFFFF;
 
                 if (verbose)
-                    fprintf(stderr, "hl: HVC #%u\n", imm);
+                    fprintf(stderr, "%s: HVC #%u\n", prefix, imm);
 
                 switch (imm) {
                 case 5: {
@@ -475,7 +502,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         int sig_ret = signal_deliver(vcpu, g, &exit_code);
                         if (sig_ret < 0)
                             running = 0; /* Default TERM/CORE disposition */
-                        /* sig_ret == 1: signal delivered to handler, continue */
                     }
                     break;
                 }
@@ -485,8 +511,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     uint64_t x0;
                     hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
                     if (verbose)
-                        fprintf(stderr, "hl: guest exit HVC #0 code=%llu\n",
-                                (unsigned long long)x0);
+                        fprintf(stderr, "%s: guest exit HVC #0 code=%llu\n",
+                                prefix, (unsigned long long)x0);
                     exit_code = (int)x0;
                     running = 0;
                     break;
@@ -510,14 +536,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     case 7: hv_reg = HV_SYS_REG_SPSR_EL1; break;
                     case 8: hv_reg = HV_SYS_REG_TTBR1_EL1; break;
                     default:
-                        fprintf(stderr, "hl: HVC #4 unknown reg %llu\n",
-                                (unsigned long long)reg_id);
+                        fprintf(stderr, "%s: HVC #4 unknown reg %llu\n",
+                                prefix, (unsigned long long)reg_id);
                         exit_code = 128;
                         running = 0;
                         continue;
                     }
                     if (verbose)
-                        fprintf(stderr, "hl: HVC #4 set reg %llu = 0x%llx\n",
+                        fprintf(stderr, "%s: HVC #4 set reg %llu = 0x%llx\n",
+                                prefix,
                                 (unsigned long long)reg_id,
                                 (unsigned long long)value);
                     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, hv_reg, value));
@@ -532,8 +559,9 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
                     hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
                     hv_vcpu_get_reg(vcpu, HV_REG_X5, &x5);
-                    fprintf(stderr, "hl: guest exception vec=0x%03llx "
+                    fprintf(stderr, "%s: guest exception vec=0x%03llx "
                             "ESR=0x%llx FAR=0x%llx ELR=0x%llx SPSR=0x%llx\n",
+                            prefix,
                             (unsigned long long)x5,
                             (unsigned long long)x0,
                             (unsigned long long)x1,
@@ -545,20 +573,20 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 }
 
                 default:
-                    fprintf(stderr, "hl: unexpected HVC #%u\n", imm);
+                    fprintf(stderr, "%s: unexpected HVC #%u\n", prefix, imm);
                     exit_code = 128;
                     running = 0;
                     break;
                 }
             } else if (ec == 0x01) {
-                /* WFI/WFE trapped -- just continue */
+                /* WFI/WFE trapped — just continue */
                 if (verbose)
-                    fprintf(stderr, "hl: WFI/WFE trapped\n");
+                    fprintf(stderr, "%s: WFI/WFE trapped\n", prefix);
             } else {
                 /* Non-HVC exception at EL2 level */
-                fprintf(stderr, "hl: unexpected exception EC=0x%x "
+                fprintf(stderr, "%s: unexpected exception EC=0x%x "
                         "syndrome=0x%llx VA=0x%llx PA=0x%llx\n",
-                        ec,
+                        prefix, ec,
                         (unsigned long long)vexit->exception.syndrome,
                         (unsigned long long)vexit->exception.virtual_address,
                         (unsigned long long)vexit->exception.physical_address);
@@ -566,162 +594,33 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 running = 0;
             }
         } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            if (!g_timed_out) {
-                fprintf(stderr, "hl: vCPU canceled\n");
-                exit_code = 128;
-                running = 0;
+            /* Canceled by hv_vcpus_exit(). For main: could be alarm
+             * timeout (already handled above). For workers/main:
+             * typically exit_group from another thread. */
+            if (is_main && g_timed_out) {
+                /* Timeout already handled above the exception switch —
+                 * loop back so the timeout check fires. */
+                continue;
             }
+            if (atomic_load(&exit_group_requested)) {
+                exit_code = atomic_load(&exit_group_code);
+            } else {
+                fprintf(stderr, "%s: vCPU canceled unexpectedly\n", prefix);
+                exit_code = 128;
+            }
+            running = 0;
         } else {
-            fprintf(stderr, "hl: unexpected exit reason 0x%x\n",
-                    vexit->reason);
+            fprintf(stderr, "%s: unexpected exit reason 0x%x\n",
+                    prefix, vexit->reason);
             exit_code = 128;
             running = 0;
         }
     }
 
-    /* Clean up timeout */
-    signal(SIGALRM, SIG_DFL);
-    alarm(0);
-
-    return exit_code;
-}
-
-/* Worker-thread vCPU run loop. Unlike the main loop, workers do NOT
- * use alarm() for timeout (SIGALRM is process-wide and would conflict).
- * Instead, workers are terminated by exit_group setting exit_group_requested
- * and calling hv_vcpus_exit() to cancel pending hv_vcpu_run calls. */
-int vcpu_run_loop_worker(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
-                         guest_t *g, int verbose) {
-    int exit_code = 0;
-    int running = 1;
-
-    while (running) {
-        /* Check if another thread called exit_group */
-        if (exit_group_requested) {
-            exit_code = exit_group_code;
-            break;
-        }
-
-        HV_CHECK(hv_vcpu_run(vcpu));
-
-        /* Re-check after waking from hv_vcpu_run */
-        if (exit_group_requested) {
-            exit_code = exit_group_code;
-            break;
-        }
-
-        if (vexit->reason == HV_EXIT_REASON_EXCEPTION) {
-            uint32_t ec = (vexit->exception.syndrome >> 26) & 0x3F;
-
-            if (ec == 0x16) {
-                uint16_t imm = vexit->exception.syndrome & 0xFFFF;
-
-                switch (imm) {
-                case 5: {
-                    /* HVC #5: Linux syscall forwarding */
-                    int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
-                    if (ret == 1)
-                        running = 0;
-
-                    /* Check guest ITIMER_REAL expiry */
-                    signal_check_timer();
-
-                    /* Deliver pending signals after each syscall */
-                    if (running && signal_pending()) {
-                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
-                        if (sig_ret < 0)
-                            running = 0;
-                    }
-                    break;
-                }
-
-                case 0: {
-                    /* HVC #0: Normal exit */
-                    uint64_t x0;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    exit_code = (int)x0;
-                    running = 0;
-                    break;
-                }
-
-                case 4: {
-                    /* HVC #4: Set system register */
-                    uint64_t reg_id, value;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &reg_id);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &value);
-
-                    hv_sys_reg_t hv_reg;
-                    switch ((int)reg_id) {
-                    case 0: hv_reg = HV_SYS_REG_VBAR_EL1; break;
-                    case 1: hv_reg = HV_SYS_REG_MAIR_EL1; break;
-                    case 2: hv_reg = HV_SYS_REG_TCR_EL1;  break;
-                    case 3: hv_reg = HV_SYS_REG_TTBR0_EL1; break;
-                    case 4: hv_reg = HV_SYS_REG_SCTLR_EL1; break;
-                    case 5: hv_reg = HV_SYS_REG_CPACR_EL1; break;
-                    case 6: hv_reg = HV_SYS_REG_ELR_EL1; break;
-                    case 7: hv_reg = HV_SYS_REG_SPSR_EL1; break;
-                    case 8: hv_reg = HV_SYS_REG_TTBR1_EL1; break;
-                    default:
-                        fprintf(stderr, "hl: worker HVC #4 unknown reg %llu\n",
-                                (unsigned long long)reg_id);
-                        exit_code = 128;
-                        running = 0;
-                        continue;
-                    }
-                    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, hv_reg, value));
-                    break;
-                }
-
-                case 2: {
-                    /* HVC #2: Bad exception */
-                    uint64_t x0, x1, x2, x3, x5;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X5, &x5);
-                    fprintf(stderr, "hl: worker exception vec=0x%03llx "
-                            "ESR=0x%llx FAR=0x%llx ELR=0x%llx SPSR=0x%llx\n",
-                            (unsigned long long)x5,
-                            (unsigned long long)x0,
-                            (unsigned long long)x1,
-                            (unsigned long long)x2,
-                            (unsigned long long)x3);
-                    exit_code = 128;
-                    running = 0;
-                    break;
-                }
-
-                default:
-                    fprintf(stderr, "hl: worker unexpected HVC #%u\n", imm);
-                    exit_code = 128;
-                    running = 0;
-                    break;
-                }
-            } else if (ec == 0x01) {
-                /* WFI/WFE trapped — just continue */
-            } else {
-                fprintf(stderr, "hl: worker unexpected exception EC=0x%x "
-                        "syndrome=0x%llx\n", ec,
-                        (unsigned long long)vexit->exception.syndrome);
-                exit_code = 128;
-                running = 0;
-            }
-        } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            /* Canceled by exit_group via hv_vcpus_exit */
-            if (exit_group_requested) {
-                exit_code = exit_group_code;
-            } else {
-                fprintf(stderr, "hl: worker vCPU canceled unexpectedly\n");
-                exit_code = 128;
-            }
-            break;
-        } else {
-            fprintf(stderr, "hl: worker unexpected exit reason 0x%x\n",
-                    vexit->reason);
-            exit_code = 128;
-            running = 0;
-        }
+    /* Clean up timeout if we set it up */
+    if (is_main) {
+        signal(SIGALRM, SIG_DFL);
+        alarm(0);
     }
 
     return exit_code;

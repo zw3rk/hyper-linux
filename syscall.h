@@ -240,18 +240,22 @@
 /* ---------- Linux FD flags ---------- */
 #define LINUX_FD_CLOEXEC   1
 
-/* ---------- Linux ioctl constants ---------- */
-#define LINUX_TCGETS      0x5401
-#define LINUX_TCSETS      0x5402
-#define LINUX_TCSETSW     0x5403
-#define LINUX_TCSETSF     0x5404
-#define LINUX_TIOCGPGRP   0x540F
-#define LINUX_TIOCSPGRP   0x5410
-#define LINUX_TIOCSCTTY   0x540E
-#define LINUX_TIOCGWINSZ  0x5413
-#define LINUX_FIONREAD    0x541B
-#define LINUX_TIOCNOTTY   0x5422
-#define LINUX_TIOCGSID    0x5429
+/* ---------- Linux ioctl constants ----------
+ * Linux and macOS use different ioctl numbers for the same operations.
+ * Linux terminal ioctls use 0x54xx (from asm-generic/ioctls.h).
+ * macOS equivalents are in <sys/ioctl.h> and <sys/ttycom.h>.
+ * Translation is done in syscall_io.c:sys_ioctl(). */
+#define LINUX_TCGETS      0x5401  /* → macOS TIOCGETA (tcgetattr) */
+#define LINUX_TCSETS      0x5402  /* → macOS TIOCSETA (tcsetattr TCSANOW) */
+#define LINUX_TCSETSW     0x5403  /* → macOS TIOCSETAW (tcsetattr TCSADRAIN) */
+#define LINUX_TCSETSF     0x5404  /* → macOS TIOCSETAF (tcsetattr TCSAFLUSH) */
+#define LINUX_TIOCGPGRP   0x540F  /* → macOS TIOCGPGRP (same semantics) */
+#define LINUX_TIOCSPGRP   0x5410  /* → macOS TIOCSPGRP (same semantics) */
+#define LINUX_TIOCSCTTY   0x540E  /* → macOS TIOCSCTTY (same semantics) */
+#define LINUX_TIOCGWINSZ  0x5413  /* → macOS TIOCGWINSZ (same struct) */
+#define LINUX_FIONREAD    0x541B  /* → macOS FIONREAD (same semantics) */
+#define LINUX_TIOCNOTTY   0x5422  /* → macOS TIOCNOTTY (same semantics) */
+#define LINUX_TIOCGSID    0x5429  /* → macOS TIOCGSID (same semantics) */
 
 /* ---------- Linux open flags ---------- */
 #define LINUX_O_RDONLY   0x0000
