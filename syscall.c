@@ -29,6 +29,7 @@
 #include "fork_ipc.h"
 #include "syscall_signal.h"
 #include "syscall_net.h"
+#include "syscall_inotify.h"
 #include "futex.h"
 #include "thread.h"
 
@@ -731,9 +732,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             guest_region_remove(g, unmap_off, end);
 
             /* Reset gap-finder hints if freed space precedes them,
-             * so the next mmap will find the newly available gap. */
-            if (unmap_off < mmap_rw_gap_hint) mmap_rw_gap_hint = 0;
-            if (unmap_off < mmap_rx_gap_hint) mmap_rx_gap_hint = 0;
+             * so the next mmap will find the newly available gap.
+             * Set hint to the freed address rather than 0 to avoid
+             * a full scan from the region base. */
+            if (unmap_off < mmap_rw_gap_hint) mmap_rw_gap_hint = unmap_off;
+            if (unmap_off < mmap_rx_gap_hint) mmap_rx_gap_hint = unmap_off;
         }
         pthread_mutex_unlock(&mmap_lock);
         result = 0;
@@ -772,11 +775,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 guest_update_perms(g, mprot_off, mprot_off + mprot_len,
                                    page_perms);
             }
-            /* PROT_NONE: only region tracking is updated (done above).
-             * Page table entries are NOT invalidated — a known limitation.
-             * The memory remains accessible in the page tables, but the
-             * region tracking correctly reflects PROT_NONE. This is safe
-             * because programs don't intentionally access PROT_NONE memory. */
+            /* PROT_NONE: invalidate page table entries so the guest
+             * faults on access. This is required for correctness — GHC
+             * and jemalloc use PROT_NONE guard pages to detect overflow. */
+            if (mprot_prot == LINUX_PROT_NONE) {
+                guest_invalidate_ptes(g, mprot_off, mprot_off + mprot_len);
+            }
         }
         pthread_mutex_unlock(&mmap_lock);
         result = 0;
@@ -952,8 +956,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                        * is safe as long as threads exit cleanly. */
         break;
     case SYS_sigaltstack:
-        result = 0;  /* Stub: alternate signal stack not tracked.
-                       * Signals are delivered on the guest's main stack. */
+        result = signal_sigaltstack(g, x0, x1);
         break;
 
     /* ---- Batch 2: Process/system info ---- */
@@ -1126,17 +1129,69 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         if (result == SYSCALL_EXEC_HAPPENED)
             return SYSCALL_EXEC_HAPPENED;
         break;
-    case SYS_execveat:
-        /* execveat with AT_EMPTY_PATH + fd is complex; stub with execve
-         * semantics when dirfd is AT_FDCWD */
-        if ((int)x0 == LINUX_AT_FDCWD) {
+    case SYS_execveat: {
+        /* execveat(dirfd, pathname, argv, envp, flags)
+         * x0=dirfd, x1=pathname, x2=argv, x3=envp, x4=flags */
+        int dirfd = (int)x0;
+        int flags = (int)x4;
+
+        if (dirfd == LINUX_AT_FDCWD && !(flags & LINUX_AT_EMPTY_PATH)) {
+            /* Simple case: relative to CWD = same as execve */
             result = sys_execve(vcpu, g, x1, x2, x3, verbose);
             if (result == SYSCALL_EXEC_HAPPENED)
                 return SYSCALL_EXEC_HAPPENED;
+        } else if (flags & LINUX_AT_EMPTY_PATH) {
+            /* AT_EMPTY_PATH: execute the file referred to by dirfd.
+             * Resolve the host fd's path and pass to sys_execve. */
+            int host_fd = fd_to_host(dirfd);
+            if (host_fd < 0) { result = -LINUX_EBADF; break; }
+            char fd_path[LINUX_PATH_MAX];
+            if (fcntl(host_fd, F_GETPATH, fd_path) < 0) {
+                result = -LINUX_ENOENT;
+                break;
+            }
+            /* Write the resolved path into guest memory temporarily.
+             * Use the top of the stack scratch area (above stack_top). */
+            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            size_t pathlen = strlen(fd_path) + 1;
+            if (guest_write(g, tmp_gva, fd_path, pathlen) < 0) {
+                result = -LINUX_EFAULT;
+                break;
+            }
+            result = sys_execve(vcpu, g, tmp_gva, x2, x3, verbose);
+            if (result == SYSCALL_EXEC_HAPPENED)
+                return SYSCALL_EXEC_HAPPENED;
         } else {
-            result = -LINUX_ENOSYS;
+            /* dirfd + relative pathname: resolve via host openat.
+             * Read pathname from guest, open relative to dirfd, get path. */
+            char pathname[LINUX_PATH_MAX];
+            if (guest_read_str(g, x1, pathname, sizeof(pathname)) < 0) {
+                result = -LINUX_EFAULT;
+                break;
+            }
+            int host_dirfd = fd_to_host(dirfd);
+            if (host_dirfd < 0) { result = -LINUX_EBADF; break; }
+            int tmp_fd = openat(host_dirfd, pathname, O_RDONLY);
+            if (tmp_fd < 0) { result = linux_errno(); break; }
+            char resolved[LINUX_PATH_MAX];
+            if (fcntl(tmp_fd, F_GETPATH, resolved) < 0) {
+                close(tmp_fd);
+                result = -LINUX_ENOENT;
+                break;
+            }
+            close(tmp_fd);
+            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            size_t pathlen = strlen(resolved) + 1;
+            if (guest_write(g, tmp_gva, resolved, pathlen) < 0) {
+                result = -LINUX_EFAULT;
+                break;
+            }
+            result = sys_execve(vcpu, g, tmp_gva, x2, x3, verbose);
+            if (result == SYSCALL_EXEC_HAPPENED)
+                return SYSCALL_EXEC_HAPPENED;
         }
         break;
+    }
     case SYS_clone:
         result = sys_clone(vcpu, g, x0, x1, x2, x3, x4, verbose);
         break;
@@ -1196,11 +1251,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_signalfd4(g, (int)x0, x1, x2, (int)x3);
         break;
 
-    /* ---- inotify stubs ---- */
+    /* ---- inotify (emulated via kqueue EVFILT_VNODE) ---- */
     case SYS_inotify_init1:
+        result = sys_inotify_init1((int)x0);
+        break;
     case SYS_inotify_add_watch:
+        result = sys_inotify_add_watch(g, (int)x0, x1, (uint32_t)x2);
+        break;
     case SYS_inotify_rm_watch:
-        result = -LINUX_ENOSYS;
+        result = sys_inotify_rm_watch((int)x0, (int)x1);
         break;
 
     /* ---- xattr syscalls ---- */

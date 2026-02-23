@@ -263,6 +263,16 @@ restore_and_bad:
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
     add sp, sp, #256
+
+    /* Determine correct vector offset for bad_exception reporting.
+     * After restore, X5 holds the EL0 caller's value — not the vector.
+     * Check SPSR_EL1.M[3:0]: 0=EL0t (Lower EL → 0x400), 4/5=EL1 (→ 0x200). */
+    mrs x5, spsr_el1
+    and x5, x5, #0xF
+    cmp x5, #0
+    mov x5, #0x400           /* Assume Lower EL (EL0 → vec 0x400) */
+    b.eq bad_exception
+    mov x5, #0x200           /* Current EL (EL1 → vec 0x200) */
     b bad_exception
 
 /* ================================================================

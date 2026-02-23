@@ -12,6 +12,7 @@
 #include "syscall_internal.h" /* fd_to_host, FD_TABLE_SIZE */
 #include "syscall.h"         /* linux_utmpx_t, FD_CLOSED, FD_STDIO, FD_REGULAR */
 #include "guest.h"
+#include "thread.h"          /* thread_active_count */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,7 +111,23 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /proc/self/status -> synthetic process status */
     if (strcmp(path, "/proc/self/status") == 0) {
-        char buf[1024];
+        /* Compute VmSize from region tracking (total virtual memory) */
+        uint64_t vm_size_kb = 0;
+        for (int i = 0; i < g->nregions; i++)
+            vm_size_kb += (g->regions[i].end - g->regions[i].start);
+        vm_size_kb /= 1024;
+
+        /* VmRSS: approximate as non-PROT_NONE regions (we can't query
+         * actual residency from HVF, but mapped != PROT_NONE is close) */
+        uint64_t vm_rss_kb = 0;
+        for (int i = 0; i < g->nregions; i++) {
+            if (g->regions[i].prot != 0)  /* PROT_NONE = 0 */
+                vm_rss_kb += (g->regions[i].end - g->regions[i].start);
+        }
+        vm_rss_kb /= 1024;
+
+        int threads = thread_active_count();
+        char buf[2048];
         int len = snprintf(buf, sizeof(buf),
             "Name:\thl\n"
             "State:\tR (running)\n"
@@ -118,10 +135,18 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "Pid:\t%lld\n"
             "PPid:\t%lld\n"
             "Uid:\t1000\t1000\t1000\t1000\n"
-            "Gid:\t1000\t1000\t1000\t1000\n",
+            "Gid:\t1000\t1000\t1000\t1000\n"
+            "VmPeak:\t%llu kB\n"
+            "VmSize:\t%llu kB\n"
+            "VmRSS:\t%llu kB\n"
+            "Threads:\t%d\n",
             (long long)proc_get_pid(),
             (long long)proc_get_pid(),
-            (long long)proc_get_ppid());
+            (long long)proc_get_ppid(),
+            (unsigned long long)vm_size_kb,
+            (unsigned long long)vm_size_kb,
+            (unsigned long long)vm_rss_kb,
+            threads);
         return proc_synthetic_fd(buf, len);
     }
 

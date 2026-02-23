@@ -13,6 +13,7 @@
 #include "syscall.h"         /* FD_CLOSED, FD_STDIO, LINUX_O_CLOEXEC, etc. */
 #include "guest.h"           /* guest_t, guest_reset, guest_build_page_tables, etc. */
 #include "elf.h"             /* elf_load, elf_map_segments */
+#include "syscall_signal.h"  /* signal_reset_for_exec */
 #include "stack.h"           /* build_linux_stack */
 
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <libkern/OSCacheControl.h>
 
 /* Read a NULL-terminated pointer array from guest memory.
  * Each pointer in the array is a 64-bit GVA pointing to a string.
@@ -99,11 +101,104 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     }
     envp[envc] = NULL;
 
-    /* Step 3: Verify path is a valid aarch64-linux ELF */
+    /* Step 3: Try loading as ELF; if that fails, check for shebang (#!).
+     * Linux kernel handles shebangs transparently in binfmt_script. */
     elf_info_t elf_info;
     if (elf_load(path, &elf_info) < 0) {
-        free(argv_buf); free(envp_buf);
-        return -LINUX_ENOENT;
+        /* Not a valid ELF — check if it's a script with a shebang line.
+         * Read the first 256 bytes and look for "#!" at the start. */
+        int script_fd = open(path, O_RDONLY);
+        if (script_fd < 0) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOENT;
+        }
+        char shebang_buf[256];
+        ssize_t nread = read(script_fd, shebang_buf, sizeof(shebang_buf) - 1);
+        close(script_fd);
+
+        if (nread < 2 || shebang_buf[0] != '#' || shebang_buf[1] != '!') {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+        shebang_buf[nread] = '\0';
+
+        /* Find end of the shebang line */
+        char *eol = strchr(shebang_buf + 2, '\n');
+        if (eol) *eol = '\0';
+
+        /* Parse interpreter path and optional argument.
+         * Format: "#! /path/to/interpreter [optional-arg]" */
+        char *interp_start = shebang_buf + 2;
+        while (*interp_start == ' ' || *interp_start == '\t')
+            interp_start++;
+        if (*interp_start == '\0') {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+
+        /* Split into interpreter path and optional argument */
+        char *interp_arg = NULL;
+        char *space = interp_start;
+        while (*space && *space != ' ' && *space != '\t')
+            space++;
+        if (*space) {
+            *space = '\0';
+            interp_arg = space + 1;
+            while (*interp_arg == ' ' || *interp_arg == '\t')
+                interp_arg++;
+            if (*interp_arg == '\0') interp_arg = NULL;
+            /* Trim trailing whitespace from arg */
+            if (interp_arg) {
+                char *end = interp_arg + strlen(interp_arg) - 1;
+                while (end > interp_arg && (*end == ' ' || *end == '\t' || *end == '\r'))
+                    *end-- = '\0';
+            }
+        }
+
+        if (verbose)
+            fprintf(stderr, "hl: execve: shebang interp=\"%s\" arg=\"%s\" script=\"%s\"\n",
+                    interp_start, interp_arg ? interp_arg : "(none)", path);
+
+        /* Rebuild argv: [interpreter, optional-arg, script-path, original-argv[1:]] */
+        int new_argc = 1 + (interp_arg ? 1 : 0) + 1 + (argc > 1 ? argc - 1 : 0);
+        if (new_argc > MAX_ARGS) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_E2BIG;
+        }
+
+        /* Allocate new argv on the stack (small, bounded) */
+        char **new_argv = alloca((new_argc + 1) * sizeof(char *));
+        int ni = 0;
+        new_argv[ni++] = interp_start;
+        if (interp_arg) new_argv[ni++] = interp_arg;
+        new_argv[ni++] = path;
+        for (int i = 1; i < argc; i++)
+            new_argv[ni++] = argv[i];
+        new_argv[ni] = NULL;
+
+        /* Copy new argv into argv_buf for the recursive call */
+        size_t buf_off = 0;
+        for (int i = 0; i < ni; i++) {
+            size_t len = strlen(new_argv[i]);
+            if (buf_off + len + 1 > STR_BUF_SIZE) {
+                free(argv_buf); free(envp_buf);
+                return -LINUX_E2BIG;
+            }
+            memcpy(argv_buf + buf_off, new_argv[i], len + 1);
+            argv[i] = argv_buf + buf_off;
+            buf_off += len + 1;
+        }
+        argv[ni] = NULL;
+        argc = ni;
+
+        /* Replace path with interpreter and re-try ELF load */
+        strncpy(path, interp_start, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+
+        if (elf_load(path, &elf_info) < 0) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOENT;
+        }
     }
 
     /* Step 4: Close CLOEXEC fds */
@@ -124,6 +219,11 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
 
     /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
     guest_reset(g);
+
+    /* Step 5b: Reset signal state for exec (POSIX requirement).
+     * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN),
+     * pending signals preserved, signal mask preserved. */
+    signal_reset_for_exec();
 
     /* Step 6: Reload shim into guest */
     const unsigned char *shim_ptr = proc_get_shim_blob();
@@ -181,6 +281,32 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                     interp_info.num_segments);
         }
     }
+
+    /* Step 7c: Invalidate I-cache for loaded code regions.
+     * ARM64 I-cache and D-cache are not coherent. elf_map_segments writes
+     * code via memcpy (updating D-cache), but the I-cache may still hold
+     * stale instructions from the pre-exec binary at the same addresses.
+     * Without explicit invalidation, the vCPU executes wrong instructions
+     * after ERET — this was the root cause of flaky test-fork-exec failures
+     * (stale I-cache from the pre-exec binary persisted non-deterministically,
+     * depending on cache eviction pressure from intervening memory accesses). */
+    for (int i = 0; i < elf_info.num_segments; i++) {
+        if (elf_info.segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *)g->host_base +
+                              elf_info.segments[i].gpa + elf_load_base;
+            sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
+        }
+    }
+    for (int i = 0; i < interp_info.num_segments; i++) {
+        if (interp_info.segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *)g->host_base +
+                              interp_info.segments[i].gpa + interp_base;
+            sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
+        }
+    }
+    /* Also invalidate the reloaded shim code — I-cache lines may have been
+     * evicted and refilled with zeroes during guest_reset(). */
+    sys_icache_invalidate((uint8_t *)g->host_base + SHIM_BASE, shim_size);
 
     /* Set brk base after the highest loaded segment */
     uint64_t brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
@@ -302,7 +428,13 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                              interp_info.segments[i].offset, interp_resolved);
         }
     }
-    guest_region_add(g, STACK_BASE, STACK_TOP,
+    /* Stack guard page: PROT_NONE at bottom to catch overflow */
+    guest_invalidate_ptes(g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE);
+    guest_region_add(g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE,
+                     LINUX_PROT_NONE,
+                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                     0, "[stack-guard]");
+    guest_region_add(g, STACK_BASE + STACK_GUARD_SIZE, STACK_TOP,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");

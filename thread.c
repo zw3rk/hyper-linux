@@ -142,3 +142,22 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
     }
     pthread_mutex_unlock(&thread_lock);
 }
+
+void thread_interrupt_all(void) {
+    /* Collect active vCPUs under the lock, then call hv_vcpus_exit
+     * outside the lock to avoid holding it during a framework call. */
+    hv_vcpu_t vcpus[MAX_THREADS];
+    int count = 0;
+
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_table[i].active)
+            vcpus[count++] = thread_table[i].vcpu;
+    }
+    pthread_mutex_unlock(&thread_lock);
+
+    /* Force all active vCPUs out of hv_vcpu_run(). Each vCPU will see
+     * HV_EXIT_REASON_CANCELED and check for pending signals. */
+    if (count > 0)
+        hv_vcpus_exit(vcpus, (uint32_t)count);
+}

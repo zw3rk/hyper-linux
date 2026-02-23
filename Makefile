@@ -44,13 +44,13 @@ RESET  := \033[0m
 
 # ── Source files ───────────────────────────────────────────────────
 HL_SRCS := hl.c guest.c elf.c syscall.c syscall_fs.c syscall_io.c \
-           syscall_poll.c syscall_fd.c \
+           syscall_poll.c syscall_fd.c syscall_inotify.c \
            syscall_time.c syscall_sys.c syscall_proc.c \
            proc_emulation.c syscall_exec.c fork_ipc.c \
            syscall_signal.c syscall_net.c stack.c \
            thread.c futex.c
 HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_fs.h \
-           syscall_io.h syscall_poll.h syscall_fd.h \
+           syscall_io.h syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h \

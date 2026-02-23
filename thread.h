@@ -32,6 +32,11 @@ typedef struct {
     uint64_t      clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
     uint64_t      sp_el1;          /* Per-thread EL1 stack top (IPA) */
     int           active;          /* Non-zero while thread is running */
+    /* Per-thread signal mask (POSIX requires each thread to have its own).
+     * Initialized to the parent's mask on clone, modified via rt_sigprocmask. */
+    uint64_t      blocked;         /* Signal mask for this thread */
+    uint64_t      saved_blocked;   /* Original mask saved by sigsuspend */
+    int           saved_blocked_valid;
 } thread_entry_t;
 
 /* Current thread pointer — set once per host pthread at thread start.
@@ -69,5 +74,11 @@ uint64_t thread_alloc_sp_el1(void);
 /* Iterate over all active threads, calling fn(entry, ctx) for each.
  * Holds the thread table lock during iteration. */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
+
+/* Interrupt all active vCPUs by calling hv_vcpus_exit().
+ * Used for signal preemption: when a signal is queued while a vCPU
+ * is running in a tight loop (no syscalls), this forces it to break
+ * out of hv_vcpu_run so the signal can be delivered. */
+void thread_interrupt_all(void);
 
 #endif /* THREAD_H */

@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/spawn.h>          /* POSIX_SPAWN_CLOEXEC_DEFAULT (macOS extension) */
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -519,6 +520,10 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
         return -LINUX_EAGAIN;
     }
 
+    /* Inherit parent's signal mask (POSIX: clone inherits blocked mask) */
+    if (current_thread)
+        t->blocked = current_thread->blocked;
+
     /* Allocate per-thread EL1 stack */
     uint64_t child_sp_el1 = thread_alloc_sp_el1();
     if (child_sp_el1 == 0) {
@@ -754,13 +759,23 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     child_argv[ci++] = fd_str;
     child_argv[ci] = NULL;
 
-    /* Set up file actions to keep sock_fds[1] open in child */
-    posix_spawn_file_actions_t file_actions;
-    posix_spawn_file_actions_init(&file_actions);
-
-    /* Set up spawn attributes */
+    /* Set up spawn attributes — close all inherited FDs by default.
+     * POSIX_SPAWN_CLOEXEC_DEFAULT (macOS extension) marks all FDs as
+     * close-on-exec in the child. Without this, ALL parent host FDs
+     * (pipes, sockets, etc.) leak into the child hl process, wasting
+     * file descriptors and potentially preventing pipe EOF detection. */
     posix_spawnattr_t spawn_attr;
     posix_spawnattr_init(&spawn_attr);
+    posix_spawnattr_setflags(&spawn_attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    /* Set up file actions — explicitly inherit only needed FDs.
+     * With CLOEXEC_DEFAULT, everything is closed unless we opt in. */
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
+    posix_spawn_file_actions_addinherit_np(&file_actions, sock_fds[1]);
 
     extern char **environ;
     pid_t child_host_pid;
@@ -863,9 +878,8 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     }
 
     /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS.
-     * Skip FDs with O_CLOEXEC set — these should not be inherited by the
-     * fork child, matching Linux semantics. (CLOEXEC is enforced in execve
-     * too, but fork should not leak CLOEXEC FDs to the child at all.) */
+     * Note: CLOEXEC FDs are inherited across fork (POSIX semantics).
+     * CLOEXEC only takes effect at exec (handled in syscall_exec.c:109-123). */
     int open_fds[FD_TABLE_SIZE];
     ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
     int host_fds_to_send[FD_TABLE_SIZE];
@@ -874,12 +888,6 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) continue;
-
-        /* Skip FDs marked O_CLOEXEC — not inherited across fork.
-         * Also check the host-side FD_CLOEXEC flag for consistency. */
-        if (fd_table[i].linux_flags & LINUX_O_CLOEXEC) continue;
-        if (fd_table[i].type != FD_STDIO &&
-            (fcntl(fd_table[i].host_fd, F_GETFD) & FD_CLOEXEC)) continue;
 
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = fd_table[i].type;

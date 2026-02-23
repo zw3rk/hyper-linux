@@ -31,6 +31,7 @@
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
 #define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
 #define STACK_BASE           0x07E00000ULL   /* Bottom of 2MB stack block */
+#define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
                                               * Below 8GB — only code goes here, not
                                               * subject to GHC's minimumAddress check. */
@@ -160,6 +161,15 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
  * already split (L2 entry is a table descriptor), this is a no-op.
  * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
 int guest_split_block(guest_t *g, uint64_t block_gpa);
+
+/* Invalidate page table entries for the range [start, end).
+ * Sets L2 block descriptors and L3 page descriptors to 0 (invalid),
+ * causing translation faults on access. Used when mprotect sets
+ * PROT_NONE — the correct behavior is for the guest to fault.
+ * If a 2MB block is only partially invalidated, the block is split
+ * into L3 pages first (preserving the non-invalidated pages).
+ * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
+int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
 
 /* Update page table permissions for the range [start, end).
  * If a 2MB block needs mixed permissions (only part of it is being

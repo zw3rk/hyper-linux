@@ -10,7 +10,7 @@
  * 4. dup() clears CLOEXEC on the new FD
  * 5. dup3(O_CLOEXEC) sets CLOEXEC on the new FD
  * 6. Non-CLOEXEC FDs survive fork
- * 7. CLOEXEC FDs are NOT transferred across fork (hl-specific behavior)
+ * 7. CLOEXEC FDs ARE inherited across fork (POSIX: CLOEXEC only at exec)
  *
  * Syscalls exercised: pipe2(59), fcntl(25), dup(23), dup3(24),
  *                     fork/clone, close(57), read(63), write(64)
@@ -228,15 +228,13 @@ static void test_no_cloexec_survives_fork(void) {
         FAIL("non-CLOEXEC FD not accessible in fork child");
 }
 
-/* ---------- Test 7: CLOEXEC FDs not transferred in fork (hl behavior) ---------- */
+/* ---------- Test 7: CLOEXEC FDs inherited in fork (POSIX) ---------- */
 
-static void test_cloexec_not_in_fork(void) {
-    TEST("CLOEXEC FDs not in fork child");
+static void test_cloexec_inherited_in_fork(void) {
+    TEST("CLOEXEC FDs inherited in fork");
 
-    /* In hl, fork IPC skips CLOEXEC FDs (they don't get sent
-     * via SCM_RIGHTS to the child process). This differs from
-     * POSIX (where CLOEXEC only applies at exec), but is the
-     * current hl behavior. */
+    /* POSIX: CLOEXEC only takes effect at exec, NOT at fork.
+     * Fork children inherit all FDs regardless of CLOEXEC. */
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) {
         FAIL("pipe2() failed");
@@ -259,14 +257,14 @@ static void test_cloexec_not_in_fork(void) {
     }
 
     if (pid == 0) {
-        /* Child: try writing to the CLOEXEC pipe — should fail
-         * because hl doesn't transfer CLOEXEC FDs across fork */
+        /* Child: try writing to the CLOEXEC pipe — should succeed
+         * because POSIX says CLOEXEC only takes effect at exec */
         close(result[0]);
         char c;
         if (write(pipefd[1], "x", 1) == 1)
-            c = 'Y'; /* FD was transferred (unexpected in hl) */
+            c = 'Y'; /* FD was inherited (POSIX correct) */
         else
-            c = 'N'; /* FD not available (expected in hl) */
+            c = 'N'; /* FD not available (POSIX violation) */
         write(result[1], &c, 1);
         close(result[1]);
         _exit(0);
@@ -284,15 +282,10 @@ static void test_cloexec_not_in_fork(void) {
     int wstatus;
     waitpid(pid, &wstatus, 0);
 
-    /* In hl's current implementation, CLOEXEC FDs are NOT sent
-     * to fork children (they're skipped in SCM_RIGHTS transfer).
-     * The child should report 'N' (write failed with EBADF). */
-    if (status_char == 'N')
+    if (status_char == 'Y')
         PASS();
-    else if (status_char == 'Y')
-        PASS(); /* Also acceptable if hl gains POSIX-correct fork */
     else
-        FAIL("child did not report status");
+        FAIL("CLOEXEC FD not inherited in fork child");
 }
 
 /* ---------- Main ---------- */
@@ -306,7 +299,7 @@ int main(void) {
     test_dup_clears_cloexec();
     test_dup3_cloexec();
     test_no_cloexec_survives_fork();
-    test_cloexec_not_in_fork();
+    test_cloexec_inherited_in_fork();
 
     printf("\ntest-cloexec: %d passed, %d failed\n", passes, fails);
     return fails > 0 ? 1 : 0;

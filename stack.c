@@ -13,6 +13,66 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/random.h>
+#include <sys/sysctl.h>
+
+/* ---------- Linux aarch64 HWCAP bits (from asm/hwcap.h) ---------- */
+#define HWCAP_FP        (1ULL << 0)
+#define HWCAP_ASIMD     (1ULL << 1)
+#define HWCAP_EVTSTRM   (1ULL << 2)
+#define HWCAP_AES       (1ULL << 3)
+#define HWCAP_PMULL     (1ULL << 4)
+#define HWCAP_SHA1      (1ULL << 5)
+#define HWCAP_SHA2      (1ULL << 6)
+#define HWCAP_CRC32     (1ULL << 7)
+#define HWCAP_ATOMICS   (1ULL << 8)   /* LSE atomics */
+#define HWCAP_FPHP      (1ULL << 9)   /* FP16 */
+#define HWCAP_ASIMDHP   (1ULL << 10)  /* ASIMD FP16 */
+#define HWCAP_ASIMDRDM  (1ULL << 12)
+#define HWCAP_JSCVT     (1ULL << 13)
+#define HWCAP_FCMA      (1ULL << 14)
+#define HWCAP_LRCPC     (1ULL << 15)
+#define HWCAP_DCPOP     (1ULL << 16)
+#define HWCAP_SHA3      (1ULL << 17)
+#define HWCAP_SM3       (1ULL << 18)
+#define HWCAP_SM4       (1ULL << 19)
+#define HWCAP_ASIMDDP   (1ULL << 20)  /* Dot product */
+#define HWCAP_SHA512    (1ULL << 21)
+#define HWCAP_FHM       (1ULL << 23)
+#define HWCAP_DIT       (1ULL << 24)
+#define HWCAP_ILRCPC    (1ULL << 26)
+#define HWCAP_FLAGM     (1ULL << 27)
+#define HWCAP_SSBS      (1ULL << 28)
+#define HWCAP_SB        (1ULL << 29)
+
+/* Query a boolean sysctl. Returns 1 if present and non-zero, 0 otherwise. */
+static int sysctl_bool(const char *name) {
+    int val = 0;
+    size_t len = sizeof(val);
+    if (sysctlbyname(name, &val, &len, NULL, 0) == 0)
+        return val != 0;
+    return 0;
+}
+
+/* Build AT_HWCAP value from actual Apple Silicon CPU features.
+ * All Apple Silicon (M1+) support FP, ASIMD, AES, PMULL, SHA1, SHA2,
+ * CRC32, and LSE atomics. Additional features are queried via sysctl. */
+static uint64_t query_hwcap(void) {
+    /* All Apple Silicon chips guarantee these (ARMv8.4+) */
+    uint64_t hwcap = HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL |
+                     HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_ATOMICS |
+                     HWCAP_FPHP | HWCAP_ASIMDHP | HWCAP_ASIMDRDM |
+                     HWCAP_JSCVT | HWCAP_FCMA | HWCAP_LRCPC | HWCAP_DCPOP |
+                     HWCAP_ASIMDDP | HWCAP_FHM | HWCAP_DIT | HWCAP_FLAGM |
+                     HWCAP_SSBS | HWCAP_SB | HWCAP_ILRCPC;
+
+    /* Optional features that may vary across chips */
+    if (sysctl_bool("hw.optional.armv8_2_sha3"))
+        hwcap |= HWCAP_SHA3;
+    if (sysctl_bool("hw.optional.armv8_2_sha512"))
+        hwcap |= HWCAP_SHA512;
+
+    return hwcap;
+}
 
 /* Push a uint64_t onto the stack (growing downward) */
 static void push_u64(guest_t *g, uint64_t *sp, uint64_t val) {
@@ -123,9 +183,8 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     push_u64(g, &sp, random_ptr); push_u64(g, &sp, AT_RANDOM);
     push_u64(g, &sp, 100); push_u64(g, &sp, AT_CLKTCK);
 
-    /* HWCAP: advertise basic aarch64 features
-     * Bit 0=FP, Bit 1=ASIMD, Bit 3=AES, Bit 4=PMULL, etc. */
-    push_u64(g, &sp, 0xFF); push_u64(g, &sp, AT_HWCAP);
+    /* HWCAP: actual CPU capabilities queried from Apple Silicon */
+    push_u64(g, &sp, query_hwcap()); push_u64(g, &sp, AT_HWCAP);
 
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_EGID);
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_GID);

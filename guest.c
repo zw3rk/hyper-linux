@@ -16,6 +16,8 @@
  *
  * PROT_NONE mappings (used by GHC RTS for heap reservation) do NOT get
  * page table entries — the translation fault is the correct behavior.
+ * When mprotect changes an accessible region to PROT_NONE,
+ * guest_invalidate_ptes() removes existing page table entries.
  * Page tables are created on demand when mprotect changes PROT_NONE
  * to an accessible permission.
  *
@@ -60,18 +62,37 @@
  * trigger page table extension concurrently (via mmap/brk/mprotect). */
 static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 
+/* Track whether the 80% warning has been emitted (avoid log spam) */
+static int pt_pool_warned = 0;
+
 /* Allocate a zeroed 4KB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
  * Caller must hold pt_lock or the higher-level mmap_lock. */
 static uint64_t pt_alloc_page(guest_t *g) {
     pthread_mutex_lock(&pt_lock);
     if (g->pt_pool_next + PAGE_SIZE > PT_POOL_END) {
-        fprintf(stderr, "guest: page table pool exhausted\n");
+        fprintf(stderr, "guest: page table pool exhausted "
+                "(used %llu / %llu bytes)\n",
+                (unsigned long long)(g->pt_pool_next - PT_POOL_BASE),
+                (unsigned long long)(PT_POOL_END - PT_POOL_BASE));
         pthread_mutex_unlock(&pt_lock);
         return 0;
     }
     uint64_t gpa = g->pt_pool_next;
     g->pt_pool_next += PAGE_SIZE;
+
+    /* Warn at 80% pool usage so users can anticipate exhaustion */
+    uint64_t used = gpa + PAGE_SIZE - PT_POOL_BASE;
+    uint64_t total = PT_POOL_END - PT_POOL_BASE;
+    if (!pt_pool_warned && used > (total * 4 / 5)) {
+        fprintf(stderr, "guest: warning: page table pool at %llu%% "
+                "(%llu / %llu bytes)\n",
+                (unsigned long long)(used * 100 / total),
+                (unsigned long long)used,
+                (unsigned long long)total);
+        pt_pool_warned = 1;
+    }
+
     pthread_mutex_unlock(&pt_lock);
     /* Zero the page in host memory */
     memset((uint8_t *)g->host_base + gpa, 0, PAGE_SIZE);
@@ -832,6 +853,65 @@ int guest_split_block(guest_t *g, uint64_t block_gpa) {
     *l2_entry = (base + l3_gpa) | PT_VALID | PT_TABLE;
 
     g->need_tlbi = 1;
+    return 0;
+}
+
+int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end) {
+    uint64_t base = g->ipa_base;
+
+    /* Page-align the range */
+    start = start & ~(PAGE_SIZE - 1);
+    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    for (uint64_t addr = start; addr < end; ) {
+        uint64_t *l2_entry = find_l2_entry(g, addr);
+        if (!l2_entry) {
+            /* No L2 entry — already unmapped, skip this 2MB block */
+            addr = ALIGN_2MB_UP(addr + 1);
+            continue;
+        }
+
+        uint64_t block_start = ALIGN_2MB_DOWN(addr);
+        uint64_t block_end = block_start + BLOCK_2MB;
+
+        /* Not mapped at all: skip */
+        if (!(*l2_entry & 1)) {
+            addr = block_end;
+            continue;
+        }
+
+        /* Check if this is a 2MB block or already an L3 table */
+        if ((*l2_entry & 3) == 1) {
+            /* 2MB block descriptor */
+            if (start <= block_start && end >= block_end) {
+                /* Invalidating the entire 2MB block: clear the L2 entry */
+                *l2_entry = 0;
+                g->need_tlbi = 1;
+                addr = block_end;
+                continue;
+            }
+
+            /* Partial invalidation within a 2MB block: split first,
+             * then invalidate individual L3 pages below. */
+            if (guest_split_block(g, block_start) < 0) return -1;
+        }
+
+        /* L3 table: invalidate individual 4KB page descriptors */
+        uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
+        uint64_t *l3 = pt_at(g, l3_ipa - base);
+
+        uint64_t page_start = (addr > block_start) ? addr : block_start;
+        uint64_t page_end = (end < block_end) ? end : block_end;
+
+        for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
+            unsigned l3_idx = (unsigned)(((base + pa) % BLOCK_2MB) / PAGE_SIZE);
+            l3[l3_idx] = 0;  /* Invalid descriptor */
+        }
+
+        g->need_tlbi = 1;
+        addr = page_end;
+    }
+
     return 0;
 }
 

@@ -11,6 +11,7 @@ Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Sili
 - **syscall_internal.h** — Shared declarations for syscall module helpers.
 - **syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
 - **syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select (~610 lines).
+- **syscall_inotify.c/h** — inotify emulation via kqueue EVFILT_VNODE (~350 lines).
 - **syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer (~190 lines).
 - **syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
 - **syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
@@ -67,7 +68,7 @@ Only `bad_exception` vectors may clobber X5 (they halt, so no preservation neede
 ```
 make hl          # build + codesign hl
 make test-hello  # build and run assembly hello world
-make test-all    # run full test suite (27 tests)
+make test-all    # run full test suite (34 tests)
 make clean       # remove _build/
 ```
 
@@ -96,9 +97,10 @@ The sysroot is inherited by fork children via IPC state transfer.
 so tools that execve dynamic children (env, nice, nohup) work correctly.
 `elf_resolve_interp()` in elf.c is shared between hl.c and syscall_exec.c.
 
-**Known limitation:** `timeout` fails — it uses fork/clone to create a
-child process with a timer, and the forked child inherits the dynamic
-linker state but the fork+exec path has issues in the interpreter space.
+**Known limitations:**
+- `timeout` fails — it uses fork/clone to create a child process with a
+  timer, and the forked child inherits the dynamic linker state but the
+  fork+exec path has issues in the interpreter space.
 
 ## L3 Page Table Splitting
 
@@ -193,7 +195,7 @@ chroot(51), memfd_create(279)
 /dev/urandom, /dev/random, /dev/tty, /dev/stdin, /dev/stdout,
 /dev/stderr, /dev/fd/N
 
-**Stubs (return 0):**
+**Stubs (return 0 / no-op but safe):**
 mlock(228), munlock(229), msync(227), membarrier(283)
 
 **Networking (syscall_net.c):**
@@ -208,9 +210,11 @@ epoll_create1(20), epoll_ctl(21), epoll_pwait(22)
 **Process management (additional):**
 waitid(95)
 
+**inotify (emulated via kqueue EVFILT_VNODE):**
+inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28)
+
 **Stubs (return -ENOSYS):**
-tee(77), inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28),
-mincore(232), clone3(435)
+tee(77), mincore(232), clone3(435)
 
 **Stubs (return -EPERM):**
 sethostname(161)
@@ -225,11 +229,16 @@ Key points:
 - `signal_deliver()` builds `linux_rt_sigframe_t` on guest stack, redirects
   vCPU PC to handler, sets X0=signum, X30=sa_restorer
 - `signal_rt_sigreturn()` restores all 31 GPRs + SP + PC + PSTATE from frame
+- `signal_reset_for_exec()` resets handlers to SIG_DFL on execve (POSIX:
+  SIG_IGN stays SIG_IGN, pending/blocked preserved). Called from sys_execve
+  after guest_reset
 - SIGPIPE queued automatically when write/writev/pwrite64 returns EPIPE
 - Guest ITIMER_REAL is emulated internally (not forwarded to host setitimer)
   because macOS shares alarm() and setitimer(ITIMER_REAL) as the same timer,
   and hl needs alarm() for its per-iteration vCPU timeout
 - `signal_check_timer()` called from vCPU loop after each syscall
+- After SYSCALL_EXEC_HAPPENED, vCPU loop verifies ELR_EL1 is non-zero
+  (defensive check against HVF register sync bugs)
 
 ## Fork/Clone Architecture
 
@@ -243,6 +252,9 @@ macOS HVF allows only one VM per process. Fork is implemented via:
    into EL0 (bypasses shim _start to preserve callee-saved GPRs),
    enters vCPU loop with X0=0 (child return from clone)
 5. Parent records child in process table, returns child PID
+
+CLOEXEC semantics follow POSIX: all FDs (including CLOEXEC) are inherited
+across fork. CLOEXEC only takes effect at exec (syscall_exec.c step 4).
 
 ## Key errno Translation
 
@@ -298,7 +310,8 @@ mappings.
 0x000200000  - 0x0003FFFFF:  Shim data/stack (2MB block, RW)
 0x000400000  - varies:        ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
 0x001000000:                  brk base (16MB)
-0x007E00000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
+0x007E00000  - 0x007E00FFF:  Stack guard page (PROT_NONE, catches overflow)
+0x007E01000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
 0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
 0x020000000  - mmap_limit:    mmap RX growth area (up to g->mmap_limit)
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
@@ -353,111 +366,84 @@ Socket syscalls are translated in `syscall_net.c/.h`. Key translations:
 - **SOL_SOCKET options**: SO_TYPE, SO_SNDBUF, SO_RCVBUF etc. have different
   numeric values on Linux vs macOS
 
-## Multi-threading Architecture (Future)
+## Multi-threading Architecture
 
-### HVF Multi-vCPU Support (VERIFIED)
+Fully implemented. Guest threads map 1:1 to host pthreads, each with its
+own HVF vCPU. Three test suites validate correctness: `test-thread` (basic
+clone/futex), `test-pthread` (musl pthread_create/join/mutex), and
+`test-signal-thread` (per-thread signal masks).
 
-Apple's Hypervisor.framework API supports multiple vCPUs per VM — QEMU, UTM,
-and cloud-hypervisor all use this. Each vCPU is bound to the host thread that
-created it (all register/run ops must happen on that thread). Multiple vCPUs
-share the same guest physical memory via `hv_vm_map()`.
+### HVF Multi-vCPU Support
 
-**Verified in hl** via `test/test-multi-vcpu.c` (5/5 tests pass):
+Apple's Hypervisor.framework supports multiple vCPUs per VM. Each vCPU is
+bound to the host thread that created it. Multiple vCPUs share the same
+guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
+(5/5 tests pass). Run with `make test-multi-vcpu`.
 
-| Test | Result | What it proves |
-|------|--------|----------------|
-| Dual vCPU creation | PASS | `hv_vcpu_create()` works twice in one VM |
-| Shared memory writes | PASS | Two vCPUs write to the same guest RAM concurrently |
-| Separate SP_EL1 stacks | PASS | Per-vCPU EL1 stacks work with concurrent SVCs |
-| Register preservation | PASS | Callee-saved regs (X19/X20) survive SVC with 2 vCPUs |
-| TLBI broadcast | PASS | `TLBI VMALLE1IS` from one vCPU invalidates the other's TLB |
+### Implementation
 
-Our current architecture is strictly single-vCPU: `guest_t` holds one
-`hv_vcpu_t` and one `hv_vcpu_exit_t *`. Fork uses `posix_spawn` to create
-entirely separate macOS processes (each with its own VM) because processes
-don't share address space. Threading is fundamentally different — threads
-share memory, so they need multiple vCPUs in ONE VM.
+**Thread table** (`thread.c/h`):
+- `thread_entry_t` per thread: vCPU handle, host pthread, per-thread
+  signal mask, `clear_child_tid` for CLONE_CHILD_CLEARTID, `sp_el1`
+- `_Thread_local current_thread` for O(1) access from syscall handlers
+- MAX_THREADS = 64 concurrent guest threads per VM
+- SP_EL1 allocation: each thread gets a 4KB EL1 exception stack from
+  the shim data region
 
-**Run validation:** `make test-multi-vcpu`
+**Futex** (`futex.c/h`):
+- Hash table of wait queues keyed by guest virtual address
+- 7 operations: FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET,
+  FUTEX_WAKE_BITSET, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP
+- Per-waiter condition variables for precise wakeup
+- `futex_wake_one()` used by thread exit for CLONE_CHILD_CLEARTID
 
-### Minimum Viable Threading: clone(CLONE_THREAD) + futex
+**sys_clone with CLONE_THREAD** (`fork_ipc.c`):
+1. `hv_vcpu_create()` + per-thread SP_EL1 allocation
+2. Set child SP, TPIDR_EL0 (TLS), copy parent's signal mask
+3. `pthread_create()` running `vcpu_run_loop()` for child vCPU
+4. Return child TID to parent, child runs with X0=0
 
-**Thread table** (`syscall_proc.c`, ~80 LOC):
-```c
-typedef struct {
-    int64_t guest_tid;       /* Linux TID */
-    hv_vcpu_t vcpu;          /* HVF vCPU handle */
-    hv_vcpu_exit_t *vexit;   /* vCPU exit info */
-    pthread_t host_thread;   /* One macOS thread per guest thread */
-    uint64_t tpidr_el0;      /* Thread-local storage pointer */
-    int active;              /* Whether thread is running */
-} thread_entry_t;
-```
-
-**Futex implementation** (`futex.c/h`, ~400 LOC):
-- Hash table of futex addresses → wait queues
-- FUTEX_WAIT: compare guest word, then `pthread_cond_timedwait`
-- FUTEX_WAKE: signal N waiters via `pthread_cond_signal`
-- FUTEX_WAIT_BITSET, FUTEX_CMP_REQUEUE for pthread_mutex/cond
-
-**sys_clone with CLONE_THREAD** (`fork_ipc.c`, ~200 LOC):
-1. `hv_vcpu_create()` for new vCPU
-2. Set SP to `child_stack`, TPIDR_EL0 to `tls` arg
-3. Copy parent's GPRs, set X0=0 in child
-4. `pthread_create()` running `vcpu_run_loop()` for child vCPU
-5. Return child TID to parent
-
-**Shared state requiring locks** (~150 LOC across files):
+**Thread-safety locks** (across files):
 
 | Resource | Lock type | File |
 |----------|-----------|------|
-| mmap allocator (mmap_next, mmap_rx_next) | pthread_mutex | syscall.c |
-| brk allocator (brk_current) | pthread_mutex | syscall.c |
-| Page table pool (pt_pool_next) | pthread_mutex | guest.c |
-| FD table | pthread_rwlock | syscall.c |
-| Signal handlers | pthread_mutex | syscall_signal.c |
+| mmap/brk allocators + page tables | pthread_mutex | syscall.c |
+| FD table | pthread_mutex | syscall.c |
+| Thread table | pthread_mutex | thread.c |
+| Futex wait queues | pthread_mutex (per-bucket) | futex.c |
 
-**Shim: no changes needed** — each vCPU has its own register state; the
-SVC→HVC forwarding in shim.S is stateless per-CPU.
+**exit_group** (`syscall.c`):
+- Sets global `exit_group_requested` flag
+- `thread_for_each(thread_force_exit_cb)` — calls `hv_vcpus_exit()`
+  on all worker vCPUs to break them out of `hv_vcpu_run()`
+- Joins worker threads with timeout to allow CLEARTID cleanup
 
-### Challenges
+### Implementation Notes
 
-0. **guest_t is single-vCPU**: `guest_t` stores one `vcpu` and one `*exit`.
-   Threading requires either a thread table alongside `guest_t`, or
-   refactoring `guest_t` to separate VM state (shared) from vCPU state
-   (per-thread). Most syscall handlers take `guest_t *g` and read
-   `g->vcpu` — all of these would need to take a per-thread vCPU context.
+0. **guest_t vs per-thread state**: Solved with a separate `thread_entry_t`
+   table alongside `guest_t`. Syscall handlers use `current_thread->vcpu`
+   instead of `g->vcpu`. The `guest_t` struct holds shared VM state (memory,
+   page tables, regions); per-thread state lives in the thread table.
 
-1. **Futex atomicity**: The compare-and-wait must be atomic w.r.t. guest
-   memory writes. Race between reading the futex word and enqueuing the
-   waiter requires careful locking.
+1. **Futex atomicity**: Hash-bucket mutex is held during compare-and-wait.
+   The guest futex word is read while holding the bucket lock, then the
+   waiter is enqueued atomically before releasing the lock.
 
-2. **Page table consistency**: One thread doing mmap while others execute.
-   After modifying page tables, must TLBI on ALL vCPUs (IPI-like broadcast).
-   HVF may handle this via hardware coherency, but needs verification.
+2. **Page table consistency**: mmap_lock serializes all page table
+   modifications. TLBI broadcasts via `TLBI VMALLE1IS` from any vCPU
+   invalidate all others (hardware coherency verified by test-multi-vcpu).
 
-3. **Signal routing**: POSIX says process-directed signals go to any thread
-   that doesn't block them. Need per-thread signal masks and routing logic.
+3. **Per-thread signal masks**: Each `thread_entry_t` has its own `blocked`
+   mask. `rt_sigprocmask` operates on `current_thread->blocked`. Child
+   threads inherit the parent's mask at clone time.
 
-4. **Thread exit + CLONE_CHILD_CLEARTID**: Must write 0 to `ctid` and do
-   FUTEX_WAKE — this is how `pthread_join` works.
+4. **CLONE_CHILD_CLEARTID**: On thread exit, worker writes 0 to
+   `clear_child_tid` GVA and calls `futex_wake_one()` — this is how
+   `pthread_join()` works via the TID address.
 
-5. **exit_group**: Must terminate all threads, not just the caller.
+### Not Implemented
 
-### Estimated Effort (~1100 LOC total)
-
-| Component | LOC | Complexity |
-|-----------|-----|------------|
-| Thread table + gettid | 80 | Low |
-| sys_clone CLONE_THREAD | 200 | Medium |
-| futex (WAIT/WAKE/WAIT_BITSET/CMP_REQUEUE) | 400 | High |
-| Locks on shared state | 150 | Low |
-| Per-thread signal masks | 150 | Medium |
-| exit_group + thread cleanup | 100 | Medium |
-
-### Deferred (not needed for MVP)
-
-- Robust futexes (set_robust_list) — cleanup on thread crash
+- Robust futexes (set_robust_list) — stub returns 0; cleanup on crash
 - PI futexes (priority inheritance) — real-time only
-- CPU affinity (sched_setaffinity) — single-socket Apple Silicon
-- clone3 — newer API, musl still uses clone()
+- CPU affinity (sched_setaffinity) — returns all-CPUs mask
+- clone3 — returns -ENOSYS; musl falls back to clone()

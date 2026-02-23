@@ -166,6 +166,30 @@ int64_t proc_alloc_pid(void) {
     return pid;
 }
 
+/* Try to reap exited children from the process table. Calls waitpid
+ * with WNOHANG on each active entry; entries whose host process has
+ * exited are freed. Returns the number of slots reclaimed. */
+static int proc_reap_finished(void) {
+    int reaped = 0;
+    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+        if (!proc_table[i].active) continue;
+        if (proc_table[i].exited) {
+            /* Already marked exited but never waited — free the slot */
+            proc_table[i].active = 0;
+            reaped++;
+            continue;
+        }
+        int status;
+        pid_t ret = waitpid(proc_table[i].host_pid, &status, WNOHANG);
+        if (ret > 0) {
+            /* Child exited — free the slot */
+            proc_table[i].active = 0;
+            reaped++;
+        }
+    }
+    return reaped;
+}
+
 void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
     for (int i = 0; i < PROC_TABLE_SIZE; i++) {
         if (!proc_table[i].active) {
@@ -177,6 +201,23 @@ void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
             return;
         }
     }
+
+    /* Table full — try reaping exited children, then retry */
+    if (proc_reap_finished() > 0) {
+        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+            if (!proc_table[i].active) {
+                proc_table[i].active = 1;
+                proc_table[i].host_pid = host_pid;
+                proc_table[i].guest_pid = guest_pid_val;
+                proc_table[i].exited = 0;
+                proc_table[i].exit_status = 0;
+                return;
+            }
+        }
+    }
+
+    fprintf(stderr, "hl: process table full (%d slots), child PID %lld dropped\n",
+            PROC_TABLE_SIZE, (long long)guest_pid_val);
 }
 
 void proc_mark_child_exited(pid_t host_pid, int status) {
@@ -497,11 +538,37 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
                     signal_check_timer();
 
+                    /* Diagnostic: log signal state after exec to help
+                     * debug ELR_EL1 corruption from stale handlers. */
+                    if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
+                        const signal_state_t *ss = signal_get_state();
+                        fprintf(stderr, "%s: post-exec signal state: "
+                                "pending=0x%llx blocked=0x%llx\n", prefix,
+                                (unsigned long long)ss->pending,
+                                (unsigned long long)ss->blocked);
+                    }
+
                     /* Deliver pending signals after each syscall */
                     if (running && signal_pending()) {
                         int sig_ret = signal_deliver(vcpu, g, &exit_code);
                         if (sig_ret < 0)
                             running = 0; /* Default TERM/CORE disposition */
+                    }
+
+                    /* After exec, verify critical registers before resuming
+                     * vCPU. This closes any gap where signal delivery or
+                     * other code between sys_execve's sync flush and
+                     * hv_vcpu_run could have modified ELR_EL1. */
+                    if (running && ret == SYSCALL_EXEC_HAPPENED) {
+                        uint64_t verify_elr;
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
+                                            &verify_elr);
+                        if (verify_elr == 0) {
+                            fprintf(stderr, "%s: FATAL: ELR_EL1=0 after "
+                                    "exec, register sync failed\n", prefix);
+                            exit_code = 128;
+                            running = 0;
+                        }
                     }
                     break;
                 }
@@ -594,9 +661,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 running = 0;
             }
         } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            /* Canceled by hv_vcpus_exit(). For main: could be alarm
-             * timeout (already handled above). For workers/main:
-             * typically exit_group from another thread. */
+            /* Canceled by hv_vcpus_exit(). Can be: alarm timeout,
+             * exit_group from another thread, or signal preemption
+             * (signal_queue called hv_vcpus_exit to deliver a signal
+             * while the guest was in a tight loop). */
             if (is_main && g_timed_out) {
                 /* Timeout already handled above the exception switch —
                  * loop back so the timeout check fires. */
@@ -604,11 +672,29 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
             }
             if (atomic_load(&exit_group_requested)) {
                 exit_code = atomic_load(&exit_group_code);
-            } else {
-                fprintf(stderr, "%s: vCPU canceled unexpectedly\n", prefix);
-                exit_code = 128;
+                running = 0;
+                break;
             }
-            running = 0;
+
+            /* Check guest ITIMER_REAL (may have fired during tight loop) */
+            signal_check_timer();
+
+            /* Signal preemption: if a signal is pending, deliver it and
+             * resume the vCPU. This enables alarm()/SIGALRM delivery
+             * and tgkill-based signals in compute-bound loops. */
+            if (signal_pending()) {
+                int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                if (sig_ret < 0)
+                    running = 0;
+                /* sig_ret >= 0: signal delivered or nothing pending,
+                 * loop back and resume vCPU execution */
+                continue;
+            }
+
+            /* No signal pending — truly unexpected cancelation */
+            if (verbose)
+                fprintf(stderr, "%s: vCPU canceled (no signal pending)\n",
+                        prefix);
         } else {
             fprintf(stderr, "%s: unexpected exit reason 0x%x\n",
                     prefix, vexit->reason);

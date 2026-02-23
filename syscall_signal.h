@@ -122,7 +122,11 @@ typedef struct {
     uint8_t  __reserved[4096] __attribute__((aligned(16)));
 } linux_sigcontext_t;
 
-/* ---------- Linux stack_t ---------- */
+/* ---------- Linux stack_t and sigaltstack constants ---------- */
+#define LINUX_SS_ONSTACK   1    /* Currently executing on altstack */
+#define LINUX_SS_DISABLE   2    /* Altstack is disabled */
+#define LINUX_MINSIGSTKSZ  2048 /* Minimum altstack size (aarch64) */
+
 typedef struct {
     uint64_t ss_sp;
     int32_t  ss_flags;
@@ -147,6 +151,12 @@ typedef struct {
     linux_ucontext_t uc;
 } linux_rt_sigframe_t;
 
+/* ---------- RT signal queue ---------- */
+/* Maximum queued instances per RT signal. POSIX says at least
+ * _POSIX_SIGQUEUE_MAX (32); Linux defaults to ~1024 per user. */
+#define RT_SIGQUEUE_MAX 32
+#define RT_SIGNAL_COUNT (LINUX_NSIG - LINUX_SIGRTMIN + 1) /* 33 signals: 32-64 */
+
 /* ---------- Signal state ---------- */
 typedef struct {
     linux_sigaction_t actions[LINUX_NSIG];  /* Per-signal handler state */
@@ -154,12 +164,23 @@ typedef struct {
     uint64_t          blocked;              /* Bitmask of blocked signals */
     uint64_t          saved_blocked;        /* Original mask before sigsuspend */
     int               saved_blocked_valid;  /* Non-zero if saved_blocked is set */
+    linux_stack_t     altstack;             /* Alternate signal stack (sigaltstack) */
+    int               on_altstack;          /* Non-zero if currently delivering on altstack */
+    /* RT signal queue: count of pending instances per signal.
+     * Standard signals (1-31) use only the pending bitmask (coalesced).
+     * RT signals (32-64) are queued: each instance is tracked separately. */
+    int               rt_queue[RT_SIGNAL_COUNT];
 } signal_state_t;
 
 /* ---------- API ---------- */
 
 /* Initialize signal state: all SIG_DFL, nothing pending/blocked. */
 void signal_init(void);
+
+/* Reset signal state for exec (POSIX requirement).
+ * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN).
+ * Pending signals and signal mask are preserved. */
+void signal_reset_for_exec(void);
 
 /* Queue a signal for delivery. */
 void signal_queue(int signum);
@@ -196,6 +217,10 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
 
 /* Handle rt_sigpending (SYS 136). */
 int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize);
+
+/* Handle sigaltstack (SYS 132). ss_gva is pointer to new stack_t (or 0),
+ * old_ss_gva is pointer to receive current stack_t (or 0). */
+int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva);
 
 /* Get/set signal state (for fork IPC serialization). */
 const signal_state_t *signal_get_state(void);

@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <libkern/OSCacheControl.h>
 
 #include "guest.h"
 #include "elf.h"
@@ -212,6 +213,28 @@ int main(int argc, const char **argv) {
                 (unsigned long long)SHIM_BASE, shim_bin_len);
     }
 
+    /* ---- Step 4b: Invalidate I-cache for all loaded code ----
+     * ARM64 I-cache and D-cache are not coherent. memcpy above writes
+     * code to the D-cache, but the I-cache may hold stale data at these
+     * addresses. While fresh mmap'd memory should have cold I-cache,
+     * this is defensive — ensures correctness regardless of macOS
+     * prefaulting or speculative instruction fetch behavior. */
+    for (int i = 0; i < elf_info.num_segments; i++) {
+        if (elf_info.segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *)g.host_base +
+                              elf_info.segments[i].gpa + elf_load_base;
+            sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
+        }
+    }
+    for (int i = 0; i < interp_info.num_segments; i++) {
+        if (interp_info.segments[i].flags & PF_X) {
+            void *host_addr = (uint8_t *)g.host_base +
+                              interp_info.segments[i].gpa + interp_base;
+            sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
+        }
+    }
+    sys_icache_invalidate((uint8_t *)g.host_base + SHIM_BASE, shim_bin_len);
+
     /* ---- Step 5: Build page tables ---- */
     #define MAX_REGIONS 32
     mem_region_t regions[MAX_REGIONS];
@@ -365,7 +388,13 @@ int main(int argc, const char **argv) {
                          0, "[heap]");
     }
 
-    guest_region_add(&g, STACK_BASE, STACK_TOP,
+    /* Stack guard page: PROT_NONE at bottom to catch overflow */
+    guest_invalidate_ptes(&g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE);
+    guest_region_add(&g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE,
+                     LINUX_PROT_NONE,
+                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                     0, "[stack-guard]");
+    guest_region_add(&g, STACK_BASE + STACK_GUARD_SIZE, STACK_TOP,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");

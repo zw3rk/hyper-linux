@@ -512,6 +512,7 @@ typedef struct {
 #define FD_TIMERFD  7
 #define FD_EVENTFD  8
 #define FD_SIGNALFD 9
+#define FD_INOTIFY  10
 
 typedef struct {
     int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */

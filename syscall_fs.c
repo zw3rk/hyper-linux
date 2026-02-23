@@ -10,6 +10,7 @@
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "syscall_fd.h"
+#include "syscall_inotify.h"
 #include "proc_emulation.h"
 #include "syscall_proc.h"   /* proc_get_sysroot */
 #include "guest.h"
@@ -190,6 +191,7 @@ int64_t sys_close(int fd) {
     case FD_EVENTFD:  eventfd_close(fd);  break;
     case FD_SIGNALFD: signalfd_close(fd); break;
     case FD_TIMERFD:  timerfd_close(fd);  break;
+    case FD_INOTIFY:  inotify_close(fd);  break;
     default: break;
     }
 
@@ -434,6 +436,10 @@ int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
         return fcntl(host_fd, F_GETFL);
     case 4: /* F_SETFL */
         return fcntl(host_fd, F_SETFL, (int)arg);
+    case 5:  /* F_GETLK — query lock; report unlocked (single-process guest) */
+    case 6:  /* F_SETLK — set/clear lock (non-blocking) */
+    case 7:  /* F_SETLKW — set/clear lock (blocking) */
+        return 0;
     default:
         return -LINUX_EINVAL;
     }

@@ -11,6 +11,7 @@
  */
 #include "syscall_io.h"
 #include "syscall_fd.h"
+#include "syscall_inotify.h"
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "syscall_proc.h"
@@ -80,6 +81,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
             return signalfd_read(fd, g, buf_gva, count);
         if (fd_table[fd].type == FD_TIMERFD)
             return timerfd_read(fd, g, buf_gva, count);
+        if (fd_table[fd].type == FD_INOTIFY)
+            return inotify_read(fd, g, buf_gva, count);
     }
 
     int host_fd = fd_to_host(fd);
