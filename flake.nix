@@ -67,6 +67,24 @@
         busybox   = crossPkgs.pkgsStatic.busybox;
       };
 
+      # Static binaries for the integration test suite (test-static-bins).
+      # Each is a standalone static aarch64-linux-musl ELF, covering shells,
+      # scripting languages, text tools, JSON/SQL processors, and more.
+      staticBins = crossPkgs.runCommand "hl-static-bins" {} ''
+        mkdir -p $out/bin
+        ln -s ${crossPkgs.pkgsStatic.bash}/bin/bash          $out/bin/bash
+        ln -s ${crossPkgs.pkgsStatic.dash}/bin/dash           $out/bin/dash
+        ln -s ${crossPkgs.pkgsStatic.lua5_4}/bin/lua          $out/bin/lua
+        ln -s ${crossPkgs.pkgsStatic.gawk}/bin/gawk           $out/bin/gawk
+        ln -s ${crossPkgs.pkgsStatic.gnugrep}/bin/grep        $out/bin/grep
+        ln -s ${crossPkgs.pkgsStatic.gnused}/bin/sed          $out/bin/sed
+        ln -s ${crossPkgs.pkgsStatic.findutils}/bin/find      $out/bin/find
+        ln -s ${crossPkgs.pkgsStatic.tree}/bin/tree           $out/bin/tree
+        ln -s ${crossPkgs.pkgsStatic.jq}/bin/jq               $out/bin/jq
+        ln -s ${crossPkgs.pkgsStatic.sqlite}/bin/sqlite3      $out/bin/sqlite3
+        ln -s ${crossPkgs.pkgsStatic.diffutils}/bin/diff      $out/bin/diff
+      '';
+
       # ── Dynamic linking test infrastructure ──────────────────────
 
       # Musl sysroot: dynamic linker + libc.so in /lib/ layout
@@ -107,7 +125,7 @@
       haskellHello = crossPkgs.haskellPackages.mkDerivation {
         pname = "hello-hyper";
         version = "0.1.0";
-        src = ./hello-hyper;
+        src = ./test/haskell;
         isExecutable = true;
         isLibrary = false;
         enableSharedExecutables = false;
@@ -115,52 +133,102 @@
         license = linuxPkgs.lib.licenses.asl20;
       };
 
+      # ── Haskell integration test binaries (native aarch64-linux) ──
+      # pandoc and shellcheck exercise the GHC runtime seriously:
+      # threaded RTS, heavy allocation, Lua FFI (pandoc), regex
+      # engines (shellcheck).  Built natively on aarch64-linux to
+      # avoid cross-compilation issues (GHC external interpreter,
+      # Template Haskell in pandoc's deps).  justStaticExecutables
+      # produces fully-static glibc-linked binaries without the
+      # pkgsStatic/isStatic numactl problem.
+      aarch64LinuxPkgs = nixpkgs.legacyPackages.aarch64-linux;
+
+      haskellBins =
+        let
+          hlib = aarch64LinuxPkgs.haskell.lib;
+          hpkgs = aarch64LinuxPkgs.haskellPackages;
+        in aarch64LinuxPkgs.runCommand "hl-haskell-bins" {} ''
+          mkdir -p $out/bin
+          ln -s ${hlib.justStaticExecutables hpkgs.pandoc}/bin/pandoc $out/bin/pandoc
+          ln -s ${hlib.justStaticExecutables hpkgs.ShellCheck}/bin/shellcheck $out/bin/shellcheck
+        '';
+
     in {
       # Test binaries package (built on x86_64-linux)
       packages.${linuxSystem}.test-binaries = testBinaries;
 
-      devShells.${darwinSystem}.default = darwinPkgs.mkShell {
-        name = "hl-dev";
+      devShells.${darwinSystem} = {
+        # Full dev shell with cross-compiled guest test binaries.
+        # Requires a configured x86_64-linux remote builder.
+        default = darwinPkgs.mkShell {
+          name = "hl-dev";
 
-        buildInputs = [
-          darwinPkgs.gnumake
-          darwinPkgs.binutils  # objcopy for shim.bin
-          darwinPkgs.lldb
-        ] ++ darwinBuildInputs;
+          buildInputs = [
+            darwinPkgs.gnumake
+            darwinPkgs.binutils  # objcopy for shim.bin
+            darwinPkgs.lldb
+          ] ++ darwinBuildInputs;
 
-        # Pre-built guest binaries (dispatched to x86_64-linux builder).
-        # NOT added to PATH — they're aarch64-linux ELFs.
-        GUEST_TEST_BINARIES = "${testBinaries}";
-        GUEST_COREUTILS = "${guestBins.coreutils}";
-        GUEST_BUSYBOX   = "${guestBins.busybox}";
+          # GNU objcopy for Mach-O → raw binary conversion (shim.S).
+          # The clang wrapper shadows binutils' objcopy with llvm-objcopy,
+          # which doesn't handle Mach-O -O binary correctly.
+          GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
 
-        # Dynamic linking tests
-        GUEST_SYSROOT          = "${musl-sysroot}";
-        GUEST_DYNAMIC_TESTS    = "${dynamicTestBinaries}";
-        GUEST_DYNAMIC_COREUTILS = "${dynamicCoreutils}";
+          # Pre-built guest binaries (dispatched to x86_64-linux builder).
+          # NOT added to PATH — they're aarch64-linux ELFs.
+          GUEST_TEST_BINARIES = "${testBinaries}";
+          GUEST_COREUTILS = "${guestBins.coreutils}";
+          GUEST_BUSYBOX   = "${guestBins.busybox}";
+          GUEST_STATIC_BINS = "${staticBins}";
 
-        # Haskell test binary
-        GUEST_HASKELL_HELLO = "${haskellHello}";
+          # Dynamic linking tests
+          GUEST_SYSROOT          = "${musl-sysroot}";
+          GUEST_DYNAMIC_TESTS    = "${dynamicTestBinaries}";
+          GUEST_DYNAMIC_COREUTILS = "${dynamicCoreutils}";
 
-        shellHook = ''
-          echo "hl development environment"
-          echo "  make help        — show available targets"
-          echo "  make hl          — build the hl executable"
-          echo "  make test-all    — run full test suite"
-          echo ""
-          echo "Guest binaries (aarch64-linux-musl, built on x86_64-linux):"
-          echo "  test binaries: $GUEST_TEST_BINARIES/bin/"
-          echo "  coreutils:     $GUEST_COREUTILS/bin/"
-          echo "  busybox:       $GUEST_BUSYBOX/bin/"
-          echo ""
-          echo "Dynamic linking tests:"
-          echo "  sysroot:       $GUEST_SYSROOT/lib/"
-          echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
-          echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
-          echo ""
-          echo "Haskell test binary:"
-          echo "  hello-hyper:   $GUEST_HASKELL_HELLO/bin/hello-hyper"
-        '';
+          # Haskell test binary
+          GUEST_HASKELL_HELLO = "${haskellHello}";
+
+          # Haskell integration test binaries (pandoc, shellcheck)
+          GUEST_HASKELL_BINS = "${haskellBins}";
+
+          shellHook = ''
+            echo "hl development environment"
+            echo "  make help        — show available targets"
+            echo "  make hl          — build the hl executable"
+            echo "  make test-all    — run full test suite"
+            echo ""
+            echo "Guest binaries (aarch64-linux-musl, built on x86_64-linux):"
+            echo "  test binaries: $GUEST_TEST_BINARIES/bin/"
+            echo "  coreutils:     $GUEST_COREUTILS/bin/"
+            echo "  busybox:       $GUEST_BUSYBOX/bin/"
+            echo "  static bins:   $GUEST_STATIC_BINS/bin/"
+            echo ""
+            echo "Dynamic linking tests:"
+            echo "  sysroot:       $GUEST_SYSROOT/lib/"
+            echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
+            echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
+            echo ""
+            echo "Haskell test binary:"
+            echo "  hello-hyper:   $GUEST_HASKELL_HELLO/bin/hello-hyper"
+            echo ""
+            echo "Haskell integration binaries (native aarch64-linux):"
+            echo "  pandoc:        $GUEST_HASKELL_BINS/bin/pandoc"
+            echo "  shellcheck:    $GUEST_HASKELL_BINS/bin/shellcheck"
+          '';
+        };
+
+        # CI-only shell: build tools without cross-compiled test binaries.
+        # GitHub Actions macOS runners lack x86_64-linux builders, so the
+        # full devShell (which needs cross-compiled GUEST_* binaries) fails.
+        ci = darwinPkgs.mkShell {
+          name = "hl-ci";
+          buildInputs = [
+            darwinPkgs.gnumake
+            darwinPkgs.binutils
+          ] ++ darwinBuildInputs;
+          GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
+        };
       };
 
       packages.${darwinSystem}.default = darwinPkgs.stdenv.mkDerivation {
@@ -171,17 +239,23 @@
         nativeBuildInputs = [
           darwinPkgs.gnumake
           darwinPkgs.binutils
+          darwinPkgs.xxd
+          darwinPkgs.darwin.sigtool  # codesign for nix sandbox
         ] ++ darwinBuildInputs;
 
         buildInputs = darwinBuildInputs;
 
+        # GNU objcopy for Mach-O → raw binary (clang wrapper shadows with llvm-objcopy)
+        GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
+
         buildPhase = ''
-          make hl
+          make hl VERSION="0.1.0+${self.shortRev or "unknown"}"
         '';
 
         installPhase = ''
-          mkdir -p $out/bin
+          mkdir -p $out/bin $out/share/man/man1
           cp _build/hl $out/bin/hl
+          cp hl.1 $out/share/man/man1/hl.1
         '';
 
         meta = with darwinPkgs.lib; {

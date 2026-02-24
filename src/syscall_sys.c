@@ -43,19 +43,19 @@ int64_t sys_uname(guest_t *g, uint64_t buf_gva) {
 int64_t sys_getrandom(guest_t *g, uint64_t buf_gva, uint64_t buflen,
                       unsigned int flags) {
     (void)flags;
+    if (buflen == 0) return 0;
 
-    void *buf = guest_ptr(g, buf_gva);
-    if (!buf) return -LINUX_EFAULT;
-
-    /* getentropy() works in chunks of 256 bytes max */
-    uint8_t *p = buf;
-    size_t remaining = buflen;
-    while (remaining > 0) {
-        size_t chunk = remaining > 256 ? 256 : remaining;
-        if (getentropy(p, chunk) != 0)
+    /* Use a host-side buffer and guest_write for bounds safety.
+     * getentropy() works in chunks of 256 bytes max. */
+    uint8_t tmp[256];
+    uint64_t offset = 0;
+    while (offset < buflen) {
+        size_t chunk = (buflen - offset) > 256 ? 256 : (size_t)(buflen - offset);
+        if (getentropy(tmp, chunk) != 0)
             return linux_errno();
-        p += chunk;
-        remaining -= chunk;
+        if (guest_write(g, buf_gva + offset, tmp, chunk) < 0)
+            return -LINUX_EFAULT;
+        offset += chunk;
     }
 
     return (int64_t)buflen;

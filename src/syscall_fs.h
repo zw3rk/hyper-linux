@@ -30,7 +30,7 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
 int64_t sys_close(int fd);
 int64_t sys_dup(int oldfd);
 int64_t sys_dup3(int oldfd, int newfd, int linux_flags);
-int64_t sys_fcntl(int fd, int cmd, uint64_t arg);
+int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg);
 int64_t sys_close_range(unsigned int first, unsigned int last,
                         unsigned int flags);
 

@@ -12,6 +12,7 @@
  */
 #include "syscall_net.h"
 #include "syscall_internal.h"
+#include "syscall_signal.h"  /* signal_queue for SIGPIPE */
 
 #include <stdio.h>
 #include <string.h>
@@ -409,10 +410,18 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
 
         ssize_t ret = sendto(host_fd, buf, len, mac_flags,
                               (struct sockaddr *)&mac_sa, (socklen_t)mac_len);
-        return ret < 0 ? linux_errno() : ret;
+        if (ret < 0) {
+            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            return linux_errno();
+        }
+        return ret;
     } else {
         ssize_t ret = send(host_fd, buf, len, mac_flags);
-        return ret < 0 ? linux_errno() : ret;
+        if (ret < 0) {
+            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            return linux_errno();
+        }
+        return ret;
     }
 }
 
@@ -626,7 +635,11 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
     };
 
     ssize_t ret = sendmsg(host_fd, &msg, mac_flags);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret < 0) {
+        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return ret;
 }
 
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
@@ -687,11 +700,13 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         if (out_len > 0) {
             uint32_t write_len = (uint32_t)out_len;
             if (write_len > lmsg.msg_namelen) write_len = lmsg.msg_namelen;
-            guest_write(g, lmsg.msg_name, linux_sa, write_len);
+            if (guest_write(g, lmsg.msg_name, linux_sa, write_len) < 0)
+                return -LINUX_EFAULT;
         }
         /* Update msg_namelen in guest (offset 8 in linux_msghdr_t) */
         uint32_t nl = (uint32_t)msg.msg_namelen;
-        guest_write(g, msg_gva + 8, &nl, 4);
+        if (guest_write(g, msg_gva + 8, &nl, 4) < 0)
+            return -LINUX_EFAULT;
     }
 
     /* Write back msg_controllen = 0 (offset 40 in linux_msghdr_t).
@@ -699,11 +714,62 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
      * see controllen=0 — otherwise musl's CMSG_FIRSTHDR returns a
      * pointer into the uninitialized cmsg buffer, causing crashes. */
     uint64_t zero64 = 0;
-    guest_write(g, msg_gva + 40, &zero64, 8);
+    if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
+        return -LINUX_EFAULT;
 
     /* Update msg_flags in guest (offset 48 in linux_msghdr_t) */
     int32_t mflags = msg.msg_flags;
-    guest_write(g, msg_gva + 48, &mflags, 4);
+    if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
+        return -LINUX_EFAULT;
 
     return ret;
+}
+
+/* ---------- sendmmsg / recvmmsg ---------- */
+
+/* Linux struct mmsghdr (aarch64):
+ *   struct msghdr msg_hdr;   // offset 0, size 56
+ *   unsigned int  msg_len;   // offset 56, size 4
+ * Total: 60 bytes (padded to 64 on LP64) */
+#define LINUX_MMSGHDR_SIZE 64
+
+int64_t sys_sendmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
+                     unsigned int vlen, int flags) {
+    if (vlen == 0) return 0;
+    if (vlen > 1024) vlen = 1024;  /* Linux caps at UIO_MAXIOV */
+
+    unsigned int sent = 0;
+    for (unsigned int i = 0; i < vlen; i++) {
+        uint64_t hdr_gva = mmsg_gva + (uint64_t)i * LINUX_MMSGHDR_SIZE;
+        int64_t ret = sys_sendmsg(g, fd, hdr_gva, flags);
+        if (ret < 0) {
+            /* Return count sent so far, or error if none */
+            return sent > 0 ? (int64_t)sent : ret;
+        }
+        /* Write msg_len field at offset 56 in mmsghdr */
+        uint32_t msg_len = (uint32_t)ret;
+        guest_write(g, hdr_gva + 56, &msg_len, 4);
+        sent++;
+    }
+    return (int64_t)sent;
+}
+
+int64_t sys_recvmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
+                     unsigned int vlen, int flags, uint64_t timeout_gva) {
+    (void)timeout_gva;  /* Timeout not implemented (rarely used) */
+    if (vlen == 0) return 0;
+    if (vlen > 1024) vlen = 1024;
+
+    unsigned int received = 0;
+    for (unsigned int i = 0; i < vlen; i++) {
+        uint64_t hdr_gva = mmsg_gva + (uint64_t)i * LINUX_MMSGHDR_SIZE;
+        int64_t ret = sys_recvmsg(g, fd, hdr_gva, flags);
+        if (ret < 0) {
+            return received > 0 ? (int64_t)received : ret;
+        }
+        uint32_t msg_len = (uint32_t)ret;
+        guest_write(g, hdr_gva + 56, &msg_len, 4);
+        received++;
+    }
+    return (int64_t)received;
 }

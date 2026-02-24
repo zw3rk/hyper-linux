@@ -4,3 +4,5 @@ archive/
 *.bin
 .direnv/
 result
+dist/out/
+dist/staging/

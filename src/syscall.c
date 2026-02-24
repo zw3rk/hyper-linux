@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/file.h>           /* flock() */
 #include <dirent.h>
 #include <time.h>
 #include <pthread.h>
@@ -97,18 +98,23 @@ void syscall_init(void) {
  * Caller must hold fd_lock. */
 static int fd_bitmap_find_free(int minfd) {
     if (minfd < 0) minfd = 0;
+    if (minfd >= FD_TABLE_SIZE) return -1;
     int word = minfd / 64;
     int bit  = minfd % 64;
 
     /* Check the partial first word (mask out bits below minfd) */
     uint64_t masked = fd_free_bitmap[word] & (~0ULL << bit);
-    if (masked)
-        return word * 64 + __builtin_ctzll(masked);
+    if (masked) {
+        int fd = word * 64 + __builtin_ctzll(masked);
+        return (fd < FD_TABLE_SIZE) ? fd : -1;
+    }
 
     /* Check remaining full words */
     for (word++; word < FD_BITMAP_WORDS; word++) {
-        if (fd_free_bitmap[word])
-            return word * 64 + __builtin_ctzll(fd_free_bitmap[word]);
+        if (fd_free_bitmap[word]) {
+            int fd = word * 64 + __builtin_ctzll(fd_free_bitmap[word]);
+            return (fd < FD_TABLE_SIZE) ? fd : -1;
+        }
     }
     return -1;
 }
@@ -165,8 +171,17 @@ int fd_alloc_at(int fd, int type, int host_fd) {
 }
 
 void fd_mark_closed(int fd) {
+    pthread_mutex_lock(&fd_lock);
     fd_table[fd].type = FD_CLOSED;
+    /* Clear host_fd and dir BEFORE marking the slot free in the bitmap.
+     * Otherwise another thread could fd_alloc() this slot, populate it
+     * with a new host_fd/dir, and then our stale writes would corrupt
+     * the new entry. */
+    fd_table[fd].host_fd = -1;
+    fd_table[fd].dir = NULL;
+    fd_table[fd].linux_flags = 0;
     fd_bitmap_set_free(fd);
+    pthread_mutex_unlock(&fd_lock);
 }
 
 /* Look up a guest FD. Returns host FD or -1 if invalid. */
@@ -530,11 +545,15 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         memset((uint8_t *)g->host_base + result_off, 0, length);
     }
 
-    /* For file-backed mmap, read file contents into the region */
+    /* For file-backed mmap, read file contents into the region.
+     * Short reads are acceptable (region is already zeroed above),
+     * but total failure means the mapping is useless. */
     if (!is_anon && fd >= 0) {
         int host_fd = fd_to_host(fd);
         if (host_fd < 0) return -LINUX_EBADF;
-        pread(host_fd, (uint8_t *)g->host_base + result_off, length, offset);
+        ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
+                           length, offset);
+        if (nr < 0) return linux_errno();
     }
 
     /* Record the new region. Normalize flags for tracking. */
@@ -897,7 +916,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_dup3((int)x0, (int)x1, (int)x2);
         break;
     case SYS_fcntl:
-        result = sys_fcntl((int)x0, (int)x1, x2);
+        result = sys_fcntl(g, (int)x0, (int)x1, x2);
         break;
     case SYS_faccessat:
         result = sys_faccessat(g, (int)x0, x1, (int)x2, (int)x3);
@@ -973,11 +992,41 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = sys_getrusage(g, (int)x0, x1);
         break;
     case SYS_prctl:
-        /* PR_SET_NAME/PR_GET_NAME: stub for thread naming */
-        if ((int)x0 == LINUX_PR_SET_NAME || (int)x0 == LINUX_PR_GET_NAME)
-            result = 0;
-        else
+        switch ((int)x0) {
+        case LINUX_PR_SET_NAME:
+        case LINUX_PR_GET_NAME:
+            result = 0;  /* Stub: thread naming (no real effect) */
+            break;
+        case LINUX_PR_SET_PDEATHSIG:
+            result = 0;  /* Stub: parent death signal (not meaningful
+                          * in our fork model — child is a separate hl
+                          * process, not a real Linux child thread) */
+            break;
+        case LINUX_PR_GET_PDEATHSIG: {
+            /* Return 0 (no parent death signal set) */
+            int32_t sig = 0;
+            if (x1 && guest_write(g, x1, &sig, 4) < 0)
+                result = -LINUX_EFAULT;
+            else
+                result = 0;
+            break;
+        }
+        case LINUX_PR_SET_NO_NEW_PRIVS:
+            result = 0;  /* Stub: we never grant new privileges anyway */
+            break;
+        case LINUX_PR_GET_NO_NEW_PRIVS:
+            result = 1;  /* Always report no-new-privs as set */
+            break;
+        case LINUX_PR_SET_DUMPABLE:
+            result = 0;  /* Stub: core dumps not applicable */
+            break;
+        case LINUX_PR_GET_DUMPABLE:
+            result = 1;  /* Report as dumpable (default Linux behavior) */
+            break;
+        default:
             result = -LINUX_ENOSYS;
+            break;
+        }
         break;
     case SYS_getppid:
         result = proc_get_ppid();
@@ -1080,10 +1129,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_truncate:
         result = sys_truncate(g, x0, (int64_t)x1);
         break;
-    case SYS_flock:
-        /* flock is a no-op stub (advisory locking not critical) */
-        result = 0;
+    case SYS_flock: {
+        /* Passthrough to macOS flock(). Linux and macOS flock operations
+         * use the same constants: LOCK_SH=1, LOCK_EX=2, LOCK_UN=8,
+         * LOCK_NB=4 — so no flag translation is needed. */
+        int host_fd = fd_to_host((int)x0);
+        if (host_fd < 0) { result = -LINUX_EBADF; break; }
+        result = flock(host_fd, (int)x1) < 0 ? linux_errno() : 0;
         break;
+    }
     case SYS_setuid:
     case SYS_setgid:
     case SYS_setreuid:
@@ -1093,19 +1147,25 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = 0;  /* Stub: pretend success */
         break;
     case SYS_getresuid: {
-        /* Write {1000,1000,1000} to guest pointers */
+        /* Write {ruid,euid,suid} = {1000,1000,1000} to guest pointers */
         uint32_t uid = 1000;
-        if (x0) guest_write(g, x0, &uid, 4);
-        if (x1) guest_write(g, x1, &uid, 4);
-        if (x2) guest_write(g, x2, &uid, 4);
+        if ((x0 && guest_write(g, x0, &uid, 4) < 0) ||
+            (x1 && guest_write(g, x1, &uid, 4) < 0) ||
+            (x2 && guest_write(g, x2, &uid, 4) < 0)) {
+            result = -LINUX_EFAULT;
+            break;
+        }
         result = 0;
         break;
     }
     case SYS_getresgid: {
         uint32_t gid = 1000;
-        if (x0) guest_write(g, x0, &gid, 4);
-        if (x1) guest_write(g, x1, &gid, 4);
-        if (x2) guest_write(g, x2, &gid, 4);
+        if ((x0 && guest_write(g, x0, &gid, 4) < 0) ||
+            (x1 && guest_write(g, x1, &gid, 4) < 0) ||
+            (x2 && guest_write(g, x2, &gid, 4) < 0)) {
+            result = -LINUX_EFAULT;
+            break;
+        }
         result = 0;
         break;
     }
@@ -1303,6 +1363,41 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     /* ---- chroot ---- */
     case SYS_chroot:
         result = sys_chroot(g, x0);
+        break;
+
+    /* ---- Vectored positioned I/O ---- */
+    /* aarch64: offset is a single 64-bit register (x3 for preadv/pwritev,
+     * x3 for preadv2/pwritev2 with flags in x4). */
+    case SYS_preadv:
+        result = sys_preadv(g, (int)x0, x1, (int)x2, (int64_t)x3);
+        break;
+    case SYS_pwritev:
+        result = sys_pwritev(g, (int)x0, x1, (int)x2, (int64_t)x3);
+        break;
+    case SYS_preadv2:
+        result = sys_preadv2(g, (int)x0, x1, (int)x2,
+                             (int64_t)x3, (int)x4);
+        break;
+    case SYS_pwritev2:
+        result = sys_pwritev2(g, (int)x0, x1, (int)x2,
+                              (int64_t)x3, (int)x4);
+        break;
+
+    /* ---- Network batch I/O ---- */
+    case SYS_sendmmsg:
+        result = sys_sendmmsg(g, (int)x0, x1, (unsigned int)x2, (int)x3);
+        break;
+    case SYS_recvmmsg:
+        result = sys_recvmmsg(g, (int)x0, x1, (unsigned int)x2,
+                              (int)x3, x4);
+        break;
+
+    /* ---- Advisory / scheduling stubs ---- */
+    case SYS_fadvise64:
+        result = 0;  /* Advisory only — safe to ignore */
+        break;
+    case SYS_sched_setaffinity:
+        result = 0;  /* Stub: macOS doesn't expose CPU affinity to HVF */
         break;
 
     /* ---- Misc stubs ---- */

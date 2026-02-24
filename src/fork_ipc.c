@@ -28,6 +28,7 @@
 #include <sys/spawn.h>          /* POSIX_SPAWN_CLOEXEC_DEFAULT (macOS extension) */
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <dirent.h>             /* fdopendir, for DIR* reconstruction in child */
 #include <sys/wait.h>
 #include <mach-o/dyld.h>
 
@@ -308,7 +309,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             return 1;
         }
 
-        /* Populate fd_table */
+        /* Populate fd_table.  Parent sends fd_entries and host_fds in
+         * 1:1 correspondence — each entry at index i has its host FD
+         * at host_fds[i] (STDIO entries include their FD too, but we
+         * use the child's existing stdio instead). */
         for (uint32_t i = 0; i < num_fds; i++) {
             int gfd = fd_entries[i].guest_fd;
             if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
@@ -320,6 +324,21 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                 fd_table[gfd].type = fd_entries[i].type;
                 fd_table[gfd].host_fd = host_fds[i];
                 fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+
+                /* Reconstruct DIR* for directory FDs. The parent's DIR*
+                 * pointer is meaningless in the child's address space.
+                 * fdopendir() takes ownership of the fd, so dup() first
+                 * to keep the original host_fd usable for other ops. */
+                if (fd_entries[i].type == FD_DIR) {
+                    int dir_fd = dup(host_fds[i]);
+                    if (dir_fd >= 0) {
+                        DIR *dir = fdopendir(dir_fd);
+                        if (dir)
+                            fd_table[gfd].dir = dir;
+                        else
+                            close(dir_fd);
+                    }
+                }
             }
         }
 
@@ -879,35 +898,45 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS.
      * Note: CLOEXEC FDs are inherited across fork (POSIX semantics).
-     * CLOEXEC only takes effect at exec (handled in syscall_exec.c:109-123). */
+     * CLOEXEC only takes effect at exec (handled in syscall_exec.c:109-123).
+     *
+     * Both arrays (fd_entries and host_fds_to_send) are kept in 1:1
+     * correspondence: each fd_entry has a matching host fd at the same
+     * index. If dup() fails for a non-STDIO fd, the entry is skipped
+     * entirely so the arrays never get out of sync. */
     int open_fds[FD_TABLE_SIZE];
     ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
     int host_fds_to_send[FD_TABLE_SIZE];
+    /* Track which host_fds were duped (need close) vs passed as-is (STDIO) */
+    int host_fds_duped[FD_TABLE_SIZE];
     uint32_t num_fds = 0;
-    int num_host_fds = 0;
 
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) continue;
+
+        int host_fd;
+        int was_duped = 0;
+        if (fd_table[i].type != FD_STDIO) {
+            /* Dup the fd so child gets its own copy */
+            int duped = dup(fd_table[i].host_fd);
+            if (duped < 0) continue; /* Skip entry if dup fails */
+            host_fd = duped;
+            was_duped = 1;
+        } else {
+            /* For stdio, send the actual fd (0, 1, 2) */
+            host_fd = fd_table[i].host_fd;
+        }
 
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = fd_table[i].type;
         fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
         fd_entries[num_fds].pad = 0;
-
-        if (fd_table[i].type != FD_STDIO) {
-            /* Dup the fd so child gets its own copy */
-            int duped = dup(fd_table[i].host_fd);
-            if (duped >= 0) {
-                host_fds_to_send[num_host_fds++] = duped;
-            }
-        } else {
-            /* For stdio, send the actual fd (0, 1, 2) */
-            host_fds_to_send[num_host_fds++] = fd_table[i].host_fd;
-        }
-
+        host_fds_to_send[num_fds] = host_fd;
+        host_fds_duped[num_fds] = was_duped;
         open_fds[num_fds] = i;
         num_fds++;
     }
+    int num_host_fds = (int)num_fds; /* 1:1 with fd_entries */
 
     if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {
         close(ipc_sock);
@@ -927,10 +956,11 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
             return -LINUX_ENOMEM;
         }
 
-        /* Close duped fds in parent */
-        for (int i = 0; i < num_host_fds; i++) {
-            if (fd_entries[i].type != FD_STDIO)
-                close(host_fds_to_send[i]);
+        /* Close duped fds in parent.  The host_fds_duped[] array
+         * tracks which entries were dup()'d (1:1 with fd_entries). */
+        for (uint32_t fi = 0; fi < num_fds; fi++) {
+            if (host_fds_duped[fi])
+                close(host_fds_to_send[fi]);
         }
     }
 

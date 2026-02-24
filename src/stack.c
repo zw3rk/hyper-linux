@@ -10,6 +10,7 @@
  */
 #include "stack.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/random.h>
@@ -115,6 +116,13 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
         while (envp[envc]) envc++;
     }
 
+    /* Bounds-check: Linux returns E2BIG for oversized argument/environment.
+     * ARG_MAX on Linux is typically 2MB; we cap at reasonable stack limits. */
+    #define MAX_ARGS 131072
+    #define MAX_ENVS 131072
+    if (argc > MAX_ARGS || envc > MAX_ENVS)
+        return 0; /* Caller treats 0 as failure */
+
     /* Phase 1: Write strings and random data at the top of the stack.
      * We work downward from stack_top. */
     uint64_t str_ptr = stack_top;
@@ -131,8 +139,17 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     uint64_t platform_ptr = str_ptr;
     write_str(g, platform_ptr, "aarch64");
 
+    /* Dynamically allocate pointer arrays to avoid stack buffer overflow
+     * with large argument or environment lists. */
+    uint64_t *env_ptrs = calloc((size_t)envc, sizeof(uint64_t));
+    uint64_t *arg_ptrs = calloc((size_t)argc, sizeof(uint64_t));
+    if ((envc > 0 && !env_ptrs) || (argc > 0 && !arg_ptrs)) {
+        free(env_ptrs);
+        free(arg_ptrs);
+        return 0;
+    }
+
     /* Environment strings */
-    uint64_t env_ptrs[4096];
     for (int i = envc - 1; i >= 0; i--) {
         size_t len = strlen(envp[i]) + 1;
         str_ptr -= len;
@@ -141,7 +158,6 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     }
 
     /* Argument strings (written backward so argv[0] is at lowest addr) */
-    uint64_t arg_ptrs[256];
     for (int i = argc - 1; i >= 0; i--) {
         size_t len = strlen(argv[i]) + 1;
         str_ptr -= len;
@@ -217,5 +233,7 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     /* argc — SP now points here, 16-byte aligned */
     push_u64(g, &sp, (uint64_t)argc);
 
+    free(env_ptrs);
+    free(arg_ptrs);
     return sp;
 }

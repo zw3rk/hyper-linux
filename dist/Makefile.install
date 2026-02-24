@@ -1,0 +1,63 @@
+# Makefile for hl distribution archive — install/uninstall only
+#
+# Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Usage:
+#   ./configure --prefix=/usr/local   (optional, writes config.mk)
+#   sudo make install
+#   sudo make uninstall
+
+.PHONY: install uninstall help
+
+# Load prefix from configure (silent if missing — defaults apply)
+-include config.mk
+
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+MANDIR  ?= $(PREFIX)/share/man
+
+# Colors
+GREEN  := \033[0;32m
+BLUE   := \033[0;34m
+YELLOW := \033[1;33m
+RESET  := \033[0m
+
+.DEFAULT_GOAL := help
+
+## Install hl binary and man page
+install:
+	@printf "$(GREEN)▸ Installing$(RESET) hl → $(BINDIR)/hl\n"
+	install -d "$(BINDIR)"
+	install -m 755 hl "$(BINDIR)/hl"
+	@printf "$(GREEN)▸ Installing$(RESET) hl.1 → $(MANDIR)/man1/hl.1\n"
+	install -d "$(MANDIR)/man1"
+	install -m 644 hl.1 "$(MANDIR)/man1/hl.1"
+	@printf "$(GREEN)✓ Installed$(RESET) to $(PREFIX)\n"
+
+## Remove hl binary and man page
+uninstall:
+	@printf "$(YELLOW)▸ Removing$(RESET) $(BINDIR)/hl\n"
+	rm -f "$(BINDIR)/hl"
+	@printf "$(YELLOW)▸ Removing$(RESET) $(MANDIR)/man1/hl.1\n"
+	rm -f "$(MANDIR)/man1/hl.1"
+	@printf "$(YELLOW)✓ Uninstalled$(RESET) from $(PREFIX)\n"
+
+## Display this help message
+help:
+	@printf "$(BLUE)hl — aarch64-linux ELF executor on macOS Apple Silicon$(RESET)\n\n"
+	@printf "Quick start:  ./hl <elf-binary>\n\n"
+	@printf "$(GREEN)Installation:$(RESET)\n"
+	@printf "  ./configure --prefix=/usr/local   (optional)\n"
+	@printf "  sudo make install\n\n"
+	@printf "$(GREEN)Targets:$(RESET)\n"
+	@awk '/^[a-zA-Z\-\_0-9%:\\]+:/ { \
+		helpMessage = match(lastLine, /^## (.*)/); \
+		if (helpMessage) { \
+			helpCommand = $$1; sub(/:$$/, "", helpCommand); \
+			helpMessage = substr(lastLine, RSTART + 3, RLENGTH); \
+			printf "  $(YELLOW)%-20s$(RESET) %s\n", helpCommand, helpMessage; \
+		} \
+	} \
+	{ lastLine = $$0 }' $(MAKEFILE_LIST)
+	@printf "\n$(GREEN)Prefix:$(RESET) $(PREFIX)\n"

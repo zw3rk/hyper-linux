@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/event.h>
 #include <poll.h>
 
@@ -24,8 +25,6 @@
 
 int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
                   uint64_t timeout_gva, uint64_t sigmask_gva) {
-    (void)sigmask_gva;  /* Ignore signal mask (single-threaded) */
-
     if (nfds > 256) return -LINUX_EINVAL;
 
     /* Read pollfd array from guest (layout is identical to macOS) */
@@ -43,24 +42,44 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         host_fds[i].revents = 0;
     }
 
-    /* Convert timeout */
+    /* Convert timeout (compute in int64_t to avoid overflow, clamp to INT_MAX) */
     int timeout_ms = -1;  /* Infinite by default */
     if (timeout_gva != 0) {
         linux_timespec_t lts;
         if (guest_read(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
-        timeout_ms = (int)(lts.tv_sec * 1000 + lts.tv_nsec / 1000000);
+        int64_t ms64 = lts.tv_sec * (int64_t)1000 + lts.tv_nsec / 1000000;
+        timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int)ms64;
+    }
+
+    /* Atomically install signal mask for the duration of the poll */
+    uint64_t saved_mask = 0;
+    int mask_installed = 0;
+    if (sigmask_gva != 0) {
+        uint64_t new_mask;
+        if (guest_read(g, sigmask_gva, &new_mask, sizeof(new_mask)) == 0) {
+            saved_mask = signal_save_blocked();
+            signal_set_blocked(new_mask);
+            mask_installed = 1;
+        }
     }
 
     int ret = poll(host_fds, nfds, timeout_ms);
-    if (ret < 0) return linux_errno();
+    int saved_errno = errno;
+
+    /* Restore original signal mask */
+    if (mask_installed)
+        signal_restore_blocked(saved_mask);
+
+    if (ret < 0) { errno = saved_errno; return linux_errno(); }
 
     /* Write back revents to guest */
     for (uint32_t i = 0; i < nfds; i++) {
         guest_fds[i].revents = host_fds[i].revents;
     }
     if (nfds > 0) {
-        guest_write(g, fds_gva, guest_fds, nfds * sizeof(linux_pollfd_t));
+        if (guest_write(g, fds_gva, guest_fds, nfds * sizeof(linux_pollfd_t)) < 0)
+            return -LINUX_EFAULT;
     }
 
     return ret;
@@ -162,9 +181,12 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
                 ebits[i / 64] |= (1ULL << (i % 64));
         }
         int bytes = ((nfds + 63) / 64) * 8;
-        if (readfds_gva) guest_write(g, readfds_gva, rbits, bytes);
-        if (writefds_gva) guest_write(g, writefds_gva, wbits, bytes);
-        if (exceptfds_gva) guest_write(g, exceptfds_gva, ebits, bytes);
+        if (readfds_gva && guest_write(g, readfds_gva, rbits, bytes) < 0)
+            return -LINUX_EFAULT;
+        if (writefds_gva && guest_write(g, writefds_gva, wbits, bytes) < 0)
+            return -LINUX_EFAULT;
+        if (exceptfds_gva && guest_write(g, exceptfds_gva, ebits, bytes) < 0)
+            return -LINUX_EFAULT;
     }
 
     return ret;
@@ -336,8 +358,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
 int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
                          int maxevents, int timeout_ms,
                          uint64_t sigmask_gva) {
-    (void)sigmask_gva; /* Signal mask not yet supported for epoll_pwait */
-
     int kq_fd = fd_to_host(epfd);
     if (kq_fd < 0) return -LINUX_EBADF;
     if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
@@ -345,6 +365,18 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
 
     epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
     if (!inst) return -LINUX_EINVAL;
+
+    /* Atomically install signal mask for the duration of the wait */
+    uint64_t saved_mask = 0;
+    int mask_installed = 0;
+    if (sigmask_gva != 0) {
+        uint64_t new_mask;
+        if (guest_read(g, sigmask_gva, &new_mask, sizeof(new_mask)) == 0) {
+            saved_mask = signal_save_blocked();
+            signal_set_blocked(new_mask);
+            mask_installed = 1;
+        }
+    }
 
     /* Convert timeout */
     struct timespec ts, *tsp = NULL;
@@ -360,11 +392,20 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
     struct kevent kevents[256];
 
     int nready = kevent(kq_fd, NULL, 0, kevents, cap, tsp);
-    if (nready < 0) return linux_errno();
+    int saved_errno = errno;
+
+    /* Restore original signal mask after the blocking wait */
+    if (mask_installed)
+        signal_restore_blocked(saved_mask);
+
+    if (nready < 0) { errno = saved_errno; return linux_errno(); }
 
     /* Merge kevent results into epoll_event results. Multiple kevents
-     * for the same fd (READ + WRITE) merge into one epoll_event. */
+     * for the same fd (READ + WRITE) merge into one epoll_event.
+     * Use guest FD (not user data) as the merge key — two different
+     * FDs could legitimately share the same epoll_data value. */
     linux_epoll_event_t out[256];
+    int out_gfds[256];  /* Parallel array tracking which guest FD each entry is for */
     int nout = 0;
 
     for (int i = 0; i < nready && nout < maxevents; i++) {
@@ -377,7 +418,7 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         /* Check if we already have an entry for this guest fd */
         int merged = 0;
         for (int j = 0; j < nout; j++) {
-            if (out[j].data == reg->data) {
+            if (out_gfds[j] == gfd) {
                 /* Same fd — merge events */
                 if (kevents[i].filter == EVFILT_READ)
                     out[j].events |= LINUX_EPOLLIN;
@@ -393,6 +434,7 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         }
 
         if (!merged) {
+            out_gfds[nout] = gfd;
             out[nout].events = 0;
             out[nout]._pad = 0;
             out[nout].data = reg->data;
@@ -408,9 +450,22 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         }
     }
 
+    /* Clear registrations for EPOLLONESHOT FDs that fired.
+     * kqueue already removed the event (EV_ONESHOT), but our table
+     * must reflect that the registration is now disabled until re-armed. */
+    for (int i = 0; i < nout; i++) {
+        int gfd = out_gfds[i];
+        if (gfd >= 0 && gfd < FD_TABLE_SIZE && inst->regs[gfd].active) {
+            if (inst->regs[gfd].events & LINUX_EPOLLONESHOT)
+                inst->regs[gfd].active = 0;
+        }
+    }
+
     /* Write results to guest */
-    if (nout > 0)
-        guest_write(g, events_gva, out, nout * sizeof(linux_epoll_event_t));
+    if (nout > 0) {
+        if (guest_write(g, events_gva, out, nout * sizeof(linux_epoll_event_t)) < 0)
+            return -LINUX_EFAULT;
+    }
 
     return nout;
 }

@@ -14,6 +14,7 @@
  */
 #include "syscall_signal.h"
 #include "syscall.h"        /* LINUX_E* errno constants */
+#include "syscall_fd.h"     /* signalfd_notify */
 #include "syscall_proc.h"   /* proc_get_pid, SYSCALL_EXEC_HAPPENED */
 #include "thread.h"         /* current_thread, thread_entry_t */
 
@@ -154,6 +155,10 @@ void signal_queue(int signum) {
     }
     pthread_mutex_unlock(&sig_lock);
 
+    /* Notify any signalfd instances whose mask includes this signal.
+     * This makes the signalfd pipe readable so poll/epoll sees it. */
+    signalfd_notify(signum);
+
     /* Force all vCPUs out of hv_vcpu_run() so the signal can be
      * delivered promptly — even if the guest is in a tight loop
      * with no syscalls. Each vCPU's CANCELED handler will check
@@ -230,13 +235,19 @@ static int timeval_cmp(const struct timeval *a, const struct timeval *b) {
     return 0;
 }
 
-/* Helper: add two timevals. */
+/* Helper: add two timevals with overflow saturation. */
 static struct timeval timeval_add(const struct timeval *a,
                                   const struct timeval *b) {
     struct timeval r = {
         .tv_sec  = a->tv_sec + b->tv_sec,
         .tv_usec = a->tv_usec + b->tv_usec,
     };
+    /* Detect overflow: if both are positive and result is negative */
+    if (a->tv_sec > 0 && b->tv_sec > 0 && r.tv_sec < 0) {
+        r.tv_sec = __LONG_MAX__;
+        r.tv_usec = 999999;
+        return r;
+    }
     if (r.tv_usec >= 1000000) {
         r.tv_sec += 1;
         r.tv_usec -= 1000000;
@@ -244,7 +255,8 @@ static struct timeval timeval_add(const struct timeval *a,
     return r;
 }
 
-/* Helper: subtract b from a (a must be >= b). */
+/* Helper: subtract b from a (a must be >= b).
+ * Clamps to zero if a < b to avoid negative results. */
 static struct timeval timeval_sub(const struct timeval *a,
                                   const struct timeval *b) {
     struct timeval r = {
@@ -254,6 +266,11 @@ static struct timeval timeval_sub(const struct timeval *a,
     if (r.tv_usec < 0) {
         r.tv_sec -= 1;
         r.tv_usec += 1000000;
+    }
+    /* Clamp underflow to zero */
+    if (r.tv_sec < 0) {
+        r.tv_sec = 0;
+        r.tv_usec = 0;
     }
     return r;
 }

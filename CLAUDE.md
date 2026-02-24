@@ -4,25 +4,26 @@ Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Sili
 
 ## Architecture
 
-- **hl.c** — Main entry point. CLI (incl. --fork-child, --sysroot), VM setup, interpreter loading (~500 lines).
-- **guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset, region tracking.
-- **elf.c/h** — ELF64 parser/loader. PT_LOAD segments, PT_INTERP parsing, ET_DYN load_base support.
-- **syscall.c/h** — Core infrastructure (FD table, errno/flag translation, brk/mmap) + dispatch switch (~900 lines).
-- **syscall_internal.h** — Shared declarations for syscall module helpers.
-- **syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
-- **syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select (~610 lines).
-- **syscall_inotify.c/h** — inotify emulation via kqueue EVFILT_VNODE (~350 lines).
-- **syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer (~190 lines).
-- **syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
-- **syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
-- **syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
-- **syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop (~550 lines).
-- **proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
-- **syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
-- **fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
-- **stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
-- **shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
-- **vm.c** — Legacy proof-of-concept host driver (kept in archive/).
+All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`).
+
+- **src/hl.c** — Main entry point. CLI (incl. --fork-child, --sysroot), VM setup, interpreter loading (~500 lines).
+- **src/guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset, region tracking.
+- **src/elf.c/h** — ELF64 parser/loader. PT_LOAD segments, PT_INTERP parsing, ET_DYN load_base support.
+- **src/syscall.c/h** — Core infrastructure (FD table, errno/flag translation, brk/mmap) + dispatch switch (~900 lines).
+- **src/syscall_internal.h** — Shared declarations for syscall module helpers.
+- **src/syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
+- **src/syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select (~610 lines).
+- **src/syscall_inotify.c/h** — inotify emulation via kqueue EVFILT_VNODE (~350 lines).
+- **src/syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer (~190 lines).
+- **src/syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
+- **src/syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
+- **src/syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
+- **src/syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop (~550 lines).
+- **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
+- **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
+- **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
+- **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
+- **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 
 ## Key Constraints
 
@@ -65,10 +66,12 @@ Only `bad_exception` vectors may clobber X5 (they halt, so no preservation neede
 
 ## Build
 
+Source files live in `src/`, build artifacts in `_build/`.
+
 ```
 make hl          # build + codesign hl
 make test-hello  # build and run assembly hello world
-make test-all    # run full test suite (34 tests)
+make test-all    # run full test suite
 make clean       # remove _build/
 ```
 
@@ -95,7 +98,7 @@ How it works:
 The sysroot is inherited by fork children via IPC state transfer.
 `sys_execve` also loads the interpreter for dynamically-linked targets,
 so tools that execve dynamic children (env, nice, nohup) work correctly.
-`elf_resolve_interp()` in elf.c is shared between hl.c and syscall_exec.c.
+`elf_resolve_interp()` in src/elf.c is shared between src/hl.c and src/syscall_exec.c.
 
 **Known limitations:**
 - `timeout` fails — it uses fork/clone to create a child process with a
@@ -109,7 +112,7 @@ writable and executable. With 2MB L2 block descriptors, this means an entire
 2MB region must be either RW or RX. Shared libraries have both .text (RX)
 and .data (RW) segments that often fall within the same 2MB range.
 
-Solution: `guest_split_block()` in guest.c converts a 2MB L2 block descriptor
+Solution: `guest_split_block()` in src/guest.c converts a 2MB L2 block descriptor
 into a table descriptor pointing to an L3 table with 512 × 4KB page entries.
 Each 4KB page can then have independent permissions. This is triggered by:
 - `sys_mmap` MAP_FIXED: when the fixed address lands in a block with different
@@ -129,99 +132,14 @@ when possible.
 This ensures .text and .data land in different 2MB blocks when possible;
 L3 splitting handles the cases where they share a block.
 
-## Implemented Syscalls (~130 total)
+## Implemented Syscalls
 
-**Basic I/O:**
-write(64), read(63), readv(65), writev(66), openat(56), close(57),
-ioctl(29) [TIOCGWINSZ, TCGETS, TCSETS], lseek(62), fstat(80),
-newfstatat(79), pread64(67), pwrite64(68)
-
-**Process/Memory:**
-exit(93), exit_group(94), brk(214), mmap(222), munmap(215), mprotect(226),
-madvise(233), set_tid_address(96), getpid(172), gettid(178), uname(160),
-getuid(174), geteuid(175), getgid(176), getegid(177), getrandom(278),
-clock_gettime(113), gettimeofday(169), nanosleep(101), clock_nanosleep(115),
-rt_sigaction(134), rt_sigprocmask(135), umask(166)
-
-**Filesystem:**
-getcwd(17), chdir(49), fchdir(50), faccessat(48), readlinkat(78),
-unlinkat(35), mkdirat(34), renameat2(276), getdents64(61), dup(23),
-dup3(24), fcntl(25), pipe2(59), ftruncate(46), truncate(45),
-statfs(43), fstatfs(44), statx(291), flock(32), close_range(436)
-
-**File manipulation (Batch 1):**
-mknodat(33), symlinkat(36), linkat(37), fchmod(52), fchmodat(53),
-fchownat(54), fchown(55), utimensat(88), futex(98), set_robust_list(99),
-sigaltstack(132)
-
-**Process management:**
-execve(221), execveat(281), clone(220), wait4(260),
-setuid(146), setgid(144), setreuid(145), setregid(143),
-setresuid(147), getresuid(148), setresgid(149), getresgid(150),
-setpriority(140), getpriority(141)
-
-**Process/system info (Batch 2):**
-sched_getaffinity(123), getpgid(155), getgroups(158), getrusage(165),
-prctl(167), getppid(173), sysinfo(179), prlimit64(261)
-
-**I/O optimization + sync (Batch 3):**
-fallocate(47), sendfile(71), sync(81), fsync(82), fdatasync(83),
-sched_yield(124), copy_file_range(285), splice(76), vmsplice(75)
-
-**Signals + I/O multiplexing (Batch 4):**
-pselect6(72), ppoll(73), kill(129), tgkill(131), rt_sigsuspend(133),
-rt_sigpending(136), rt_sigreturn(139), setpgid(154), setsid(157)
-
-**Timers:**
-setitimer(103), getitimer(102), timerfd_create(85), timerfd_settime(86),
-timerfd_gettime(87)
-
-**Extended ioctls:**
-TCSETSW(0x5403), TCSETSF(0x5404), TIOCGPGRP(0x540F), TIOCSPGRP(0x5410),
-TIOCSCTTY(0x540E), FIONREAD(0x541B), TIOCNOTTY(0x5422), TIOCGSID(0x5429)
-
-**xattr syscalls:**
-getxattr(8), lgetxattr(9), setxattr(5), lsetxattr(6),
-listxattr(11), llistxattr(12), removexattr(14), lremovexattr(15),
-fgetxattr(16), fsetxattr(7), flistxattr(13), fremovexattr(18)
-
-**Filesystem (additional):**
-chroot(51), memfd_create(279)
-
-**/proc and /dev emulation (intercepted in openat/readlinkat):**
-/proc/self/exe, /proc/self/cwd, /proc/self/fd/N, /proc/cpuinfo,
-/proc/self/status, /proc/self/maps, /proc/uptime, /proc/loadavg,
-/var/run/utmp, /run/utmp, /dev/null, /dev/zero,
-/dev/urandom, /dev/random, /dev/tty, /dev/stdin, /dev/stdout,
-/dev/stderr, /dev/fd/N
-
-**Stubs (return 0 / no-op but safe):**
-mlock(228), munlock(229), msync(227), membarrier(283)
-
-**Networking (syscall_net.c):**
-socket(198), socketpair(199), bind(200), listen(201), accept(202),
-connect(203), getsockname(204), getpeername(205), sendto(206),
-recvfrom(207), setsockopt(208), getsockopt(209), shutdown(210),
-sendmsg(211), recvmsg(212), accept4(242)
-
-**epoll (emulated via kqueue):**
-epoll_create1(20), epoll_ctl(21), epoll_pwait(22)
-
-**Process management (additional):**
-waitid(95)
-
-**inotify (emulated via kqueue EVFILT_VNODE):**
-inotify_init1(26), inotify_add_watch(27), inotify_rm_watch(28)
-
-**Stubs (return -ENOSYS):**
-tee(77), mincore(232), clone3(435)
-
-**Stubs (return -EPERM):**
-sethostname(161)
+~140 syscalls implemented.  See the **SYSCALL SUPPORT** section in `hl.1`
+(the man page) for the complete, authoritative list.
 
 ## Signal Delivery
 
-Signals are fully implemented in `syscall_signal.c/.h`. The signal frame
+Signals are fully implemented in `src/syscall_signal.c/.h`. The signal frame
 matches Linux `arch/arm64/kernel/signal.c:setup_rt_frame()` layout so that
 musl's `__restore_rt` → `rt_sigreturn` (SYS 139) correctly restores state.
 
@@ -254,7 +172,7 @@ macOS HVF allows only one VM per process. Fork is implemented via:
 5. Parent records child in process table, returns child PID
 
 CLOEXEC semantics follow POSIX: all FDs (including CLOEXEC) are inherited
-across fork. CLOEXEC only takes effect at exec (syscall_exec.c step 4).
+across fork. CLOEXEC only takes effect at exec (src/syscall_exec.c step 4).
 
 ## Key errno Translation
 
@@ -285,7 +203,7 @@ These differ from x86_64! From asm-generic/fcntl.h:
 ## Linux vs macOS Clock IDs
 
 Must translate! Linux CLOCK_MONOTONIC=1 but macOS CLOCK_MONOTONIC=6.
-See translate_clockid() in syscall.c.
+See translate_clockid() in src/syscall.c.
 
 ## Stack Alignment
 
@@ -357,7 +275,7 @@ needs TLBI must set X8 explicitly.
 
 ## Socket Networking
 
-Socket syscalls are translated in `syscall_net.c/.h`. Key translations:
+Socket syscalls are translated in `src/syscall_net.c/.h`. Key translations:
 - **AF_INET6**: Linux=10, macOS=30
 - **sockaddr**: Linux has no `sa_len` byte; macOS does. All sockaddr
   conversions go through `linux_to_mac_sockaddr()`/`mac_to_linux_sockaddr()`
@@ -382,7 +300,7 @@ guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
 
 ### Implementation
 
-**Thread table** (`thread.c/h`):
+**Thread table** (`src/thread.c/h`):
 - `thread_entry_t` per thread: vCPU handle, host pthread, per-thread
   signal mask, `clear_child_tid` for CLONE_CHILD_CLEARTID, `sp_el1`
 - `_Thread_local current_thread` for O(1) access from syscall handlers
@@ -390,14 +308,14 @@ guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
 - SP_EL1 allocation: each thread gets a 4KB EL1 exception stack from
   the shim data region
 
-**Futex** (`futex.c/h`):
+**Futex** (`src/futex.c/h`):
 - Hash table of wait queues keyed by guest virtual address
 - 7 operations: FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET,
   FUTEX_WAKE_BITSET, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP
 - Per-waiter condition variables for precise wakeup
 - `futex_wake_one()` used by thread exit for CLONE_CHILD_CLEARTID
 
-**sys_clone with CLONE_THREAD** (`fork_ipc.c`):
+**sys_clone with CLONE_THREAD** (`src/fork_ipc.c`):
 1. `hv_vcpu_create()` + per-thread SP_EL1 allocation
 2. Set child SP, TPIDR_EL0 (TLS), copy parent's signal mask
 3. `pthread_create()` running `vcpu_run_loop()` for child vCPU
@@ -407,12 +325,12 @@ guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
 
 | Resource | Lock type | File |
 |----------|-----------|------|
-| mmap/brk allocators + page tables | pthread_mutex | syscall.c |
-| FD table | pthread_mutex | syscall.c |
-| Thread table | pthread_mutex | thread.c |
-| Futex wait queues | pthread_mutex (per-bucket) | futex.c |
+| mmap/brk allocators + page tables | pthread_mutex | src/syscall.c |
+| FD table | pthread_mutex | src/syscall.c |
+| Thread table | pthread_mutex | src/thread.c |
+| Futex wait queues | pthread_mutex (per-bucket) | src/futex.c |
 
-**exit_group** (`syscall.c`):
+**exit_group** (`src/syscall.c`):
 - Sets global `exit_group_requested` flag
 - `thread_for_each(thread_force_exit_cb)` — calls `hv_vcpus_exit()`
   on all worker vCPUs to break them out of `hv_vcpu_run()`

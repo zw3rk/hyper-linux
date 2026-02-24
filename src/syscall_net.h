@@ -106,5 +106,9 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
 int64_t sys_shutdown(int fd, int how);
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
+int64_t sys_sendmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
+                     unsigned int vlen, int flags);
+int64_t sys_recvmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
+                     unsigned int vlen, int flags, uint64_t timeout_gva);
 
 #endif /* SYSCALL_NET_H */

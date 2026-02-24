@@ -1,0 +1,272 @@
+.\" Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+.\" SPDX-License-Identifier: Apache-2.0
+.Dd February 23, 2026
+.Dt HL 1
+.Os
+.Sh NAME
+.Nm hl
+.Nd run aarch64-linux ELF binaries on macOS Apple Silicon
+.Sh SYNOPSIS
+.Nm
+.Op Fl hvV
+.Op Fl t Ar seconds
+.Op Fl -timeout Ar seconds
+.Op Fl -sysroot Ar path
+.Op Fl -verbose
+.Op Fl -
+.Ar elf-path
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+executes aarch64-linux ELF binaries on macOS Apple Silicon using
+Apple's Hypervisor.framework.
+It creates a lightweight virtual machine with a minimal EL1 shim that
+provides exception vectors and forwards Linux syscalls (SVC #0) to the
+host via HVC, where they are translated to macOS equivalents.
+.Pp
+Both statically-linked and dynamically-linked ELF binaries are
+supported.
+For dynamic binaries, a musl sysroot must be provided via
+.Fl -sysroot .
+.Pp
+Guest memory is identity-mapped with 2MB block page tables.
+The address space size is determined at runtime by querying the
+maximum IPA (Intermediate Physical Address) size:
+36-bit (64GB) on older macOS, or 40-bit (1TB) on macOS 15+.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl h , Fl -help
+Display this manual page.
+Falls back to a brief usage summary if
+.Xr man 1
+is not available.
+.It Fl V , Fl -version
+Print the version string and exit.
+.It Fl v , Fl -verbose
+Enable verbose output on stderr.
+Shows ELF loading details, page table layout, vCPU register
+configuration, and syscall-level diagnostics.
+.It Fl t Ar seconds , Fl -timeout Ar seconds
+Set the per-iteration vCPU timeout in seconds.
+Default: 10.
+The timeout is a safety watchdog that prevents infinite loops in the
+guest from hanging the host.
+It does not limit total execution time.
+.It Fl -sysroot Ar path
+Path to a musl sysroot directory containing the dynamic linker and
+shared libraries.
+When set,
+.Nm
+loads the ELF interpreter (e.g.,
+.Pa ld-musl-aarch64.so.1 )
+from this sysroot and transparently redirects absolute path opens
+through it.
+.It Fl -
+Stop processing
+.Nm
+options.
+All subsequent arguments are passed to the guest binary.
+.El
+.Sh MEMORY LAYOUT
+The guest address space is organized as follows:
+.Pp
+.Bl -column "0x200000000" "varies" "Description" -compact
+.It Sy Start Ta Sy End Ta Sy Description
+.It 0x010000 Ta 0x0FFFFF Ta Page table pool (960KB)
+.It 0x100000 Ta 0x1FFFFF Ta Shim code (2MB, RX)
+.It 0x200000 Ta 0x3FFFFF Ta Shim data/stack (2MB, RW)
+.It 0x400000 Ta varies Ta ELF LOAD segments
+.It 0x1000000 Ta varies Ta brk heap (grows up)
+.It 0x7E00000 Ta 0x7E00FFF Ta Stack guard page (PROT_NONE)
+.It 0x7E01000 Ta 0x7FFFFFF Ta Stack (2MB, RW, grows down)
+.It 0x10000000 Ta 0x1FFFFFFF Ta mmap RX region (256MB initial)
+.It 0x200000000 Ta 0x20FFFFFFF Ta mmap RW region (256MB initial, at 8GB)
+.El
+.Pp
+Additional mmap pages beyond the initial regions are mapped dynamically
+via page table extension with TLB invalidation.
+PIE executables (ET_DYN) are loaded at 0x400000.
+.Sh SYSCALL SUPPORT
+.Nm
+translates approximately 160 Linux aarch64 syscalls to macOS equivalents.
+.Ss Basic I/O
+read, readv, write, writev, openat, close, lseek, pread64, pwrite64,
+preadv, pwritev, preadv2, pwritev2, ioctl, fstat, newfstatat.
+.Ss Process and Memory
+exit, exit_group, brk, mmap, munmap, mprotect, madvise,
+set_tid_address, getpid, gettid, getppid, getuid, geteuid, getgid,
+getegid, uname, getrandom, umask, prctl.
+.Ss Filesystem
+getcwd, chdir, fchdir, faccessat, readlinkat, unlinkat, mkdirat,
+mknodat, symlinkat, linkat, renameat2, getdents64, dup, dup3, fcntl,
+pipe2, ftruncate, truncate, statfs, fstatfs, statx, flock,
+close_range, fchmod, fchmodat, fchownat, fchown, utimensat, chroot,
+memfd_create.
+.Ss Extended Attributes
+getxattr, lgetxattr, setxattr, lsetxattr, listxattr, llistxattr,
+removexattr, lremovexattr, fgetxattr, fsetxattr, flistxattr,
+fremovexattr.
+.Ss Signals
+rt_sigaction, rt_sigprocmask, rt_sigsuspend, rt_sigpending,
+rt_sigreturn, sigaltstack, kill, tgkill.
+.Ss Time and Timers
+clock_gettime, clock_nanosleep, nanosleep, gettimeofday, setitimer,
+getitimer, timerfd_create, timerfd_settime, timerfd_gettime.
+.Ss Process Management
+clone, execve, execveat, wait4, waitid, setuid, setgid, setreuid,
+setregid, setresuid, getresuid, setresgid, getresgid, setpriority,
+getpriority, setpgid, getpgid, setsid, getgroups, getrusage,
+sched_getaffinity, sched_setaffinity, prlimit64, sysinfo.
+.Ss I/O Optimization and Sync
+fallocate, sendfile, sync, fsync, fdatasync, sched_yield,
+copy_file_range, splice, vmsplice, fadvise64.
+.Ss I/O Multiplexing
+pselect6, ppoll, epoll_create1, epoll_ctl, epoll_pwait.
+.Ss Networking
+socket, socketpair, bind, listen, accept, accept4, connect,
+getsockname, getpeername, sendto, recvfrom, setsockopt, getsockopt,
+shutdown, sendmsg, recvmsg, sendmmsg, recvmmsg.
+.Ss inotify (via kqueue)
+inotify_init1, inotify_add_watch, inotify_rm_watch.
+.Ss Stubs (no-op, return 0)
+mlock, munlock, msync, membarrier, set_robust_list, futex
+(FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET,
+FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP).
+.Ss /proc and /dev Emulation
+The following virtual paths are intercepted in openat and readlinkat:
+.Pa /proc/self/exe ,
+.Pa /proc/self/cwd ,
+.Pa /proc/self/fd/ Ns Ar N ,
+.Pa /proc/self/maps ,
+.Pa /proc/self/status ,
+.Pa /proc/cpuinfo ,
+.Pa /proc/uptime ,
+.Pa /proc/loadavg ,
+.Pa /dev/null ,
+.Pa /dev/zero ,
+.Pa /dev/urandom ,
+.Pa /dev/random ,
+.Pa /dev/tty ,
+.Pa /dev/stdin ,
+.Pa /dev/stdout ,
+.Pa /dev/stderr ,
+.Pa /dev/fd/ Ns Ar N .
+.Sh DYNAMIC LINKING
+For dynamically-linked ELF binaries, use
+.Fl -sysroot
+to point to a directory containing the musl dynamic linker and shared
+libraries:
+.Bd -literal -offset indent
+hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
+.Ed
+.Pp
+.Nm
+parses PT_INTERP from the ELF to find the interpreter path (typically
+.Pa /lib/ld-musl-aarch64.so.1 ) ,
+loads it from the sysroot, and sets the entry point to the dynamic
+linker.
+Absolute path opens are transparently redirected through the sysroot.
+.Pp
+The sysroot is inherited by fork children and honored across execve.
+.Sh THREADING
+.Nm
+supports multi-threaded guest binaries.
+Guest threads map 1:1 to host pthreads, each with its own HVF vCPU
+sharing the same guest physical memory.
+.Pp
+The clone syscall with CLONE_THREAD creates new vCPUs.
+Futex operations (FUTEX_WAIT, FUTEX_WAKE, and bitset/requeue variants)
+are fully implemented.
+Per-thread signal masks are maintained.
+Up to 64 concurrent guest threads are supported.
+.Sh FORK
+macOS HVF allows only one VM per process.
+Fork is implemented via
+.Xr posix_spawn 2
+and IPC: the parent serializes VM state (registers, memory regions,
+file descriptors via SCM_RIGHTS, signal state) over a Unix socket to a
+new
+.Nm
+process running in
+.Fl -fork-child
+mode.
+.Pp
+CLOEXEC semantics follow POSIX: all file descriptors are inherited
+across fork; O_CLOEXEC takes effect only at execve.
+.Sh ENVIRONMENT
+.Nm
+does not use any special environment variables.
+The guest inherits the host's environment verbatim.
+.Sh EXIT STATUS
+The exit status of
+.Nm
+is the exit code of the guest binary.
+If the guest calls
+.Fn exit 42 ,
+.Nm
+exits with status 42.
+.Sh EXAMPLES
+Run a statically-linked binary:
+.Bd -literal -offset indent
+hl ./hello-static
+.Ed
+.Pp
+Run with verbose output and a 30-second timeout:
+.Bd -literal -offset indent
+hl --verbose --timeout 30 ./my-program arg1 arg2
+.Ed
+.Pp
+Run a dynamically-linked binary with a musl sysroot:
+.Bd -literal -offset indent
+hl --sysroot ./musl-sysroot ./my-dynamic-program
+.Ed
+.Pp
+Run jq on a JSON file:
+.Bd -literal -offset indent
+hl /path/to/aarch64-linux/jq '.name' data.json
+.Ed
+.Pp
+Run an interactive bash shell:
+.Bd -literal -offset indent
+hl /path/to/aarch64-linux/bash
+.Ed
+.Pp
+Pass
+.Fl -
+to separate
+.Nm
+options from guest arguments starting with
+.Sq - :
+.Bd -literal -offset indent
+hl -- ./my-program --guest-flag
+.Ed
+.Sh LIMITATIONS
+.Bl -bullet -compact
+.It
+Apple HVF enforces W^X: memory regions cannot be simultaneously
+writable and executable.
+Code and data in the same 2MB block require L3 page table splitting.
+.It
+.Xr ptrace 2
+is not supported.
+Debuggers cannot attach to the guest.
+.It
+Job control syscalls (TIOCSPGRP, TIOCSCTTY) are stubs.
+Interactive job control in guest shells is limited.
+.It
+MAP_SHARED is treated as MAP_PRIVATE.
+The guest is single-process from the VM's perspective, so shared
+memory semantics are not observable.
+.It
+Only aarch64-linux ELF binaries are supported.
+No x86_64, no 32-bit ARM.
+.It
+Requires macOS on Apple Silicon with the
+.Li com.apple.security.hypervisor
+entitlement.
+.El
+.Sh SEE ALSO
+.Lk https://developer.apple.com/documentation/hypervisor "Apple Hypervisor.framework"
+.Sh AUTHORS
+.An Moritz Angermann Aq Mt moritz@zw3rk.com ,
+zw3rk pte. ltd.

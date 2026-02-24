@@ -93,9 +93,10 @@ static uint64_t pt_alloc_page(guest_t *g) {
         pt_pool_warned = 1;
     }
 
-    pthread_mutex_unlock(&pt_lock);
-    /* Zero the page in host memory */
+    /* Zero the page while still holding the lock so no other thread
+     * can observe a partially-zeroed page table page. */
     memset((uint8_t *)g->host_base + gpa, 0, PAGE_SIZE);
+    pthread_mutex_unlock(&pt_lock);
     return gpa;
 }
 

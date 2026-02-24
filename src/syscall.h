@@ -164,6 +164,18 @@
 #define SYS_fremovexattr    18
 /* chroot */
 #define SYS_chroot          51
+/* scheduling */
+#define SYS_sched_setaffinity 122
+/* network batch I/O */
+#define SYS_recvmmsg        243
+#define SYS_sendmmsg        269
+/* file advisory */
+#define SYS_fadvise64       223
+/* vectored positioned I/O */
+#define SYS_preadv          69
+#define SYS_pwritev         70
+#define SYS_preadv2         286
+#define SYS_pwritev2        287
 /* misc */
 #define SYS_sethostname     161
 #define SYS_memfd_create    279
@@ -286,8 +298,14 @@
 #define LINUX_FUTEX_WAKE  1
 
 /* ---------- Linux prctl operations ---------- */
-#define LINUX_PR_SET_NAME  15
-#define LINUX_PR_GET_NAME  16
+#define LINUX_PR_SET_PDEATHSIG  1
+#define LINUX_PR_GET_PDEATHSIG  2
+#define LINUX_PR_GET_DUMPABLE   3
+#define LINUX_PR_SET_DUMPABLE   4
+#define LINUX_PR_SET_NAME      15
+#define LINUX_PR_GET_NAME      16
+#define LINUX_PR_SET_NO_NEW_PRIVS 38
+#define LINUX_PR_GET_NO_NEW_PRIVS 39
 
 /* ---------- Linux mmap flags ---------- */
 #define LINUX_PROT_NONE  0x0

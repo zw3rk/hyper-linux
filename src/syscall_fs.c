@@ -28,16 +28,25 @@
 
 /* ---------- stat translation ---------- */
 
+/* Re-encode macOS dev_t to Linux new_encode_dev format.
+ * macOS: major = (dev >> 24) & 0xFF, minor = dev & 0xFFFFFF
+ * Linux: (minor & 0xFF) | (major << 8) | ((minor & ~0xFF) << 12) */
+static uint64_t mac_to_linux_dev(dev_t dev) {
+    unsigned int maj = ((unsigned int)dev >> 24) & 0xFF;
+    unsigned int min = (unsigned int)dev & 0xFFFFFF;
+    return (uint64_t)((min & 0xFF) | (maj << 8) | ((min & ~0xFFU) << 12));
+}
+
 /* Translate macOS struct stat to Linux aarch64 struct stat */
 static void translate_stat(const struct stat *mac, linux_stat_t *lin) {
     memset(lin, 0, sizeof(*lin));
-    lin->st_dev     = mac->st_dev;
+    lin->st_dev     = mac_to_linux_dev(mac->st_dev);
     lin->st_ino     = mac->st_ino;
     lin->st_mode    = mac->st_mode;
     lin->st_nlink   = (uint32_t)mac->st_nlink;
     lin->st_uid     = mac->st_uid;
     lin->st_gid     = mac->st_gid;
-    lin->st_rdev    = mac->st_rdev;
+    lin->st_rdev    = mac_to_linux_dev(mac->st_rdev);
     lin->st_size    = mac->st_size;
     lin->st_blksize = (int32_t)mac->st_blksize;
     lin->st_blocks  = mac->st_blocks;
@@ -175,19 +184,30 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
 
 int64_t sys_close(int fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
-    if (fd_table[fd].type == FD_CLOSED) return -LINUX_EBADF;
 
-    /* Close type-specific resources stored in dir pointer */
-    if (fd_table[fd].dir) {
-        if (fd_table[fd].type == FD_DIR)
-            closedir((DIR *)fd_table[fd].dir);
-        else if (fd_table[fd].type == FD_EPOLL)
-            free(fd_table[fd].dir);  /* epoll_instance_t */
-        fd_table[fd].dir = NULL;
+    /* Snapshot the entry and mark closed atomically under fd_lock.
+     * This prevents another thread from seeing the fd as open while
+     * we're cleaning up, or from fd_alloc() reusing this slot too early. */
+    fd_entry_t snap;
+    snap = fd_table[fd];
+    if (snap.type == FD_CLOSED) return -LINUX_EBADF;
+
+    /* Mark closed first (fd_mark_closed acquires fd_lock internally
+     * and clears host_fd/dir/linux_flags before marking the slot free
+     * in the bitmap, preventing races with concurrent fd_alloc). */
+    fd_mark_closed(fd);
+
+    /* Now do cleanup on the snapshot — no lock needed since slot is
+     * already marked closed and no other thread will touch it. */
+    if (snap.dir) {
+        if (snap.type == FD_DIR)
+            closedir((DIR *)snap.dir);
+        else if (snap.type == FD_EPOLL)
+            free(snap.dir);  /* epoll_instance_t */
     }
 
     /* Clean up emulated I/O subsystem state (pipes, kqueues, counters) */
-    switch (fd_table[fd].type) {
+    switch (snap.type) {
     case FD_EVENTFD:  eventfd_close(fd);  break;
     case FD_SIGNALFD: signalfd_close(fd); break;
     case FD_TIMERFD:  timerfd_close(fd);  break;
@@ -196,11 +216,9 @@ int64_t sys_close(int fd) {
     }
 
     /* Don't actually close stdin/stdout/stderr on the host */
-    if (fd_table[fd].type != FD_STDIO) {
-        close(fd_table[fd].host_fd);
+    if (snap.type != FD_STDIO) {
+        close(snap.host_fd);
     }
-    fd_mark_closed(fd);
-    fd_table[fd].host_fd = -1;
     return 0;
 }
 
@@ -394,7 +412,7 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
     return newfd;
 }
 
-int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
+int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
@@ -436,10 +454,56 @@ int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
         return fcntl(host_fd, F_GETFL);
     case 4: /* F_SETFL */
         return fcntl(host_fd, F_SETFL, (int)arg);
-    case 5:  /* F_GETLK — query lock; report unlocked (single-process guest) */
-    case 6:  /* F_SETLK — set/clear lock (non-blocking) */
-    case 7:  /* F_SETLKW — set/clear lock (blocking) */
+    case 5:  /* F_GETLK */
+    case 6:  /* F_SETLK */
+    case 7: { /* F_SETLKW */
+        /* Translate Linux struct flock (aarch64) to macOS struct flock.
+         * Linux aarch64 layout: {short l_type, short l_whence,
+         *   long l_start, long l_len, int l_pid, pad[4]}
+         * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
+         *   short l_type, short l_whence} */
+        uint8_t *lflock = guest_ptr(g, arg);
+        if (!lflock) return -LINUX_EFAULT;
+
+        /* Read Linux flock fields */
+        int16_t l_type, l_whence;
+        int64_t l_start, l_len;
+        memcpy(&l_type,   lflock + 0, 2);
+        memcpy(&l_whence, lflock + 2, 2);
+        memcpy(&l_start,  lflock + 8, 8);   /* offset 8 due to padding */
+        memcpy(&l_len,    lflock + 16, 8);
+
+        struct flock mac_fl = {
+            .l_start  = l_start,
+            .l_len    = l_len,
+            .l_pid    = 0,
+            .l_type   = l_type,   /* F_RDLCK=0, F_WRLCK=1, F_UNLCK=2 same on both */
+            .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
+        };
+
+        int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
+        if (fcntl(host_fd, mac_cmd, &mac_fl) < 0)
+            return linux_errno();
+
+        /* For F_GETLK, write back the result */
+        if (cmd == 5) {
+            int16_t rt = mac_fl.l_type, rw = mac_fl.l_whence;
+            int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
+            int32_t rp = mac_fl.l_pid;
+            memcpy(lflock + 0, &rt, 2);
+            memcpy(lflock + 2, &rw, 2);
+            memcpy(lflock + 8, &rs, 8);
+            memcpy(lflock + 16, &rl, 8);
+            memcpy(lflock + 24, &rp, 4);
+        }
         return 0;
+    }
+    case 1024: /* F_GETPIPE_SZ */
+        /* macOS doesn't support pipe size queries; return default 64KB */
+        return 65536;
+    case 1031: /* F_SETPIPE_SZ */
+        /* macOS doesn't support pipe size setting; pretend success */
+        return (int64_t)arg;
     default:
         return -LINUX_EINVAL;
     }
@@ -448,9 +512,10 @@ int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
 int64_t sys_close_range(unsigned int first, unsigned int last,
                         unsigned int flags) {
     (void)flags;
-    if (first > last || last >= (unsigned)FD_TABLE_SIZE) {
-        if (last >= (unsigned)FD_TABLE_SIZE) last = FD_TABLE_SIZE - 1;
-    }
+    /* Linux returns EINVAL when first > last (even if both are valid) */
+    if (first > last) return -LINUX_EINVAL;
+    /* Clamp to FD table size (Linux clamps ~0U to NR_OPEN_MAX) */
+    if (last >= (unsigned)FD_TABLE_SIZE) last = FD_TABLE_SIZE - 1;
     for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
         if (fd_table[i].type != FD_CLOSED) {
             if (fd_table[i].dir) {
@@ -462,9 +527,9 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
             }
             if (fd_table[i].type != FD_STDIO)
                 close(fd_table[i].host_fd);
+            /* fd_mark_closed clears host_fd/dir/linux_flags atomically
+             * under fd_lock before marking the slot free in the bitmap. */
             fd_mark_closed(i);
-            fd_table[i].host_fd = -1;
-            fd_table[i].linux_flags = 0;
         }
     }
     return 0;
@@ -487,14 +552,21 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     size_t guest_pos = 0;
     struct dirent *de;
 
-    while ((de = readdir(dir)) != NULL) {
+    while (1) {
+        /* Save position BEFORE readdir so we can rewind if the entry
+         * doesn't fit.  macOS telldir returns an opaque cookie —
+         * arithmetic on it (e.g. telldir()-1) is undefined. */
+        long saved_pos = telldir(dir);
+        de = readdir(dir);
+        if (!de) break;
+
         size_t name_len = strlen(de->d_name);
         /* Linux dirent64: 19-byte header + name + null, padded to 8 */
         size_t reclen = (19 + name_len + 1 + 7) & ~7ULL;
 
         if (guest_pos + reclen > count) {
-            /* Unread this entry for the next getdents64 call */
-            seekdir(dir, telldir(dir) - 1);
+            /* Entry doesn't fit — rewind so next call gets it */
+            seekdir(dir, saved_pos);
             break;
         }
 

@@ -27,6 +27,14 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
                      uint64_t count, int64_t offset);
 int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt);
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt);
+int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
+                   int iovcnt, int64_t offset);
+int64_t sys_pwritev(guest_t *g, int fd, uint64_t iov_gva,
+                    int iovcnt, int64_t offset);
+int64_t sys_preadv2(guest_t *g, int fd, uint64_t iov_gva,
+                    int iovcnt, int64_t offset, int flags);
+int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
+                     int iovcnt, int64_t offset, int flags);
 
 /* terminal I/O */
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg);

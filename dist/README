@@ -1,0 +1,57 @@
+hl — Run aarch64-linux ELF binaries on macOS Apple Silicon
+==========================================================
+
+Quick Start
+-----------
+
+  No installation required.  Run directly from this directory:
+
+    ./hl <elf-binary>
+    ./hl --verbose ./my-static-program arg1 arg2
+
+Install
+-------
+
+  Optional system-wide installation (default: /usr/local):
+
+    ./configure
+    sudo make install
+
+  Custom prefix:
+
+    ./configure --prefix=$HOME/.local
+    make install
+
+  Remove:
+
+    sudo make uninstall
+
+Dynamic Linking
+---------------
+
+  For dynamically-linked aarch64-linux ELF binaries, supply a musl
+  sysroot containing the dynamic linker and shared libraries:
+
+    ./hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
+
+Man Page
+--------
+
+  Before installation:    man ./hl.1
+  After installation:     man hl
+
+  hl --help also displays the man page automatically.
+
+Requirements
+------------
+
+  - Apple Silicon Mac (arm64)
+  - macOS 13 (Ventura) or later
+  - Hypervisor entitlement is embedded in the signed binary
+
+License
+-------
+
+  Apache License 2.0
+  Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+  See LICENSE for the full text.

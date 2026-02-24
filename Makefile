@@ -9,14 +9,24 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl clean test-hello test-all test-coreutils test-busybox \
-       test-dynamic test-dynamic-coreutils test-perf test-multi-vcpu \
-       test-haskell help
+.PHONY: all hl clean dist pkg release test-hello test-all test-coreutils \
+       test-busybox test-static-bins test-dynamic test-dynamic-coreutils \
+       test-perf test-multi-vcpu test-haskell test-haskell-bins help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
 SIGN_IDENTITY ?= -
 BUILD_DIR := _build
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+
+# GNU objcopy for Mach-O → raw binary.  The clang wrapper in newer nixpkgs
+# shadows binutils' objcopy with llvm-objcopy, which doesn't handle
+# Mach-O -O binary correctly.  GNU_OBJCOPY is set by the nix flake.
+ifdef GNU_OBJCOPY
+  OBJCOPY := $(GNU_OBJCOPY)
+else
+  OBJCOPY ?= objcopy
+endif
 
 # Cross-compiler prefix (only used when GUEST_TEST_BINARIES is unset)
 CROSS ?= aarch64-unknown-linux-musl-
@@ -42,19 +52,22 @@ YELLOW := \033[1;33m
 RED    := \033[0;31m
 RESET  := \033[0m
 
-# ── Source files ───────────────────────────────────────────────────
-HL_SRCS := hl.c guest.c elf.c syscall.c syscall_fs.c syscall_io.c \
-           syscall_poll.c syscall_fd.c syscall_inotify.c \
-           syscall_time.c syscall_sys.c syscall_proc.c \
-           proc_emulation.c syscall_exec.c fork_ipc.c \
-           syscall_signal.c syscall_net.c stack.c \
-           thread.c futex.c
-HL_HDRS := guest.h elf.h syscall.h syscall_internal.h syscall_fs.h \
-           syscall_io.h syscall_poll.h syscall_fd.h syscall_inotify.h \
+# ── Source layout ─────────────────────────────────────────────────
+SRC_DIR := src
+
+HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
+           syscall_fs.c syscall_io.c syscall_poll.c syscall_fd.c \
+           syscall_inotify.c syscall_time.c syscall_sys.c \
+           syscall_proc.c proc_emulation.c syscall_exec.c \
+           fork_ipc.c syscall_signal.c syscall_net.c stack.c \
+           thread.c futex.c)
+HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
+           syscall_internal.h syscall_fs.h syscall_io.h \
+           syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h \
-           thread.h futex.h
+           thread.h futex.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -66,15 +79,26 @@ all: hl $(TEST_DEPS)
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
+# ── Version header ────────────────────────────────────────────────
+# Regenerates when HEAD or index changes (commit/checkout/stage).
+# cmp trick avoids unnecessary rebuilds when version is unchanged.
+# Override: make hl VERSION=v0.1.0 (used by nix build in sandbox).
+# When .git/ is absent (nix sandbox), skip git-file deps.
+VERSION_DEPS := $(wildcard .git/HEAD .git/index)
+$(BUILD_DIR)/version.h: $(VERSION_DEPS) | $(BUILD_DIR)
+	@printf '#define HL_VERSION "%s"\n' "$(VERSION)" > $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null || mv $@.tmp $@
+	@rm -f $@.tmp
+
 # ── Shim binary blob ──────────────────────────────────────────────
 
-$(BUILD_DIR)/shim.o: shim.S | $(BUILD_DIR)
+$(BUILD_DIR)/shim.o: $(SRC_DIR)/shim.S | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Assembling$(RESET) shim.S\n"
 	as -arch arm64 -o $@ $<
 
 $(BUILD_DIR)/shim.bin: $(BUILD_DIR)/shim.o
 	@printf "$(GREEN)▸ Creating binary$(RESET) shim.bin\n"
-	nix shell nixpkgs#binutils -c objcopy -O binary $< $@
+	$(OBJCOPY) -O binary $< $@
 
 ## Generate shim_blob.h from shim.bin (C byte array)
 $(BUILD_DIR)/shim_blob.h: $(BUILD_DIR)/shim.bin
@@ -89,10 +113,10 @@ $(BUILD_DIR)/shim_blob.h: $(BUILD_DIR)/shim.bin
 hl: $(BUILD_DIR)/hl
 	@printf "$(GREEN)✓ hl built successfully$(RESET)\n"
 
-$(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
+$(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Compiling$(RESET) hl\n"
 	clang -O2 -Wall -Wextra -Wpedantic \
-		-I$(BUILD_DIR) \
+		-I$(BUILD_DIR) -I$(SRC_DIR) \
 		-o $@ $(HL_SRCS) \
 		-framework Hypervisor -arch arm64
 	@printf "$(GREEN)▸ Signing$(RESET) hl\n"
@@ -227,6 +251,18 @@ test-busybox: $(BUILD_DIR)/hl
 	fi
 	@bash test/test-busybox.sh $(BUILD_DIR)/hl $(BUSYBOX_BIN)
 
+# ── Static binary integration tests ──────────────────────────────
+
+STATIC_BINS_DIR ?= $(GUEST_STATIC_BINS)/bin
+
+## Run static binary smoke tests (bash, lua, gawk, jq, sqlite, etc.)
+test-static-bins: $(BUILD_DIR)/hl
+	@if [ ! -d "$(STATIC_BINS_DIR)" ]; then \
+		printf "$(RED)✗ Static bins not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-static-bins.sh $(BUILD_DIR)/hl $(STATIC_BINS_DIR)
+
 # ── Dynamic linking tests ────────────────────────────────────────
 
 # Musl sysroot with dynamic linker + libc.so (set by nix develop)
@@ -277,6 +313,18 @@ test-haskell: $(BUILD_DIR)/hl
 	@printf "$(BLUE)▸ Running$(RESET) Haskell hello-hyper\n"
 	$(BUILD_DIR)/hl $(HASKELL_HELLO)
 
+# ── Haskell binary integration tests ────────────────────────────────
+
+HASKELL_BINS_DIR ?= $(GUEST_HASKELL_BINS)/bin
+
+## Run Haskell binary integration tests (pandoc, shellcheck)
+test-haskell-bins: $(BUILD_DIR)/hl
+	@if [ ! -d "$(HASKELL_BINS_DIR)" ]; then \
+		printf "$(RED)✗ Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR)
+
 # ── Multi-vCPU validation test ─────────────────────────────────────
 
 ## Build the multi-vCPU HVF validation test (native macOS binary)
@@ -298,6 +346,38 @@ test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
 ## Remove all build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
+
+# ── Distribution ─────────────────────────────────────────────────
+
+DIST_OUT  := dist/out
+DIST_NAME := hl-$(VERSION)
+
+## Build distribution zip archive
+dist: $(BUILD_DIR)/hl
+	@rm -rf dist/staging/$(DIST_NAME)
+	@mkdir -p dist/staging/$(DIST_NAME) $(DIST_OUT)
+	@printf "$(GREEN)▸ Assembling$(RESET) $(DIST_NAME)/\n"
+	@cp $(BUILD_DIR)/hl           dist/staging/$(DIST_NAME)/hl
+	@cp hl.1                      dist/staging/$(DIST_NAME)/hl.1
+	@cp dist/configure            dist/staging/$(DIST_NAME)/configure
+	@cp dist/Makefile.install     dist/staging/$(DIST_NAME)/Makefile
+	@cp dist/README               dist/staging/$(DIST_NAME)/README
+	@cp LICENSE                   dist/staging/$(DIST_NAME)/LICENSE
+	@cp entitlements.plist        dist/staging/$(DIST_NAME)/entitlements.plist
+	@chmod 755 dist/staging/$(DIST_NAME)/hl
+	@chmod 755 dist/staging/$(DIST_NAME)/configure
+	@printf "$(GREEN)▸ Creating$(RESET) $(DIST_OUT)/$(DIST_NAME).zip\n"
+	@cd dist/staging && ditto -c -k --keepParent $(DIST_NAME) ../out/$(DIST_NAME).zip
+	@rm -rf dist/staging/$(DIST_NAME)
+	@printf "$(GREEN)✓ $(DIST_OUT)/$(DIST_NAME).zip$(RESET)\n"
+
+## Build .pkg macOS installer
+pkg: $(BUILD_DIR)/hl
+	@sh dist/build-pkg.sh "$(VERSION)" "$(BUILD_DIR)/hl" hl.1
+
+## Full signed + notarized release (requires SIGN_IDENTITY, INSTALLER_SIGN_IDENTITY)
+release:
+	@sh dist/build-release.sh "$(VERSION)"
 
 # ── Help ───────────────────────────────────────────────────────────
 

@@ -1,0 +1,85 @@
+# CI — build, test, and release hl
+#
+# Branch pushes / PRs:  build (nix build + make)
+# master push:           build + dist artifacts
+# v* tags:               build + dist + GitHub Release
+#
+# NOTE: Tests require x86_64-linux cross-compiled guest binaries (the full
+# devShell).  GitHub Actions macOS runners lack a linux builder, so tests
+# run locally only (`nix develop -c make test-all`).
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  # ── Build ──────────────────────────────────────────────────────────
+  build:
+    runs-on: macos-latest  # ARM64 (Apple Silicon)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Validate the nix package builds correctly
+      - name: Build hl (nix package)
+        run: nix build
+
+      # Also validate the Makefile build path (used by dist)
+      - name: Build hl (make)
+        run: nix develop .#ci -c make hl
+
+  # ── Distribution artifacts (master + tags) ──────────────────────────
+  dist:
+    needs: build
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for git describe
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build distribution
+        run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hl-dist
+          path: |
+            dist/out/*.zip
+            dist/out/*.pkg
+
+  # ── GitHub Release (tags only) ──────────────────────────────────────
+  release:
+    needs: dist
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build distribution
+        run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/out/*.zip
+            dist/out/*.pkg
+          generate_release_notes: true

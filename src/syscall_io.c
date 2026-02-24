@@ -135,6 +135,11 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
     for (int i = 0; i < iovcnt; i++) {
         void *base = guest_ptr(g, guest_iov[i].iov_base);
         if (!base) return -LINUX_EFAULT;
+        /* Validate the entire buffer is within guest memory */
+        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
+        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT; /* overflow */
+        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
+            return -LINUX_EFAULT;
         host_iov[i].iov_base = base;
         host_iov[i].iov_len = guest_iov[i].iov_len;
     }
@@ -158,6 +163,11 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
     for (int i = 0; i < iovcnt; i++) {
         void *base = guest_ptr(g, guest_iov[i].iov_base);
         if (!base) return -LINUX_EFAULT;
+        /* Validate the entire buffer is within guest memory */
+        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
+        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT; /* overflow */
+        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
+            return -LINUX_EFAULT;
         host_iov[i].iov_base = base;
         host_iov[i].iov_len = guest_iov[i].iov_len;
     }
@@ -168,6 +178,77 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
         return linux_errno();
     }
     return ret;
+}
+
+/* Helper: build host iovec array from guest iovec array.
+ * Returns 0 on success, -LINUX_EFAULT on bad guest pointer. */
+static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
+                               struct iovec *host_iov) {
+    linux_iovec_t *guest_iov = guest_ptr(g, iov_gva);
+    if (!guest_iov) return -LINUX_EFAULT;
+    for (int i = 0; i < iovcnt; i++) {
+        void *base = guest_ptr(g, guest_iov[i].iov_base);
+        if (!base) return -LINUX_EFAULT;
+        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
+        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT;
+        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
+            return -LINUX_EFAULT;
+        host_iov[i].iov_base = base;
+        host_iov[i].iov_len = guest_iov[i].iov_len;
+    }
+    return 0;
+}
+
+int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
+                   int iovcnt, int64_t offset) {
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+
+    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+    if (err < 0) return err;
+
+    ssize_t ret = preadv(host_fd, host_iov, iovcnt, offset);
+    return ret < 0 ? linux_errno() : ret;
+}
+
+int64_t sys_pwritev(guest_t *g, int fd, uint64_t iov_gva,
+                    int iovcnt, int64_t offset) {
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+
+    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+    if (err < 0) return err;
+
+    ssize_t ret = pwritev(host_fd, host_iov, iovcnt, offset);
+    if (ret < 0) {
+        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return ret;
+}
+
+int64_t sys_preadv2(guest_t *g, int fd, uint64_t iov_gva,
+                    int iovcnt, int64_t offset, int flags) {
+    /* preadv2 extends preadv with a flags parameter (RWF_HIPRI,
+     * RWF_DSYNC, etc.). macOS has no preadv2 equivalent, so we
+     * ignore the flags and delegate to preadv. If offset is -1,
+     * use the current file position (like readv). */
+    (void)flags;
+    if (offset == -1)
+        return sys_readv(g, fd, iov_gva, iovcnt);
+    return sys_preadv(g, fd, iov_gva, iovcnt, offset);
+}
+
+int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
+                     int iovcnt, int64_t offset, int flags) {
+    (void)flags;
+    if (offset == -1)
+        return sys_writev(g, fd, iov_gva, iovcnt);
+    return sys_pwritev(g, fd, iov_gva, iovcnt, offset);
 }
 
 /* ---------- terminal I/O ---------- */
@@ -221,7 +302,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         if (guest_read(g, arg, &lt, sizeof(lt)) < 0)
             return -LINUX_EFAULT;
         struct termios t;
-        tcgetattr(host_fd, &t); /* Get current as base */
+        if (tcgetattr(host_fd, &t) < 0)
+            return -LINUX_ENOTTY;  /* Not a terminal */
         t.c_iflag = lt.c_iflag;
         t.c_oflag = lt.c_oflag;
         t.c_cflag = lt.c_cflag;
@@ -242,7 +324,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         /* Get foreground process group */
         pid_t pgrp = tcgetpgrp(host_fd);
         if (pgrp < 0) return -LINUX_ENOTTY;
-        int32_t val = (int32_t)proc_get_pid();
+        int32_t val = (int32_t)pgrp;
         if (guest_write(g, arg, &val, sizeof(val)) < 0)
             return -LINUX_EFAULT;
         return 0;
@@ -337,7 +419,11 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
         if (nr <= 0) break;
 
         ssize_t nw = write(host_out, buf, nr);
-        if (nw < 0) return total > 0 ? (int64_t)total : linux_errno();
+        if (nw < 0) {
+            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            if (total > 0) break;  /* Report partial success below */
+            return linux_errno();
+        }
 
         total += nw;
         remaining -= nw;
@@ -345,9 +431,10 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
         if (nw < nr) break;  /* Short write */
     }
 
-    /* Write back updated offset */
+    /* Write back updated offset (even on partial transfer) */
     if (offset_gva != 0) {
-        guest_write(g, offset_gva, &offset, 8);
+        if (guest_write(g, offset_gva, &offset, 8) < 0)
+            return -LINUX_EFAULT;
     }
 
     return (int64_t)total;
@@ -392,7 +479,11 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
         } else {
             nw = write(host_out, buf, nr);
         }
-        if (nw < 0) return total > 0 ? (int64_t)total : linux_errno();
+        if (nw < 0) {
+            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            if (total > 0) break;  /* Report partial success below */
+            return linux_errno();
+        }
 
         total += nw;
         remaining -= nw;
@@ -401,9 +492,15 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
         if (nw < nr) break;
     }
 
-    /* Write back updated offsets */
-    if (off_in_gva != 0) guest_write(g, off_in_gva, &off_in, 8);
-    if (off_out_gva != 0) guest_write(g, off_out_gva, &off_out, 8);
+    /* Write back updated offsets (even on partial transfer) */
+    if (off_in_gva != 0) {
+        if (guest_write(g, off_in_gva, &off_in, 8) < 0)
+            return -LINUX_EFAULT;
+    }
+    if (off_out_gva != 0) {
+        if (guest_write(g, off_out_gva, &off_out, 8) < 0)
+            return -LINUX_EFAULT;
+    }
 
     return (int64_t)total;
 }
@@ -448,7 +545,10 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
             ssize_t w = (off_out >= 0)
                 ? pwrite(host_out, buf + written, r - written, off_out)
                 : write(host_out, buf + written, r - written);
-            if (w <= 0) { free(buf); goto done; }
+            if (w <= 0) {
+                if (w < 0 && errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+                free(buf); goto done;
+            }
             written += w;
             if (off_out >= 0) off_out += w;
         }
@@ -486,7 +586,10 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
         if (!src) return -LINUX_EFAULT;
 
         ssize_t w = write(host_fd, src, liov.iov_len);
-        if (w < 0) return total > 0 ? (int64_t)total : linux_errno();
+        if (w < 0) {
+            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            return total > 0 ? (int64_t)total : linux_errno();
+        }
         total += w;
         if ((size_t)w < liov.iov_len) break;
     }

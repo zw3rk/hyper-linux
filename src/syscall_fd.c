@@ -21,7 +21,13 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/event.h>
+
+/* Mutex protecting timerfd/eventfd/signalfd per-slot state.  Prevents
+ * races when two threads operate on the same special FD concurrently
+ * (e.g., two threads reading the same eventfd). Lock order: 5. */
+static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ================================================================
  * timerfd emulation via kqueue EVFILT_TIMER
@@ -137,14 +143,22 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
     }
 
     int kq = timerfd_state[slot].kq_fd;
-    int64_t value_ms = its.it_value_sec * 1000 + its.it_value_nsec / 1000000;
+    /* Convert directly to microseconds for best precision with NOTE_USECONDS */
+    int64_t value_us = its.it_value_sec * 1000000LL + its.it_value_nsec / 1000;
     int64_t interval_ns = its.it_interval_sec * 1000000000LL + its.it_interval_nsec;
 
-    if (value_ms == 0 && its.it_value_nsec == 0) {
+    if (value_us == 0 && its.it_value_nsec == 0) {
         /* Disarm timer */
         struct kevent kev;
         EV_SET(&kev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
         kevent(kq, &kev, 1, NULL, 0, NULL); /* Ignore error if not armed */
+
+        /* Drain any stale pending events so the next timerfd_read()
+         * doesn't see expirations from the now-disarmed timer. */
+        struct timespec ts_zero = {0, 0};
+        while (kevent(kq, NULL, 0, &kev, 1, &ts_zero) > 0)
+            ;
+
         timerfd_state[slot].armed = 0;
         timerfd_state[slot].expirations = 0;
     } else {
@@ -153,7 +167,7 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
         uint16_t kflags = EV_ADD | EV_ENABLE;
         if (interval_ns == 0) kflags |= EV_ONESHOT;
         EV_SET(&kev, 1, EVFILT_TIMER, kflags, NOTE_USECONDS,
-               value_ms * 1000, NULL);
+               value_us, NULL);
         if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
             return linux_errno();
         timerfd_state[slot].armed = 1;
@@ -220,8 +234,9 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva) {
 int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count) {
     if (count < 8) return -LINUX_EINVAL;
 
+    pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
 
     int kq = timerfd_state[slot].kq_fd;
 
@@ -239,22 +254,29 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (timerfd_state[slot].expirations == 0) {
         /* No events yet — check if non-blocking */
         int fl = fcntl(kq, F_GETFL);
-        if (fl >= 0 && (fl & O_NONBLOCK))
+        if (fl >= 0 && (fl & O_NONBLOCK)) {
+            pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
+        }
 
-        /* Blocking: wait for the timer to fire */
+        /* Blocking: release lock, wait for the timer, re-lock */
+        pthread_mutex_unlock(&sfd_lock);
         nev = kevent(kq, NULL, 0, &kev, 1, NULL);
+        pthread_mutex_lock(&sfd_lock);
         if (nev > 0) {
             uint64_t fires = (uint64_t)kev.data;
             if (fires == 0) fires = 1;
             timerfd_state[slot].expirations += fires;
         }
-        if (timerfd_state[slot].expirations == 0)
+        if (timerfd_state[slot].expirations == 0) {
+            pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
+        }
     }
 
     uint64_t val = timerfd_state[slot].expirations;
     timerfd_state[slot].expirations = 0;
+    pthread_mutex_unlock(&sfd_lock);
 
     if (guest_write(g, buf_gva, &val, 8) < 0)
         return -LINUX_EFAULT;
@@ -374,17 +396,27 @@ void eventfd_close(int guest_fd) {
 int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count) {
     if (count < 8) return -LINUX_EINVAL;
 
+    pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
 
     if (eventfd_state[slot].counter == 0) {
-        if (eventfd_state[slot].nonblock) return -LINUX_EAGAIN;
-        /* Blocking mode: block on the pipe read end */
+        if (eventfd_state[slot].nonblock) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EAGAIN;
+        }
+        /* Blocking mode: release lock, block on pipe, re-lock */
+        int rd_fd = eventfd_state[slot].pipe_rd;
+        pthread_mutex_unlock(&sfd_lock);
         uint8_t byte;
-        ssize_t r = read(eventfd_state[slot].pipe_rd, &byte, 1);
+        ssize_t r = read(rd_fd, &byte, 1);
         if (r < 0) return linux_errno();
+        pthread_mutex_lock(&sfd_lock);
         /* Counter was updated by the writer — re-check */
-        if (eventfd_state[slot].counter == 0) return -LINUX_EAGAIN;
+        if (eventfd_state[slot].counter == 0) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EAGAIN;
+        }
     }
 
     uint64_t val;
@@ -402,6 +434,7 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         while (read(eventfd_state[slot].pipe_rd, &drain, 1) > 0)
             ;
     }
+    pthread_mutex_unlock(&sfd_lock);
 
     if (guest_write(g, buf_gva, &val, 8) < 0)
         return -LINUX_EFAULT;
@@ -414,19 +447,22 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 int64_t eventfd_write(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count) {
     if (count < 8) return -LINUX_EINVAL;
 
-    int slot = eventfd_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
-
     uint64_t val;
     if (guest_read(g, buf_gva, &val, 8) < 0)
         return -LINUX_EFAULT;
-
     if (val == UINT64_MAX) return -LINUX_EINVAL;
 
-    /* Check for counter overflow */
+    pthread_mutex_lock(&sfd_lock);
+    int slot = eventfd_find(guest_fd);
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
+
+    /* Check for counter overflow (Linux max is UINT64_MAX - 1) */
     if (eventfd_state[slot].counter > UINT64_MAX - 1 - val) {
-        if (eventfd_state[slot].nonblock) return -LINUX_EAGAIN;
-        /* In blocking mode we'd block; for now just clamp */
+        /* Would overflow: block or return EAGAIN. In blocking mode a
+         * real kernel blocks until a read drains the counter; we return
+         * EAGAIN to avoid hanging since we can't truly block here. */
+        pthread_mutex_unlock(&sfd_lock);
+        return -LINUX_EAGAIN;
     }
 
     int was_zero = (eventfd_state[slot].counter == 0);
@@ -437,6 +473,7 @@ int64_t eventfd_write(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
         uint8_t byte = 1;
         write(eventfd_state[slot].pipe_wr, &byte, 1);
     }
+    pthread_mutex_unlock(&sfd_lock);
 
     return 8;
 }
@@ -536,9 +573,11 @@ int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,
 
     /* If fd >= 0, update existing signalfd mask */
     if (fd >= 0) {
+        pthread_mutex_lock(&sfd_lock);
         int slot = signalfd_find(fd);
-        if (slot < 0) return -LINUX_EINVAL;
+        if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EINVAL; }
         signalfd_state[slot].mask = mask;
+        pthread_mutex_unlock(&sfd_lock);
         return fd;
     }
 
@@ -627,6 +666,7 @@ int64_t signalfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
 /* Notify signalfd pipes when a signal is queued. Called from
  * signal_queue() — writes a byte to make poll/epoll see readability. */
 void signalfd_notify(int signum) {
+    pthread_mutex_lock(&sfd_lock);
     for (int i = 0; i < SIGNALFD_MAX; i++) {
         if (signalfd_state[i].guest_fd < 0) continue;
         uint64_t bit = 1ULL << (signum - 1);
@@ -635,4 +675,5 @@ void signalfd_notify(int signum) {
             write(signalfd_state[i].pipe_wr, &byte, 1);
         }
     }
+    pthread_mutex_unlock(&sfd_lock);
 }

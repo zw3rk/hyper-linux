@@ -30,7 +30,9 @@
 #define PIE_LOAD_BASE        0x00400000ULL   /* PIE (ET_DYN) executable base (4MB) */
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
 #define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
-#define STACK_BASE           0x07E00000ULL   /* Bottom of 2MB stack block */
+#define STACK_BASE           0x07800000ULL   /* Bottom of 8MB stack region (4×2MB blocks).
+                                              * macOS demand-pages HVF backing memory, so
+                                              * unused stack pages consume no host RAM. */
 #define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
                                               * Below 8GB — only code goes here, not

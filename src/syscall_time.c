@@ -80,9 +80,47 @@ int64_t sys_nanosleep(guest_t *g, uint64_t req_gva, uint64_t rem_gva) {
 
 int64_t sys_clock_nanosleep(guest_t *g, int clockid, int flags,
                             uint64_t req_gva, uint64_t rem_gva) {
-    (void)flags; /* TIMER_ABSTIME=1 — fall back to relative sleep */
-    (void)clockid; /* Ignore clock ID, just sleep */
-    return sys_nanosleep(g, req_gva, rem_gva);
+    #define TIMER_ABSTIME 1
+
+    linux_timespec_t lreq;
+    if (guest_read(g, req_gva, &lreq, sizeof(lreq)) < 0)
+        return -LINUX_EFAULT;
+
+    int mac_clockid = translate_clockid(clockid);
+    if (mac_clockid < 0) return -LINUX_EINVAL;
+
+    struct timespec req;
+
+    if (flags & TIMER_ABSTIME) {
+        /* Absolute timeout: compute remaining time from clock - target */
+        struct timespec now;
+        if (clock_gettime(mac_clockid, &now) < 0)
+            return linux_errno();
+
+        int64_t target_ns = lreq.tv_sec * 1000000000LL + lreq.tv_nsec;
+        int64_t now_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t delta_ns = target_ns - now_ns;
+        if (delta_ns <= 0) return 0;  /* Already past */
+
+        req.tv_sec = delta_ns / 1000000000LL;
+        req.tv_nsec = delta_ns % 1000000000LL;
+    } else {
+        req.tv_sec = lreq.tv_sec;
+        req.tv_nsec = lreq.tv_nsec;
+    }
+
+    struct timespec rem = {0};
+    if (nanosleep(&req, &rem) < 0) {
+        /* For absolute timeouts, Linux does not write back remaining time */
+        if (rem_gva && !(flags & TIMER_ABSTIME)) {
+            linux_timespec_t lrem = { .tv_sec = rem.tv_sec,
+                                       .tv_nsec = rem.tv_nsec };
+            guest_write(g, rem_gva, &lrem, sizeof(lrem));
+        }
+        return linux_errno();
+    }
+
+    return 0;
 }
 
 int64_t sys_gettimeofday(guest_t *g, uint64_t tv_gva, uint64_t tz_gva) {

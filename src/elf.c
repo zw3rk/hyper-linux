@@ -110,8 +110,13 @@ int elf_load(const char *path, elf_info_t *info) {
                 long saved_pos = ftell(f);
                 if (fseek(f, ph->p_offset, SEEK_SET) == 0) {
                     size_t n = fread(info->interp_path, 1, interp_len, f);
-                    if (n == interp_len)
-                        info->interp_path[interp_len - 1] = '\0'; /* ensure NUL */
+                    /* interp_len includes the NUL from the ELF file.
+                     * On short read, clear the path (unusable). On full
+                     * read, force-terminate as insurance. */
+                    if (n < interp_len)
+                        info->interp_path[0] = '\0';
+                    else
+                        info->interp_path[interp_len - 1] = '\0';
                 }
                 fseek(f, saved_pos, SEEK_SET);
             }

@@ -147,8 +147,6 @@ static uint32_t in_mask_to_notes(uint32_t mask) {
     /* NOTE_LINK covers hard link count changes */
     if (mask & (IN_CREATE | IN_DELETE))
         notes |= NOTE_LINK | NOTE_WRITE;
-    /* NOTE_REVOKE for unmount-like events */
-    notes |= NOTE_REVOKE;
     return notes;
 }
 
@@ -261,8 +259,14 @@ static int collect_events(inotify_instance_t *inst) {
         /* Queue event without a filename for file watches. For directory
          * watches, we also omit the filename since kqueue EVFILT_VNODE
          * doesn't tell us which child changed. */
-        if (queue_event(inst, w->wd, in_mask, 0, NULL) == 0)
+        if (queue_event(inst, w->wd, in_mask, 0, NULL) == 0) {
             collected++;
+        } else {
+            /* Buffer full — queue IN_Q_OVERFLOW and stop collecting.
+             * IN_Q_OVERFLOW (0x4000) uses wd=-1 per Linux semantics. */
+            queue_event(inst, -1, 0x4000, 0, NULL);
+            break;
+        }
     }
 
     /* Signal the self-pipe so poll/epoll sees readability */
@@ -425,10 +429,16 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
 
             /* Blocking read: wait on the kqueue for events.
              * The self-pipe makes poll/select/epoll work, but for direct
-             * read() calls we poll the kqueue with a short timeout loop. */
+             * read() calls we poll the kqueue with a moderate timeout and
+             * retry to avoid hanging indefinitely (allows signal delivery). */
             struct kevent kev;
-            struct timespec ts = {1, 0};  /* 1 second timeout */
-            int nev = kevent(inst->kq_fd, NULL, 0, &kev, 1, &ts);
+            struct timespec ts = {1, 0};  /* 1 second per attempt */
+            int nev;
+            for (int attempt = 0; attempt < 300; attempt++) {
+                nev = kevent(inst->kq_fd, NULL, 0, &kev, 1, &ts);
+                if (nev > 0) break;
+                if (nev < 0 && errno != EINTR) return linux_errno();
+            }
             if (nev <= 0)
                 return -LINUX_EAGAIN;
 
