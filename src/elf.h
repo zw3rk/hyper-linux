@@ -37,6 +37,7 @@
 #define ET_DYN     3
 
 /* e_machine */
+#define EM_X86_64  62
 #define EM_AARCH64 183
 
 /* Program header types */
@@ -89,6 +90,7 @@ typedef struct {
     /* From ELF header */
     uint64_t entry;        /* e_entry: program entry point */
     uint16_t e_type;       /* ET_EXEC or ET_DYN */
+    uint16_t e_machine;    /* EM_AARCH64 or EM_X86_64 */
     uint16_t phnum;        /* Number of program headers */
     uint16_t phentsize;    /* Size of each program header */
 

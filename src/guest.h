@@ -19,9 +19,16 @@
 #include <stddef.h>
 
 /* ---------- Memory layout constants ---------- */
-#define GUEST_MEM_SIZE_36BIT 0x1000000000ULL  /* 64GB: 36-bit IPA (HVF default) */
-#define GUEST_MEM_SIZE_40BIT 0x10000000000ULL /* 1TB: 40-bit IPA (macOS 15+) */
+#define GUEST_MEM_SIZE_36BIT 0x1000000000ULL     /* 64GB: 36-bit IPA (HVF default) */
+#define GUEST_MEM_SIZE_40BIT 0x10000000000ULL    /* 1TB: 40-bit IPA (macOS 15+) */
 #define GUEST_MEM_SIZE_DEFAULT GUEST_MEM_SIZE_36BIT /* Fallback if IPA query fails */
+
+/* Rosetta Linux binary: static aarch64-linux ELF that JIT-translates x86_64
+ * instructions to ARM64. Linked at 128TB (ET_EXEC, not relocatable). When
+ * running x86_64-linux binaries, rosetta is loaded at this fixed address
+ * and makes ARM64 Linux syscalls that hl handles transparently. */
+#define ROSETTA_IPA_BASE     0x800000000000ULL   /* 128TB: rosetta link address */
+#define ROSETTA_PATH         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta"
 #define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
 #define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
 #define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
@@ -50,6 +57,31 @@
 #define INTERP_LOAD_DEFAULT  0xF00000000ULL  /* Default dynamic linker base for 36-bit IPA (60GB) */
 #define BLOCK_2MB            (2ULL * 1024 * 1024)
 
+/* ---------- Kernel VA space (TTBR1) ---------- */
+/* Rosetta uses MAP_FIXED at kernel-space addresses (bit 63 set, e.g.,
+ * 0xFFFFFFFFFFFFA000) for internal allocations: file mappings, JIT code
+ * cache (128MB), thread stacks, etc. In a real VZ VM, rosetta runs at
+ * EL1 with full 64-bit VA. We emulate this via TTBR1 page tables that
+ * map the top 256MB of VA space to a dedicated host buffer.
+ *
+ * All rosetta kernel-space addresses observed fall within the last 256MB:
+ *   0xFFFFFFFFF0000000 – 0xFFFFFFFFFFFFFFFF
+ * This maps linearly to a GPA range within the primary buffer via TTBR1
+ * L2 block descriptors. No separate hv_vm_map is needed — the primary
+ * buffer's Stage-2 mapping already covers the GPA range. */
+#define KBUF_VA_BASE    0xFFFFFFFFF0000000ULL  /* Bottom of 256MB kernel window */
+#define KBUF_SIZE       0x10000000ULL          /* 256MB */
+
+/* User VA mirror of the kbuf region. Bits 47:0 match KBUF_VA_BASE.
+ * Rosetta's tagged pointer system (TaggedPointer.h) extracts pointers
+ * via `value & 0x0000FFFFFFFFFFFF`, stripping bits 63:48 (the tag).
+ * When a kernel VA pointer (0xFFFF...) is stored via set_pointer, the
+ * BFI instruction overwrites bits 63:48 with the tag. On extraction,
+ * get_pointer returns the bits-47:0 version — which is this user VA.
+ * By mapping the SAME physical memory at both kernel VA (TTBR1) and
+ * user VA (TTBR0), the extracted pointer accesses the correct memory. */
+#define KBUF_USER_VA    (KBUF_VA_BASE & 0x0000FFFFFFFFFFFFULL)  /* 0x0000FFFFF0000000 */
+
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.
  * All guest physical addresses = GUEST_IPA_BASE + offset.
  * Must be 0 so that guest virtual addresses match ELF link addresses
@@ -66,12 +98,34 @@
 #define MEM_PERM_RW  (MEM_PERM_R | MEM_PERM_W)
 #define MEM_PERM_RWX (MEM_PERM_R | MEM_PERM_W | MEM_PERM_X)
 
-/* A contiguous region of guest memory to be mapped in page tables */
+/* A contiguous region of guest memory to be mapped in page tables.
+ * For identity-mapped regions (normal case): va_base=0 means VA==GPA.
+ * For non-identity regions (rosetta): va_base specifies the virtual
+ * address that maps to gpa_start. Page table walker uses va_base for
+ * L0/L1/L2 index computation, gpa_start for block descriptor output. */
 typedef struct {
-    uint64_t gpa_start;  /* Guest physical address (2MB aligned) */
-    uint64_t gpa_end;    /* End address (exclusive, 2MB aligned) */
+    uint64_t gpa_start;  /* Output IPA/GPA (2MB aligned) */
+    uint64_t gpa_end;    /* Output IPA/GPA end (exclusive, 2MB aligned) */
+    uint64_t va_base;    /* VA start for this region (0 = same as gpa_start) */
     int      perms;      /* MEM_PERM_* flags */
 } mem_region_t;
+
+/* ---------- VA alias mapping ---------- */
+
+/* A virtual-address alias for non-identity-mapped guest memory. Used when
+ * guest code references high virtual addresses (e.g., rosetta at 128TB)
+ * that are mapped by page tables to low GPAs in the primary buffer.
+ * The CPU's MMU handles VA→IPA translation for instruction fetch and
+ * data access, but syscall handlers (guest_ptr/read/write) need host-side
+ * resolution: VA → host pointer. Each alias maps a VA range to a GPA
+ * offset within host_base. */
+typedef struct {
+    uint64_t  va_start;     /* Guest virtual address start */
+    uint64_t  gpa_start;    /* GPA offset in primary buffer (host_base+gpa) */
+    uint64_t  size;         /* Region size in bytes */
+} guest_va_alias_t;
+
+#define GUEST_MAX_ALIASES 16
 
 /* ---------- Semantic region tracking ---------- */
 
@@ -79,6 +133,15 @@ typedef struct {
  * GHC RTS creates many regions via mmap/mprotect on its PROT_NONE
  * reservation; 1024 provides ample headroom. */
 #define GUEST_MAX_REGIONS 1024
+
+/* Preannounced regions appear in /proc/self/maps but NOT in the main
+ * regions[] array. Used in rosetta mode to advertise x86_64 binary LOAD
+ * segments before rosetta maps them via MAP_FIXED_NOREPLACE. Rosetta reads
+ * /proc/self/maps once at startup and caches the code map for JIT target
+ * validation; without these entries, indirect call targets (function
+ * pointers) fail with "BasicBlock requested for unrecognized address".
+ * Kept separate from regions[] to avoid -EEXIST on rosetta's NOREPLACE. */
+#define GUEST_MAX_PREANNOUNCED 16
 
 /* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
  * Distinct from mem_region_t which is used purely for page table construction.
@@ -107,12 +170,25 @@ typedef struct {
     uint64_t    mmap_rx_next; /* RX mmap high-water mark (for fork IPC state transfer) */
     uint64_t    mmap_rx_end;  /* Current page-table-covered RX mmap limit */
     uint64_t    ttbr0;        /* TTBR0 value (IPA of L0 page table) */
+    uint64_t    ttbr1;        /* TTBR1 value (IPA of L0 page table for kernel VA) */
+    uint64_t    kbuf_gpa;     /* GPA of 256MB kernel VA buffer in primary buffer */
+    void       *kbuf_base;    /* Host pointer to kbuf (host_base + kbuf_gpa) */
     int         need_tlbi;    /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t   vcpu;         /* vCPU handle */
     hv_vcpu_exit_t *exit;     /* vCPU exit info */
+    /* VA alias mappings for non-identity regions (e.g., rosetta at 128TB
+     * mapped to low GPA in primary buffer). Used by gva_resolve() for
+     * syscall handlers that need to access guest memory by VA. */
+    guest_va_alias_t va_aliases[GUEST_MAX_ALIASES];
+    int              naliases;
+    uint32_t            ipa_bits;  /* IPA bits requested from HVF */
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int            nregions;  /* Number of active regions */
+    /* Preannounced regions for /proc/self/maps (rosetta mode only).
+     * See GUEST_MAX_PREANNOUNCED comment above. */
+    guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
+    int            npreannounced;
 } guest_t;
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */
@@ -123,8 +199,20 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset) {
 /* ---------- API ---------- */
 
 /* Allocate guest memory, create VM, map to hypervisor.
+ * size: primary buffer size (0 = auto-detect from IPA capacity).
+ * ipa_bits: IPA width for HVF VM (0 = auto-detect).
  * Returns 0 on success, -1 on failure. */
-int guest_init(guest_t *g, uint64_t size);
+int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits);
+
+/* Register a VA alias for a non-identity-mapped region. Allows syscall
+ * handlers (guest_ptr/read/write) to resolve high virtual addresses
+ * (e.g., rosetta at 128TB) to the correct host pointer within host_base.
+ * va_start: guest virtual address range start
+ * gpa_start: GPA offset where data lives in primary buffer
+ * size: region size in bytes
+ * Returns 0 on success, -1 if alias table is full. */
+int guest_add_va_alias(guest_t *g, uint64_t va_start,
+                       uint64_t gpa_start, uint64_t size);
 
 /* Tear down VM and free guest memory. */
 void guest_destroy(guest_t *g);
@@ -157,6 +245,13 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
  * Returns 0 on success, -1 on failure. */
 int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms);
 
+/* Initialize kernel VA space (TTBR1) for rosetta's kernel-space mmaps.
+ * Uses the primary buffer at `kbuf_gpa` (must be within guest_size, 2MB
+ * aligned) and builds TTBR1 page tables (L0→L1→L2) mapping the top 256MB
+ * of VA space to that GPA range. Sets g->ttbr1, g->kbuf_gpa, g->kbuf_base.
+ * Returns 0 on success, -1 on failure. */
+int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa);
+
 /* Split a 2MB block descriptor into 512 × 4KB L3 page descriptors.
  * block_gpa must be within a currently-mapped 2MB block. The block's
  * permissions are inherited by all 512 page entries. If the block is
@@ -181,6 +276,21 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * perms is a MEM_PERM_R/W/X combination. Sets g->need_tlbi = 1.
  * Returns 0 on success, -1 on failure. */
 int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
+
+/* Kernel VA (TTBR1) W^X support: split a 2MB block and update permissions
+ * for pages in the kernel buffer region. Used by the HVC #9 handler when
+ * rosetta's JIT needs permission toggling on kernel VA pages. */
+int guest_kbuf_split_block(guest_t *g, uint64_t block_va);
+int guest_kbuf_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
+int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
+
+/* Create non-identity page table entries mapping a VA range to a GPA range.
+ * Used for high-VA MAP_FIXED (e.g., rosetta slab allocator at 240TB).
+ * L0/L1/L2 indices are derived from va_start; block descriptor output IPAs
+ * come from gpa_start. Both va_start and gpa_start must be 2MB-aligned.
+ * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
+int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
+                       uint64_t gpa_start, int perms);
 
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and
  * resets page table pool, brk, and mmap allocation state. Preserves the
@@ -223,5 +333,11 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
 
 /* Clear all tracked regions. Used by execve before re-adding new regions. */
 void guest_region_clear(guest_t *g);
+
+/* Debug: dump ARM64 page table entries for a given GPA offset range.
+ * Walks L0→L1→L2→L3 and prints descriptor values, permissions, and
+ * the actual IPA pointed to by each entry. Useful for verifying that
+ * the vCPU sees the correct pages with the correct permissions. */
+void guest_dump_ptes(const guest_t *g, uint64_t start, uint64_t end);
 
 #endif /* GUEST_H */

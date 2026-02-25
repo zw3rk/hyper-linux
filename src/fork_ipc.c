@@ -41,6 +41,7 @@
 /* IPC header: sent first over socketpair */
 typedef struct {
     uint32_t magic;
+    uint32_t ipa_bits;       /* IPA width for HVF VM (e.g., 36, 40, 48) */
     int64_t  child_pid;
     int64_t  parent_pid;
     /* Guest state */
@@ -202,7 +203,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
 
     /* Step 2: Create guest VM with the same size as parent */
     guest_t g;
-    if (guest_init(&g, hdr.guest_size) < 0) {
+    if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
         fprintf(stderr, "hl: fork-child: failed to init guest\n");
         return 1;
     }
@@ -459,8 +460,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
 
     /* Enable MMU directly (page tables already in guest memory from IPC).
-     * SCTLR must include MMU-enable (M), caches (C, I), and RES1 bits. */
-    uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I;
+     * SCTLR must include MMU-enable (M), caches (C, I), RES1 bits,
+     * and EL0 cache maintenance access (UCI, UCT) for JIT translators. */
+    uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I
+                             | SCTLR_UCT | SCTLR_UCI;
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
 
     /* Restore all 31 GPRs from parent state, then override X0=0 (child
@@ -823,6 +826,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
+        .ipa_bits = g->ipa_bits,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
         .guest_size = g->guest_size,

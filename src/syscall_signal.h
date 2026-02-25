@@ -110,6 +110,10 @@ typedef struct {
 #define LINUX_SI_KERNEL  128
 #define LINUX_SI_TIMER   -2
 
+/* si_code values for SIGTRAP (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
+#define LINUX_TRAP_TRACE  2   /* Process trace trap (single-step) */
+
 /* ---------- Linux sigcontext (aarch64) ---------- */
 /* From arch/arm64/include/uapi/asm/sigcontext.h */
 typedef struct {
@@ -184,6 +188,12 @@ void signal_reset_for_exec(void);
 
 /* Queue a signal for delivery. */
 void signal_queue(int signum);
+
+/* Set fault info for the next signal delivery. When set, signal_deliver()
+ * populates si_code, si_addr, and fault_address from these values instead
+ * of using the default SI_USER/si_pid fields. Consumed (cleared) after
+ * one delivery. Used for synchronous faults: BRK→SIGTRAP, etc. */
+void signal_set_fault_info(int si_code, uint64_t addr);
 
 /* Consume (clear) a pending signal. Used by signalfd reads. */
 void signal_consume(int signum);

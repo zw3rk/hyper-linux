@@ -107,6 +107,8 @@
 #define SYS_setsid          157
 #define SYS_getgroups       158
 #define SYS_uname           160
+#define SYS_getrlimit       163
+#define SYS_setrlimit       164
 #define SYS_getrusage       165
 #define SYS_umask           166
 #define SYS_prctl           167
@@ -306,6 +308,15 @@
 #define LINUX_PR_GET_NAME      16
 #define LINUX_PR_SET_NO_NEW_PRIVS 38
 #define LINUX_PR_GET_NO_NEW_PRIVS 39
+/* PR_SET_MEM_MODEL / PR_GET_MEM_MODEL: per-thread memory ordering control.
+ * On Apple Silicon, setting model to TSO enables Total Store Ordering via
+ * ACTLR_EL1.EnTSO, giving ARM64 loads/stores x86-style memory ordering.
+ * Rosetta requires this for correct x86_64 memory semantics.
+ * From Asahi Linux: include/uapi/linux/prctl.h (not in mainline Linux). */
+#define LINUX_PR_SET_MEM_MODEL       0x4d4d444c  /* "MMDL" in ASCII */
+#define LINUX_PR_GET_MEM_MODEL       0x6d4d444c  /* "mMDL" in ASCII */
+#define LINUX_PR_SET_MEM_MODEL_DEFAULT 0
+#define LINUX_PR_SET_MEM_MODEL_TSO     1
 
 /* ---------- Linux mmap flags ---------- */
 #define LINUX_PROT_NONE  0x0
@@ -313,10 +324,11 @@
 #define LINUX_PROT_WRITE 0x2
 #define LINUX_PROT_EXEC  0x4
 
-#define LINUX_MAP_SHARED    0x01
-#define LINUX_MAP_PRIVATE   0x02
-#define LINUX_MAP_FIXED     0x10
-#define LINUX_MAP_ANONYMOUS 0x20
+#define LINUX_MAP_SHARED          0x01
+#define LINUX_MAP_PRIVATE         0x02
+#define LINUX_MAP_FIXED           0x10
+#define LINUX_MAP_ANONYMOUS       0x20
+#define LINUX_MAP_FIXED_NOREPLACE 0x100000
 
 /* ---------- Linux struct stat (aarch64) ---------- */
 typedef struct {

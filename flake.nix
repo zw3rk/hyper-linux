@@ -1,5 +1,5 @@
 {
-  description = "hl — aarch64-linux ELF executor on macOS Apple Silicon via Hypervisor.framework";
+  description = "hl — aarch64-linux and x86_64-linux ELF executor on macOS Apple Silicon via Hypervisor.framework";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -16,6 +16,11 @@
       linuxSystem = "x86_64-linux";
       linuxPkgs = nixpkgs.legacyPackages.${linuxSystem};
       crossPkgs = linuxPkgs.pkgsCross.aarch64-multiplatform-musl;
+
+      # x86_64-linux-musl cross packages (for rosetta testing).
+      # Since linuxSystem is x86_64-linux, musl64 cross-compiles from
+      # x86_64-linux to x86_64-linux-musl (same arch, different libc).
+      x64CrossPkgs = linuxPkgs.pkgsCross.musl64;
 
       # Darwin SDK for Hypervisor.framework
       darwinBuildInputs = [
@@ -85,6 +90,59 @@
         ln -s ${crossPkgs.pkgsStatic.diffutils}/bin/diff      $out/bin/diff
       '';
 
+      # ── x86_64-linux-musl test binaries (for rosetta testing) ────
+
+      # Static x86_64-linux-musl test binaries, built on x86_64-linux.
+      # Same C sources as aarch64, plus x86_64-specific assembly.
+      x64TestBinaries = x64CrossPkgs.stdenv.mkDerivation {
+        pname = "hl-x64-test-binaries";
+        version = "0.1.0";
+        src = ./test;
+
+        dontConfigure = true;
+        dontFixup = true;
+
+        buildPhase = ''
+          # x86_64 assembly hello world (custom linker script)
+          $AS -o hello-x86_64.o hello-x86_64.S
+          $LD -T simple-x86_64.ld -o test-hello hello-x86_64.o
+
+          # All C test programs (static musl) — same source as aarch64.
+          # Skip arch-specific tests that use aarch64 inline assembly
+          # (register bindings like __asm__("x0"), svc #0 instructions).
+          for f in *.c; do
+            name="''${f%.c}"
+            [ "$name" = "test-multi-vcpu" ] && continue   # native macOS (HVF API)
+            [ "$name" = "hello-dynamic" ] && continue      # dynamic linking not tested yet
+            [ "$name" = "test-negative" ] && continue      # aarch64 inline asm (svc #0)
+            [ "$name" = "test-stress" ] && continue        # aarch64 inline asm (svc #0)
+            [ "$name" = "test-thread" ] && continue        # aarch64 inline asm (svc #0)
+            [ "$name" = "test-signal" ] && continue        # aarch64 inline asm (register x19-x28)
+            [ "$name" = "test-signal-thread" ] && continue # aarch64 inline asm (svc #0)
+
+            extra_flags=""
+            [ "$name" = "test-pthread" ] && extra_flags="-lpthread"
+
+            $CC -static -O2 -o "$name" "$f" $extra_flags
+          done
+        '';
+
+        installPhase = ''
+          mkdir -p $out/bin
+          cp test-hello $out/bin/
+          for f in *.c; do
+            name="''${f%.c}"
+            [ -f "$name" ] && cp "$name" $out/bin/
+          done
+        '';
+      };
+
+      # Static x86_64-linux-musl guest tool binaries
+      x64GuestBins = {
+        coreutils = x64CrossPkgs.pkgsStatic.coreutils;
+        busybox   = x64CrossPkgs.pkgsStatic.busybox;
+      };
+
       # ── Dynamic linking test infrastructure ──────────────────────
 
       # Musl sysroot: dynamic linker + libc.so in /lib/ layout
@@ -153,9 +211,31 @@
           ln -s ${hlib.justStaticExecutables hpkgs.ShellCheck}/bin/shellcheck $out/bin/shellcheck
         '';
 
+      # ── CI guest bundle ──────────────────────────────────────────
+      # Self-contained archive of all cross-compiled guest binaries.
+      # Deep-copies (dereferences symlinks) so the output has no nix
+      # store references — safe to tar up and transfer as a CI artifact.
+      # Excludes haskellBins (native aarch64-linux, can't build on
+      # the x86_64-linux CI runner).
+      guestBundle = crossPkgs.runCommand "hl-guest-bundle" {} ''
+        mkdir -p $out/{test-binaries,coreutils,busybox,static-bins}/bin
+        mkdir -p $out/{sysroot/lib,dynamic-tests,dynamic-coreutils,haskell-hello}/bin
+        cp -rL ${testBinaries}/bin/.         $out/test-binaries/bin/
+        cp -rL ${guestBins.coreutils}/bin/.  $out/coreutils/bin/
+        cp -rL ${guestBins.busybox}/bin/.    $out/busybox/bin/
+        cp -rL ${staticBins}/bin/.           $out/static-bins/bin/
+        cp -rL ${musl-sysroot}/lib/.         $out/sysroot/lib/
+        cp -rL ${dynamicTestBinaries}/bin/.  $out/dynamic-tests/bin/
+        cp -rL ${dynamicCoreutils}/bin/.     $out/dynamic-coreutils/bin/
+        cp -rL ${haskellHello}/bin/.         $out/haskell-hello/bin/
+      '';
+
     in {
-      # Test binaries package (built on x86_64-linux)
-      packages.${linuxSystem}.test-binaries = testBinaries;
+      # Linux packages (built on x86_64-linux)
+      packages.${linuxSystem} = {
+        test-binaries = testBinaries;
+        guest-bundle = guestBundle;
+      };
 
       devShells.${darwinSystem} = {
         # Full dev shell with cross-compiled guest test binaries.
@@ -186,6 +266,11 @@
           GUEST_DYNAMIC_TESTS    = "${dynamicTestBinaries}";
           GUEST_DYNAMIC_COREUTILS = "${dynamicCoreutils}";
 
+          # x86_64-linux-musl test binaries (for rosetta testing)
+          GUEST_X64_TEST_BINARIES = "${x64TestBinaries}";
+          GUEST_X64_COREUTILS = "${x64GuestBins.coreutils}";
+          GUEST_X64_BUSYBOX   = "${x64GuestBins.busybox}";
+
           # Haskell test binary
           GUEST_HASKELL_HELLO = "${haskellHello}";
 
@@ -203,6 +288,11 @@
             echo "  coreutils:     $GUEST_COREUTILS/bin/"
             echo "  busybox:       $GUEST_BUSYBOX/bin/"
             echo "  static bins:   $GUEST_STATIC_BINS/bin/"
+            echo ""
+            echo "x86_64-linux-musl guest binaries (for rosetta testing):"
+            echo "  x64 tests:    $GUEST_X64_TEST_BINARIES/bin/"
+            echo "  x64 coreutils: $GUEST_X64_COREUTILS/bin/"
+            echo "  x64 busybox:  $GUEST_X64_BUSYBOX/bin/"
             echo ""
             echo "Dynamic linking tests:"
             echo "  sysroot:       $GUEST_SYSROOT/lib/"

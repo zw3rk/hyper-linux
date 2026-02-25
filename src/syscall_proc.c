@@ -678,8 +678,170 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     break;
                 }
 
+                case 7: {
+                    /* HVC #7: MRS trap emulation — guest EL0 code read
+                     * a system register (e.g., ID_AA64MMFR1_EL1 for
+                     * feature detection). Extract the register encoding
+                     * from ESR_EL1's ISS field and read it via HVF.
+                     * Return value in X0 for the shim to store into the
+                     * saved register frame. */
+                    uint64_t esr;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+                    uint32_t iss = (uint32_t)(esr & 0x1FFFFFF);
+
+                    /* ISS encoding for EC=0x18 (MSR/MRS trap):
+                     *   [21:20] = Op0    [19:17] = Op2
+                     *   [16:14] = Op1    [13:10] = CRn
+                     *   [9:5]   = Rt     [4:1]   = CRm
+                     *   [0]     = Direction (1=MRS read) */
+                    uint32_t op0 = (iss >> 20) & 0x3;
+                    uint32_t op2 = (iss >> 17) & 0x7;
+                    uint32_t op1 = (iss >> 14) & 0x7;
+                    uint32_t crn = (iss >> 10) & 0xF;
+                    uint32_t crm = (iss >> 1)  & 0xF;
+
+                    /* Construct HVF system register ID:
+                     *   (Op0<<14) | (Op1<<11) | (CRn<<7) | (CRm<<3) | Op2 */
+                    hv_sys_reg_t reg = (hv_sys_reg_t)(
+                        (op0 << 14) | (op1 << 11) |
+                        (crn << 7)  | (crm << 3)  | op2);
+
+                    uint64_t value = 0;
+                    hv_return_t ret = hv_vcpu_get_sys_reg(vcpu, reg, &value);
+                    if (ret != HV_SUCCESS) {
+                        /* HVF doesn't expose all system registers. Provide
+                         * host-side values for known registers that trap. */
+                        int have_fallback = 0;
+
+                        /* CNTFRQ_EL0 (3,3,14,0,0): counter frequency.
+                         * Read directly from host hardware — Apple Silicon
+                         * uses 24MHz. Rosetta needs this for timing. */
+                        if (op0 == 3 && op1 == 3 && crn == 14 &&
+                            crm == 0 && op2 == 0) {
+                            __asm__ volatile("mrs %0, cntfrq_el0"
+                                             : "=r"(value));
+                            have_fallback = 1;
+                        }
+
+                        if (verbose) {
+                            if (have_fallback) {
+                                fprintf(stderr, "%s: MRS trap: "
+                                        "Op0=%u Op1=%u CRn=%u CRm=%u "
+                                        "Op2=%u → 0x%llx (host)\n",
+                                        prefix, op0, op1, crn, crm, op2,
+                                        (unsigned long long)value);
+                            } else {
+                                fprintf(stderr, "%s: MRS trap: unknown reg "
+                                        "Op0=%u Op1=%u CRn=%u CRm=%u "
+                                        "Op2=%u (hv_reg=0x%x) → 0\n",
+                                        prefix, op0, op1, crn, crm, op2,
+                                        (unsigned)reg);
+                            }
+                        }
+                    } else if (verbose) {
+                        fprintf(stderr, "%s: MRS trap: Op0=%u Op1=%u "
+                                "CRn=%u CRm=%u Op2=%u → 0x%llx\n",
+                                prefix, op0, op1, crn, crm, op2,
+                                (unsigned long long)value);
+                    }
+                    hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
+                    break;
+                }
+
+                case 9: {
+                    /* HVC #9: W^X page permission toggle for JIT.
+                     *
+                     * Apple HVF enforces W^X: pages cannot be both writable
+                     * and executable simultaneously. JIT translators (rosetta)
+                     * need to write code (RW), then execute it (RX). The shim
+                     * detects permission faults (EC=0x20 instruction abort,
+                     * EC=0x24 data abort) and forwards the faulting address
+                     * here.
+                     *
+                     * Toggling at 2MB granularity causes thrashing when the
+                     * JIT writes new code and executes existing code within
+                     * the same 2MB block. Instead, we split the 2MB block
+                     * into 4KB L3 pages and toggle only the faulting 4KB page.
+                     * This allows different pages within a 2MB block to have
+                     * independent RW/RX permissions simultaneously.
+                     *
+                     * x0 = FAR_EL1 (faulting virtual address)
+                     * x1 = type: 0 = exec fault → flip to RX
+                     *            1 = write fault → flip to RW */
+                    uint64_t far, type;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &far);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &type);
+
+                    uint64_t page_start = far & ~(4096ULL - 1);
+                    uint64_t page_end = page_start + 4096;
+                    int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
+
+                    if (verbose)
+                        fprintf(stderr, "%s: W^X toggle at 0x%llx → %s "
+                                "(page 0x%llx)\n",
+                                prefix, (unsigned long long)far,
+                                (type == 0) ? "RX" : "RW",
+                                (unsigned long long)page_start);
+
+                    /* Route to TTBR1 handler for kernel VA addresses
+                     * (rosetta's JIT cache, internal allocations) or
+                     * TTBR0 handler for normal user VA addresses. */
+                    if (far >= KBUF_VA_BASE && g->kbuf_base) {
+                        guest_kbuf_split_block(g, far & ~(BLOCK_2MB - 1));
+                        guest_kbuf_update_perms(g, page_start, page_end,
+                                                new_perms);
+                    } else {
+                        uint64_t block_start = far & ~(BLOCK_2MB - 1);
+                        guest_split_block(g, block_start);
+                        guest_update_perms(g, page_start, page_end,
+                                           new_perms);
+                    }
+                    /* TLB flush is done by the shim (tlbi_restore_eret) */
+                    g->need_tlbi = 0;
+                    break;
+                }
+
+                case 10: {
+                    /* HVC #10: BRK from EL0 → deliver SIGTRAP.
+                     *
+                     * Rosetta's JIT uses BRK instructions as trampolines
+                     * and internal breakpoints. The guest registers a SIGTRAP
+                     * handler via rt_sigaction. We queue SIGTRAP and deliver
+                     * it synchronously (build signal frame, redirect to handler).
+                     *
+                     * The shim has already restored all GPRs to their EL0
+                     * values, so signal_deliver reads the correct state.
+                     *
+                     * The Linux kernel sets si_code=TRAP_BRKPT, si_addr=BRK_PC,
+                     * and fault_address=BRK_PC for BRK-triggered SIGTRAP.
+                     * Rosetta's handler needs these to identify the trap type
+                     * and resume execution correctly. */
+                    uint64_t brk_pc;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
+
+                    if (verbose)
+                        fprintf(stderr, "%s: BRK at 0x%llx → SIGTRAP\n",
+                                prefix, (unsigned long long)brk_pc);
+
+                    signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
+                    signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                    int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                    if (verbose)
+                        fprintf(stderr, "%s: signal_deliver returned %d\n",
+                                prefix, sig_ret);
+                    if (sig_ret < 0) {
+                        /* Default action: terminate */
+                        running = 0;
+                    }
+                    /* sig_ret == 0: no handler (shouldn't happen, signal just queued)
+                     * sig_ret == 1: signal frame built, ERET resumes at handler */
+                    break;
+                }
+
                 case 2: {
-                    /* HVC #2: Bad exception in guest */
+                    /* HVC #2: Bad exception in guest.
+                     * Shim clobbers X0-X3,X5 with exception info.
+                     * X4,X6-X30 and SP_EL0 still hold faulting values. */
                     uint64_t x0, x1, x2, x3, x5;
                     hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
                     hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
@@ -694,6 +856,47 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             (unsigned long long)x1,
                             (unsigned long long)x2,
                             (unsigned long long)x3);
+
+                    /* Dump preserved registers for debugging */
+                    uint64_t sp_el0;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp_el0);
+                    fprintf(stderr, "%s:   SP_EL0=0x%llx\n", prefix,
+                            (unsigned long long)sp_el0);
+                    for (int ri = 4; ri <= 30; ri++) {
+                        /* Skip X5 (clobbered by shim for vec offset) */
+                        if (ri >= 0 && ri <= 3) continue;
+                        if (ri == 5) continue;
+                        uint64_t rv;
+                        hv_vcpu_get_reg(vcpu,
+                                        (hv_reg_t)(HV_REG_X0 + ri), &rv);
+                        fprintf(stderr, "%s:   X%-2d=0x%016llx\n", prefix,
+                                ri, (unsigned long long)rv);
+                    }
+
+                    /* Try to read faulting instruction from kbuf
+                     * (for JIT code at kernel VA) */
+                    uint64_t elr = x2;  /* ELR_EL1 */
+                    if (elr >= KBUF_VA_BASE && g->kbuf_base) {
+                        uint64_t koff = elr - KBUF_VA_BASE;
+                        if (koff + 4 <= KBUF_SIZE) {
+                            uint32_t insn;
+                            memcpy(&insn,
+                                   (uint8_t *)g->kbuf_base + koff, 4);
+                            fprintf(stderr, "%s:   insn@ELR=0x%08x\n",
+                                    prefix, insn);
+                        }
+                    }
+
+                    /* Check if FAR looks like a tagged pointer */
+                    uint64_t far = x1;
+                    uint16_t top16 = (uint16_t)(far >> 48);
+                    if (top16 != 0x0000 && top16 != 0xFFFF) {
+                        fprintf(stderr, "%s:   FAR tag=0x%04x, "
+                                "extracted addr=0x%llx\n",
+                                prefix, top16,
+                                (unsigned long long)(far & 0x0000FFFFFFFFFFFFULL));
+                    }
+
                     exit_code = 128;
                     running = 0;
                     break;

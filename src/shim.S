@@ -14,6 +14,8 @@
  *   #2  Bad exception     (x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector)
  *   #4  Set sysreg        (x0 = reg ID, x1 = value; host writes via HVF)
  *   #5  Syscall forward   (registers preserved from EL0 SVC #0)
+ *   #7  MRS trap          (host reads sysreg from ESR ISS; returns value in x0)
+ *   #9  W^X toggle        (x0 = FAR, x1 = type: 0=exec→RX, 1=write→RW)
  *
  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
  * NOT as a statement separator. Each instruction must be on its own line.
@@ -243,7 +245,135 @@ svc_handler:
     b restore_and_bad
 
 not_svc:
-    /* Not an SVC — restore and report as bad exception */
+    /* ---- EC=0x18: MSR/MRS / system instruction trap ---- */
+    cmp x10, #0x18
+    b.eq handle_sysreg_trap
+
+    /* ---- EC=0x20: Instruction abort from lower EL ----
+     * W^X demand toggle: when JIT code pages are mapped RW (for writing),
+     * instruction fetch fails. Toggle to RX and retry. */
+    cmp x10, #0x20
+    b.eq handle_inst_abort
+
+    /* ---- EC=0x24: Data abort from lower EL ----
+     * W^X demand toggle: when JIT code pages are mapped RX (for execution),
+     * writes fail. Toggle to RW and retry. */
+    cmp x10, #0x24
+    b.eq handle_data_abort
+
+    /* ---- EC=0x3C: BRK from AArch64 lower EL ----
+     * JIT translators (rosetta) use BRK instructions as trampolines.
+     * The guest registers a SIGTRAP handler via rt_sigaction to catch
+     * these. Forward to host for signal delivery. */
+    cmp x10, #0x3C
+    b.eq handle_brk
+
+    b restore_and_bad
+
+/* ================================================================
+ * handle_sysreg_trap — EC=0x18: MSR/MRS / system instruction
+ *
+ * MRS reads (Direction=1): forward to host via HVC #7 to read the
+ * system register value (e.g., ID_AA64MMFR1_EL1, CNTFRQ_EL0).
+ * MSR/SYS writes (Direction=0): execute IC IALLU as safety net for
+ * cache maintenance instructions that trap despite SCTLR.UCI=1.
+ * ================================================================ */
+handle_sysreg_trap:
+    tst x9, #1
+    b.eq 4f
+
+    /* MRS read: host returns register value in X0 */
+    hvc #7
+    ubfx x10, x9, #5, #5     /* Rt = ISS[9:5] */
+    cmp x10, #31
+    b.eq 3f                   /* XZR → discard */
+    lsl x10, x10, #3
+    str x0, [sp, x10]         /* frame[Rt] = value */
+    b 3f
+
+4:  /* System instruction: IC IALLU from EL1 for cache coherency */
+    ic iallu
+    dsb ish
+    isb
+
+3:  /* Advance ELR_EL1 past the trapped instruction */
+    mrs x10, elr_el1
+    add x10, x10, #4
+    msr elr_el1, x10
+    b restore_eret
+
+/* ================================================================
+ * handle_inst_abort — EC=0x20: Instruction abort from lower EL
+ *
+ * For JIT translators (rosetta): code pages are initially mapped RW
+ * (for code generation). When execution is attempted, the permission
+ * fault triggers here. We ask the host to flip the page to RX via
+ * HVC #9, flush the TLB, then retry the instruction fetch.
+ *
+ * Only handles permission faults (IFSC[5:2]=0x03). Translation faults
+ * and other types fall through to bad_exception.
+ * ================================================================ */
+handle_inst_abort:
+    and x11, x9, #0x3C       /* IFSC[5:2] */
+    cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
+    b.ne restore_and_bad
+
+    mrs x0, far_el1           /* Faulting address */
+    mov x1, #0                /* Type 0 = instruction fault → flip to RX */
+    hvc #9
+    b tlbi_restore_eret
+
+/* ================================================================
+ * handle_data_abort — EC=0x24: Data abort from lower EL
+ *
+ * For JIT translators: when a code page has been flipped to RX,
+ * subsequent writes (for new code generation) trigger permission
+ * faults. We flip the page back to RW via HVC #9 and retry.
+ *
+ * Only handles write permission faults (WnR=1, DFSC[5:2]=0x03).
+ * ================================================================ */
+handle_data_abort:
+    tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
+    b.eq restore_and_bad
+    and x11, x9, #0x3C       /* DFSC[5:2] */
+    cmp x11, #0x0C            /* Permission fault? */
+    b.ne restore_and_bad
+
+    mrs x0, far_el1           /* Faulting address */
+    mov x1, #1                /* Type 1 = write fault → flip to RW */
+    hvc #9
+    b tlbi_restore_eret
+
+/* ================================================================
+ * Shared exit paths for exception handlers
+ * ================================================================ */
+tlbi_restore_eret:
+    /* Flush TLB after page permission toggle (W^X or page table change) */
+    tlbi vmalle1is
+    dsb ish
+    isb
+    /* Fall through to restore_eret */
+
+restore_eret:
+    /* Restore all GPRs from saved frame and return to EL0 */
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+    eret
 
 restore_and_bad:
     ldp x0, x1, [sp, #0]
@@ -274,6 +404,46 @@ restore_and_bad:
     b.eq bad_exception
     mov x5, #0x200           /* Current EL (EL1 → vec 0x200) */
     b bad_exception
+
+/* ================================================================
+ * handle_brk — BRK instruction from EL0 (EC=0x3C)
+ *
+ * Rosetta's JIT translator uses BRK instructions as patching
+ * trampolines and debug hooks. The guest registers a SIGTRAP
+ * handler via rt_sigaction. We restore all GPRs and forward to
+ * the host via HVC #10 for signal delivery.
+ *
+ * Host reads ESR_EL1 (BRK immediate), ELR_EL1 (BRK PC), and
+ * current GPRs from the vCPU. If a SIGTRAP handler is registered,
+ * the host builds a signal frame and redirects PC to the handler.
+ * Otherwise, the host performs the default SIGTRAP action (terminate).
+ * ================================================================ */
+handle_brk:
+    /* Restore all GPRs from stack frame (host needs current state) */
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+
+    /* Forward to host for SIGTRAP delivery */
+    hvc #10
+
+    /* Host has set up signal frame (if handler registered) or
+     * flagged for termination. Either way, ERET to new PC. */
+    eret
 
 /* ================================================================
  * handle_svc_0 — Linux syscall forwarding

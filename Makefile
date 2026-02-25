@@ -11,7 +11,8 @@
 
 .PHONY: all hl clean dist pkg release test-hello test-all test-coreutils \
        test-busybox test-static-bins test-dynamic test-dynamic-coreutils \
-       test-perf test-multi-vcpu test-haskell test-haskell-bins help
+       test-perf test-multi-vcpu test-haskell test-haskell-bins \
+       test-x64-hello test-x64-all test-x64-coreutils test-x64-busybox help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -60,14 +61,14 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
            syscall_inotify.c syscall_time.c syscall_sys.c \
            syscall_proc.c proc_emulation.c syscall_exec.c \
            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
-           thread.c futex.c)
+           thread.c futex.c vdso.c)
 HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_internal.h syscall_fs.h syscall_io.h \
            syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h \
-           thread.h futex.h)
+           thread.h futex.h vdso.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -324,6 +325,89 @@ test-haskell-bins: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR)
+
+# ── x86_64-linux via Rosetta tests ─────────────────────────────────
+
+# x86_64-linux-musl test binary directory (set by nix develop)
+X64_TEST_DIR ?= $(GUEST_X64_TEST_BINARIES)/bin
+X64_COREUTILS_BIN ?= $(GUEST_X64_COREUTILS)/bin
+X64_BUSYBOX_BIN ?= $(GUEST_X64_BUSYBOX)/bin/busybox
+
+## Run x86_64 assembly hello world via rosetta
+test-x64-hello: $(BUILD_DIR)/hl
+	@if [ ! -d "$(X64_TEST_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 test binaries not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) x86_64 test-hello (via rosetta)\n"
+	$(BUILD_DIR)/hl $(X64_TEST_DIR)/test-hello
+
+## Run x86_64 test suite (same tests as aarch64, via rosetta)
+test-x64-all: $(BUILD_DIR)/hl
+	@if [ ! -d "$(X64_TEST_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 test binaries not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "\n$(BLUE)━━━ Running x86_64 test suite (via rosetta) ━━━$(RESET)\n\n"
+	@pass=0; fail=0; \
+	run_test() { \
+		name=$$(basename "$$2"); \
+		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
+		if output=$$($$@ 2>&1); then \
+			printf "$(GREEN)✓ PASS$(RESET)\n"; \
+			pass=$$((pass + 1)); \
+		else \
+			rc=$$?; \
+			if [ "$$expected_rc" != "" ] && [ "$$rc" = "$$expected_rc" ]; then \
+				printf "$(GREEN)✓ PASS$(RESET) (exit $$rc)\n"; \
+				pass=$$((pass + 1)); \
+			else \
+				printf "$(RED)✗ FAIL$(RESET) (exit $$rc)\n"; \
+				printf "  %s\n" "$$output" | head -5; \
+				fail=$$((fail + 1)); \
+			fi; \
+		fi; \
+	}; \
+	printf "$(BLUE)── Assembly tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-hello; \
+	printf "\n$(BLUE)── C tests (x86_64 musl static, via rosetta) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-musl; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-write; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/echo-test hello world; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-argc a b c; \
+	expected_rc=42 run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-complex; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-string; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-comprehensive; \
+	printf "\n$(BLUE)── Process tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fork; \
+	printf "\n$(BLUE)── Socket tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-socket; \
+	printf "\n$(BLUE)── Syscall coverage tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sysinfo; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-poll; \
+	printf "\n$(BLUE)── I/O subsystem tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-eventfd; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-timerfd; \
+	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-pthread; \
+	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed ━━━$(RESET)\n"
+
+## Run x86_64 coreutils integration tests (via rosetta)
+test-x64-coreutils: $(BUILD_DIR)/hl
+	@if [ ! -d "$(X64_COREUTILS_BIN)" ]; then \
+		printf "$(RED)✗ x86_64 coreutils not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-coreutils.sh $(BUILD_DIR)/hl $(X64_COREUTILS_BIN)
+
+## Run x86_64 busybox integration tests (via rosetta)
+test-x64-busybox: $(BUILD_DIR)/hl
+	@if [ ! -x "$(X64_BUSYBOX_BIN)" ]; then \
+		printf "$(RED)✗ x86_64 busybox not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-busybox.sh $(BUILD_DIR)/hl $(X64_BUSYBOX_BIN)
 
 # ── Multi-vCPU validation test ─────────────────────────────────────
 

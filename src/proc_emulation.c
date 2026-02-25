@@ -27,23 +27,25 @@
 #include <sys/param.h>
 
 /* Create a synthetic file from a buffer. Returns a host fd positioned at
- * the start, or -1 on failure. Caller owns the returned fd. */
+ * the start, or -1 on failure. Caller owns the returned fd.
+ * Uses a temp file (unlinked immediately) so that pread/lseek work —
+ * rosetta pread()s /proc/self/maps during initialization. */
 static int proc_synthetic_fd(const void *data, size_t len) {
-    /* Use a pipe: write data into write end, return read end */
-    int fds[2];
-    if (pipe(fds) < 0) return -1;
+    char template[] = "/tmp/hl-proc-XXXXXX";
+    int fd = mkstemp(template);
+    if (fd < 0) return -1;
+    unlink(template);  /* Delete on close; fd keeps it alive */
 
-    /* Write all data (may need multiple writes for large data) */
     const uint8_t *p = data;
     size_t remaining = len;
     while (remaining > 0) {
-        ssize_t n = write(fds[1], p, remaining);
-        if (n <= 0) { close(fds[0]); close(fds[1]); return -1; }
+        ssize_t n = write(fd, p, remaining);
+        if (n <= 0) { close(fd); return -1; }
         p += n;
         remaining -= n;
     }
-    close(fds[1]);  /* Close write end so reads see EOF */
-    return fds[0];
+    lseek(fd, 0, SEEK_SET);  /* Rewind so first read starts at beginning */
+    return fd;
 }
 
 int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int mode) {
@@ -87,6 +89,17 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         int host_fd = fd_to_host(n);
         if (host_fd < 0) { errno = EBADF; return -1; }
         return dup(host_fd);
+    }
+
+    /* /proc/self/exe -> open the actual ELF binary.
+     * Rosetta opens this to read the x86_64 binary for JIT translation.
+     * Unlike readlinkat (which returns the path string), openat needs
+     * to return an actual file descriptor to the binary. */
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        const char *exe = proc_get_elf_path();
+        if (!exe) { errno = ENOENT; return -1; }
+        int fd = open(exe, O_RDONLY);
+        return fd >= 0 ? fd : -1;
     }
 
     /* /proc/cpuinfo -> synthetic file with CPU count */
@@ -158,12 +171,75 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         return proc_synthetic_fd(data, len);
     }
 
-    /* /proc/self/maps -> generated from guest region tracking */
+    /* /proc/self/maps -> generated from guest region tracking.
+     * Addresses are page-aligned (rounded down/up) to match real Linux
+     * behavior. Rosetta's VMAllocationTracker asserts page alignment.
+     * Non-identity mapped regions (via sys_mmap_high_va) are tracked by
+     * GPA for gap-finder collision avoidance, but /proc/self/maps must
+     * show the VA that was returned to the guest (e.g., 0xf00000000000
+     * for rosetta's 384MB slab). We resolve GPA→VA via the alias table.
+     *
+     * Preannounced regions (x86_64 binary LOAD segments in rosetta mode)
+     * are merged into the output in sorted order. These entries let
+     * rosetta's JIT validate indirect call targets (function pointers)
+     * before rosetta itself mmaps the binary. Once rosetta's mmaps create
+     * actual regions[] entries, preannounced entries that overlap are
+     * skipped to avoid duplicate lines. */
     if (strcmp(path, "/proc/self/maps") == 0) {
         char buf[16384];
         int off = 0;
-        for (int i = 0; i < g->nregions && off < (int)sizeof(buf) - 128; i++) {
-            const guest_region_t *r = &g->regions[i];
+
+        /* Two-pointer merge of regions[] and preannounced[], both sorted
+         * by start address. Preannounced entries shadowed by actual
+         * regions are skipped. */
+        int ri = 0, pi = 0;
+        while ((ri < g->nregions || pi < g->npreannounced) &&
+               off < (int)sizeof(buf) - 256) {
+            const guest_region_t *r;
+            int from_preannounced = 0;
+
+            /* Pick the next entry in address order */
+            if (ri < g->nregions &&
+                (pi >= g->npreannounced ||
+                 g->regions[ri].start <= g->preannounced[pi].start)) {
+                r = &g->regions[ri++];
+            } else {
+                r = &g->preannounced[pi++];
+                from_preannounced = 1;
+            }
+
+            /* Skip preannounced entries that overlap with actual regions
+             * (rosetta has already mapped them via MAP_FIXED_NOREPLACE). */
+            if (from_preannounced) {
+                int shadowed = 0;
+                for (int j = 0; j < g->nregions; j++) {
+                    if (g->regions[j].start < r->end &&
+                        g->regions[j].end > r->start) {
+                        shadowed = 1;
+                        break;
+                    }
+                }
+                if (shadowed) continue;
+            }
+
+            uint64_t start = r->start;
+            uint64_t end = r->end;
+
+            /* Translate GPA→VA for non-identity mapped regions.
+             * Check if this region's GPA falls within a VA alias. */
+            for (int j = 0; j < g->naliases; j++) {
+                const guest_va_alias_t *a = &g->va_aliases[j];
+                if (start >= a->gpa_start &&
+                    end <= a->gpa_start + a->size) {
+                    uint64_t gpa_off = start - a->gpa_start;
+                    start = a->va_start + gpa_off;
+                    end = start + (r->end - r->start);
+                    break;
+                }
+            }
+
+            start &= ~0xFFFULL;          /* page-align down */
+            end = (end + 0xFFF) & ~0xFFFULL;    /* page-align up */
             char perms[5];
             perms[0] = (r->prot & 0x1) ? 'r' : '-'; /* PROT_READ */
             perms[1] = (r->prot & 0x2) ? 'w' : '-'; /* PROT_WRITE */
@@ -173,14 +249,11 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             /* Format: start-end perms offset dev:major inode pathname */
             off += snprintf(buf + off, sizeof(buf) - off,
                 "%08llx-%08llx %s %08llx 00:00 0",
-                (unsigned long long)r->start,
-                (unsigned long long)r->end,
+                (unsigned long long)start,
+                (unsigned long long)end,
                 perms,
                 (unsigned long long)r->offset);
             if (r->name[0]) {
-                /* Pad to column 73 (Linux convention) then append name */
-                int col = off - (int)(buf + off - buf); /* current position in line */
-                (void)col;
                 off += snprintf(buf + off, sizeof(buf) - off,
                     "          %s", r->name);
             }
@@ -240,6 +313,22 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         entry.ut_tv_sec = now.tv_sec;
         entry.ut_tv_usec = now.tv_usec;
         return proc_synthetic_fd(&entry, sizeof(entry));
+    }
+
+    /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address.
+     * Rosetta's VMAllocationTracker reads this to determine the lowest
+     * address it can mmap. Standard Linux default is 65536 (0x10000). */
+    if (strcmp(path, "/proc/sys/vm/mmap_min_addr") == 0) {
+        const char *data = "65536\n";
+        return proc_synthetic_fd(data, strlen(data));
+    }
+
+    /* /proc/sys/kernel/randomize_va_space -> ASLR disabled.
+     * Rosetta reads this during initialization. Value 0 = disabled.
+     * In our controlled VM environment, ASLR is not applicable. */
+    if (strcmp(path, "/proc/sys/kernel/randomize_va_space") == 0) {
+        const char *data = "0\n";
+        return proc_synthetic_fd(data, strlen(data));
     }
 
     /* /proc/version -> synthetic kernel version string */

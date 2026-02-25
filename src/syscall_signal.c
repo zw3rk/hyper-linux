@@ -27,6 +27,20 @@
 /* ---------- Signal state (module-level, process-wide) ---------- */
 static signal_state_t sig_state;
 
+/* ---------- Per-thread pending fault info ----------
+ * When a synchronous fault (BRK, segfault, etc.) needs to deliver a signal,
+ * the caller sets this before signal_queue()+signal_deliver(). signal_deliver()
+ * consumes it to populate si_code/si_addr/fault_address in the signal frame
+ * instead of the default SI_USER/si_pid fields. Thread-local because each
+ * vCPU thread delivers signals independently. */
+typedef struct {
+    int valid;          /* Non-zero if fault info is pending */
+    int si_code;        /* e.g., LINUX_TRAP_BRKPT */
+    uint64_t addr;      /* Fault address (BRK PC, segfault addr, etc.) */
+} pending_fault_t;
+
+static _Thread_local pending_fault_t pending_fault;
+
 /* Protects signal actions array. Multiple threads may call rt_sigaction
  * concurrently (e.g., during musl init). Pending/blocked masks are
  * process-wide for the MVP; per-thread masks are deferred. */
@@ -164,6 +178,12 @@ void signal_queue(int signum) {
      * with no syscalls. Each vCPU's CANCELED handler will check
      * signal_pending() and call signal_deliver(). */
     thread_interrupt_all();
+}
+
+void signal_set_fault_info(int si_code, uint64_t addr) {
+    pending_fault.valid = 1;
+    pending_fault.si_code = si_code;
+    pending_fault.addr = addr;
 }
 
 void signal_consume(int signum) {
@@ -593,6 +613,11 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     int idx = signum - 1;
     linux_sigaction_t *act = &sig_state.actions[idx];
 
+    fprintf(stderr, "hl: signal_deliver: sig=%d handler=0x%llx flags=0x%llx mask=0x%llx\n",
+            signum, (unsigned long long)act->sa_handler,
+            (unsigned long long)act->sa_flags,
+            (unsigned long long)act->sa_mask);
+
     /* Check handler type */
     if (act->sa_handler == LINUX_SIG_IGN) {
         /* Ignored — discard signal */
@@ -633,10 +658,19 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     linux_rt_sigframe_t frame;
     memset(&frame, 0, sizeof(frame));
 
-    /* siginfo */
+    /* siginfo — fault signals use si_code/si_addr from pending_fault;
+     * non-fault signals use SI_USER with si_pid. */
     frame.info.si_signo = signum;
-    frame.info.si_code = LINUX_SI_USER;
-    frame.info.si_pid = (int32_t)proc_get_pid();
+    if (pending_fault.valid) {
+        frame.info.si_code = pending_fault.si_code;
+        /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union.
+         * On aarch64-linux, si_addr is a 64-bit pointer occupying both
+         * int32_t fields. Write it via memcpy to avoid strict aliasing. */
+        memcpy(&frame.info.si_pid, &pending_fault.addr, 8);
+    } else {
+        frame.info.si_code = LINUX_SI_USER;
+        frame.info.si_pid = (int32_t)proc_get_pid();
+    }
 
     /* ucontext */
     frame.uc.uc_flags = 0;
@@ -651,8 +685,14 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         frame.uc.uc_sigmask = *blocked;
     }
 
-    /* sigcontext — save all registers */
-    frame.uc.uc_mcontext.fault_address = 0;
+    /* sigcontext — save all registers.
+     * fault_address: for synchronous faults (BRK, segfault), set to the
+     * faulting address; for asynchronous signals, zero. */
+    frame.uc.uc_mcontext.fault_address =
+        pending_fault.valid ? pending_fault.addr : 0;
+
+    /* Consume the pending fault info (one-shot) */
+    pending_fault.valid = 0;
     for (int i = 0; i < 31; i++)
         frame.uc.uc_mcontext.regs[i] = saved_regs[i];
     frame.uc.uc_mcontext.sp = saved_sp;
@@ -705,6 +745,29 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         uint64_t ucontext_addr = frame_sp + sizeof(linux_siginfo_t);
         hv_vcpu_set_reg(vcpu, HV_REG_X1, siginfo_addr);
         hv_vcpu_set_reg(vcpu, HV_REG_X2, ucontext_addr);
+    }
+
+    /* DEBUG: signal delivery details (temporary) */
+    {
+        int32_t verify_signo = -1;
+        guest_read(g, frame_sp, &verify_signo, sizeof(verify_signo));
+        uint64_t verify_x0, verify_x1;
+        hv_vcpu_get_reg(vcpu, HV_REG_X0, &verify_x0);
+        hv_vcpu_get_reg(vcpu, HV_REG_X1, &verify_x1);
+        fprintf(stderr, "hl: signal_deliver: sig=%d handler=0x%llx flags=0x%llx "
+                "restorer=0x%llx frame_sp=0x%llx SA_SIGINFO=%d "
+                "si_signo=%d si_code=%d verify_signo=%d "
+                "X0=%llu X1=0x%llx saved_sp=0x%llx sizeof(frame)=%zu\n",
+                signum, (unsigned long long)act->sa_handler,
+                (unsigned long long)act->sa_flags,
+                (unsigned long long)act->sa_restorer,
+                (unsigned long long)frame_sp,
+                !!(act->sa_flags & LINUX_SA_SIGINFO),
+                frame.info.si_signo, frame.info.si_code, verify_signo,
+                (unsigned long long)verify_x0,
+                (unsigned long long)verify_x1,
+                (unsigned long long)saved_sp,
+                sizeof(frame));
     }
 
     /* 5. Update blocked mask during handler execution */

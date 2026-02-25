@@ -3,8 +3,9 @@
  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Reads a static aarch64-linux ELF64 executable, validates the header,
- * extracts PT_LOAD segments, and copies them into guest memory.
+ * Reads aarch64-linux or x86_64-linux ELF64 executables, validates the
+ * header, extracts PT_LOAD segments, and copies them into guest memory.
+ * x86_64 binaries are executed via Apple's Rosetta Linux translator.
  */
 #include "elf.h"
 
@@ -54,9 +55,10 @@ int elf_load(const char *path, elf_info_t *info) {
         return -1;
     }
 
-    /* Validate machine (aarch64) */
-    if (ehdr.e_machine != EM_AARCH64) {
-        fprintf(stderr, "%s: not aarch64 (e_machine=%u)\n", path, ehdr.e_machine);
+    /* Validate machine: aarch64 (native) or x86_64 (via rosetta) */
+    if (ehdr.e_machine != EM_AARCH64 && ehdr.e_machine != EM_X86_64) {
+        fprintf(stderr, "%s: unsupported architecture (e_machine=%u)\n",
+                path, ehdr.e_machine);
         fclose(f);
         return -1;
     }
@@ -70,6 +72,7 @@ int elf_load(const char *path, elf_info_t *info) {
 
     info->entry = ehdr.e_entry;
     info->e_type = ehdr.e_type;
+    info->e_machine = ehdr.e_machine;
     info->phnum = ehdr.e_phnum;
     info->phentsize = ehdr.e_phentsize;
     info->load_min = UINT64_MAX;

@@ -93,7 +93,8 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            const char **envp,
                            const elf_info_t *elf_info,
                            uint64_t elf_load_base,
-                           uint64_t interp_base) {
+                           uint64_t interp_base,
+                           uint64_t vdso_base) {
     /*
      * Linux initial stack layout (growing from high to low):
      *   [ 16 random bytes for AT_RANDOM ]
@@ -173,18 +174,20 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     str_ptr &= ~15ULL;
     uint64_t sp = str_ptr;
 
-    /* Count auxv entries: base 14 + optional AT_BASE + AT_EXECFN = up to 16.
+    /* Count auxv entries: base 14 + optional AT_BASE + AT_EXECFN +
+     * optional AT_SYSINFO_EHDR = up to 17.
      * Each auxv entry = 2 words. Plus AT_NULL = 2 words.
      * Total words from auxv = (num_auxv_entries + 1) * 2.
      * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) + argc(1).
      *
      * Base auxv: 14 entries = 28 words, AT_NULL = 2 words.
-     * Optional: AT_BASE (if interp_base != 0) = +2, AT_EXECFN = +2.
-     * Total = 30 + 2(EXECFN) + 2(BASE if present) + 1 + envc + 1 + argc + 1
-     *       = 35 + argc + envc [+ 2 if interp_base != 0]
+     * Optional: AT_BASE (if interp_base != 0) = +2, AT_EXECFN = +2,
+     *           AT_SYSINFO_EHDR (if vdso_base != 0) = +2.
+     * Total = 30 + optional + 1 + envc + 1 + argc + 1
      * For 16-byte alignment: total must be even. */
     int extra = 2;  /* AT_EXECFN always present */
     if (interp_base != 0) extra += 2;  /* AT_BASE */
+    if (vdso_base != 0) extra += 2;    /* AT_SYSINFO_EHDR */
     int total_entries = 33 + extra + argc + envc;
     if (total_entries & 1) {
         push_u64(g, &sp, 0);  /* alignment padding */
@@ -212,6 +215,11 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     push_u64(g, &sp, elf_info->phentsize); push_u64(g, &sp, AT_PHENT);
     push_u64(g, &sp, elf_info->phdr_gpa + elf_load_base); push_u64(g, &sp, AT_PHDR);
     push_u64(g, &sp, 4096); push_u64(g, &sp, AT_PAGESZ);
+
+    /* AT_SYSINFO_EHDR: vDSO ELF header address (required by rosetta) */
+    if (vdso_base != 0) {
+        push_u64(g, &sp, vdso_base); push_u64(g, &sp, AT_SYSINFO_EHDR);
+    }
 
     /* AT_BASE: interpreter load base (only present for dynamic linking) */
     if (interp_base != 0) {

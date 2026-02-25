@@ -1,6 +1,6 @@
 # hyper-linux
 
-Run static and dynamically-linked aarch64-linux ELF binaries on macOS Apple Silicon via Hypervisor.framework.
+Run static and dynamically-linked aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon via Hypervisor.framework.
 
 ## Architecture
 
@@ -104,6 +104,63 @@ so tools that execve dynamic children (env, nice, nohup) work correctly.
 - `timeout` fails — it uses fork/clone to create a child process with a
   timer, and the forked child inherits the dynamic linker state but the
   fork+exec path has issues in the interpreter space.
+
+## x86_64-linux via Rosetta
+
+hl supports x86_64-linux ELF binaries via Apple's Rosetta Linux translator:
+
+```
+hl ./my-x86_64-binary [args...]
+```
+
+How it works:
+1. `elf_load()` detects `e_machine == EM_X86_64` (62)
+2. Rosetta binary loaded from `/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta`
+   (static aarch64-linux ELF, ET_EXEC, linked at 0x800000000000 / 128TB)
+3. HVF VM created with 48-bit IPA to cover rosetta's link address
+4. Rosetta mapped at high IPA via `guest_add_mapping()` (separate host buffer
+   because macOS user space is <128TB, so can't identity-map at that address)
+5. x86_64 binary mapped at its requested address in the primary buffer (low IPA)
+6. Entry point set to rosetta's entry; argv follows binfmt_misc convention:
+   `[rosetta_path, x86_64_binary_path, original_argv...]`
+7. Rosetta JIT-translates x86_64→ARM64 at runtime; all syscalls appear as
+   ARM64 SVC #0 — hl's existing ~140 syscall handlers work transparently
+
+### Multi-Region Guest Memory
+
+The primary buffer (host_base at IPA 0) covers up to 1TB (40-bit).
+High-IPA regions (like rosetta at 128TB) use `guest_add_mapping()`:
+- Allocates a demand-paged host buffer via mmap at a low host address
+- Maps it via `hv_vm_map()` at the requested high IPA
+- `gva_resolve()` handles multi-region address translation (fast path
+  for primary region, linear scan for extra mappings)
+- Page table builder handles arbitrary GPAs naturally (L0 index 256
+  for rosetta at 128TB, 512GB per L0 entry)
+
+### 48-bit IPA
+
+Apple Silicon supports up to 48-bit IPA despite `hv_vm_config_get_max_ipa_size()`
+reporting 36 as default. The IPA width is requested via:
+```c
+hv_vm_config_set_ipa_size(config, 48);
+```
+Only requested when rosetta is needed; normal aarch64 binaries use the
+standard 36/40-bit path.
+
+### Rosetta Stack/Auxv Semantics
+
+Rosetta is treated as a binfmt_misc interpreter (NOT a PT_INTERP dynamic linker):
+- Auxv (AT_PHDR/PHENT/PHNUM/ENTRY) describes rosetta, not the x86_64 binary
+- Rosetta discovers the x86_64 binary via argv[1] (the real path)
+- PT_INTERP from the x86_64 binary is skipped — rosetta handles x86_64
+  dynamic linking internally (loading ld-linux-x86-64.so.2 etc.)
+- AT_PLATFORM remains "aarch64" (correct: rosetta produces ARM64 code)
+
+### Fork/IPC Propagation
+
+`fork_ipc.c` propagates `g->ipa_bits` in the IPC header so child processes
+create their VMs with the same IPA width. Extra mappings are NOT currently
+transferred — fork children in rosetta mode may need additional work.
 
 ## L3 Page Table Splitting
 
@@ -235,6 +292,8 @@ mappings.
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
 0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit)
 interp_base  - varies:        Dynamic linker (g->interp_base, if --sysroot)
+--- Extra IPA mappings (x86_64 mode only, via guest_add_mapping) ---
+0x800000000000+:               Rosetta binary (3 segments at 128TB link addr)
 ```
 
 The address space size is determined at runtime by querying the max IPA

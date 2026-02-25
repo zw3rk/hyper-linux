@@ -253,11 +253,68 @@ int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
 
 /* ---------- terminal I/O ---------- */
 
+/* Rosetta Virtualization.framework ioctls — type 'a' (0x61).
+ * In VZ Linux VMs, rosetta communicates with the macOS hypervisor via
+ * custom ioctls on the virtiofs-mounted rosetta binary (opened via
+ * /proc/self/exe). We emulate these to make rosetta work in HVF.
+ *
+ * 0x80456125: _IOR('a', 0x25, 69)  — environment signature check
+ * 0x80806123: _IOR('a', 0x23, 128) — capabilities/config query
+ * 0x6124:     _IO('a', 0x24)       — JIT activation / hypervisor handshake */
+#define ROSETTA_VZ_CHECK      0x80456125
+#define ROSETTA_VZ_CAPS       0x80806123
+#define ROSETTA_VZ_ACTIVATE   0x6124
+
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
     switch (request) {
+    case ROSETTA_VZ_CHECK: {
+        /* Rosetta environment check. Returns a 69-byte signature that
+         * rosetta memcmp's against an embedded constant to verify it's
+         * running in a supported Apple Virtualization.framework environment.
+         * This MUST succeed — without it, rosetta prints "Rosetta is only
+         * intended to run on Apple Silicon with a macOS host using
+         * Virtualization.framework with Rosetta mode enabled" and aborts. */
+        static const char rosetta_sig[69] =
+            "Our hard work\nby these words guarded\n"
+            "please don't steal\n\xc2\xa9 Apple Inc";
+        if (guest_write(g, arg, rosetta_sig, sizeof(rosetta_sig)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
+    case ROSETTA_VZ_CAPS: {
+        /* Rosetta capabilities query. Returns 128 bytes of host capability
+         * data that controls rosetta's runtime behavior:
+         *   caps[0]:   Master VZ enable flag (non-zero = VZ features on)
+         *   caps[1]:   Sub-capability (read if caps[0]!=0 && caps[108]==0)
+         *   caps[108]: Additional capability flag
+         *   caps[109]: Stored separately as extra flag
+         *   caps[3..108]: 106 bytes copied into rosetta internal state
+         *
+         * In VZ mode, rosetta enables AOT translation paths (loading
+         * pre-translated .flu cache files) and may use rosettad for
+         * ahead-of-time translation. The JIT code path remains the same
+         * (ExecutableHeap at 0xf00000000000) regardless of VZ state.
+         *
+         * We return success with caps[0]=1 to enable VZ mode. */
+        uint8_t caps[128] = {0};
+        caps[0] = 1;  /* Enable VZ mode */
+        if (guest_write(g, arg, caps, sizeof(caps)) < 0)
+            return -LINUX_EFAULT;
+        fprintf(stderr, "hl: VZ_CAPS: returning success (VZ mode enabled)\n");
+        return 0;
+    }
+
+    case ROSETTA_VZ_ACTIVATE:
+        /* Rosetta JIT activation / hypervisor handshake. Returning 0
+         * tells rosetta the VZ channel is active. On error, rosetta
+         * handles EOPNOTSUPP (95) and ENOTTY (25) gracefully. */
+        fprintf(stderr, "hl: VZ_ACTIVATE: returning success\n");
+        return 0;
+
     case LINUX_TIOCGWINSZ: {
         /* Get terminal window size */
         struct winsize ws;

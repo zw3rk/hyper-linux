@@ -1,0 +1,252 @@
+/* vdso.c — Minimal vDSO (Virtual Dynamic Shared Object) for hl
+ *
+ * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Builds a minimal vDSO ELF image in guest memory. The vDSO is required
+ * by Rosetta's JIT translator, which parses it to locate four kernel
+ * helper functions via the SHT_DYNSYM section:
+ *
+ *   __kernel_rt_sigreturn    (NR 139)
+ *   __kernel_clock_getres    (NR 114)
+ *   __kernel_clock_gettime   (NR 113)
+ *   __kernel_gettimeofday    (NR 169)
+ *
+ * Each function is a simple ARM64 trampoline: mov x8, #NR; svc #0; ret.
+ * The image is mapped into guest memory at VDSO_BASE and its address is
+ * provided via AT_SYSINFO_EHDR in the auxiliary vector.
+ *
+ * The vDSO is built as a position-independent ET_DYN with p_vaddr=0.
+ * Rosetta computes load_offset = AT_SYSINFO_EHDR - p_vaddr, then
+ * accesses sections via load_offset + sh_offset. All internal addresses
+ * (sh_addr, st_value, e_entry) are relative to 0; rosetta adds
+ * load_offset (== VDSO_BASE) to get the actual guest virtual addresses.
+ *
+ * Layout of the 4KB vDSO page (file offsets from 0):
+ *
+ *   Offset  Content              Size
+ *   0x000   ELF64 header         64 bytes
+ *   0x040   Phdr[0] (PT_LOAD)    56 bytes
+ *   0x078   .text trampolines    48 bytes (4 × 12)
+ *   0x0A8   .dynstr strings      90 bytes
+ *   0x108   .dynsym entries      120 bytes (NULL + 4 symbols)
+ *   0x180   Shdr[0] (SHN_UNDEF)  64 bytes
+ *   0x1C0   Shdr[1] (.text)      64 bytes
+ *   0x200   Shdr[2] (.dynstr)    64 bytes
+ *   0x240   Shdr[3] (.dynsym)    64 bytes
+ *   0x280   end
+ */
+#include "vdso.h"
+#include "elf.h"
+
+#include <string.h>
+#include <stdio.h>
+
+/* ---------- ELF section header (not in our elf.h) ---------- */
+
+typedef struct {
+    uint32_t sh_name;       /* Section name (index into shstrtab) */
+    uint32_t sh_type;       /* Section type */
+    uint64_t sh_flags;      /* Section flags */
+    uint64_t sh_addr;       /* Section virtual address (relative to 0) */
+    uint64_t sh_offset;     /* Section file offset */
+    uint64_t sh_size;       /* Section size in bytes */
+    uint32_t sh_link;       /* Link to another section */
+    uint32_t sh_info;       /* Additional section info */
+    uint64_t sh_addralign;  /* Section alignment */
+    uint64_t sh_entsize;    /* Entry size if section holds table */
+} elf64_shdr_t;
+
+/* ELF section types */
+#define SHT_NULL     0
+#define SHT_STRTAB   3
+#define SHT_DYNSYM  11
+
+/* ELF section flags */
+#define SHF_ALLOC     (1ULL << 1)
+#define SHF_EXECINSTR (1ULL << 2)
+
+/* ---------- ELF symbol table entry ---------- */
+
+typedef struct {
+    uint32_t st_name;       /* Symbol name (index into strtab) */
+    uint8_t  st_info;       /* Symbol type and binding */
+    uint8_t  st_other;      /* Symbol visibility */
+    uint16_t st_shndx;      /* Section index */
+    uint64_t st_value;      /* Symbol value (relative to 0) */
+    uint64_t st_size;       /* Symbol size */
+} elf64_sym_t;
+
+/* Symbol binding/type macros */
+#define STB_GLOBAL   1
+#define STT_FUNC     2
+#define ELF_ST_INFO(bind, type)  (((bind) << 4) | ((type) & 0xf))
+
+/* ---------- vDSO image layout offsets ---------- */
+
+#define VDSO_OFF_EHDR    0x000
+#define VDSO_OFF_PHDR    0x040   /* = sizeof(elf64_ehdr_t) */
+#define VDSO_OFF_TEXT    0x078   /* = PHDR + sizeof(elf64_phdr_t) */
+#define VDSO_OFF_DYNSTR  0x0A8   /* after .text (4 × 12 = 48 bytes) */
+#define VDSO_OFF_DYNSYM  0x108   /* after .dynstr (90 bytes), 8-byte aligned */
+#define VDSO_OFF_SHDR    0x180   /* after .dynsym (5 × 24 = 120 bytes) */
+
+/* Number of vDSO symbols (excluding the mandatory NULL entry) */
+#define VDSO_NUM_SYMS 4
+
+/* .text trampolines: each is 3 ARM64 instructions (12 bytes).
+ * The trampolines are simple syscall wrappers that rosetta uses
+ * instead of the original Linux vDSO implementations.
+ *
+ * Order matches the symbol table entries below:
+ *   [0] __kernel_rt_sigreturn:  mov x8, #139; svc #0; ret
+ *   [1] __kernel_clock_getres:  mov x8, #114; svc #0; ret
+ *   [2] __kernel_clock_gettime: mov x8, #113; svc #0; ret
+ *   [3] __kernel_gettimeofday:  mov x8, #169; svc #0; ret */
+static const uint32_t trampoline_code[VDSO_NUM_SYMS][3] = {
+    { 0xD2801168, 0xD4000001, 0xD65F03C0 },  /* NR 139: rt_sigreturn */
+    { 0xD2800E48, 0xD4000001, 0xD65F03C0 },  /* NR 114: clock_getres */
+    { 0xD2800E28, 0xD4000001, 0xD65F03C0 },  /* NR 113: clock_gettime */
+    { 0xD2801528, 0xD4000001, 0xD65F03C0 },  /* NR 169: gettimeofday */
+};
+#define TRAMPOLINE_SIZE 12  /* bytes per trampoline */
+
+/* .dynstr: concatenated NUL-terminated strings.
+ *   offset 0:  "" (mandatory empty string)
+ *   offset 1:  "__kernel_rt_sigreturn"
+ *   offset 23: "__kernel_clock_getres"
+ *   offset 45: "__kernel_clock_gettime"
+ *   offset 68: "__kernel_gettimeofday" */
+static const char dynstr_data[] =
+    "\0__kernel_rt_sigreturn"      /*  0: 1 + 21 = 22, next at 23 */
+    "\0__kernel_clock_getres"      /* 23: 1 + 21 = 22, next at 45 */
+    "\0__kernel_clock_gettime"     /* 45: 1 + 22 = 23, next at 68 */
+    "\0__kernel_gettimeofday";     /* 68: 1 + 21 = 22, total = 90 */
+#define DYNSTR_SIZE (sizeof(dynstr_data))  /* 90 bytes */
+
+/* Symbol name offsets in dynstr (index of first char after each NUL) */
+static const uint32_t sym_name_offsets[VDSO_NUM_SYMS] = {
+    1,   /* __kernel_rt_sigreturn */
+    23,  /* __kernel_clock_getres */
+    45,  /* __kernel_clock_gettime */
+    68,  /* __kernel_gettimeofday */
+};
+
+uint64_t vdso_build(guest_t *g) {
+    /* Get host pointer to the vDSO page */
+    uint8_t *page = (uint8_t *)guest_ptr(g, VDSO_BASE);
+    if (!page) {
+        fprintf(stderr, "vdso: VDSO_BASE 0x%llx out of guest memory\n",
+                (unsigned long long)VDSO_BASE);
+        return 0;
+    }
+
+    /* Zero the entire 4KB page */
+    memset(page, 0, VDSO_SIZE);
+
+    /* ---- ELF header ---- */
+    elf64_ehdr_t *ehdr = (elf64_ehdr_t *)(page + VDSO_OFF_EHDR);
+    ehdr->e_ident[0] = ELFMAG0;
+    ehdr->e_ident[1] = ELFMAG1;
+    ehdr->e_ident[2] = ELFMAG2;
+    ehdr->e_ident[3] = ELFMAG3;
+    ehdr->e_ident[EI_CLASS] = ELFCLASS64;
+    ehdr->e_ident[EI_DATA]  = ELFDATA2LSB;
+    ehdr->e_ident[6] = 1;  /* EV_CURRENT */
+    ehdr->e_type      = ET_DYN;      /* Shared object (vDSO convention) */
+    ehdr->e_machine   = EM_AARCH64;
+    ehdr->e_version   = 1;           /* EV_CURRENT */
+    ehdr->e_entry     = VDSO_OFF_TEXT;  /* Relative to load base (0) */
+    ehdr->e_phoff     = VDSO_OFF_PHDR;
+    ehdr->e_shoff     = VDSO_OFF_SHDR;
+    ehdr->e_flags     = 0;
+    ehdr->e_ehsize    = sizeof(elf64_ehdr_t);
+    ehdr->e_phentsize = sizeof(elf64_phdr_t);
+    ehdr->e_phnum     = 1;
+    ehdr->e_shentsize = sizeof(elf64_shdr_t);
+    ehdr->e_shnum     = 4;           /* NULL + .text + .dynstr + .dynsym */
+    ehdr->e_shstrndx  = 2;           /* .dynstr doubles as shstrtab */
+
+    /* ---- Program header: single PT_LOAD covering the whole page ----
+     * p_vaddr = 0: standard position-independent convention for ET_DYN.
+     * Rosetta computes load_offset = AT_SYSINFO_EHDR - p_vaddr = VDSO_BASE.
+     * All file offsets are then resolved as load_offset + offset. */
+    elf64_phdr_t *phdr = (elf64_phdr_t *)(page + VDSO_OFF_PHDR);
+    phdr->p_type   = PT_LOAD;
+    phdr->p_flags  = PF_R | PF_X;
+    phdr->p_offset = 0;
+    phdr->p_vaddr  = 0;              /* Position-independent: base = 0 */
+    phdr->p_paddr  = 0;
+    phdr->p_filesz = VDSO_SIZE;
+    phdr->p_memsz  = VDSO_SIZE;
+    phdr->p_align  = 0x1000;         /* Page-aligned */
+
+    /* ---- .text: syscall trampolines ---- */
+    memcpy(page + VDSO_OFF_TEXT, trampoline_code, sizeof(trampoline_code));
+
+    /* ---- .dynstr: string table ---- */
+    memcpy(page + VDSO_OFF_DYNSTR, dynstr_data, DYNSTR_SIZE);
+
+    /* ---- .dynsym: symbol table ---- */
+    elf64_sym_t *sym = (elf64_sym_t *)(page + VDSO_OFF_DYNSYM);
+
+    /* sym[0]: mandatory NULL entry */
+    memset(&sym[0], 0, sizeof(elf64_sym_t));
+
+    /* sym[1..4]: kernel helper function symbols.
+     * st_value is relative to 0 (position-independent); rosetta adds
+     * load_offset (VDSO_BASE) to get the actual guest virtual address. */
+    for (int i = 0; i < VDSO_NUM_SYMS; i++) {
+        sym[i + 1].st_name  = sym_name_offsets[i];
+        sym[i + 1].st_info  = ELF_ST_INFO(STB_GLOBAL, STT_FUNC);
+        sym[i + 1].st_other = 0;
+        sym[i + 1].st_shndx = 1;  /* .text section index */
+        sym[i + 1].st_value = VDSO_OFF_TEXT +
+                               (uint64_t)i * TRAMPOLINE_SIZE;
+        sym[i + 1].st_size  = TRAMPOLINE_SIZE;
+    }
+
+    /* ---- Section header table ---- */
+    elf64_shdr_t *shdr = (elf64_shdr_t *)(page + VDSO_OFF_SHDR);
+
+    /* shdr[0]: SHN_UNDEF (required NULL entry) */
+    memset(&shdr[0], 0, sizeof(elf64_shdr_t));
+
+    /* shdr[1]: .text */
+    shdr[1].sh_name      = 0;
+    shdr[1].sh_type      = 1;        /* SHT_PROGBITS */
+    shdr[1].sh_flags     = SHF_ALLOC | SHF_EXECINSTR;
+    shdr[1].sh_addr      = VDSO_OFF_TEXT;    /* Relative to 0 */
+    shdr[1].sh_offset    = VDSO_OFF_TEXT;
+    shdr[1].sh_size      = sizeof(trampoline_code);
+    shdr[1].sh_link      = 0;
+    shdr[1].sh_info      = 0;
+    shdr[1].sh_addralign = 4;
+    shdr[1].sh_entsize   = 0;
+
+    /* shdr[2]: .dynstr (SHT_STRTAB) — also serves as shstrtab */
+    shdr[2].sh_name      = 0;
+    shdr[2].sh_type      = SHT_STRTAB;
+    shdr[2].sh_flags     = SHF_ALLOC;
+    shdr[2].sh_addr      = VDSO_OFF_DYNSTR;  /* Relative to 0 */
+    shdr[2].sh_offset    = VDSO_OFF_DYNSTR;
+    shdr[2].sh_size      = DYNSTR_SIZE;
+    shdr[2].sh_link      = 0;
+    shdr[2].sh_info      = 0;
+    shdr[2].sh_addralign = 1;
+    shdr[2].sh_entsize   = 0;
+
+    /* shdr[3]: .dynsym (SHT_DYNSYM) — linked to .dynstr (section 2) */
+    shdr[3].sh_name      = 0;
+    shdr[3].sh_type      = SHT_DYNSYM;
+    shdr[3].sh_flags     = SHF_ALLOC;
+    shdr[3].sh_addr      = VDSO_OFF_DYNSYM;  /* Relative to 0 */
+    shdr[3].sh_offset    = VDSO_OFF_DYNSYM;
+    shdr[3].sh_size      = (VDSO_NUM_SYMS + 1) * sizeof(elf64_sym_t);
+    shdr[3].sh_link      = 2;        /* Index of associated .dynstr */
+    shdr[3].sh_info      = 1;        /* First non-local symbol index */
+    shdr[3].sh_addralign = 8;
+    shdr[3].sh_entsize   = sizeof(elf64_sym_t);
+
+    return VDSO_BASE;
+}

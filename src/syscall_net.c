@@ -317,6 +317,7 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
     if (guest_read(g, addr_gva, linux_sa, addrlen) < 0) return -LINUX_EFAULT;
 
+
     struct sockaddr_storage mac_sa;
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
     if (mac_len < 0) return -LINUX_EINVAL;

@@ -28,19 +28,22 @@
 #define AT_HWCAP   16
 #define AT_CLKTCK  17
 #define AT_RANDOM  25
+#define AT_SYSINFO_EHDR 33
 #define AT_EXECFN  31
-#define AT_PLATFORM 45
+#define AT_PLATFORM 15
 
 /* Build a Linux-compatible initial stack at the given stack_top.
  * Passes argc/argv and envp (NULL-terminated array of "KEY=val" strings).
  * elf_load_base is the base address PIE executables were loaded at (0 for ET_EXEC).
  * interp_base is the load base of the dynamic linker (0 if statically linked).
+ * vdso_base is the guest address of the vDSO ELF image (0 if no vDSO).
  * Returns the initial SP (stack pointer) to pass to the guest. */
 uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            int argc, const char **argv,
                            const char **envp,
                            const elf_info_t *elf_info,
                            uint64_t elf_load_base,
-                           uint64_t interp_base);
+                           uint64_t interp_base,
+                           uint64_t vdso_base);
 
 #endif /* STACK_H */

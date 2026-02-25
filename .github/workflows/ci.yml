@@ -1,12 +1,15 @@
 # CI — build, test, and release hl
 #
-# Branch pushes / PRs:  build (nix build + make)
-# master push:           build + dist artifacts
-# v* tags:               build + dist + GitHub Release
+# Pipeline:
+#   guest-bins (ubuntu) ──┐
+#                          ├──▸ test (macOS)
+#   build (macOS)        ──┘
+#   build ──▸ dist ──▸ release
 #
-# NOTE: Tests require x86_64-linux cross-compiled guest binaries (the full
-# devShell).  GitHub Actions macOS runners lack a linux builder, so tests
-# run locally only (`nix develop -c make test-all`).
+# guest-bins builds cross-compiled aarch64-linux-musl guest binaries on
+# a Linux runner (which has x86_64-linux nix), then uploads them as an
+# artifact.  The test job downloads both the hl binary and guest-bins,
+# then runs the full test suite on macOS.
 
 name: CI
 
@@ -17,7 +20,7 @@ on:
   pull_request:
 
 jobs:
-  # ── Build ──────────────────────────────────────────────────────────
+  # ── Build hl (macOS) ─────────────────────────────────────────────
   build:
     runs-on: macos-latest  # ARM64 (Apple Silicon)
     steps:
@@ -30,11 +33,101 @@ jobs:
       - name: Build hl (nix package)
         run: nix build
 
-      # Also validate the Makefile build path (used by dist)
+      # Also validate the Makefile build path (used by dist + test)
       - name: Build hl (make)
         run: nix develop .#ci -c make hl
 
-  # ── Distribution artifacts (master + tags) ──────────────────────────
+  # ── Guest binaries (Linux) ──────────────────────────────────────
+  # Cross-compile aarch64-linux-musl test binaries on x86_64-linux,
+  # bundle into a single tarball, upload as artifact.
+  guest-bins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build guest-bundle
+        run: nix build .#packages.x86_64-linux.guest-bundle
+
+      - name: Package guest binaries
+        run: tar -czf guest-bins.tar.gz -C result .
+
+      - name: Upload guest-bins artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins.tar.gz
+
+  # ── Test suite (macOS + guest binaries) ─────────────────────────
+  # Downloads guest-bins from the Linux job, builds hl on macOS,
+  # then runs the full test suite with GUEST_* env vars pointing
+  # at the extracted bundle.
+  test:
+    needs: [build, guest-bins]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Download guest-bins artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+
+      - name: Extract guest binaries
+        run: |
+          mkdir -p guest-bins
+          tar -xzf guest-bins.tar.gz -C guest-bins
+          chmod -R +x guest-bins/*/bin/*
+
+      - name: Build hl
+        run: nix develop .#ci -c make hl
+
+      - name: Run unit tests (test-all)
+        env:
+          GUEST_TEST_BINARIES: ${{ github.workspace }}/guest-bins/test-binaries
+        run: nix develop .#ci -c make test-all
+
+      - name: Run coreutils integration tests
+        env:
+          GUEST_COREUTILS: ${{ github.workspace }}/guest-bins/coreutils
+        run: nix develop .#ci -c make test-coreutils
+
+      - name: Run busybox integration tests
+        env:
+          GUEST_BUSYBOX: ${{ github.workspace }}/guest-bins/busybox
+        run: nix develop .#ci -c make test-busybox
+
+      - name: Run static binary integration tests
+        env:
+          GUEST_STATIC_BINS: ${{ github.workspace }}/guest-bins/static-bins
+        run: nix develop .#ci -c make test-static-bins
+
+      - name: Run dynamic linking tests
+        env:
+          GUEST_SYSROOT: ${{ github.workspace }}/guest-bins/sysroot
+          GUEST_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/dynamic-tests
+        run: nix develop .#ci -c make test-dynamic
+
+      - name: Run dynamic coreutils tests
+        env:
+          GUEST_SYSROOT: ${{ github.workspace }}/guest-bins/sysroot
+          GUEST_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/dynamic-coreutils
+        run: nix develop .#ci -c make test-dynamic-coreutils
+
+      - name: Run Haskell test
+        env:
+          GUEST_HASKELL_HELLO: ${{ github.workspace }}/guest-bins/haskell-hello
+        run: nix develop .#ci -c make test-haskell
+
+      # Skipped: test-haskell-bins (needs native aarch64-linux pandoc/shellcheck)
+      # Skipped: test-perf (benchmark, not correctness test)
+
+  # ── Distribution artifacts (master + tags) ──────────────────────
   dist:
     needs: build
     if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
@@ -58,9 +151,9 @@ jobs:
             dist/out/*.zip
             dist/out/*.pkg
 
-  # ── GitHub Release (tags only) ──────────────────────────────────────
+  # ── GitHub Release (tags only) ──────────────────────────────────
   release:
-    needs: dist
+    needs: [dist, test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     permissions:
