@@ -49,6 +49,10 @@ static char elf_path[LINUX_PATH_MAX] = {0};
 static char cmdline_buf[8192] = {0};
 static size_t cmdline_len = 0;
 
+/* Absolute path of the hl binary itself (for spawning sub-processes like
+ * rosettad).  Set once at startup via _NSGetExecutablePath(). */
+static char hl_path[LINUX_PATH_MAX] = {0};
+
 /* Sysroot path for dynamic linker library resolution */
 static char sysroot_path[LINUX_PATH_MAX] = {0};
 
@@ -118,6 +122,17 @@ void proc_set_elf_path(const char *path) {
 
 const char *proc_get_elf_path(void) {
     return elf_path[0] ? elf_path : NULL;
+}
+
+void proc_set_hl_path(const char *path) {
+    if (path) {
+        strncpy(hl_path, path, sizeof(hl_path) - 1);
+        hl_path[sizeof(hl_path) - 1] = '\0';
+    }
+}
+
+const char *proc_get_hl_path(void) {
+    return hl_path[0] ? hl_path : NULL;
 }
 
 void proc_set_cmdline(int argc, const char **argv) {

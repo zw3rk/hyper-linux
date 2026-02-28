@@ -43,6 +43,14 @@ void proc_set_elf_path(const char *path);
 /* Get the stored ELF binary path. Returns NULL if not set. */
 const char *proc_get_elf_path(void);
 
+/* Store the absolute path of the hl binary itself.  Used by the
+ * rosettad handler to spawn sub-processes.  Set once at startup
+ * via _NSGetExecutablePath(). */
+void proc_set_hl_path(const char *path);
+
+/* Get the stored hl binary path. Returns NULL if not set. */
+const char *proc_get_hl_path(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation.
  * argv is a NULL-terminated array of strings. */
 void proc_set_cmdline(int argc, const char **argv);

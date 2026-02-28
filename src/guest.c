@@ -170,11 +170,23 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     }
 
     /* Create Hypervisor VM with the determined IPA width and map the
-     * primary slab at GUEST_IPA_BASE. */
-    hv_vm_config_t config = hv_vm_config_create();
-    hv_vm_config_set_ipa_size(config, vm_ipa);
-    hv_return_t ret = hv_vm_create(config);
-    os_release(config);
+     * primary slab at GUEST_IPA_BASE.
+     *
+     * macOS may not release HVF VM resources immediately after
+     * hv_vm_destroy(), so rapid sequential VM creation (e.g. running
+     * many test binaries) can hit transient resource exhaustion.
+     * Retry with linear backoff (500ms intervals, up to 30 attempts =
+     * 15 seconds max wait) to handle this gracefully. */
+    hv_return_t ret = HV_ERROR;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        hv_vm_config_t config = hv_vm_config_create();
+        hv_vm_config_set_ipa_size(config, vm_ipa);
+        ret = hv_vm_create(config);
+        os_release(config);
+        if (ret == HV_SUCCESS)
+            break;
+        usleep(500000);  /* 500ms between attempts */
+    }
     if (ret != HV_SUCCESS) {
         fprintf(stderr, "guest: hv_vm_create failed: %d (ipa_bits=%u)\n",
                 (int)ret, vm_ipa);

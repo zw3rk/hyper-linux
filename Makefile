@@ -305,14 +305,14 @@ test-perf: $(BUILD_DIR)/hl
 
 HASKELL_HELLO ?= $(GUEST_HASKELL_HELLO)/bin/hello-hyper
 
-## Run static Haskell hello world (GHC-produced aarch64-linux-musl ELF)
+## Run Haskell hello world (GHC-produced aarch64-linux-musl ELF)
 test-haskell: $(BUILD_DIR)/hl
 	@if [ ! -x "$(HASKELL_HELLO)" ]; then \
 		printf "$(RED)✗ Haskell hello not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
 	@printf "$(BLUE)▸ Running$(RESET) Haskell hello-hyper\n"
-	$(BUILD_DIR)/hl $(HASKELL_HELLO)
+	$(BUILD_DIR)/hl --sysroot $(SYSROOT_DIR) $(HASKELL_HELLO)
 
 # ── Haskell binary integration tests ────────────────────────────────
 

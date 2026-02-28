@@ -145,11 +145,35 @@
 
       # ── Dynamic linking test infrastructure ──────────────────────
 
-      # Musl sysroot: dynamic linker + libc.so in /lib/ layout
-      musl-sysroot = crossPkgs.runCommand "musl-sysroot" {} ''
+      # Musl sysroot: dynamic linker + libc + shared libs needed by
+      # dynamically-linked coreutils and GHC-compiled binaries.
+      # All libs are patchelf'd to remove nix store RPATHs so the musl
+      # dynamic linker resolves everything from the sysroot /lib.
+      gccLibs = crossPkgs.stdenv.cc.cc.lib;
+      musl-sysroot = crossPkgs.runCommand "musl-sysroot" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
         mkdir -p $out/lib
-        cp -a ${crossPkgs.musl}/lib/ld-musl-aarch64.so.1 $out/lib/
-        cp -a ${crossPkgs.musl}/lib/libc.so $out/lib/
+        cp -a  ${crossPkgs.musl}/lib/ld-musl-aarch64.so.1      $out/lib/
+        cp -a  ${crossPkgs.musl}/lib/libc.so                    $out/lib/
+        # coreutils: acl, attr, gmp
+        cp -aL ${crossPkgs.acl.out}/lib/libacl.so*              $out/lib/
+        cp -aL ${crossPkgs.attr.out}/lib/libattr.so*            $out/lib/
+        cp -aL ${crossPkgs.gmp}/lib/libgmp.so*                  $out/lib/
+        # GHC RTS: libffi, libnuma
+        cp -aL ${crossPkgs.libffi}/lib/libffi.so*               $out/lib/
+        cp -aL ${crossPkgs.numactl}/lib/libnuma.so*             $out/lib/
+        # GCC runtime: libatomic, libgcc_s (needed by libnuma, libffi)
+        cp -aL ${gccLibs}/lib/libatomic.so*                     $out/lib/
+        cp -aL ${gccLibs}/lib/libgcc_s.so*                      $out/lib/
+
+        # Strip nix store RPATHs from all shared libs so the musl
+        # dynamic linker resolves deps from /lib (the sysroot root).
+        chmod -R u+w $out/lib
+        for f in $out/lib/*.so*; do
+          [ -L "$f" ] && continue  # skip symlinks
+          patchelf --remove-rpath "$f" 2>/dev/null || true
+        done
       '';
 
       # Dynamically-linked test binaries (linked against musl shared lib)
@@ -217,7 +241,9 @@
       # store references — safe to tar up and transfer as a CI artifact.
       # Excludes haskellBins (native aarch64-linux, can't build on
       # the x86_64-linux CI runner).
-      guestBundle = crossPkgs.runCommand "hl-guest-bundle" {} ''
+      guestBundle = crossPkgs.runCommand "hl-guest-bundle" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
         mkdir -p $out/{test-binaries,coreutils,busybox,static-bins}/bin
         mkdir -p $out/{sysroot/lib,dynamic-tests,dynamic-coreutils,haskell-hello}/bin
         cp -rL ${testBinaries}/bin/.         $out/test-binaries/bin/
@@ -228,6 +254,17 @@
         cp -rL ${dynamicTestBinaries}/bin/.  $out/dynamic-tests/bin/
         cp -rL ${dynamicCoreutils}/bin/.     $out/dynamic-coreutils/bin/
         cp -rL ${haskellHello}/bin/.         $out/haskell-hello/bin/
+
+        # Patch haskell-hello interpreter to use sysroot-relative path.
+        # GHC cross-musl produces dynamically-linked binaries with nix
+        # store interpreter paths; rewrite to /lib/ld-musl-aarch64.so.1
+        # so hl --sysroot can find the dynamic linker.
+        chmod -R u+w $out/haskell-hello/
+        for f in $out/haskell-hello/bin/*; do
+          if patchelf --print-interpreter "$f" 2>/dev/null | grep -q nix; then
+            patchelf --set-interpreter /lib/ld-musl-aarch64.so.1 "$f"
+          fi
+        done
       '';
 
     in {
@@ -235,6 +272,16 @@
       packages.${linuxSystem} = {
         test-binaries = testBinaries;
         guest-bundle = guestBundle;
+      };
+
+      # Hydra jobset — ensures ci.zw3rk.com builds guest-bundle and
+      # pushes it to cache.zw3rk.com so GHA self-hosted runners can
+      # fetch pre-built binaries without needing a Linux builder.
+      hydraJobs.${linuxSystem} = {
+        guest-bundle = guestBundle;
+      };
+      hydraJobs.${darwinSystem} = {
+        hl = self.packages.${darwinSystem}.default;
       };
 
       devShells.${darwinSystem} = {
@@ -349,7 +396,7 @@
         '';
 
         meta = with darwinPkgs.lib; {
-          description = "Run static aarch64-linux ELF binaries on macOS Apple Silicon";
+          description = "Run aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon";
           platforms = [ "aarch64-darwin" ];
           license = licenses.asl20;
         };

@@ -156,6 +156,41 @@ Rosetta is treated as a binfmt_misc interpreter (NOT a PT_INTERP dynamic linker)
   dynamic linking internally (loading ld-linux-x86-64.so.2 etc.)
 - AT_PLATFORM remains "aarch64" (correct: rosetta produces ARM64 code)
 
+### Rosetta AOT Translation (rosettad)
+
+Rosetta supports ahead-of-time (AOT) translation via the `rosettad` daemon,
+which is also a static aarch64-linux binary. The AOT flow is essential for
+complex binaries (indirect calls, function pointers) that fail with JIT-only
+("BasicBlock requested for unrecognized address").
+
+**VZ mode activation:** Rosetta checks for VZ (Virtualization.framework)
+support via 3 ioctls: VZ_CHECK (0x80456125) returns a 69-byte signature,
+VZ_CAPS (0x80806123) returns 128 bytes of capability data, VZ_ACTIVATE
+(0x6124). These are intercepted in `syscall_io.c`.
+
+**rosettad protocol** (implemented in `syscall_io.c:rosettad_handler_thread`):
+- Rosetta opens `AF_UNIX SOCK_SEQPACKET` — intercepted in `syscall_net.c`
+  with `socketpair(SOCK_STREAM)` (macOS doesn't support SEQPACKET for AF_UNIX)
+- `'?'` → handshake, respond `0x01`
+- `'t'` → translate: receive binary fd via SCM_RIGHTS, run `rosettad translate`
+  via subprocess, send back AOT fd + 32-byte digest
+- `'d'` → digest cache lookup (respond `0x00` = not cached)
+- `'q'` → quit
+
+**cmsghdr format translation** (critical for SCM_RIGHTS to work):
+Linux aarch64 and macOS have incompatible `struct cmsghdr` layouts:
+- Linux: `{uint64_t cmsg_len, int level, int type}` (16 bytes), data at offset 16,
+  CMSG_ALIGN rounds to 8. SOL_SOCKET=1
+- macOS: `{uint32_t cmsg_len, int level, int type}` (12 bytes), data at offset 12,
+  CMSG_ALIGN rounds to 4. SOL_SOCKET=0xFFFF
+
+`sys_sendmsg` translates Linux→macOS, `sys_recvmsg` translates macOS→Linux.
+Both translate SOL_SOCKET values and guest↔host fd numbers for SCM_RIGHTS.
+
+**argv construction:** Rosetta passes argv[1] directly as the translated
+program's argv[0]. We pass the real binary path (not `/proc/self/fd/N`)
+so programs like busybox can use `basename(argv[0])` for applet lookup.
+
 ### Fork/IPC Propagation
 
 `fork_ipc.c` propagates `g->ipa_bits` in the IPC header so child processes

@@ -518,18 +518,27 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
     if (last >= (unsigned)FD_TABLE_SIZE) last = FD_TABLE_SIZE - 1;
     for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
         if (fd_table[i].type != FD_CLOSED) {
-            if (fd_table[i].dir) {
-                if (fd_table[i].type == FD_DIR)
-                    closedir((DIR *)fd_table[i].dir);
-                else if (fd_table[i].type == FD_EPOLL)
-                    free(fd_table[i].dir);
-                fd_table[i].dir = NULL;
-            }
-            if (fd_table[i].type != FD_STDIO)
-                close(fd_table[i].host_fd);
-            /* fd_mark_closed clears host_fd/dir/linux_flags atomically
-             * under fd_lock before marking the slot free in the bitmap. */
+            fd_entry_t snap = fd_table[i];
             fd_mark_closed(i);
+
+            if (snap.dir) {
+                if (snap.type == FD_DIR)
+                    closedir((DIR *)snap.dir);
+                else if (snap.type == FD_EPOLL)
+                    free(snap.dir);
+            }
+
+            /* Clean up emulated I/O subsystem state */
+            switch (snap.type) {
+            case FD_EVENTFD:  eventfd_close(i);  break;
+            case FD_SIGNALFD: signalfd_close(i); break;
+            case FD_TIMERFD:  timerfd_close(i);  break;
+            case FD_INOTIFY:  inotify_close(i);  break;
+            default: break;
+            }
+
+            if (snap.type != FD_STDIO)
+                close(snap.host_fd);
         }
     }
     return 0;
@@ -628,6 +637,8 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags) {
     guest_fds[1] = fd_alloc(FD_PIPE, host_fds[1]);
 
     if (guest_fds[0] < 0 || guest_fds[1] < 0) {
+        if (guest_fds[0] >= 0) fd_mark_closed(guest_fds[0]);
+        if (guest_fds[1] >= 0) fd_mark_closed(guest_fds[1]);
         close(host_fds[0]);
         close(host_fds[1]);
         return -LINUX_ENOMEM;

@@ -79,6 +79,14 @@ void syscall_init(void) {
     memset(fd_table, 0, sizeof(fd_table));
     signal_init();
 
+    /* Initialize special FD subsystems (eventfd, signalfd, timerfd,
+     * inotify).  Must happen before any guest code runs so that
+     * concurrent CLONE_THREAD callers don't race on lazy init. */
+    eventfd_init();
+    signalfd_init();
+    timerfd_init();
+    inotify_init();
+
     /* Mark all FDs as free in bitmap */
     memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
 

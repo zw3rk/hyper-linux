@@ -2,14 +2,16 @@
 #
 # Pipeline:
 #   guest-bins (ubuntu) ──┐
-#                          ├──▸ test (macOS)
+#                          ├──▸ test (macOS, self-hosted)
 #   build (macOS)        ──┘
 #   build ──▸ dist ──▸ release
 #
 # guest-bins builds cross-compiled aarch64-linux-musl guest binaries on
-# a Linux runner (which has x86_64-linux nix), then uploads them as an
-# artifact.  The test job downloads both the hl binary and guest-bins,
-# then runs the full test suite on macOS.
+# a GitHub-hosted Linux runner (~$0.02/run with warm cache), then uploads
+# them as an artifact.  All macOS jobs run on self-hosted Apple Silicon
+# runners (tart-run) to avoid the 10x macOS billing multiplier.
+# Self-hosted runners don't hit the HVF resource exhaustion issue that
+# plagued shared CI runners, so integration tests are enabled.
 
 name: CI
 
@@ -19,15 +21,22 @@ on:
     tags: ['v*']
   pull_request:
 
+# Nix configuration for all jobs.  Tart VMs may have nix pre-installed
+# without flakes/nix-command enabled, so NIX_CONFIG ensures they work.
+env:
+  NIX_CONFIG: |
+    extra-experimental-features = nix-command flakes
+
 jobs:
-  # ── Build hl (macOS) ─────────────────────────────────────────────
+  # ── Build hl (macOS, self-hosted) ──────────────────────────────
   build:
-    runs-on: macos-latest  # ARM64 (Apple Silicon)
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       # Validate the nix package builds correctly
       - name: Build hl (nix package)
@@ -37,9 +46,9 @@ jobs:
       - name: Build hl (make)
         run: nix develop .#ci -c make hl
 
-  # ── Guest binaries (Linux) ──────────────────────────────────────
-  # Cross-compile aarch64-linux-musl test binaries on x86_64-linux,
-  # bundle into a single tarball, upload as artifact.
+  # ── Guest binaries (Linux, GitHub-hosted) ──────────────────────
+  # Cross-compile aarch64-linux-musl test binaries on x86_64-linux.
+  # Linux runners are $0.006/min (1x multiplier) — ~$0.02/run cached.
   guest-bins:
     runs-on: ubuntu-latest
     steps:
@@ -62,16 +71,18 @@ jobs:
 
   # ── Test suite (macOS + guest binaries) ─────────────────────────
   # Downloads guest-bins from the Linux job, builds hl on macOS,
-  # then runs the full test suite with GUEST_* env vars pointing
-  # at the extracted bundle.
+  # then runs unit tests + integration tests.  Requires bare-metal
+  # HVF access (nested virt in tart VMs doesn't work on M1).
   test:
     needs: [build, guest-bins]
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, hvf]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Download guest-bins artifact
         uses: actions/download-artifact@v4
@@ -94,44 +105,41 @@ jobs:
 
       - name: Run coreutils integration tests
         env:
-          GUEST_COREUTILS: ${{ github.workspace }}/guest-bins/coreutils
+          COREUTILS_BIN: ${{ github.workspace }}/guest-bins/coreutils/bin
         run: nix develop .#ci -c make test-coreutils
 
       - name: Run busybox integration tests
         env:
-          GUEST_BUSYBOX: ${{ github.workspace }}/guest-bins/busybox
+          BUSYBOX_BIN: ${{ github.workspace }}/guest-bins/busybox/bin/busybox
         run: nix develop .#ci -c make test-busybox
 
       - name: Run static binary integration tests
         env:
-          GUEST_STATIC_BINS: ${{ github.workspace }}/guest-bins/static-bins
+          STATIC_BINS_DIR: ${{ github.workspace }}/guest-bins/static-bins/bin
         run: nix develop .#ci -c make test-static-bins
 
       - name: Run dynamic linking tests
         env:
+          SYSROOT_DIR: ${{ github.workspace }}/guest-bins/sysroot
           GUEST_SYSROOT: ${{ github.workspace }}/guest-bins/sysroot
           GUEST_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/dynamic-tests
-        run: nix develop .#ci -c make test-dynamic
-
-      - name: Run dynamic coreutils tests
-        env:
-          GUEST_SYSROOT: ${{ github.workspace }}/guest-bins/sysroot
           GUEST_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/dynamic-coreutils
-        run: nix develop .#ci -c make test-dynamic-coreutils
+          DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-dynamic
+          nix develop .#ci -c make test-dynamic-coreutils
 
-      - name: Run Haskell test
+      - name: Run Haskell integration tests
         env:
-          GUEST_HASKELL_HELLO: ${{ github.workspace }}/guest-bins/haskell-hello
+          HASKELL_HELLO: ${{ github.workspace }}/guest-bins/haskell-hello/bin/hello-hyper
+          SYSROOT_DIR: ${{ github.workspace }}/guest-bins/sysroot
         run: nix develop .#ci -c make test-haskell
-
-      # Skipped: test-haskell-bins (needs native aarch64-linux pandoc/shellcheck)
-      # Skipped: test-perf (benchmark, not correctness test)
 
   # ── Distribution artifacts (master + tags) ──────────────────────
   dist:
     needs: build
     if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -139,6 +147,7 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Build distribution
         run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
@@ -155,7 +164,7 @@ jobs:
   release:
     needs: [dist, test]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: write
     steps:
@@ -165,6 +174,7 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Build distribution
         run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'

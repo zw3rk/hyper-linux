@@ -613,11 +613,6 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     int idx = signum - 1;
     linux_sigaction_t *act = &sig_state.actions[idx];
 
-    fprintf(stderr, "hl: signal_deliver: sig=%d handler=0x%llx flags=0x%llx mask=0x%llx\n",
-            signum, (unsigned long long)act->sa_handler,
-            (unsigned long long)act->sa_flags,
-            (unsigned long long)act->sa_mask);
-
     /* Check handler type */
     if (act->sa_handler == LINUX_SIG_IGN) {
         /* Ignored — discard signal */
@@ -745,29 +740,6 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         uint64_t ucontext_addr = frame_sp + sizeof(linux_siginfo_t);
         hv_vcpu_set_reg(vcpu, HV_REG_X1, siginfo_addr);
         hv_vcpu_set_reg(vcpu, HV_REG_X2, ucontext_addr);
-    }
-
-    /* DEBUG: signal delivery details (temporary) */
-    {
-        int32_t verify_signo = -1;
-        guest_read(g, frame_sp, &verify_signo, sizeof(verify_signo));
-        uint64_t verify_x0, verify_x1;
-        hv_vcpu_get_reg(vcpu, HV_REG_X0, &verify_x0);
-        hv_vcpu_get_reg(vcpu, HV_REG_X1, &verify_x1);
-        fprintf(stderr, "hl: signal_deliver: sig=%d handler=0x%llx flags=0x%llx "
-                "restorer=0x%llx frame_sp=0x%llx SA_SIGINFO=%d "
-                "si_signo=%d si_code=%d verify_signo=%d "
-                "X0=%llu X1=0x%llx saved_sp=0x%llx sizeof(frame)=%zu\n",
-                signum, (unsigned long long)act->sa_handler,
-                (unsigned long long)act->sa_flags,
-                (unsigned long long)act->sa_restorer,
-                (unsigned long long)frame_sp,
-                !!(act->sa_flags & LINUX_SA_SIGINFO),
-                frame.info.si_signo, frame.info.si_code, verify_signo,
-                (unsigned long long)verify_x0,
-                (unsigned long long)verify_x1,
-                (unsigned long long)saved_sp,
-                sizeof(frame));
     }
 
     /* 5. Update blocked mask during handler execution */

@@ -160,6 +160,43 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
     int nonblock = extract_sock_nonblock(type);
     int cloexec = extract_sock_cloexec(type);
 
+    /* Rosetta uses AF_UNIX SOCK_SEQPACKET to connect to rosettad for AOT
+     * translation. macOS doesn't support SOCK_SEQPACKET for AF_UNIX, and
+     * Linux abstract sockets don't exist on macOS either. Instead, create
+     * a socketpair: give rosetta one end (already connected), and save the
+     * other end for our rosettad protocol handler. When rosetta calls
+     * connect() on this fd, we return success immediately. */
+    if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0)
+            return linux_errno();
+
+        /* pair[0] = rosetta's end, pair[1] = our protocol handler end */
+        if (nonblock) {
+            int fl = fcntl(pair[0], F_GETFL);
+            if (fl >= 0) fcntl(pair[0], F_SETFL, fl | O_NONBLOCK);
+        }
+        if (cloexec) fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+
+        int one = 1;
+        setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+        int gfd = fd_alloc(FD_SOCKET, pair[0]);
+        if (gfd < 0) { close(pair[0]); close(pair[1]); return -LINUX_EMFILE; }
+
+        int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
+        fd_table[gfd].linux_flags = linux_flags_val;
+
+        /* Save both ends: handler_fd for our protocol thread, client_fd
+         * to recognize rosetta's connect() call later. */
+        extern void rosettad_set_socket(int handler_fd);
+        extern void rosettad_set_client_fd(int client_fd);
+        rosettad_set_socket(pair[1]);
+        rosettad_set_client_fd(pair[0]);
+
+        return gfd;
+    }
+
     int fd = socket(mac_domain, real_type, protocol);
     if (fd < 0) return linux_errno();
 
@@ -317,6 +354,11 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
     if (guest_read(g, addr_gva, linux_sa, addrlen) < 0) return -LINUX_EFAULT;
 
+    /* Rosettad socketpair: already connected via socketpair(), so
+     * return success immediately when rosetta tries connect(). */
+    extern int rosettad_is_socket(int host_fd);
+    if (rosettad_is_socket(host_fd))
+        return 0;
 
     struct sockaddr_storage mac_sa;
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
@@ -625,13 +667,95 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         host_iov[i].iov_len = guest_iov[i].iov_len;
     }
 
+    /* Translate control messages from Linux to macOS format.
+     *
+     * The cmsghdr layout differs between Linux aarch64 and macOS:
+     *   Linux:  { uint64_t cmsg_len; int cmsg_level; int cmsg_type; }  (16 bytes)
+     *   macOS:  { uint32_t cmsg_len; int cmsg_level; int cmsg_type; }  (12 bytes)
+     *
+     * CMSG_DATA offset: Linux=16, macOS=12
+     * CMSG_ALIGN:       Linux rounds to 8, macOS rounds to 4
+     * SOL_SOCKET:       Linux=1, macOS=0xFFFF
+     *
+     * For SCM_RIGHTS with 1 fd:
+     *   Linux:  cmsg_len=20, msg_controllen=24
+     *   macOS:  cmsg_len=16, msg_controllen=16
+     */
+    uint8_t linux_ctrl[512];   /* Linux-format control from guest */
+    uint8_t mac_ctrl[256];     /* macOS-format control for host sendmsg */
+    uint8_t *ctrl_ptr = NULL;
+    socklen_t ctrl_len = 0;
+
+    if (lmsg.msg_control && lmsg.msg_controllen > 0 &&
+        lmsg.msg_controllen <= sizeof(linux_ctrl)) {
+        if (guest_read(g, lmsg.msg_control, linux_ctrl,
+                       lmsg.msg_controllen) < 0)
+            return -LINUX_EFAULT;
+
+        /* Walk Linux cmsghdr chain and translate to macOS format.
+         * Linux cmsghdr: [8 cmsg_len][4 level][4 type][data at 16]
+         * Linux CMSG_ALIGN rounds to 8 bytes. */
+        size_t lpos = 0;   /* position in linux_ctrl */
+        size_t mpos = 0;   /* position in mac_ctrl */
+        uint64_t lctl_len = lmsg.msg_controllen;
+
+        while (lpos + 16 <= lctl_len) {
+            uint64_t lcmsg_len;
+            int32_t  lcmsg_level, lcmsg_type;
+            memcpy(&lcmsg_len, linux_ctrl + lpos, 8);
+            memcpy(&lcmsg_level, linux_ctrl + lpos + 8, 4);
+            memcpy(&lcmsg_type, linux_ctrl + lpos + 12, 4);
+
+            if (lcmsg_len < 16) break;  /* invalid */
+            size_t ldata_len = (size_t)(lcmsg_len - 16);
+
+            /* Translate SOL_SOCKET (Linux=1 → macOS=0xFFFF) */
+            int mac_level = (lcmsg_level == 1) ? SOL_SOCKET : lcmsg_level;
+            int mac_type = lcmsg_type;
+
+            /* Build macOS cmsghdr: [4 cmsg_len][4 level][4 type][data at 12] */
+            if (mpos + CMSG_SPACE(ldata_len) > sizeof(mac_ctrl)) break;
+
+            /* Use CMSG macros to build properly aligned macOS cmsghdr */
+            struct msghdr tmsg = { .msg_control = mac_ctrl + mpos,
+                                   .msg_controllen = sizeof(mac_ctrl) - mpos };
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&tmsg);
+            if (!cmsg) break;
+            cmsg->cmsg_len = CMSG_LEN(ldata_len);
+            cmsg->cmsg_level = mac_level;
+            cmsg->cmsg_type = mac_type;
+            memcpy(CMSG_DATA(cmsg), linux_ctrl + lpos + 16, ldata_len);
+
+            /* For SCM_RIGHTS: translate guest fds to host fds */
+            if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
+                int *fds = (int *)CMSG_DATA(cmsg);
+                size_t nfds = ldata_len / sizeof(int);
+                for (size_t i = 0; i < nfds; i++) {
+                    int hfd = fd_to_host(fds[i]);
+                    if (hfd < 0) return -LINUX_EBADF;
+                    fds[i] = hfd;
+                }
+            }
+
+            mpos += CMSG_SPACE(ldata_len);
+
+            /* Advance to next Linux cmsghdr (8-byte aligned) */
+            lpos += (size_t)((lcmsg_len + 7) & ~7ULL);
+        }
+
+        if (mpos > 0) {
+            ctrl_ptr = mac_ctrl;
+            ctrl_len = (socklen_t)mpos;
+        }
+    }
+
     struct msghdr msg = {
         .msg_name = dest_sa,
         .msg_namelen = dest_len,
         .msg_iov = host_iov,
         .msg_iovlen = (int)lmsg.msg_iovlen,
-        .msg_control = NULL,
-        .msg_controllen = 0,
+        .msg_control = ctrl_ptr,
+        .msg_controllen = ctrl_len,
         .msg_flags = 0,
     };
 
@@ -679,13 +803,27 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
     struct sockaddr_storage mac_sa;
     socklen_t sa_len = sizeof(mac_sa);
 
+    /* Provide a control message buffer for SCM_RIGHTS reception.
+     * Rosetta uses SCM_RIGHTS to receive AOT translation fds from
+     * the rosettad handler thread via the socketpair.
+     *
+     * macOS cmsghdr is 12 bytes, Linux is 16 bytes — we must
+     * translate from macOS format back to Linux format before
+     * writing to guest memory. */
+    uint8_t mac_ctrl[256];
+    socklen_t ctrl_alloc = 0;
+
+    if (lmsg.msg_control && lmsg.msg_controllen > 0) {
+        ctrl_alloc = sizeof(mac_ctrl);
+    }
+
     struct msghdr msg = {
         .msg_name = lmsg.msg_name ? &mac_sa : NULL,
         .msg_namelen = lmsg.msg_name ? sa_len : 0,
         .msg_iov = host_iov,
         .msg_iovlen = (int)lmsg.msg_iovlen,
-        .msg_control = NULL,
-        .msg_controllen = 0,
+        .msg_control = ctrl_alloc > 0 ? mac_ctrl : NULL,
+        .msg_controllen = ctrl_alloc,
         .msg_flags = 0,
     };
 
@@ -710,13 +848,82 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
             return -LINUX_EFAULT;
     }
 
-    /* Write back msg_controllen = 0 (offset 40 in linux_msghdr_t).
-     * We don't forward ancillary data to the host, so the guest must
-     * see controllen=0 — otherwise musl's CMSG_FIRSTHDR returns a
-     * pointer into the uninitialized cmsg buffer, causing crashes. */
-    uint64_t zero64 = 0;
-    if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
-        return -LINUX_EFAULT;
+    /* Translate received macOS cmsghdr chain → Linux format.
+     *
+     * macOS: { uint32_t cmsg_len; int level; int type; data at 12 }
+     * Linux: { uint64_t cmsg_len; int level; int type; data at 16 }
+     *
+     * SOL_SOCKET: macOS=0xFFFF → Linux=1
+     * CMSG_ALIGN: macOS=4, Linux=8 */
+    if (ctrl_alloc > 0 && msg.msg_controllen > 0 && lmsg.msg_control) {
+        uint8_t linux_ctrl[512];
+        size_t lpos = 0;
+
+        struct cmsghdr *cmsg;
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            /* Linux CMSG_LEN = 16 + data_len */
+            uint64_t lcmsg_len = 16 + data_len;
+            /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */
+            size_t lcmsg_space = (size_t)((lcmsg_len + 7) & ~7ULL);
+
+            if (lpos + lcmsg_space > sizeof(linux_ctrl)) break;
+            if (lpos + lcmsg_space > lmsg.msg_controllen) break;
+
+            /* Translate SOL_SOCKET (macOS=0xFFFF → Linux=1) */
+            int32_t llevel = (cmsg->cmsg_level == SOL_SOCKET) ? 1
+                             : cmsg->cmsg_level;
+            int32_t ltype = cmsg->cmsg_type;
+
+            /* For SCM_RIGHTS: translate host fds → guest fds */
+            uint8_t data_copy[128];
+            uint8_t *data_src = CMSG_DATA(cmsg);
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS && data_len <= sizeof(data_copy)) {
+                memcpy(data_copy, data_src, data_len);
+                int *fds = (int *)data_copy;
+                size_t nfds = data_len / sizeof(int);
+                for (size_t i = 0; i < nfds; i++) {
+                    int gfd = fd_alloc(FD_REGULAR, fds[i]);
+                    if (gfd < 0) {
+                        close(fds[i]);
+                        fds[i] = -1;
+                    } else {
+                        fds[i] = gfd;
+                    }
+                }
+                data_src = data_copy;
+            }
+
+            /* Build Linux cmsghdr */
+            memset(linux_ctrl + lpos, 0, lcmsg_space);
+            memcpy(linux_ctrl + lpos, &lcmsg_len, 8);
+            memcpy(linux_ctrl + lpos + 8, &llevel, 4);
+            memcpy(linux_ctrl + lpos + 12, &ltype, 4);
+            memcpy(linux_ctrl + lpos + 16, data_src, data_len);
+
+            lpos += lcmsg_space;
+        }
+
+        if (lpos > 0) {
+            if (guest_write(g, lmsg.msg_control, linux_ctrl, lpos) < 0)
+                return -LINUX_EFAULT;
+            uint64_t lctl = lpos;
+            if (guest_write(g, msg_gva + 40, &lctl, 8) < 0)
+                return -LINUX_EFAULT;
+        } else {
+            uint64_t zero64 = 0;
+            if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
+                return -LINUX_EFAULT;
+        }
+    } else {
+        /* No control messages — write controllen=0 to prevent guest from
+         * reading uninitialized cmsg buffer via CMSG_FIRSTHDR. */
+        uint64_t zero64 = 0;
+        if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
+            return -LINUX_EFAULT;
+    }
 
     /* Update msg_flags in guest (offset 48 in linux_msghdr_t) */
     int32_t mflags = msg.msg_flags;

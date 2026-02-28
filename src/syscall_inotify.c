@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 
@@ -81,16 +82,17 @@ typedef struct {
 } inotify_instance_t;
 
 static inotify_instance_t inotify_state[INOTIFY_MAX];
-static int inotify_inited = 0;
+
+/* Mutex protecting inotify_state[] for concurrent access.
+ * Two guest threads may create/close/add-watch on different inotify
+ * instances simultaneously.  Lock order: 7 (after pid_lock). */
+static pthread_mutex_t inotify_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------- Init / lookup helpers ---------- */
 
-static void inotify_init_once(void) {
-    if (!inotify_inited) {
-        for (int i = 0; i < INOTIFY_MAX; i++)
-            inotify_state[i].guest_fd = -1;
-        inotify_inited = 1;
-    }
+void inotify_init(void) {
+    for (int i = 0; i < INOTIFY_MAX; i++)
+        inotify_state[i].guest_fd = -1;
 }
 
 static int inotify_find(int guest_fd) {
@@ -279,8 +281,6 @@ static int collect_events(inotify_instance_t *inst) {
 /* ---------- Public API ---------- */
 
 int64_t sys_inotify_init1(int flags) {
-    inotify_init_once();
-
     int kq = kqueue();
     if (kq < 0) return linux_errno();
 
@@ -308,8 +308,10 @@ int64_t sys_inotify_init1(int flags) {
         return -LINUX_EMFILE;
     }
 
+    pthread_mutex_lock(&inotify_lock);
     int slot = inotify_slot_alloc();
     if (slot < 0) {
+        pthread_mutex_unlock(&inotify_lock);
         close(kq);
         close(pipefd[0]);
         close(pipefd[1]);
@@ -325,6 +327,7 @@ int64_t sys_inotify_init1(int flags) {
     inst->nonblock = (flags & IN_NONBLOCK) ? 1 : 0;
     inst->event_used = 0;
     memset(inst->watches, 0, sizeof(inst->watches));
+    pthread_mutex_unlock(&inotify_lock);
 
     fd_table[gfd].linux_flags = (flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
 
@@ -333,12 +336,8 @@ int64_t sys_inotify_init1(int flags) {
 
 int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
                                uint64_t path_gva, uint32_t mask) {
-    int slot = inotify_find(inotify_fd);
-    if (slot < 0) return -LINUX_EBADF;
-
-    inotify_instance_t *inst = &inotify_state[slot];
-
-    /* Read path from guest memory */
+    /* Read path from guest memory (no lock needed — guest_read_str
+     * only touches per-guest state, not inotify_state). */
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
@@ -355,9 +354,21 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     if (fstat(host_fd, &st) == 0 && S_ISDIR(st.st_mode))
         is_dir = 1;
 
+    pthread_mutex_lock(&inotify_lock);
+
+    int slot = inotify_find(inotify_fd);
+    if (slot < 0) {
+        pthread_mutex_unlock(&inotify_lock);
+        close(host_fd);
+        return -LINUX_EBADF;
+    }
+
+    inotify_instance_t *inst = &inotify_state[slot];
+
     /* Find or allocate a watch slot */
     int widx = watch_slot_alloc(inst);
     if (widx < 0) {
+        pthread_mutex_unlock(&inotify_lock);
         close(host_fd);
         return -LINUX_ENOSPC;
     }
@@ -369,18 +380,26 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     w->mask = mask;
     w->is_dir = is_dir;
 
+    /* Capture kq_fd while under lock */
+    int kq_fd = inst->kq_fd;
+    pthread_mutex_unlock(&inotify_lock);
+
     /* Register kevent with EVFILT_VNODE. EV_CLEAR makes it re-arm
      * automatically after each kevent() retrieval, matching inotify's
-     * continuous monitoring behavior. */
+     * continuous monitoring behavior.
+     * kevent() is thread-safe; run outside the lock to avoid blocking. */
     uint32_t notes = in_mask_to_notes(mask);
     struct kevent kev;
     EV_SET(&kev, (uintptr_t)host_fd, EVFILT_VNODE,
            EV_ADD | EV_CLEAR, notes, 0, NULL);
-    if (kevent(inst->kq_fd, &kev, 1, NULL, 0, NULL) < 0) {
+    if (kevent(kq_fd, &kev, 1, NULL, 0, NULL) < 0) {
         int saved = errno;
-        close(host_fd);
+        /* Roll back the watch slot */
+        pthread_mutex_lock(&inotify_lock);
         w->wd = 0;
         w->host_fd = 0;
+        pthread_mutex_unlock(&inotify_lock);
+        close(host_fd);
         errno = saved;
         return linux_errno();
     }
@@ -389,25 +408,37 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
 }
 
 int64_t sys_inotify_rm_watch(int inotify_fd, int wd) {
+    pthread_mutex_lock(&inotify_lock);
+
     int slot = inotify_find(inotify_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) {
+        pthread_mutex_unlock(&inotify_lock);
+        return -LINUX_EBADF;
+    }
 
     inotify_instance_t *inst = &inotify_state[slot];
     int widx = watch_find(inst, wd);
-    if (widx < 0) return -LINUX_EINVAL;
+    if (widx < 0) {
+        pthread_mutex_unlock(&inotify_lock);
+        return -LINUX_EINVAL;
+    }
 
     inotify_watch_t *w = &inst->watches[widx];
+    int host_fd = w->host_fd;
+    int kq_fd = inst->kq_fd;
 
-    /* Remove from kqueue */
-    struct kevent kev;
-    EV_SET(&kev, (uintptr_t)w->host_fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-    kevent(inst->kq_fd, &kev, 1, NULL, 0, NULL);  /* Ignore error */
-
-    close(w->host_fd);
+    /* Clear the slot while holding the lock */
     w->wd = 0;
     w->host_fd = 0;
     w->mask = 0;
     w->is_dir = 0;
+    pthread_mutex_unlock(&inotify_lock);
+
+    /* Remove from kqueue and close outside lock */
+    struct kevent kev;
+    EV_SET(&kev, (uintptr_t)host_fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
+    kevent(kq_fd, &kev, 1, NULL, 0, NULL);  /* Ignore error */
+    close(host_fd);
 
     return 0;
 }
@@ -499,28 +530,46 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
 }
 
 void inotify_close(int guest_fd) {
+    pthread_mutex_lock(&inotify_lock);
+
     int slot = inotify_find(guest_fd);
-    if (slot < 0) return;
+    if (slot < 0) {
+        pthread_mutex_unlock(&inotify_lock);
+        return;
+    }
 
     inotify_instance_t *inst = &inotify_state[slot];
 
-    /* Close all watch host fds and remove from kqueue */
+    /* Snapshot state that needs cleanup, then mark slot free.
+     * This prevents other threads from finding this instance. */
+    int kq_fd = inst->kq_fd;
+    int pipe_wr = inst->pipe_wr;
+
+    /* Collect watch host fds to close outside lock */
+    int watch_fds[INOTIFY_WATCHES];
+    int nfds = 0;
     for (int i = 0; i < INOTIFY_WATCHES; i++) {
         if (inst->watches[i].wd != 0) {
-            struct kevent kev;
-            EV_SET(&kev, (uintptr_t)inst->watches[i].host_fd,
-                   EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-            kevent(inst->kq_fd, &kev, 1, NULL, 0, NULL);
-            close(inst->watches[i].host_fd);
+            watch_fds[nfds++] = inst->watches[i].host_fd;
             inst->watches[i].wd = 0;
         }
     }
 
-    /* Close kqueue and pipe write end.
-     * pipe_rd is closed by sys_close() as the host_fd. */
-    close(inst->kq_fd);
-    close(inst->pipe_wr);
-
     inst->guest_fd = -1;
     inst->event_used = 0;
+    pthread_mutex_unlock(&inotify_lock);
+
+    /* Close all watch fds and remove from kqueue outside lock */
+    for (int i = 0; i < nfds; i++) {
+        struct kevent kev;
+        EV_SET(&kev, (uintptr_t)watch_fds[i],
+               EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
+        kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+        close(watch_fds[i]);
+    }
+
+    /* Close kqueue and pipe write end.
+     * pipe_rd is closed by sys_close() as the host_fd. */
+    close(kq_fd);
+    close(pipe_wr);
 }

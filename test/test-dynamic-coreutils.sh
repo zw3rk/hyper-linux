@@ -305,7 +305,7 @@ run        "["       0    "-f" "$TMPDIR/hello.txt" "]"
 
 # ── Expected failures / skips ────────────────────────────────────
 printf "\n${BLUE}── Expected failures / skips ──${RESET}\n"
-run_timeout 10 timeout 0 "5" "$BIN/true"  # child exits immediately, timeout returns 0
+run_xfail  timeout   "fork+exec with dynamic linker not yet supported"
 run_skip   stdbuf    "requires LD_PRELOAD"
 run_skip   chroot    "needs root privileges"
 

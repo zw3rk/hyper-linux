@@ -57,13 +57,9 @@ static struct {
     int      armed;         /* 1 if timer is running */
 } timerfd_state[TIMERFD_MAX];
 
-static void timerfd_init_once(void) {
-    static int inited = 0;
-    if (!inited) {
-        for (int i = 0; i < TIMERFD_MAX; i++)
-            timerfd_state[i].guest_fd = -1;
-        inited = 1;
-    }
+void timerfd_init(void) {
+    for (int i = 0; i < TIMERFD_MAX; i++)
+        timerfd_state[i].guest_fd = -1;
 }
 
 static int timerfd_find(int guest_fd) {
@@ -79,8 +75,6 @@ static int timerfd_alloc(void) {
 }
 
 int64_t sys_timerfd_create(int clockid, int flags) {
-    timerfd_init_once();
-
     int kq = kqueue();
     if (kq < 0) return linux_errno();
 
@@ -319,13 +313,9 @@ static struct {
     int      nonblock;     /* O_NONBLOCK */
 } eventfd_state[EVENTFD_MAX];
 
-static void eventfd_init_once(void) {
-    static int inited = 0;
-    if (!inited) {
-        for (int i = 0; i < EVENTFD_MAX; i++)
-            eventfd_state[i].guest_fd = -1;
-        inited = 1;
-    }
+void eventfd_init(void) {
+    for (int i = 0; i < EVENTFD_MAX; i++)
+        eventfd_state[i].guest_fd = -1;
 }
 
 static int eventfd_find(int guest_fd) {
@@ -341,8 +331,6 @@ static int eventfd_slot_alloc(void) {
 }
 
 int64_t sys_eventfd2(unsigned int initval, int flags) {
-    eventfd_init_once();
-
     /* Create self-pipe for poll/epoll readiness signaling */
     int pipefd[2];
     if (pipe(pipefd) < 0) return linux_errno();
@@ -530,13 +518,9 @@ static struct {
     int      nonblock;   /* O_NONBLOCK */
 } signalfd_state[SIGNALFD_MAX];
 
-static void signalfd_init_once(void) {
-    static int inited = 0;
-    if (!inited) {
-        for (int i = 0; i < SIGNALFD_MAX; i++)
-            signalfd_state[i].guest_fd = -1;
-        inited = 1;
-    }
+void signalfd_init(void) {
+    for (int i = 0; i < SIGNALFD_MAX; i++)
+        signalfd_state[i].guest_fd = -1;
 }
 
 static int signalfd_find(int guest_fd) {
@@ -563,8 +547,6 @@ void signalfd_close(int guest_fd) {
 
 int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,
                        uint64_t sigsetsize, int flags) {
-    signalfd_init_once();
-
     /* Read the signal mask from guest memory */
     uint64_t mask = 0;
     if (sigsetsize < 8) return -LINUX_EINVAL;

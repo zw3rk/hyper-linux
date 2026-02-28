@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include "guest.h"
 
+/* Initialize inotify state arrays. Must be called once from
+ * syscall_init() before any guest code runs. */
+void inotify_init(void);
+
 /* Create an inotify instance. flags may include IN_NONBLOCK (0x800) and
  * IN_CLOEXEC (0x80000). Returns a guest fd or negative Linux errno. */
 int64_t sys_inotify_init1(int flags);

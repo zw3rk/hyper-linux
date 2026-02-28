@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include "guest.h"
 
+/* Initialize all special FD subsystem state arrays. Must be called
+ * once from syscall_init() before any guest code runs. */
+void timerfd_init(void);
+void eventfd_init(void);
+void signalfd_init(void);
+
 /* timerfd (emulated via kqueue) */
 int64_t sys_timerfd_create(int clockid, int flags);
 int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,

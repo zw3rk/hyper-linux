@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <libkern/OSCacheControl.h>
+#include <mach-o/dyld.h>
 
 #include "guest.h"
 #include "elf.h"
@@ -699,6 +700,16 @@ int main(int argc, const char **argv) {
     /* ---- Step 6: Build Linux initial stack ---- */
     syscall_init();
     proc_init();
+
+    /* Record the absolute path of the hl binary itself so that
+     * sub-processes (rosettad AOT translation) can invoke it. */
+    {
+        char self_path[LINUX_PATH_MAX];
+        uint32_t path_len = sizeof(self_path);
+        if (_NSGetExecutablePath(self_path, &path_len) == 0)
+            proc_set_hl_path(self_path);
+    }
+
     proc_set_shim(shim_bin, shim_bin_len);
     /* In rosetta mode, /proc/self/exe must point to rosetta (the
      * interpreter), not the x86_64 binary. This matches real Linux
@@ -731,12 +742,12 @@ int main(int argc, const char **argv) {
     }
 
     if (need_rosetta) {
-        /* Rosetta mode: build argv as binfmt_misc with 'OCF' flags would.
-         * Linux binfmt_misc with 'O' flag:
-         *   1. Kernel opens the x86_64 binary → fd N (lowest available = 3)
-         *   2. argv = [interpreter, /dev/fd/N, original_argv0, ...]
-         * Rosetta expects the binary pre-opened; it reads the fd path
-         * via readlinkat(/proc/self/fd/N) to get the real binary path. */
+        /* Rosetta mode: build argv similar to binfmt_misc.
+         * Rosetta passes argv[1] directly as the translated program's
+         * argv[0], so we use the real binary path (not /proc/self/fd/N)
+         * so that programs like busybox can determine their applet name
+         * via basename(argv[0]).  The binary is also pre-opened at fd 3
+         * for rosetta to mmap during translation. */
         int bin_host_fd = open(elf_realpath, O_RDONLY);
         if (bin_host_fd < 0) {
             fprintf(stderr, "hl: failed to pre-open binary: %s\n", elf_realpath);
@@ -751,10 +762,12 @@ int main(int argc, const char **argv) {
             return 1;
         }
 
-        char devfd_path[32];
-        snprintf(devfd_path, sizeof(devfd_path), "/dev/fd/%d", bin_guest_fd);
-
-        int rosetta_argc = guest_argc + 2;
+        /* Rosetta passes argv[1] directly as the translated program's
+         * argv[0].  We pass the real binary path here so the translated
+         * program sees the correct name (e.g., busybox uses basename(argv[0])
+         * for applet lookup).  The binary is also pre-opened at fd 3 for
+         * rosetta's internal use (it opens argv[1] and mmaps the ELF). */
+        int rosetta_argc = guest_argc + 1;  /* rosetta_path + binary_path + original_argv[1:] */
         const char **rosetta_argv = malloc(sizeof(char *) * (rosetta_argc + 1));
         if (!rosetta_argv) {
             fprintf(stderr, "hl: malloc failed for rosetta argv\n");
@@ -762,9 +775,9 @@ int main(int argc, const char **argv) {
             return 1;
         }
         rosetta_argv[0] = ROSETTA_PATH;
-        rosetta_argv[1] = devfd_path;
-        for (int i = 0; i < guest_argc; i++)
-            rosetta_argv[i + 2] = guest_argv[i];
+        rosetta_argv[1] = elf_realpath;
+        for (int i = 1; i < guest_argc; i++)
+            rosetta_argv[i + 1] = guest_argv[i];
         rosetta_argv[rosetta_argc] = NULL;
 
         /* Stack auxv describes rosetta as the main binary (binfmt_misc

@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <pthread.h>
 #include <termios.h>
 
 /* ---------- Linux terminal struct types ---------- */
@@ -251,6 +253,207 @@ int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
     return sys_pwritev(g, fd, iov_gva, iovcnt, offset);
 }
 
+/* ---------- rosettad socket tracking ---------- */
+
+/* Rosetta connects to rosettad via a Unix socket for AOT translation.
+ * Since macOS doesn't support Linux abstract sockets, we use a socketpair
+ * to intercept this communication. These functions track which host fd
+ * is the rosettad socketpair end so we can intercept connect() and
+ * monitor the protocol. */
+static int rosettad_handler_fd = -1;  /* Our end of the socketpair */
+static int rosettad_client_fd = -1;   /* Rosetta's end (host fd) */
+
+/* Receive a file descriptor via SCM_RIGHTS ancillary data.
+ * Also reads the normal data payload into buf (up to buflen).
+ * Returns bytes of normal data received, or -1 on error.
+ * On success, *recv_fd is set to the received fd (-1 if none). */
+static ssize_t recv_fd(int sock, void *buf, size_t buflen, int *recv_fd_out) {
+    struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+    uint8_t cmsg_buf[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = cmsg_buf, .msg_controllen = sizeof(cmsg_buf)
+    };
+
+    *recv_fd_out = -1;
+    ssize_t n = recvmsg(sock, &msg, 0);
+    if (n <= 0) return n;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS) {
+        memcpy(recv_fd_out, CMSG_DATA(cmsg), sizeof(int));
+    }
+    return n;
+}
+
+/* Send a file descriptor via SCM_RIGHTS ancillary data.
+ * Also sends normal data from buf (buflen bytes).
+ * Returns bytes sent or -1 on error. */
+static ssize_t send_fd(int sock, const void *buf, size_t buflen, int send_fd_val) {
+    struct iovec iov = { .iov_base = (void *)buf, .iov_len = buflen };
+    uint8_t cmsg_buf[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = cmsg_buf, .msg_controllen = sizeof(cmsg_buf)
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &send_fd_val, sizeof(int));
+
+    return sendmsg(sock, &msg, 0);
+}
+
+/* Handle the rosettad protocol on our end of the socketpair.
+ * Protocol:
+ *   '?' → respond 0x01 (ready)
+ *   't' → receive binary fd via SCM_RIGHTS, translate, send back AOT fd
+ *   'd' → receive 32-byte digest, check cache, respond
+ *   'q' → quit
+ */
+static void *rosettad_handler_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+
+    for (;;) {
+        uint8_t cmd;
+        ssize_t n = read(fd, &cmd, 1);
+        if (n <= 0) break;
+
+        switch (cmd) {
+        case '?': {
+            /* Handshake: respond 0x01 (ready) */
+            uint8_t resp = 0x01;
+            write(fd, &resp, 1);
+            break;
+        }
+
+        case 't': {
+            /* Translate request: rosetta sends the binary fd via sendmsg
+             * (SCM_RIGHTS) with a 1-byte data payload. */
+            uint8_t params[256];
+            int bin_fd = -1;
+
+            recv_fd(fd, params, sizeof(params), &bin_fd);
+
+            if (bin_fd < 0) {
+                uint8_t resp = 0x00;
+                write(fd, &resp, 1);
+                break;
+            }
+
+            /* Get the binary's path via F_GETPATH */
+            char bin_path[1024];
+            if (fcntl(bin_fd, F_GETPATH, bin_path) < 0) {
+                fprintf(stderr, "hl: rosettad: F_GETPATH failed: %s\n",
+                        strerror(errno));
+                uint8_t resp = 0x00;
+                write(fd, &resp, 1);
+                close(bin_fd);
+                break;
+            }
+            close(bin_fd);
+
+            /* Create temp file for AOT output */
+            char aot_path[] = "/tmp/hl-aot-XXXXXX";
+            int aot_fd = mkstemp(aot_path);
+            if (aot_fd < 0) {
+                uint8_t resp = 0x00;
+                write(fd, &resp, 1);
+                break;
+            }
+            close(aot_fd);
+
+            /* Run rosettad translate via hl (it's a Linux binary).
+             * proc_get_hl_path() returns the absolute path of the running
+             * hl binary, resolved at startup via _NSGetExecutablePath(). */
+            const char *hl_bin = proc_get_hl_path();
+            if (!hl_bin) hl_bin = "hl";  /* fallback to PATH lookup */
+            char cmd_buf[2048];
+            snprintf(cmd_buf, sizeof(cmd_buf),
+                     "'%s' /Library/Apple/usr/libexec/oah/RosettaLinux/rosettad "
+                     "translate '%s' '%s' 2>/dev/null",
+                     hl_bin, bin_path, aot_path);
+            int ret = system(cmd_buf);
+
+            if (ret != 0) {
+                fprintf(stderr, "hl: rosettad: translate failed (%d) for %s\n",
+                        ret, bin_path);
+                uint8_t resp = 0x00;
+                write(fd, &resp, 1);
+                unlink(aot_path);
+                break;
+            }
+
+            /* TODO: Compute real digest via rosettad digest command.
+             * For now, send zeros — rosetta accepts this. */
+            uint8_t digest[32] = {0};
+
+            /* Open the AOT file and send it back */
+            aot_fd = open(aot_path, O_RDONLY);
+            if (aot_fd < 0) {
+                uint8_t resp = 0x00;
+                write(fd, &resp, 1);
+                unlink(aot_path);
+                break;
+            }
+            unlink(aot_path);  /* Remove temp file, fd keeps it alive */
+
+            /* Send success + digest */
+            uint8_t resp = 0x01;
+            write(fd, &resp, 1);
+            write(fd, digest, 32);
+
+            /* Send AOT fd via SCM_RIGHTS.
+             * The metadata payload format is unknown — send minimal data. */
+            uint8_t meta[8] = {0};
+            send_fd(fd, meta, sizeof(meta), aot_fd);
+            close(aot_fd);
+            break;
+        }
+
+        case 'd': {
+            /* Digest lookup: receive 32-byte SHA256 */
+            uint8_t digest[32];
+            read(fd, digest, 32);
+            /* We don't have a cache, respond 0x00 (not found) */
+            uint8_t resp = 0x00;
+            write(fd, &resp, 1);
+            break;
+        }
+
+        case 'q':
+            goto done;
+
+        default:
+            fprintf(stderr, "hl: rosettad: unknown cmd 0x%02x\n", cmd);
+            goto done;
+        }
+    }
+
+done:
+    close(fd);
+    return NULL;
+}
+
+void rosettad_set_socket(int fd) {
+    rosettad_handler_fd = fd;
+    /* Start background thread to monitor what rosetta sends */
+    pthread_t thr;
+    pthread_create(&thr, NULL, rosettad_handler_thread, (void *)(intptr_t)fd);
+    pthread_detach(thr);
+}
+
+void rosettad_set_client_fd(int fd) {
+    rosettad_client_fd = fd;
+}
+
+int rosettad_is_socket(int host_fd) {
+    return rosettad_client_fd >= 0 && host_fd == rosettad_client_fd;
+}
+
 /* ---------- terminal I/O ---------- */
 
 /* Rosetta Virtualization.framework ioctls — type 'a' (0x61).
@@ -301,10 +504,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
          *
          * We return success with caps[0]=1 to enable VZ mode. */
         uint8_t caps[128] = {0};
-        caps[0] = 1;  /* Enable VZ mode */
+        caps[0] = 1;   /* Enable VZ mode */
+        caps[108] = 1;  /* Additional capability flag */
         if (guest_write(g, arg, caps, sizeof(caps)) < 0)
             return -LINUX_EFAULT;
-        fprintf(stderr, "hl: VZ_CAPS: returning success (VZ mode enabled)\n");
         return 0;
     }
 
@@ -312,7 +515,6 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         /* Rosetta JIT activation / hypervisor handshake. Returning 0
          * tells rosetta the VZ channel is active. On error, rosetta
          * handles EOPNOTSUPP (95) and ENOTTY (25) gracefully. */
-        fprintf(stderr, "hl: VZ_ACTIVATE: returning success\n");
         return 0;
 
     case LINUX_TIOCGWINSZ: {
@@ -604,7 +806,7 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
                 : write(host_out, buf + written, r - written);
             if (w <= 0) {
                 if (w < 0 && errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-                free(buf); goto done;
+                goto done;
             }
             written += w;
             if (off_out >= 0) off_out += w;
