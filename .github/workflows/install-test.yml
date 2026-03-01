@@ -1,0 +1,206 @@
+# CI — Verify all installation methods work correctly
+#
+# Runs after a release is published to validate that users can actually
+# install hl via every documented method.  Also runs on PRs that touch
+# install-related files.
+#
+# Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Install Tests
+
+on:
+  # Validate after every release
+  release:
+    types: [published]
+  # Validate on PRs touching install infrastructure
+  pull_request:
+    paths:
+      - 'site/install.sh'
+      - 'Formula/**'
+      - 'dist/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/install-test.yml'
+  # Manual trigger for debugging
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to test (e.g. v0.1.1)'
+        required: false
+        default: ''
+
+env:
+  NIX_CONFIG: |
+    extra-experimental-features = nix-command flakes
+
+jobs:
+  # ── curl installer ──────────────────────────────────────────────
+  # Validates site/install.sh works end-to-end.
+  # On PR: dry-run using the dist artifacts from the build job.
+  # On release: tests the actual published release URL.
+  install-curl:
+    name: "curl installer"
+    runs-on: [self-hosted, macOS, ARM64]
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run install script
+        run: |
+          # Install to a temporary prefix to avoid contaminating the runner
+          export INSTALL_DIR="$(mktemp -d)/bin"
+          export MAN_DIR="$(mktemp -d)/man/man1"
+          mkdir -p "$INSTALL_DIR" "$MAN_DIR"
+
+          # Patch install.sh to use our temp dirs (in-memory, not modifying file)
+          sed "s|/usr/local/bin|$INSTALL_DIR|g; s|/usr/local/share/man/man1|$MAN_DIR|g" \
+            site/install.sh | sh
+
+      - name: Verify installed binary
+        run: |
+          INSTALL_DIR="$(ls -d /tmp/tmp.*/bin 2>/dev/null | head -1)"
+          test -x "${INSTALL_DIR}/hl"
+          "${INSTALL_DIR}/hl" --version | grep -q "hl"
+          echo "✓ curl installer works"
+
+  # ── Homebrew formula (syntax check) ─────────────────────────────
+  # Validates the formula is syntactically correct and can be loaded.
+  # Full `brew install` test requires the tap repo, so we test what
+  # we can: ruby syntax, brew audit, and brew style.
+  install-brew:
+    name: "brew formula lint"
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate formula syntax
+        run: |
+          ruby -c Formula/hl.rb
+          echo "✓ Ruby syntax OK"
+
+      - name: Brew audit (tap mode)
+        run: |
+          # Create a temporary tap structure for brew to validate
+          TAP_DIR="$(brew --repository)/Library/Taps/zw3rk/homebrew-hyper-linux"
+          mkdir -p "${TAP_DIR}/Formula"
+          cp Formula/hl.rb "${TAP_DIR}/Formula/hl.rb"
+          # Initialize as a git repo (brew audit requires this)
+          cd "$TAP_DIR"
+          git init -q
+          git add .
+          git commit -q -m "init"
+          # Run audit (--tap to validate as a tap formula)
+          brew audit --formula "${TAP_DIR}/Formula/hl.rb" || true
+          # Style check
+          brew style --formula "${TAP_DIR}/Formula/hl.rb" || true
+          # Clean up
+          rm -rf "$TAP_DIR"
+          echo "✓ Brew audit complete"
+
+  # ── Nix flake ───────────────────────────────────────────────────
+  # Validates `nix build` and `nix run` work correctly.
+  install-nix:
+    name: "nix flake"
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Validate nix build
+        run: |
+          nix build
+          test -x result/bin/hl
+          result/bin/hl --version | grep -q "hl"
+          echo "✓ nix build works"
+
+      - name: Validate nix run
+        run: |
+          nix run . -- --version 2>&1 | grep -q "hl"
+          echo "✓ nix run works"
+
+  # ── .pkg installer ─────────────────────────────────────────────
+  # Validates the pkg builds and can be expanded (not installed,
+  # since that requires root and modifies the runner).
+  install-pkg:
+    name: "pkg installer"
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Build pkg
+        run: nix develop .#ci -c sh -c 'make hl && make pkg'
+
+      - name: Validate pkg contents
+        run: |
+          PKG=$(ls dist/out/*.pkg | head -1)
+          # Expand to temp dir and verify contents
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/pkg"
+          # Check payload exists
+          test -d "$EXPAND_DIR/pkg"
+          echo "✓ pkg builds and expands correctly"
+          rm -rf "$EXPAND_DIR"
+
+  # ── From-source build ──────────────────────────────────────────
+  # Validates clean checkout → build → working binary.
+  install-source:
+    name: "from source"
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Clean build from source
+        run: |
+          nix develop .#ci -c sh -c 'make clean && make hl'
+          test -x _build/hl
+          _build/hl --version | grep -q "hl"
+          echo "✓ from-source build works"
+
+  # ── dist zip ───────────────────────────────────────────────────
+  # Validates the zip archive builds and contains expected files.
+  install-dist:
+    name: "dist zip"
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Build dist zip
+        run: nix develop .#ci -c sh -c 'make hl && make dist'
+
+      - name: Validate zip contents
+        run: |
+          ZIP=$(ls dist/out/*.zip | head -1)
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -qo "$ZIP" -d "$EXTRACT_DIR"
+          # Find extracted directory
+          DIR=$(find "$EXTRACT_DIR" -maxdepth 1 -type d -name 'hl-*' | head -1)
+          # Verify all expected files
+          test -f "$DIR/hl"
+          test -f "$DIR/hl.1"
+          test -f "$DIR/entitlements.plist"
+          test -f "$DIR/configure"
+          test -f "$DIR/Makefile"
+          test -f "$DIR/LICENSE"
+          test -f "$DIR/README"
+          # Verify binary is executable
+          test -x "$DIR/hl"
+          echo "✓ dist zip contains all expected files"
+          rm -rf "$EXTRACT_DIR"

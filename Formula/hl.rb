@@ -5,6 +5,10 @@
 #
 # Install: brew install zw3rk/hyper-linux/hl
 #   (auto-taps github.com/zw3rk/homebrew-hyper-linux)
+#
+# This formula downloads a pre-built binary from GitHub Releases.
+# Codesigning with Hypervisor.framework entitlement happens in
+# post_install so it persists across `brew upgrade`.
 
 class Hl < Formula
   desc "Run aarch64/x86_64 Linux ELF binaries on macOS Apple Silicon"
@@ -20,12 +24,15 @@ class Hl < Formula
   def install
     bin.install "hl"
     man1.install "hl.1"
+    # Store entitlements for post_install codesigning and manual re-signing
+    (share/"hl").install "entitlements.plist"
+  end
 
-    # Re-sign with Hypervisor.framework entitlement.  The ad-hoc
-    # signature ("-") works for local execution; a Developer ID
-    # signature is needed for distribution outside Homebrew.
-    system "codesign", "--entitlements", buildpath/"entitlements.plist",
-           "-f", "-s", "-", bin/"hl"
+  def post_install
+    # Ad-hoc codesign with Hypervisor.framework entitlement.
+    # Must run on the end-user machine (ad-hoc signatures are local).
+    system "codesign", "--entitlements", "#{share}/hl/entitlements.plist",
+           "-f", "-s", "-", "#{bin}/hl"
   end
 
   def caveats
@@ -35,7 +42,8 @@ class Hl < Formula
 
       The binary has been codesigned with an ad-hoc signature for
       Hypervisor.framework access.  If you see "hv_vm_create failed",
-      check System Settings → Privacy & Security.
+      re-sign manually:
+        codesign --entitlements #{share}/hl/entitlements.plist -f -s - #{bin}/hl
     EOS
   end
 
