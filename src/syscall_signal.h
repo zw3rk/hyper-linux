@@ -114,6 +114,15 @@ typedef struct {
 #define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
 #define LINUX_TRAP_TRACE  2   /* Process trace trap (single-step) */
 
+/* si_code values for SIGSEGV (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_SEGV_MAPERR 1   /* Address not mapped to object */
+#define LINUX_SEGV_ACCERR 2   /* Invalid permissions for mapped object */
+
+/* si_code values for SIGBUS (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_BUS_ADRALN  1   /* Invalid address alignment */
+#define LINUX_BUS_ADRERR  2   /* Non-existent physical address */
+#define LINUX_BUS_OBJERR  3   /* Object-specific hardware error */
+
 /* ---------- Linux sigcontext (aarch64) ---------- */
 /* From arch/arm64/include/uapi/asm/sigcontext.h */
 typedef struct {

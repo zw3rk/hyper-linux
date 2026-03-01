@@ -43,6 +43,7 @@
 /* Program header types */
 #define PT_NULL    0
 #define PT_LOAD    1
+#define PT_DYNAMIC 2
 #define PT_INTERP  3
 #define PT_NOTE    4
 #define PT_PHDR    6

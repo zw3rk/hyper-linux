@@ -14,6 +14,7 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"
 #include "hv_util.h"
+#include "crash_report.h"
 #include "thread.h"
 #include "futex.h"
 
@@ -68,6 +69,126 @@ _Atomic int exit_group_requested = 0;
 
 /* Exit code set by the thread that calls exit_group */
 _Atomic int exit_group_code = 0;
+
+/* ---------- Rosetta memory dump for debugging ---------- */
+
+/* Dump guest memory regions to files for post-mortem analysis.
+ * Called when rosetta's JIT assertion fires (BRK → SIG_DFL SIGTRAP).
+ * Writes:
+ *   /tmp/hl-dump-regs.txt   — vCPU register state
+ *   /tmp/hl-dump-regions.txt — guest region listing
+ *   /tmp/hl-dump-XXXX-XXXX.bin — binary dumps of each region
+ */
+static void dump_rosetta_state(hv_vcpu_t vcpu, guest_t *g) {
+    fprintf(stderr, "hl: === ROSETTA STATE DUMP ===\n");
+
+    /* 1. Dump all vCPU registers */
+    FILE *rf = fopen("/tmp/hl-dump-regs.txt", "w");
+    if (rf) {
+        for (int i = 0; i <= 30; i++) {
+            uint64_t v;
+            hv_vcpu_get_reg(vcpu, (hv_reg_t)(HV_REG_X0 + i), &v);
+            fprintf(rf, "X%-2d = 0x%016llx\n", i, (unsigned long long)v);
+        }
+        uint64_t sp, pc, cpsr;
+        hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
+        hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
+        uint64_t elr;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+        fprintf(rf, "SP  = 0x%016llx\n", (unsigned long long)sp);
+        fprintf(rf, "PC  = 0x%016llx\n", (unsigned long long)pc);
+        fprintf(rf, "ELR = 0x%016llx\n", (unsigned long long)elr);
+        fprintf(rf, "CPSR= 0x%016llx\n", (unsigned long long)cpsr);
+        fclose(rf);
+        fprintf(stderr, "hl: dumped registers → /tmp/hl-dump-regs.txt\n");
+    }
+
+    /* 2. Dump region listing + binary data */
+    FILE *lf = fopen("/tmp/hl-dump-regions.txt", "w");
+    for (int i = 0; i < g->nregions; i++) {
+        guest_region_t *r = &g->regions[i];
+        uint64_t start = r->start;
+        uint64_t end   = r->end;
+        uint64_t size  = end - start;
+
+        /* Resolve display VA for aliases */
+        uint64_t disp_start = start;
+        uint64_t disp_end   = end;
+        if (r->display_va) {
+            disp_start = r->display_va;
+            disp_end   = r->display_va + size;
+        } else {
+            for (int j = 0; j < g->naliases; j++) {
+                if (start >= g->va_aliases[j].gpa_start &&
+                    end <= g->va_aliases[j].gpa_start + g->va_aliases[j].size) {
+                    disp_start = g->va_aliases[j].va_start +
+                                 (start - g->va_aliases[j].gpa_start);
+                    disp_end = disp_start + size;
+                    break;
+                }
+            }
+        }
+
+        char perms[5] = "----";
+        if (r->prot & 1) perms[0] = 'r';
+        if (r->prot & 2) perms[1] = 'w';
+        if (r->prot & 4) perms[2] = 'x';
+        perms[3] = (r->flags & 1) ? 's' : 'p';
+
+        if (lf) {
+            fprintf(lf, "%012llx-%012llx %s %s (gpa %012llx, %llu bytes)\n",
+                    (unsigned long long)disp_start,
+                    (unsigned long long)disp_end,
+                    perms,
+                    r->name[0] ? r->name : "<anon>",
+                    (unsigned long long)start,
+                    (unsigned long long)size);
+        }
+
+        /* Dump binary contents of interesting regions
+         * (skip huge anonymous regions to avoid multi-GB dumps) */
+        if (size > 0 && size <= 16 * 1024 * 1024 &&
+            start < g->guest_size) {
+            char path[256];
+            snprintf(path, sizeof(path),
+                     "/tmp/hl-dump-%012llx-%012llx.bin",
+                     (unsigned long long)disp_start,
+                     (unsigned long long)disp_end);
+            FILE *bf = fopen(path, "wb");
+            if (bf) {
+                uint64_t safe_size = size;
+                if (start + safe_size > g->guest_size)
+                    safe_size = g->guest_size - start;
+                fwrite((uint8_t *)g->host_base + start, 1, safe_size, bf);
+                fclose(bf);
+            }
+        }
+    }
+
+    /* Also dump kbuf pages that were W^X toggled (rosetta JIT slab).
+     * The kbuf sits at g->kbuf_gpa in the primary buffer. Dump the
+     * first 16MB of it (covers rosetta's active JIT pages). */
+    if (g->kbuf_base) {
+        char path[256];
+        uint64_t dump_size = 16 * 1024 * 1024;
+        snprintf(path, sizeof(path), "/tmp/hl-dump-kbuf-16MB.bin");
+        FILE *bf = fopen(path, "wb");
+        if (bf) {
+            fwrite(g->kbuf_base, 1, dump_size, bf);
+            fclose(bf);
+            if (lf) fprintf(lf, "kbuf: %012llx (host %p, 16MB dumped)\n",
+                            (unsigned long long)g->kbuf_gpa, g->kbuf_base);
+        }
+    }
+
+    if (lf) {
+        fclose(lf);
+        fprintf(stderr, "hl: dumped regions → /tmp/hl-dump-regions.txt\n");
+    }
+
+    fprintf(stderr, "hl: === END DUMP ===\n");
+}
 
 /* ---------- Public API ---------- */
 
@@ -253,6 +374,124 @@ void proc_mark_child_exited(pid_t host_pid, int status) {
     pthread_mutex_unlock(&pid_lock);
 }
 
+/* ---------- sys_ptrace ---------- */
+
+int64_t sys_ptrace(guest_t *g, uint64_t request, int64_t pid,
+                   uint64_t addr, uint64_t data) {
+    switch (request) {
+
+    case LINUX_PTRACE_SEIZE: {
+        /* Attach to target thread without stopping it. The tracee
+         * can later be stopped via PTRACE_INTERRUPT or BRK-induced
+         * ptrace-stop. Unlike PTRACE_ATTACH, SEIZE does not send
+         * SIGSTOP — Rosetta relies on this. */
+        thread_entry_t *target = thread_find(pid);
+        if (!target)
+            return -LINUX_ESRCH;
+        if (target->ptraced)
+            return -LINUX_EPERM;
+
+        target->ptraced    = 1;
+        target->tracer_tid = current_thread->guest_tid;
+        return 0;
+    }
+
+    case LINUX_PTRACE_CONT: {
+        /* Resume a stopped tracee, optionally injecting a signal.
+         * data = signal to inject (0 = none). */
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced)
+            return -LINUX_ESRCH;
+        if (!target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        thread_ptrace_cont(target, (int)data);
+        return 0;
+    }
+
+    case LINUX_PTRACE_INTERRUPT: {
+        /* Force a running tracee into ptrace-stop. Uses hv_vcpus_exit
+         * to break the tracee out of hv_vcpu_run; the tracee will then
+         * enter ptrace-stop in its HV_EXIT_REASON_CANCELED handler. */
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced)
+            return -LINUX_ESRCH;
+        if (target->ptrace_stopped)
+            return 0;  /* Already stopped */
+
+        hv_vcpus_exit(&target->vcpu, 1);
+        return 0;
+    }
+
+    case LINUX_PTRACE_GETREGSET: {
+        /* Read tracee registers via iovec. addr = NT_PRSTATUS (1),
+         * data = guest pointer to linux iovec_t {base, len}. */
+        if (addr != LINUX_NT_PRSTATUS)
+            return -LINUX_EINVAL;
+
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced || !target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        /* Read guest iovec */
+        linux_iovec_t iov;
+        if (guest_read(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        /* Copy register data (truncate if iovec is smaller) */
+        size_t copy_len = sizeof(linux_user_pt_regs_t);
+        if (iov.iov_len < copy_len)
+            copy_len = iov.iov_len;
+
+        if (guest_write(g, iov.iov_base, &target->ptrace_regs, copy_len) < 0)
+            return -LINUX_EFAULT;
+
+        /* Write back actual bytes transferred */
+        iov.iov_len = copy_len;
+        if (guest_write(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        return 0;
+    }
+
+    case LINUX_PTRACE_SETREGSET: {
+        /* Write tracee registers via iovec. addr = NT_PRSTATUS (1),
+         * data = guest pointer to linux iovec_t {base, len}. */
+        if (addr != LINUX_NT_PRSTATUS)
+            return -LINUX_EINVAL;
+
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced || !target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        /* Read guest iovec */
+        linux_iovec_t iov;
+        if (guest_read(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        /* Copy register data from guest */
+        size_t copy_len = sizeof(linux_user_pt_regs_t);
+        if (iov.iov_len < copy_len)
+            copy_len = iov.iov_len;
+
+        if (guest_read(g, iov.iov_base, &target->ptrace_regs, copy_len) < 0)
+            return -LINUX_EFAULT;
+
+        target->ptrace_regs_dirty = 1;
+
+        /* Write back actual bytes transferred */
+        iov.iov_len = copy_len;
+        if (guest_write(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        return 0;
+    }
+
+    default:
+        return -LINUX_EINVAL;
+    }
+}
+
 /* Write a macOS struct rusage to guest memory as linux_rusage_t.
  * The structs have identical field layout on LP64. */
 static int write_rusage_to_guest(guest_t *g, uint64_t gva,
@@ -283,6 +522,25 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
 int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                   int options, uint64_t rusage_gva) {
 
+    /* First check for ptraced or vm-clone children in the thread table.
+     * Rosetta's two-process JIT uses clone(CLONE_VM) + ptrace, and the
+     * child runs as an in-process thread, not a separate host process.
+     * thread_ptrace_wait handles both ptrace-stopped and vm-exited states. */
+    if (current_thread) {
+        int ptrace_status = 0;
+        int64_t ptrace_tid = thread_ptrace_wait(
+            current_thread->guest_tid, pid, &ptrace_status, options);
+        if (ptrace_tid > 0) {
+            if (status_gva) {
+                int32_t ls = ptrace_status;
+                guest_write(g, status_gva, &ls, sizeof(ls));
+            }
+            return ptrace_tid;
+        }
+        /* ptrace_tid == 0: no matching children or WNOHANG — fall through
+         * to the process table for regular fork children. */
+    }
+
     /* Translate Linux wait options */
     int mac_options = 0;
     if (options & 1) mac_options |= WNOHANG;   /* WNOHANG = 1 on both */
@@ -307,6 +565,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
                 pid_t host_pid = proc_table[i].host_pid;
                 int64_t gpid = proc_table[i].guest_pid;
+                int slot = i;
                 pthread_mutex_unlock(&pid_lock);
 
                 int status;
@@ -321,7 +580,10 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                     if (rusage_gva)
                         write_rusage_to_guest(g, rusage_gva, &ru);
                     pthread_mutex_lock(&pid_lock);
-                    proc_table[i].active = 0;
+                    /* Re-validate slot: another thread may have reaped it */
+                    if (proc_table[slot].active &&
+                        proc_table[slot].host_pid == host_pid)
+                        proc_table[slot].active = 0;
                     pthread_mutex_unlock(&pid_lock);
                     return gpid;
                 } else if (ret == 0) {
@@ -352,6 +614,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
             pid_t host_pid = proc_table[i].host_pid;
             int64_t gpid = proc_table[i].guest_pid;
+            int slot = i;
             pthread_mutex_unlock(&pid_lock);
 
             int status;
@@ -366,7 +629,10 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                 if (rusage_gva)
                     write_rusage_to_guest(g, rusage_gva, &ru);
                 pthread_mutex_lock(&pid_lock);
-                proc_table[i].active = 0;
+                /* Re-validate slot: another thread may have reaped it */
+                if (proc_table[slot].active &&
+                    proc_table[slot].host_pid == host_pid)
+                    proc_table[slot].active = 0;
                 pthread_mutex_unlock(&pid_lock);
                 /* Queue SIGCHLD for parent process */
                 signal_queue(LINUX_SIGCHLD);
@@ -550,7 +816,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         if (is_main)
             alarm((unsigned)timeout_sec);
 
-        HV_CHECK(hv_vcpu_run(vcpu));
+        HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         /* Main: disarm timeout */
         if (is_main)
@@ -587,6 +853,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     (unsigned long long)elr,
                     (unsigned long long)sctlr_val);
 
+            crash_report(vcpu, g, CRASH_TIMEOUT, NULL);
             exit_code = 124;
             break;
         }
@@ -641,6 +908,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         if (verify_elr == 0) {
                             fprintf(stderr, "%s: FATAL: ELR_EL1=0 after "
                                     "exec, register sync failed\n", prefix);
+                            crash_report(vcpu, g, CRASH_ELR_ZERO,
+                                         "ELR_EL1=0 after exec");
                             exit_code = 128;
                             running = 0;
                         }
@@ -722,10 +991,79 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         (crn << 7)  | (crm << 3)  | op2);
 
                     uint64_t value = 0;
-                    hv_return_t ret = hv_vcpu_get_sys_reg(vcpu, reg, &value);
+
+                    /* ID register emulation: return VZ-sanitized values
+                     * matching a real VZ (Lima) VM BEFORE trying HVF.
+                     * HVF's hv_vcpu_get_sys_reg succeeds for ID registers
+                     * but returns raw hardware values — which include
+                     * features the hypervisor doesn't actually virtualize.
+                     * Rosetta's JIT uses these to select code generation
+                     * paths; exposing unsupported features causes wrong
+                     * JIT code and assertion failures.
+                     *
+                     * Values captured from a Lima VZ VM on Apple Silicon
+                     * via inline MRS from EL0 (kernel trap-and-emulate).
+                     * These are checked first, before the HVF call. */
+                    int have_vz_override = 0;
+
+                    /* ID_AA64MMFR0_EL1 (3,0,0,7,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 0) {
+                        value = 0x00000111ff000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64MMFR1_EL1 (3,0,0,7,1) — VZ returns 0.
+                     * Raw hardware (e.g., 0x11212000) exposes HPDS, PAN,
+                     * LO, XNX etc. that VZ doesn't virtualize. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 1) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64MMFR2_EL1 (3,0,0,7,2) — VZ returns 0. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 2) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64ISAR0_EL1 (3,0,0,6,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 6 && op2 == 0) {
+                        value = 0x0021100110212120ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64ISAR1_EL1 (3,0,0,6,1) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 6 && op2 == 1) {
+                        value = 0x0000101110211402ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64PFR0_EL1 (3,0,0,4,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 4 && op2 == 0) {
+                        value = 0x0001000000110011ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64PFR1_EL1 (3,0,0,4,1) — VZ returns 0. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 4 && op2 == 1) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+
+                    if (have_vz_override) {
+                        if (verbose)
+                            fprintf(stderr, "%s: MRS trap: Op0=%u Op1=%u "
+                                    "CRn=%u CRm=%u Op2=%u → 0x%llx (VZ)\n",
+                                    prefix, op0, op1, crn, crm, op2,
+                                    (unsigned long long)value);
+                    }
+
+                    hv_return_t ret = have_vz_override ? HV_SUCCESS
+                        : hv_vcpu_get_sys_reg(vcpu, reg, &value);
                     if (ret != HV_SUCCESS) {
-                        /* HVF doesn't expose all system registers. Provide
-                         * host-side values for known registers that trap. */
+                        /* HVF doesn't expose this register. Provide a
+                         * host-side fallback for known registers. */
                         int have_fallback = 0;
 
                         /* CNTFRQ_EL0 (3,3,14,0,0): counter frequency.
@@ -737,6 +1075,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                              : "=r"(value));
                             have_fallback = 1;
                         }
+
+                        /* Non-ID register fallbacks for registers
+                         * that HVF doesn't expose. ID registers are
+                         * handled above (VZ overrides). */
 
                         if (verbose) {
                             if (have_fallback) {
@@ -759,6 +1101,16 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 prefix, op0, op1, crn, crm, op2,
                                 (unsigned long long)value);
                     }
+
+                    /* ID_AA64MMFR1_EL1 (3,0,0,7,1): pass through real
+                     * hardware value without modification. Real Lima VZ
+                     * VMs return the actual hardware value (no FEAT_AFP
+                     * on M1/M2), and rosetta runs successfully with
+                     * quality=1 JIT. Faking FEAT_AFP to unlock quality=2
+                     * combined with other hl-specific behaviors causes
+                     * "BasicBlock requested for unrecognized address"
+                     * assertion failures. */
+
                     hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
                     break;
                 }
@@ -802,14 +1154,24 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                      * (rosetta's JIT cache, internal allocations) or
                      * TTBR0 handler for normal user VA addresses. */
                     if (far >= KBUF_VA_BASE && g->kbuf_base) {
-                        guest_kbuf_split_block(g, far & ~(BLOCK_2MB - 1));
-                        guest_kbuf_update_perms(g, page_start, page_end,
-                                                new_perms);
+                        int sr = guest_kbuf_split_block(g,
+                                     far & ~(BLOCK_2MB - 1));
+                        int ur = guest_kbuf_update_perms(g, page_start,
+                                     page_end, new_perms);
+                        if (verbose && (sr < 0 || ur < 0))
+                            fprintf(stderr, "%s: W^X kbuf toggle FAILED "
+                                    "(split=%d update=%d)\n",
+                                    prefix, sr, ur);
                     } else {
                         uint64_t block_start = far & ~(BLOCK_2MB - 1);
-                        guest_split_block(g, block_start);
-                        guest_update_perms(g, page_start, page_end,
-                                           new_perms);
+                        int sr = guest_split_block(g, block_start);
+                        int ur = guest_update_perms(g, page_start,
+                                     page_end, new_perms);
+                        if (verbose && (sr < 0 || ur < 0))
+                            fprintf(stderr, "%s: W^X user toggle FAILED "
+                                    "(split=%d update=%d) far=0x%llx\n",
+                                    prefix, sr, ur,
+                                    (unsigned long long)far);
                     }
                     /* TLB flush is done by the shim (tlbi_restore_eret) */
                     g->need_tlbi = 0;
@@ -817,15 +1179,16 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 }
 
                 case 10: {
-                    /* HVC #10: BRK from EL0 → deliver SIGTRAP.
+                    /* HVC #10: BRK from EL0 → deliver SIGTRAP or ptrace-stop.
                      *
                      * Rosetta's JIT uses BRK instructions as trampolines
-                     * and internal breakpoints. The guest registers a SIGTRAP
-                     * handler via rt_sigaction. We queue SIGTRAP and deliver
-                     * it synchronously (build signal frame, redirect to handler).
+                     * and internal breakpoints. If the thread is ptraced,
+                     * the BRK enters a ptrace-stop (the tracer reads/writes
+                     * registers then CONT's). Otherwise we queue SIGTRAP
+                     * and deliver it via the signal frame mechanism.
                      *
                      * The shim has already restored all GPRs to their EL0
-                     * values, so signal_deliver reads the correct state.
+                     * values, so signal_deliver / ptrace_stop read correct state.
                      *
                      * The Linux kernel sets si_code=TRAP_BRKPT, si_addr=BRK_PC,
                      * and fault_address=BRK_PC for BRK-triggered SIGTRAP.
@@ -835,21 +1198,95 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
 
                     if (verbose)
-                        fprintf(stderr, "%s: BRK at 0x%llx → SIGTRAP\n",
-                                prefix, (unsigned long long)brk_pc);
+                        fprintf(stderr, "%s: BRK at 0x%llx → %s\n",
+                                prefix, (unsigned long long)brk_pc,
+                                current_thread->ptraced ? "ptrace-stop" : "SIGTRAP");
 
-                    signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
-                    signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                    if (current_thread->ptraced) {
+                        /* Ptrace-stop: suspend vCPU, notify tracer.
+                         * thread_ptrace_stop blocks until tracer CONT's. */
+                        int cont_sig = thread_ptrace_stop(current_thread, 5);
+                        if (cont_sig > 0) {
+                            signal_queue(cont_sig);
+                            int sr = signal_deliver(vcpu, g, &exit_code);
+                            if (sr < 0) running = 0;
+                        }
+                    } else {
+                        /* Non-ptraced: deliver SIGTRAP via signal frame */
+                        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
+                        signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        if (verbose)
+                            fprintf(stderr, "%s: signal_deliver returned %d\n",
+                                    prefix, sig_ret);
+                        if (sig_ret < 0) {
+                            /* SIG_DFL for SIGTRAP: rosetta assertion crash.
+                             * Dump all memory state for post-mortem analysis
+                             * of the JIT/AOT translation failure. */
+                            dump_rosetta_state(vcpu, g);
+                            running = 0;
+                        }
+                    }
+                    break;
+                }
+
+                case 11: {
+                    /* HVC #11: EL0 fault → deliver SIGSEGV.
+                     *
+                     * The shim forwards translation faults, access flag
+                     * faults, and read permission faults from EL0 here.
+                     * A real Linux kernel delivers SIGSEGV for these.
+                     * This enables fault-driven lazy JIT translation:
+                     * rosetta registers a SIGSEGV handler and uses faults
+                     * to discover untranslated code addresses.
+                     *
+                     * Decode fault type from ESR_EL1:
+                     *   EC=0x20 (instruction abort) or EC=0x24 (data abort)
+                     *   xFSC[5:2]: 0x01=translation, 0x03=permission
+                     *   WnR (bit 6): 1=write, 0=read (data abort only)
+                     *
+                     * si_code mapping:
+                     *   Translation fault → SEGV_MAPERR (address not mapped)
+                     *   Permission fault  → SEGV_ACCERR (bad permissions) */
+                    uint64_t esr, far_addr;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
+
+                    uint32_t ec = (uint32_t)((esr >> 26) & 0x3F);
+                    uint32_t fsc = (uint32_t)(esr & 0x3F);
+                    uint32_t fsc_type = (fsc >> 2) & 0xF;  /* xFSC[5:2] */
+
+                    /* Determine si_code based on fault type */
+                    int si_code;
+                    if (fsc_type == 0x03) {
+                        si_code = LINUX_SEGV_ACCERR;  /* Permission fault */
+                    } else {
+                        si_code = LINUX_SEGV_MAPERR;  /* Translation/other */
+                    }
+
+                    if (verbose) {
+                        const char *fault_type =
+                            (ec == 0x20) ? "inst" : "data";
+                        const char *code_name =
+                            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
+                        fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
+                                "(ESR=0x%llx FSC=0x%x) → SIGSEGV/%s\n",
+                                prefix, fault_type,
+                                (unsigned long long)far_addr,
+                                (unsigned long long)esr,
+                                fsc, code_name);
+                    }
+
+                    signal_set_fault_info(si_code, far_addr);
+                    signal_queue(LINUX_SIGSEGV);
                     int sig_ret = signal_deliver(vcpu, g, &exit_code);
                     if (verbose)
-                        fprintf(stderr, "%s: signal_deliver returned %d\n",
+                        fprintf(stderr, "%s: SIGSEGV deliver returned %d\n",
                                 prefix, sig_ret);
                     if (sig_ret < 0) {
-                        /* Default action: terminate */
+                        /* Default action: core dump (we just terminate) */
                         running = 0;
                     }
-                    /* sig_ret == 0: no handler (shouldn't happen, signal just queued)
-                     * sig_ret == 1: signal frame built, ERET resumes at handler */
                     break;
                 }
 
@@ -912,16 +1349,29 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 (unsigned long long)(far & 0x0000FFFFFFFFFFFFULL));
                     }
 
+                    {
+                        char detail[128];
+                        snprintf(detail, sizeof(detail),
+                                 "vec=0x%03llx ESR=0x%llx FAR=0x%llx",
+                                 (unsigned long long)x5,
+                                 (unsigned long long)x0,
+                                 (unsigned long long)x1);
+                        crash_report(vcpu, g, CRASH_BAD_EXCEPTION, detail);
+                    }
                     exit_code = 128;
                     running = 0;
                     break;
                 }
 
-                default:
+                default: {
                     fprintf(stderr, "%s: unexpected HVC #%u\n", prefix, imm);
+                    char detail[64];
+                    snprintf(detail, sizeof(detail), "HVC #%u", imm);
+                    crash_report(vcpu, g, CRASH_UNEXPECTED_HVC, detail);
                     exit_code = 128;
                     running = 0;
                     break;
+                }
                 }
             } else if (ec == 0x01) {
                 /* WFI/WFE trapped — just continue */
@@ -935,6 +1385,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         (unsigned long long)vexit->exception.syndrome,
                         (unsigned long long)vexit->exception.virtual_address,
                         (unsigned long long)vexit->exception.physical_address);
+                {
+                    char detail[128];
+                    snprintf(detail, sizeof(detail),
+                             "EC=0x%x syndrome=0x%llx VA=0x%llx",
+                             ec,
+                             (unsigned long long)vexit->exception.syndrome,
+                             (unsigned long long)vexit->exception.virtual_address);
+                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC, detail);
+                }
                 exit_code = 128;
                 running = 0;
             }
@@ -952,6 +1411,22 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 exit_code = atomic_load(&exit_group_code);
                 running = 0;
                 break;
+            }
+
+            /* PTRACE_INTERRUPT: if this thread is ptraced and not already
+             * stopped, enter ptrace-stop so the tracer can inspect state.
+             * This handles hv_vcpus_exit from sys_ptrace PTRACE_INTERRUPT. */
+            if (current_thread->ptraced && !current_thread->ptrace_stopped) {
+                if (verbose)
+                    fprintf(stderr, "%s: ptrace interrupt → ptrace-stop\n",
+                            prefix);
+                int cont_sig = thread_ptrace_stop(current_thread, 5);
+                if (cont_sig > 0) {
+                    signal_queue(cont_sig);
+                    int sr = signal_deliver(vcpu, g, &exit_code);
+                    if (sr < 0) running = 0;
+                }
+                continue;
             }
 
             /* Check guest ITIMER_REAL (may have fired during tight loop) */
@@ -976,6 +1451,12 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         } else {
             fprintf(stderr, "%s: unexpected exit reason 0x%x\n",
                     prefix, vexit->reason);
+            {
+                char detail[64];
+                snprintf(detail, sizeof(detail),
+                         "exit reason 0x%x", vexit->reason);
+                crash_report(vcpu, g, CRASH_UNEXPECTED_EXIT, detail);
+            }
             exit_code = 128;
             running = 0;
         }

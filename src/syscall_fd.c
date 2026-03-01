@@ -253,10 +253,17 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return -LINUX_EAGAIN;
         }
 
-        /* Blocking: release lock, wait for the timer, re-lock */
+        /* Blocking: release lock, wait for the timer, re-lock.
+         * Another thread may close the fd while we wait — kevent()
+         * returns EBADF in that case, and we re-validate the slot. */
         pthread_mutex_unlock(&sfd_lock);
         nev = kevent(kq, NULL, 0, &kev, 1, NULL);
         pthread_mutex_lock(&sfd_lock);
+        /* Re-validate: slot may have been freed by timerfd_close() */
+        if (timerfd_state[slot].guest_fd != guest_fd) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EBADF;
+        }
         if (nev > 0) {
             uint64_t fires = (uint64_t)kev.data;
             if (fires == 0) fires = 1;
@@ -393,13 +400,20 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
         }
-        /* Blocking mode: release lock, block on pipe, re-lock */
+        /* Blocking mode: release lock, block on pipe, re-lock.
+         * Another thread may close the fd while we wait — read()
+         * returns EBADF in that case, and we re-validate the slot. */
         int rd_fd = eventfd_state[slot].pipe_rd;
         pthread_mutex_unlock(&sfd_lock);
         uint8_t byte;
         ssize_t r = read(rd_fd, &byte, 1);
         if (r < 0) return linux_errno();
         pthread_mutex_lock(&sfd_lock);
+        /* Re-validate: slot may have been freed by eventfd_close() */
+        if (eventfd_state[slot].guest_fd != guest_fd) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EBADF;
+        }
         /* Counter was updated by the writer — re-check */
         if (eventfd_state[slot].counter == 0) {
             pthread_mutex_unlock(&sfd_lock);
@@ -611,9 +625,19 @@ int64_t signalfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
 
     if (deliverable == 0) {
         if (signalfd_state[slot].nonblock) return -LINUX_EAGAIN;
-        /* In blocking mode, we'd block on the pipe. For single-threaded
-         * guests, signals only arrive between syscalls, so return EAGAIN. */
-        return -LINUX_EAGAIN;
+        /* Blocking mode: wait for signalfd_notify() to write to the pipe.
+         * This happens when signal_queue() fires for a signal in our mask. */
+        int rd_fd = signalfd_state[slot].pipe_rd;
+        uint8_t byte;
+        /* pipe_rd is O_NONBLOCK — temporarily make it blocking for the wait */
+        fcntl(rd_fd, F_SETFL, 0);
+        ssize_t r = read(rd_fd, &byte, 1);
+        fcntl(rd_fd, F_SETFL, O_NONBLOCK);
+        if (r <= 0) return -LINUX_EAGAIN;
+        /* Re-check: a signal matching our mask should now be pending */
+        sig = signal_get_state();
+        deliverable = sig->pending & mask;
+        if (deliverable == 0) return -LINUX_EAGAIN;
     }
 
     size_t total = 0;

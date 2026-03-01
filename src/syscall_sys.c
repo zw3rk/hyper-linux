@@ -29,8 +29,11 @@ int64_t sys_uname(guest_t *g, uint64_t buf_gva) {
     memset(&uts, 0, sizeof(uts));
     strncpy(uts.sysname, "Linux", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.nodename, "hl", LINUX_UTSNAME_LEN - 1);
-    strncpy(uts.release, "6.1.0", LINUX_UTSNAME_LEN - 1);
-    strncpy(uts.version, "#1 SMP", LINUX_UTSNAME_LEN - 1);
+    /* Kernel version must match what Rosetta expects from a VZ guest.
+     * Rosetta parses the release string and may enable/disable features
+     * based on it. Use a version matching real VZ VMs (Ubuntu 24.04). */
+    strncpy(uts.release, "6.8.0-101-generic", LINUX_UTSNAME_LEN - 1);
+    strncpy(uts.version, "#101-Ubuntu SMP PREEMPT_DYNAMIC", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.machine, "aarch64", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.domainname, "(none)", LINUX_UTSNAME_LEN - 1);
 
@@ -148,21 +151,35 @@ int64_t sys_sysinfo(guest_t *g, uint64_t info_gva) {
         si.uptime = now.tv_sec - boottime.tv_sec;
     }
 
-    /* Total RAM from hw.memsize */
+    /* Total RAM: cap to 4GB to match real Linux VZ VM behavior.
+     *
+     * Rosetta uses sysinfo.totalram to size its JIT slab (the mmap at
+     * 0xf00000000000). With the host Mac's full RAM (e.g. 16GB+), rosetta
+     * allocates a 384MB slab; the real Lima VZ VM with 4GB reports ~61MB.
+     * The different slab size changes rosetta's internal memory layout
+     * (hash tables, block arrays, JIT code regions) and can affect JIT
+     * code translation behavior. Cap to 4GB to match real VZ VM. */
     uint64_t memsize = 0;
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = { CTL_HW, HW_MEMSIZE };
     if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        si.totalram = memsize;
+        const uint64_t VM_RAM_CAP = 4094595072ULL; /* Match Lima VZ 4GB VM */
+        si.totalram = (memsize > VM_RAM_CAP) ? VM_RAM_CAP : memsize;
     }
 
-    /* Free RAM from vm_statistics64 */
+    /* Free RAM from vm_statistics64 (scaled proportionally to capped total) */
     vm_statistics64_data_t vmstat;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                           (host_info64_t)&vmstat, &count) == KERN_SUCCESS) {
         uint64_t page_size = 4096;
-        si.freeram = (uint64_t)vmstat.free_count * page_size;
+        uint64_t real_free = (uint64_t)vmstat.free_count * page_size;
+        /* Scale freeram proportionally if we capped totalram */
+        if (memsize > 0 && memsize > si.totalram) {
+            si.freeram = real_free * si.totalram / memsize;
+        } else {
+            si.freeram = real_free;
+        }
     }
 
     /* Load averages (× 65536 for fixed-point) */
@@ -228,9 +245,24 @@ int64_t sys_prlimit64(guest_t *g, int pid, int resource,
         if (getrlimit(mac_res, &rl) < 0)
             return linux_errno();
 
+        /* Translate macOS RLIM_INFINITY → Linux RLIM_INFINITY.
+         * macOS: 0x7FFFFFFFFFFFFFFF, Linux: 0xFFFFFFFFFFFFFFFF.
+         * Rosetta and musl both check for RLIM_INFINITY to determine
+         * uncapped resources (e.g., stack size for thread stacks). */
         linux_rlimit64_t old_lim;
-        old_lim.rlim_cur = rl.rlim_cur;
-        old_lim.rlim_max = rl.rlim_max;
+        old_lim.rlim_cur = (rl.rlim_cur == RLIM_INFINITY)
+                           ? UINT64_MAX : rl.rlim_cur;
+        old_lim.rlim_max = (rl.rlim_max == RLIM_INFINITY)
+                           ? UINT64_MAX : rl.rlim_max;
+
+        /* RLIMIT_STACK: macOS returns ~8372224 (~8MB-16KB) which differs
+         * from Linux's standard 8388608 (8MB = 8192*1024). Rosetta uses
+         * this to size its internal stack allocations. Round up to the
+         * standard Linux default for consistency. */
+        if (resource == 3 /* RLIMIT_STACK */ &&
+            old_lim.rlim_cur > 0 && old_lim.rlim_cur < 8388608)
+            old_lim.rlim_cur = 8388608;
+
         if (guest_write(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
             return -LINUX_EFAULT;
     }

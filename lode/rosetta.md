@@ -139,17 +139,29 @@ high-VA allocations go through `sys_mmap_high_va` (the user VA allocator)
 rather than the kbuf kernel VA path, so the kbuf path may not even be
 needed anymore. Further investigation required.
 
-### Approach 3: VZ Mode Activation (CURRENT)
+### Approach 3: VZ Mode Activation (COMPLETE — Necessary but Insufficient)
 
 **Rationale:** Return success for VZ_CAPS to enable rosetta's AOT code
 paths (pre-translated binary loading, rosettad daemon integration).
 
 **Status:** VZ_CAPS returns success with caps[0]=1. VZ_ACTIVATE returns 0.
 Combined with user VA aliasing, this eliminates the TaggedPointer assertion.
-test-write passes. But the JIT forward-scan limitation persists — VZ mode
-alone doesn't fix indirect branches.
+Simple binaries (hello-write, hello-musl, echo-test) work. AOT translation
+via rosettad protocol is fully functional — rosetta requests translation,
+receives AOT file, and loads it (confirmed by pread64 + mmap on AOT fd).
 
-**Next step:** Integrate rosettad for AOT pre-translation.
+**However,** AOT alone is insufficient. rosettad's static CFG analysis
+produces incomplete translations (e.g., misses 0x402da0 in printf_core —
+a rotated loop where the loop head is only reachable from its own backedge).
+When the JIT encounters an address not in AOT's `_potential_targets`, it
+asserts: `"BasicBlock requested for unrecognized address"`.
+
+**Root cause:** AOT populates `_potential_targets` (which the assertion
+checks: `_mode == TranslationMode::Aot || _potential_targets.empty()`).
+With AOT loaded but incomplete, the JIT sees non-empty potential_targets
+and asserts on missing addresses. This is a broken hybrid state.
+
+**Next step:** Implement ptrace (Approach 5).
 
 ### Approach 4: Pre-map / Preannounce Segments (FAILED)
 
@@ -166,6 +178,52 @@ rosetta reads them, so the JIT knows which addresses contain code.
 build its module list, but the forward scan still starts from the entry
 point and only translates sequentially. Code unreachable by forward scan
 remains untranslated regardless of /proc/self/maps contents.
+
+### Approach 5: Implement ptrace Syscall (NEXT)
+
+**Rationale:** Rosetta's real architecture is a two-process ptrace-based
+JIT. In VZ (Tart/Lima), rosetta:
+1. Starts as a single process
+2. Creates an inferior via `clone(CLONE_VM)` (shared address space)
+3. Attaches via `PTRACE_SEIZE`
+4. Inferior runs translated ARM64 code with BRK at untranslated addresses
+5. SIGTRAP stops inferior; parent catches via wait4()
+6. Parent reads registers (PTRACE_GETREGSET), translates the block, patches
+7. Parent continues inferior (PTRACE_CONT)
+
+This architecture dynamically discovers ALL indirect branch targets — the
+"BasicBlock requested" assertion never fires because blocks are created
+on-demand via the ptrace stop/translate/continue cycle. Single-stepping
+through indirect branches discovers targets that static CFG analysis misses.
+
+**Without ptrace (current hl):** Rosetta falls back to signal-handler mode
+(SIGTRAP/SIGSEGV handlers). But this + AOT creates a broken hybrid state
+where `_potential_targets` is non-empty but incomplete.
+
+**Required ptrace operations:**
+- `PTRACE_SEIZE` (0x4206): Attach without stopping
+- `PTRACE_CONT` (7): Continue stopped process
+- `PTRACE_INTERRUPT` (0x4207): Stop running process
+- `PTRACE_GETREGSET` (0x4204): Read registers (NT_PRSTATUS=1)
+- `PTRACE_SETREGSET` (0x4205): Write registers
+- wait4() must return WIFSTOPPED with SIGTRAP
+
+**Challenge:** ptrace is fundamentally a cross-process mechanism. In hl,
+each thread has its own vCPU. The tracer thread needs to:
+- Intercept BRK-induced SIGTRAP in the inferior vCPU
+- Read/write the inferior vCPU's registers
+- Control inferior vCPU execution (stop/continue)
+
+This maps naturally to hl's thread table: the "tracer" is a host pthread
+that calls wait4() and the "inferior" is another host pthread running a
+vCPU. The ptrace machinery would intercept between the two.
+
+**Key evidence from rosetta binary strings:**
+- `"ptrace seize failed with error %lu"`
+- `"Expected inferior to be stopped by SIGTRAP"`
+- `"handle_jit_breakpoint"`
+- `"returning to the same address after a jit breakpoint fault"`
+- `"Unexpected indirect branch while single stepping"`
 
 ## AOT Translation Architecture
 
@@ -205,6 +263,214 @@ rosettad listens on: `<cache_path>/uds/rosetta.sock`
 Two mechanisms for VZ guest access:
 1. Unix Domain Socket (UDS) via file sharing
 2. Abstract socket (macOS 14+)
+
+### rosettad Protocol (hl implementation)
+
+hl intercepts rosetta's SOCK_SEQPACKET socket creation and uses a
+SOCK_DGRAM socketpair (macOS lacks SEQPACKET). A handler thread processes:
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `'?'` | Handshake | `0x01` (ready) |
+| `'t'` | Translate (binary fd via SCM_RIGHTS) | 3 separate messages: `0x01` + 32-byte digest + AOT fd (SCM_RIGHTS, 1-byte iov) |
+| `'d'` | Digest cache lookup (32-byte SHA256) | `0x00` (not cached) |
+| `'q'` | Quit | (close) |
+
+**Critical protocol details:**
+- Translate response MUST be 3 separate writes (atomic sendmsg hangs rosetta)
+- AOT fd send MUST use exactly 1 byte iov payload (not 8) — rosetta's recv_fd
+  allocates 1-byte buffer; extra bytes trigger MSG_TRUNC on SOCK_DGRAM
+- VZ_CAPS caps[3..108] provides daemon socket path; currently zeros (intercepted
+  anyway via socketpair)
+
+## TranslationMode Architecture (Reverse-Engineered)
+
+Rosetta uses three independent mode/quality concepts that interact but
+must not be confused:
+
+### 1. Translation Quality (BSS[0x474])
+
+Hardware-dependent, set once during initialization at VA 0x800000030c64:
+- **1 = basic**: M2 (Apple A15 derivative), no FEAT_AFP support
+- **2 = enhanced**: M3+ (Apple A17+), has FEAT_AFP
+
+Detection: reads `ID_AA64MMFR1_EL1`, checks AFP field (bits 44-47).
+This affects code generation quality, not the JIT vs AOT decision.
+
+### 2. TranslationMode Enum (Per-Translation-Unit)
+
+Stored at object offset 0x18, read in the translate dispatch at
+VA 0x800000039e00 (`ldrb w8, [x19, #0x18]`):
+
+| Value | Name | Description |
+|-------|------|-------------|
+| 0 | Aot | Fully pre-translated AOT cache (TranslationCacheAot.cpp) |
+| 1 | JIT | Pure JIT — forward scan from entry, no AOT data |
+| 2 | AOT-assisted JIT | JIT with AOT-seeded blocks |
+| 3 | (unknown) | Separate handler at 0x3a2e8 |
+
+**Critical finding: The JIT translate path (big function at 0x46cb0)
+NEVER uses TranslationMode::Aot (0).** The mode computation at
+VA 0x800000034f78 produces only mode 1 or 2:
+
+```asm
+; [sp, #0x48] = is_aot_mode (from per-fragment flag at object+0x214)
+and w8, w8, #0xff    ; mask to byte
+cmp w8, #1           ; compare
+mov w8, #1           ; default = JIT (1)
+cinc w8, w8, eq      ; if is_aot_mode == 1: mode = 2 (AOT-assisted)
+sturb w8, [x29, #-0x44]  ; store as local _mode
+```
+
+### 3. is_aot_mode Flag (Per-Fragment)
+
+Stored at object offset 0x214. Extracted at VA 0x80000004901c:
+```asm
+; x8 loaded from [x21, #0x88] (AOT metadata flags in fragment header)
+ubfx w8, w8, #8, #1    ; extract bit 8
+strb w8, [x20, #0x214] ; store as is_aot_mode
+```
+
+When this flag is set (1), the translate caller at 0x33688 forces
+`w2=1` and enters the big translate with mode=2 (AOT-assisted JIT).
+
+### TranslationMode::Aot (0) — Separate Code Path
+
+Mode 0 is used by TranslationCacheAot.cpp for fully pre-translated
+AOT cache entries. It has its own dispatch path at 0x39e1c which calls
+function 0x39378 (AOT translation cache operations). Features exclusive
+to mode 0:
+- `translate_indirect_jmp_dyld_stub` (asserts `_mode == Aot` at 0x39ed0)
+- `_potential_targets` usage (the tree at [sp,#0x150] is only read
+  in the mode==0 path at 0x47138-0x47144)
+- Set by a lookup function at 0x29ae4 that searches a table at
+  0x80000001c380
+
+Mode 0 is set when a fully translated AOT cache file (`.flu` or
+`.aotcache`) exists and the translation unit lookup succeeds.
+
+### How AOT-Assisted JIT (Mode 2) Works
+
+When rosettad provides an AOT translation:
+
+1. **Fragment loading:** The AOT file's fragment header at offset 0x88
+   has bit 8 set, causing `is_aot_mode=1` (object+0x214)
+
+2. **Mode selection:** The translate caller sees `is_aot_mode=1` and
+   passes `w2=1`, which the big translate function converts to mode=2
+
+3. **Block seeding (0x46ee8):** Mode 2 calls `seed_block()` at
+   VA 0x80000002a7b0 with `w1=0` (entry offset). This function:
+   - Checks a bitmap at object+0x18 for already-registered blocks
+   - If new, increments block count at object+0x28
+   - Performs binary search (0x2a914) to find insertion point
+   - Adds block offset to sorted array at object+0x30
+
+4. **Main translate loop:** Both modes enter the same loop at 0x475a4.
+   Inside the loop at 0x47cdc:
+   - Mode 2 takes a short path (`b.eq 0x47f8c`) that skips the
+     block list iteration (0x47ce8-0x47d3c)
+   - Mode 1 performs the full block list scan
+
+5. **block_for_offset (0x387d4):** Uses binary search on the block
+   table. With AOT-seeded blocks, lookups succeed for all known
+   addresses. Returns NULL (assertion) only for addresses not in
+   any pre-registered block.
+
+### The `_potential_targets` Assertion
+
+At VA 0x800000048eac (`_mode == TranslationMode::Aot || _potential_targets.empty()`,
+BranchTargetFinderBase.hpp:57):
+
+```asm
+800000047444: ldrb w10, [sp, #0x110]   ; load _mode
+800000047448: cbz  w10, 0x47454        ; if mode==0 (Aot): skip check
+80000004744c: ldr  x10, [sp, #0x158]   ; load _potential_targets.end
+800000047450: cbnz x10, 0x48eac        ; if non-empty: ASSERT
+```
+
+Within the big translate function, `_potential_targets` at [sp,#0x150]:
+- Initialized to zero at 0x46e54: `stp xzr, xzr, [sp, #0x150]`
+- Reset to zero at 0x4758c: `stp xzr, xzr, [sp, #0x150]`
+- **Never populated with non-zero values in this function**
+
+The assertion is a defensive invariant: potential targets should only
+exist in Aot mode (0). In JIT mode (1) and AOT-assisted mode (2),
+they must be empty. Since no code path in the big translate function
+populates `_potential_targets`, this assertion should never fire here.
+It would only fire if a called function corrupted the stack.
+
+### BSS[0xa04] — VZ Enable Flag (rosettad Gate)
+
+Written at VA 0x800000030304 from VZ_CAPS caps[0]:
+```asm
+8000000301f4: adrp  x19, 0x8000000a0000
+8000000301f8: add   x19, x19, #0xa04    ; x19 = &BSS[0xa04]
+...
+800000030304: strb  w20, [x19]           ; BSS[0xa04] = caps[0]
+800000030308: strb  w21, [x19, #0x1]    ; BSS[0xa05] = caps[108]
+80000003030c: strb  w22, [x19, #0x2]    ; BSS[0xa06] = caps[1] or derived
+```
+
+The runtime AOT loading path at 0x90ae8 checks both flags:
+```asm
+ldrb w8, [x8, #0x498]    ; DISABLE_AOT env flag
+cbnz w8, skip_aot         ; if set, no AOT
+ldrb w8, [x8, #0xa04]    ; VZ enable flag (from caps[0])
+cbz  w8, jit_only          ; if zero, JIT-only mode
+; ... proceed to rosettad connection
+```
+
+When hl sets caps[0]=1 in VZ_CAPS response, BSS[0xa04]=1, enabling
+the rosettad connection path.
+
+### BSS Layout Summary (0x8000000a0000+)
+
+| Offset | Size | Description |
+|--------|------|-------------|
+| 0x474 | 1 | Translation quality (1=basic, 2=enhanced) |
+| 0x496 | 2 | Flag checked after VZ_ACTIVATE |
+| 0x498 | 1 | DISABLE_AOT env flag |
+| 0x49b | 1 | Set during init loop |
+| 0x49c | 1 | Checked after translate call |
+| 0x49f | 1 | Rosetta version/signature byte |
+| 0xa04 | 1 | VZ enable flag (= VZ_CAPS caps[0]) |
+| 0xa05 | 1 | VZ sub-capability (= VZ_CAPS caps[108]) |
+| 0xa06 | 108 | Rosettad socket path (= VZ_CAPS caps[1..108]) |
+
+### Answer to Key Questions
+
+**Q: Is TranslationMode::Aot set when the ENTIRE binary is AOT-translated?**
+A: Yes. Mode 0 (Aot) is used for fully pre-translated cache entries via
+TranslationCacheAot.cpp. It is a per-translation-unit setting, not global.
+Each translation unit can independently be mode 0 (fully cached), mode 1
+(JIT), or mode 2 (AOT-assisted JIT).
+
+**Q: On M2 (no FEAT_AFP, quality=1), when rosettad provides AOT, does
+rosetta set TranslationMode::Aot?**
+A: No. When rosettad provides AOT, rosetta sets `is_aot_mode=1` (per-fragment
+flag at object+0x214), which causes mode=2 (AOT-assisted JIT), NOT mode=0
+(Aot). Mode 0 is only for fully pre-translated cache entries that go through
+a completely different code path (TranslationCacheAot.cpp).
+
+**Q: What prevents the block_for_offset assertion from firing in a real VM?**
+A: In a real VZ VM (Tart/Lima), rosetta uses the ptrace two-process
+architecture:
+1. `clone(CLONE_VM)` creates an inferior sharing address space
+2. `PTRACE_SEIZE` attaches the tracer
+3. BRK instructions at untranslated addresses trigger SIGTRAP
+4. Tracer catches via wait4(), reads regs, translates the block on-demand
+5. Tracer writes patched code, calls PTRACE_CONT
+
+This on-demand translation via ptrace-stop/translate/continue means
+blocks are created as needed when reached, so `block_for_offset()` always
+finds the block. The forward-scan limitation only applies to the non-ptrace
+fallback path.
+
+AOT-assisted mode (2) helps by pre-seeding known blocks, reducing ptrace
+stops. But the ptrace architecture is the fundamental mechanism that handles
+ALL indirect branch targets — including those that static CFG analysis
+misses (rotated loops, computed gotos, function pointers).
 
 ## Key Technical Details
 

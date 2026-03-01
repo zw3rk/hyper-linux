@@ -17,6 +17,7 @@
 #include "syscall_fd.h"     /* signalfd_notify */
 #include "syscall_proc.h"   /* proc_get_pid, SYSCALL_EXEC_HAPPENED */
 #include "thread.h"         /* current_thread, thread_entry_t */
+#include "vdso.h"           /* VDSO_BASE */
 
 #include <stdio.h>
 #include <string.h>
@@ -387,9 +388,19 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
     if (act_gva) {
         linux_sigaction_t act;
         if (guest_read(g, act_gva, &act, sizeof(act)) < 0) {
+            fprintf(stderr, "hl: rt_sigaction: guest_read failed for "
+                    "act_gva=0x%llx signum=%d\n",
+                    (unsigned long long)act_gva, signum);
             pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
         }
+        fprintf(stderr, "hl: rt_sigaction: signum=%d handler=0x%llx "
+                "flags=0x%llx restorer=0x%llx mask=0x%llx\n",
+                signum, (unsigned long long)act.sa_handler,
+                (unsigned long long)act.sa_flags,
+                (unsigned long long)act.sa_restorer,
+                (unsigned long long)act.sa_mask);
+
         sig_state.actions[idx] = act;
     }
 
@@ -614,6 +625,10 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     linux_sigaction_t *act = &sig_state.actions[idx];
 
     /* Check handler type */
+    fprintf(stderr, "hl: signal_deliver: signum=%d handler=0x%llx "
+            "flags=0x%llx\n", signum,
+            (unsigned long long)act->sa_handler,
+            (unsigned long long)act->sa_flags);
     if (act->sa_handler == LINUX_SIG_IGN) {
         /* Ignored — discard signal */
         pthread_mutex_unlock(&sig_lock);
@@ -623,6 +638,8 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     if (act->sa_handler == LINUX_SIG_DFL) {
         /* Apply default disposition */
         sig_disposition_t disp = signal_default_disposition(signum);
+        fprintf(stderr, "hl: signal_deliver: signum=%d handler=SIG_DFL "
+                "disp=%d\n", signum, (int)disp);
         switch (disp) {
         case SIG_DISP_TERM:
         case SIG_DISP_CORE:
@@ -717,6 +734,12 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
 
     if (guest_write(g, frame_sp, &frame, sizeof(frame)) < 0) {
         /* Can't write frame — terminate with default disposition */
+        fprintf(stderr, "hl: signal_deliver: guest_write failed for "
+                "frame_sp=0x%llx (signal_sp=0x%llx signum=%d "
+                "frame_size=%zu)\n",
+                (unsigned long long)frame_sp,
+                (unsigned long long)signal_sp,
+                signum, sizeof(frame));
         *exit_code = 128 + signum;
         pthread_mutex_unlock(&sig_lock);
         return -1;
@@ -731,8 +754,20 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     /* X0 = signal number */
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t)signum);
 
-    /* X30 (LR) = sa_restorer (musl's __restore_rt which calls rt_sigreturn) */
-    hv_vcpu_set_reg(vcpu, HV_REG_X30, act->sa_restorer);
+    /* X30 (LR) = return address for signal handler.
+     * On aarch64-linux, the kernel always sets LR to the vDSO's
+     * __kernel_rt_sigreturn (mov x8,#139; svc #0; ret). The sa_restorer
+     * field is architecturally unused on aarch64 — the kernel ignores it.
+     * However, musl explicitly sets sa_restorer to its own __restore_rt
+     * trampoline. We honor sa_restorer if set (for musl compatibility),
+     * otherwise use the vDSO trampoline (for rosetta and any signal handler
+     * that relies on kernel behavior). */
+    uint64_t restorer = act->sa_restorer;
+    if (restorer == 0) {
+        /* vDSO __kernel_rt_sigreturn: VDSO_BASE + .text offset 0 */
+        restorer = VDSO_BASE + 0xB0;
+    }
+    hv_vcpu_set_reg(vcpu, HV_REG_X30, restorer);
 
     if (act->sa_flags & LINUX_SA_SIGINFO) {
         /* X1 = pointer to siginfo, X2 = pointer to ucontext */
@@ -740,6 +775,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         uint64_t ucontext_addr = frame_sp + sizeof(linux_siginfo_t);
         hv_vcpu_set_reg(vcpu, HV_REG_X1, siginfo_addr);
         hv_vcpu_set_reg(vcpu, HV_REG_X2, ucontext_addr);
+
     }
 
     /* 5. Update blocked mask during handler execution */

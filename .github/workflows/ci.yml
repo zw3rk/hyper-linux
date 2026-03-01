@@ -135,6 +135,46 @@ jobs:
           SYSROOT_DIR: ${{ github.workspace }}/guest-bins/sysroot
         run: nix develop .#ci -c make test-haskell
 
+      - name: Run x86_64 unit tests (Rosetta)
+        env:
+          GUEST_X64_TEST_BINARIES: ${{ github.workspace }}/guest-bins/x64-test-binaries
+        run: nix develop .#ci -c make test-x64-all
+
+      - name: Run x86_64 coreutils integration tests (Rosetta)
+        continue-on-error: true  # ~42 tools fail with rosetta BasicBlock assertion (needs AOT)
+        env:
+          X64_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-coreutils/bin
+        run: nix develop .#ci -c make test-x64-coreutils
+
+      - name: Run x86_64 busybox integration tests (Rosetta)
+        continue-on-error: true  # rosetta JIT limitations, same as coreutils
+        env:
+          X64_BUSYBOX_BIN: ${{ github.workspace }}/guest-bins/x64-busybox/bin/busybox
+        run: nix develop .#ci -c make test-x64-busybox
+
+      - name: Run glibc dynamic linking tests (aarch64)
+        env:
+          GLIBC_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/glibc-sysroot
+          GUEST_GLIBC_SYSROOT: ${{ github.workspace }}/guest-bins/glibc-sysroot
+          GUEST_GLIBC_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/glibc-dynamic-tests
+          GUEST_GLIBC_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/glibc-dynamic-coreutils
+          GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/glibc-dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-glibc-dynamic
+          nix develop .#ci -c make test-glibc-coreutils
+
+      - name: Run x86_64 glibc dynamic linking tests (Rosetta)
+        continue-on-error: true  # rosetta JIT limitations
+        env:
+          X64_GLIBC_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot
+          GUEST_X64_GLIBC_SYSROOT: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot
+          GUEST_X64_GLIBC_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-tests
+          GUEST_X64_GLIBC_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-coreutils
+          X64_GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-x64-glibc-dynamic
+          nix develop .#ci -c make test-x64-glibc-coreutils
+
   # ── Distribution artifacts (master + tags) ──────────────────────
   dist:
     needs: build

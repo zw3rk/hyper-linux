@@ -224,6 +224,7 @@ int main(int argc, const char **argv) {
         fprintf(stderr, "hl: failed to initialize guest\n");
         return 1;
     }
+    g.is_rosetta = need_rosetta;
 
     /* ---- Step 2b: Place rosetta in the primary buffer ---- */
     /* Rosetta's ELF link address is at 128TB (VA 0x800000000000), but we
@@ -314,31 +315,23 @@ int main(int argc, const char **argv) {
      * have absolute addresses (typically 0x400000+), so use base 0. */
     uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
 
-    /* For x86_64 binaries with rosetta: do NOT map the binary into guest
-     * memory. Rosetta opens the binary itself (via argv[1] path) and maps
-     * it with MAP_FIXED_NOREPLACE. This matches binfmt_misc 'O' flag
-     * behavior where the kernel opens the binary but the interpreter
-     * (rosetta) is responsible for mapping it. */
-    if (!need_rosetta) {
-        if (elf_map_segments(&elf_info, elf_path,
-                             g.host_base, g.guest_size, elf_load_base) < 0) {
-            fprintf(stderr, "hl: failed to map ELF segments\n");
-            guest_destroy(&g);
-            return 1;
-        }
+    /* Map ELF segments into guest memory. For x86_64 binaries, the kernel
+     * would have already mapped the binary before launching Rosetta as the
+     * binfmt_misc interpreter. Rosetta reads /proc/self/maps to discover
+     * the binary layout, then either reuses existing mappings or re-maps
+     * via MAP_FIXED. Pre-mapping ensures correct /proc/self/maps output
+     * and consistent binary data in guest memory. */
+    if (elf_map_segments(&elf_info, elf_path,
+                         g.host_base, g.guest_size, elf_load_base) < 0) {
+        fprintf(stderr, "hl: failed to map ELF segments\n");
+        guest_destroy(&g);
+        return 1;
     }
 
-    /* Set brk base after the highest loaded segment. For rosetta mode,
-     * use BRK_BASE_DEFAULT since the binary isn't mapped yet (rosetta
-     * will manage the binary's address space via mmap). */
-    uint64_t brk_start;
-    if (need_rosetta) {
+    /* Set brk base after the highest loaded segment. */
+    uint64_t brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
+    if (brk_start < BRK_BASE_DEFAULT)
         brk_start = BRK_BASE_DEFAULT;
-    } else {
-        brk_start = (elf_info.load_max + elf_load_base + 4095) & ~4095ULL;
-        if (brk_start < BRK_BASE_DEFAULT)
-            brk_start = BRK_BASE_DEFAULT;
-    }
     g.brk_base = brk_start;
     g.brk_current = brk_start;
 
@@ -470,8 +463,14 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
 
-    /* ELF segments: map each based on its p_flags. Skip for rosetta
-     * mode — rosetta maps the x86_64 binary itself via mmap. */
+    /* ELF segments: map each based on its p_flags.
+     * For x86_64/rosetta mode, we skip pre-mapping binary segment PTEs.
+     * Rosetta does its own mmap(MAP_FIXED) calls to set up the binary's
+     * address space, which creates the correct page table entries. If we
+     * pre-map here, the initial PROT_NONE reservation would need to
+     * invalidate these entries — simpler to let Rosetta manage them.
+     * The binary data is already loaded into host memory (elf_map_segments
+     * above); PTEs are just not created until Rosetta's MAP_FIXED calls. */
     if (!need_rosetta) {
         for (int i = 0; i < elf_info.num_segments; i++) {
             if (nregions >= MAX_REGIONS) break;
@@ -604,9 +603,18 @@ int main(int argc, const char **argv) {
     if (!realpath(elf_path, elf_realpath))
         strncpy(elf_realpath, elf_path, sizeof(elf_realpath) - 1);
 
-    /* In rosetta mode, the x86_64 binary's segments are NOT pre-registered
-     * in regions[] — rosetta maps them itself via MAP_FIXED, and sys_mmap
-     * tracks them as they're created.  Only register for non-rosetta. */
+    /* In rosetta mode, do NOT register the x86_64 binary segments in
+     * regions[]. Rosetta expects to reserve the binary's address range
+     * via MAP_FIXED_NOREPLACE and then map the binary itself. If we
+     * register the segments, MAP_FIXED_NOREPLACE returns -EEXIST and
+     * rosetta aborts with "failed to reserve initial vm for elf".
+     *
+     * In a real Linux VM with binfmt_misc, the kernel does NOT pre-load
+     * the x86_64 binary — it only loads the rosetta interpreter. Rosetta
+     * discovers the binary via argv[1] and loads it from scratch.
+     *
+     * For native aarch64, we always register segments so they appear in
+     * /proc/self/maps and prevent mmap overlap. */
     if (!need_rosetta) {
         for (int i = 0; i < elf_info.num_segments; i++) {
             int prot = LINUX_PROT_READ;
@@ -736,6 +744,20 @@ int main(int argc, const char **argv) {
             guest_destroy(&g);
             return 1;
         }
+        /* Register [vvar] and [vdso] in the region table so they
+         * appear in /proc/self/maps. Real Linux VMs have both entries;
+         * rosetta's VMAllocationTracker parses maps at startup and
+         * uses it to build its initial memory layout knowledge.
+         * [vvar] is a read-only page placed immediately before [vdso]. */
+        guest_region_add(&g, VDSO_BASE - 0x1000,
+                         VDSO_BASE,
+                         LINUX_PROT_READ, LINUX_MAP_PRIVATE,
+                         0, "[vvar]");
+        guest_region_add(&g, VDSO_BASE,
+                         VDSO_BASE + VDSO_SIZE,
+                         LINUX_PROT_READ | LINUX_PROT_EXEC,
+                         LINUX_MAP_PRIVATE,
+                         0, "[vdso]");
         if (verbose)
             fprintf(stderr, "hl: vDSO built at 0x%llx\n",
                     (unsigned long long)vdso_addr);

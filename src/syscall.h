@@ -188,8 +188,28 @@
 #define SYS_mincore         232
 #define SYS_eventfd2        19
 #define SYS_signalfd4       74
+#define SYS_rt_tgsigqueueinfo 240
 #define SYS_clone3          435
 #define SYS_close_range     436
+#define SYS_ptrace          117
+
+/* ---------- Linux ptrace constants ---------- */
+#define LINUX_PTRACE_CONT       7
+#define LINUX_PTRACE_GETREGSET  0x4204
+#define LINUX_PTRACE_SETREGSET  0x4205
+#define LINUX_PTRACE_SEIZE      0x4206
+#define LINUX_PTRACE_INTERRUPT  0x4207
+#define LINUX_NT_PRSTATUS       1
+
+/* Linux aarch64 user_pt_regs — matches the kernel's struct user_pt_regs.
+ * Used by PTRACE_GETREGSET/SETREGSET with NT_PRSTATUS to exchange
+ * GPR state between tracer and tracee threads. */
+typedef struct {
+    uint64_t regs[31];  /* X0-X30 */
+    uint64_t sp;        /* SP_EL0 */
+    uint64_t pc;        /* ELR_EL1 */
+    uint64_t pstate;    /* SPSR_EL1 */
+} linux_user_pt_regs_t;
 
 /* ---------- Linux errno values ---------- */
 #define LINUX_EPERM       1

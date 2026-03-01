@@ -163,12 +163,13 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
     /* Rosetta uses AF_UNIX SOCK_SEQPACKET to connect to rosettad for AOT
      * translation. macOS doesn't support SOCK_SEQPACKET for AF_UNIX, and
      * Linux abstract sockets don't exist on macOS either. Instead, create
-     * a socketpair: give rosetta one end (already connected), and save the
-     * other end for our rosettad protocol handler. When rosetta calls
-     * connect() on this fd, we return success immediately. */
+     * a socketpair with SOCK_DGRAM: this preserves message boundaries
+     * (critical for the rosettad framing protocol), which SOCK_STREAM
+     * would not. When rosetta calls connect() on this fd, we return
+     * success immediately. */
     if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
         int pair[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0)
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
             return linux_errno();
 
         /* pair[0] = rosetta's end, pair[1] = our protocol handler end */
@@ -191,6 +192,9 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
          * to recognize rosetta's connect() call later. */
         extern void rosettad_set_socket(int handler_fd);
         extern void rosettad_set_client_fd(int client_fd);
+        fprintf(stderr, "hl: rosettad: SEQPACKET socket created as DGRAM "
+                "pair: client_fd=%d(guest=%d), handler_fd=%d\n",
+                pair[0], gfd, pair[1]);
         rosettad_set_socket(pair[1]);
         rosettad_set_client_fd(pair[0]);
 
@@ -357,8 +361,27 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     /* Rosettad socketpair: already connected via socketpair(), so
      * return success immediately when rosetta tries connect(). */
     extern int rosettad_is_socket(int host_fd);
-    if (rosettad_is_socket(host_fd))
+    if (rosettad_is_socket(host_fd)) {
+        /* Rosetta constructs a sockaddr_un from VZ_CAPS[1..108] and calls
+         * connect(). We intercept this because the socketpair is already
+         * connected — the path in caps doesn't matter. Log it for debug. */
+        uint16_t sa_family;
+        memcpy(&sa_family, linux_sa, 2);
+        if (sa_family == LINUX_AF_UNIX && addrlen > 2) {
+            const char *path = (const char *)(linux_sa + 2);
+            if (path[0] == '\0')
+                fprintf(stderr, "hl: rosettad: connect intercepted "
+                        "(abstract socket, addrlen=%u) -> success\n", addrlen);
+            else
+                fprintf(stderr, "hl: rosettad: connect intercepted "
+                        "(path: %.*s) -> success\n",
+                        (int)(addrlen - 2), path);
+        } else {
+            fprintf(stderr, "hl: rosettad: connect intercepted "
+                    "(family=%d) -> success\n", sa_family);
+        }
         return 0;
+    }
 
     struct sockaddr_storage mac_sa;
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
@@ -885,12 +908,20 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
                 int *fds = (int *)data_copy;
                 size_t nfds = data_len / sizeof(int);
                 for (size_t i = 0; i < nfds; i++) {
+                    int host_recv_fd = fds[i];
                     int gfd = fd_alloc(FD_REGULAR, fds[i]);
                     if (gfd < 0) {
                         close(fds[i]);
                         fds[i] = -1;
                     } else {
                         fds[i] = gfd;
+                        /* Log SCM_RIGHTS fd reception for rosettad debugging */
+                        extern int rosettad_is_socket(int host_fd);
+                        if (rosettad_is_socket(fd_to_host(fd))) {
+                            fprintf(stderr, "hl: rosettad: recvmsg SCM_RIGHTS "
+                                    "host_fd=%d → guest_fd=%d\n",
+                                    host_recv_fd, gfd);
+                        }
                     }
                 }
                 data_src = data_copy;

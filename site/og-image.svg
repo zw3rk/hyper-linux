@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="400" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#e6edf3"/>
+      <stop offset="100%" stop-color="#58a6ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Subtle grid lines -->
+  <g opacity="0.04" stroke="#58a6ff" stroke-width="1">
+    <line x1="0" y1="157" x2="1200" y2="157"/>
+    <line x1="0" y1="315" x2="1200" y2="315"/>
+    <line x1="0" y1="473" x2="1200" y2="473"/>
+    <line x1="300" y1="0" x2="300" y2="630"/>
+    <line x1="600" y1="0" x2="600" y2="630"/>
+    <line x1="900" y1="0" x2="900" y2="630"/>
+  </g>
+
+  <!-- Top accent line -->
+  <rect x="0" y="0" width="1200" height="3" fill="#58a6ff" opacity="0.6"/>
+
+  <!-- Logo / title -->
+  <text x="100" y="200" font-family="SF Mono, Menlo, Consolas, monospace" font-size="72" font-weight="700" fill="url(#accent)">
+    hyper-<tspan fill="#58a6ff">linux</tspan>
+  </text>
+
+  <!-- Tagline -->
+  <text x="100" y="265" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, sans-serif" font-size="30" fill="#8b949e">
+    Run Linux binaries on macOS. No VM. No Docker. No kernel.
+  </text>
+
+  <!-- Divider -->
+  <rect x="100" y="300" width="120" height="2" rx="1" fill="#30363d"/>
+
+  <!-- Stats row -->
+  <g font-family="SF Mono, Menlo, Consolas, monospace">
+    <!-- Stat 1 -->
+    <text x="100" y="370" font-size="36" font-weight="700" fill="#58a6ff">~1-3 ms</text>
+    <text x="100" y="400" font-size="16" fill="#6e7681">VM startup</text>
+
+    <!-- Stat 2 -->
+    <text x="370" y="370" font-size="36" font-weight="700" fill="#58a6ff">~160</text>
+    <text x="370" y="400" font-size="16" fill="#6e7681">Linux syscalls</text>
+
+    <!-- Stat 3 -->
+    <text x="590" y="370" font-size="36" font-weight="700" fill="#58a6ff">300 KB</text>
+    <text x="590" y="400" font-size="16" fill="#6e7681">single binary</text>
+
+    <!-- Stat 4 -->
+    <text x="840" y="370" font-size="36" font-weight="700" fill="#3fb950">native</text>
+    <text x="840" y="400" font-size="16" fill="#6e7681">ARM64 speed</text>
+  </g>
+
+  <!-- Terminal snippet -->
+  <g transform="translate(100, 440)">
+    <rect width="1000" height="48" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <text x="16" y="32" font-family="SF Mono, Menlo, Consolas, monospace" font-size="20">
+      <tspan fill="#3fb950">$</tspan>
+      <tspan fill="#e6edf3"> curl -fsSL https://hyper-linux.app/install.sh | sh</tspan>
+    </text>
+  </g>
+
+  <!-- Bottom: URL + author -->
+  <text x="100" y="565" font-family="SF Mono, Menlo, Consolas, monospace" font-size="18" fill="#484f58">hyper-linux.app</text>
+  <text x="1100" y="565" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, sans-serif" font-size="16" fill="#484f58" text-anchor="end">Apple Silicon &#xB7; Apache 2.0</text>
+</svg>

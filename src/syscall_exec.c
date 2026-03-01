@@ -236,6 +236,18 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
      * PIE (ET_DYN) binaries start near address 0 and would overlap with
      * the shim; load them at PIE_LOAD_BASE instead. */
     uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+
+    /* Validate that the ELF fits within the guest address space */
+    uint64_t elf_end = elf_info.load_max + elf_load_base;
+    if (elf_end > g->guest_size) {
+        fprintf(stderr, "hl: execve: ELF extends beyond guest address space "
+                "(0x%llx > 0x%llx) for %s\n",
+                (unsigned long long)elf_end,
+                (unsigned long long)g->guest_size, path);
+        free(argv_buf); free(envp_buf);
+        return -LINUX_ENOEXEC;
+    }
+
     if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size,
                          elf_load_base) < 0) {
         fprintf(stderr, "hl: execve: failed to map ELF segments for %s\n", path);

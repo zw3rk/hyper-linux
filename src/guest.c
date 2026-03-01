@@ -205,8 +205,9 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
         return -1;
     }
 
-    fprintf(stderr, "guest: IPA size: %u bits (%lluGB primary)\n",
-            vm_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)));
+    fprintf(stderr, "guest: IPA size: %u bits (%lluGB primary, max_ipa=%u)\n",
+            vm_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)),
+            max_ipa);
 
     return 0;
 }
@@ -598,11 +599,13 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
     }
 
     guest_region_t *r = &g->regions[i];
-    r->start  = start;
-    r->end    = end;
-    r->prot   = prot;
-    r->flags  = flags;
-    r->offset = offset;
+    r->start       = start;
+    r->end         = end;
+    r->prot        = prot;
+    r->flags       = flags;
+    r->offset      = offset;
+    r->display_va  = 0;
+    r->display_end = 0;
     if (name) {
         strncpy(r->name, name, sizeof(r->name) - 1);
         r->name[sizeof(r->name) - 1] = '\0';
@@ -617,6 +620,35 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
     try_merge_right(g, i);
     try_merge_left(g, i);
 
+    return 0;
+}
+
+int guest_preannounce(guest_t *g, uint64_t start, uint64_t end,
+                      int prot, int flags, uint64_t offset,
+                      const char *name) {
+    if (g->npreannounced >= GUEST_MAX_PREANNOUNCED) return -1;
+
+    /* Insert sorted by start address */
+    int i = g->npreannounced;
+    while (i > 0 && g->preannounced[i - 1].start > start) {
+        g->preannounced[i] = g->preannounced[i - 1];
+        i--;
+    }
+
+    guest_region_t *r = &g->preannounced[i];
+    r->start      = start;
+    r->end        = end;
+    r->prot       = prot;
+    r->flags      = flags;
+    r->offset     = offset;
+    r->display_va = 0;
+    if (name) {
+        strncpy(r->name, name, sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    } else {
+        r->name[0] = '\0';
+    }
+    g->npreannounced++;
     return 0;
 }
 
@@ -1393,11 +1425,22 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx = (unsigned)(((base + pa) % BLOCK_2MB) / PAGE_SIZE);
-            /* Extract the existing output IPA from the L3 entry rather than
-             * computing base+pa — correct for non-identity mapped regions
-             * where pa is a VA, not a GPA. guest_split_block already set
-             * the correct IPA when creating the L3 entries. */
-            uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+            /* Extract the existing output IPA from the L3 entry. For
+             * non-identity mapped regions, pa is a VA not a GPA, so we
+             * must use the IPA already stored in the descriptor (set by
+             * guest_split_block).
+             *
+             * For invalidated entries (set to 0 by guest_invalidate_ptes),
+             * the stored IPA is 0 — wrong. Fall back to computing the
+             * identity-mapped IPA (base + pa). This is correct for TTBR0
+             * user-space regions where VA == IPA == GPA. Non-identity
+             * mapped regions (rosetta VA aliases) should never have
+             * invalidated entries that get re-activated here. */
+            uint64_t page_ipa;
+            if (l3[l3_idx] & PT_VALID)
+                page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+            else
+                page_ipa = base + (pa & ~(PAGE_SIZE - 1));
             l3[l3_idx] = make_page_desc(page_ipa, perms);
         }
 
@@ -1408,98 +1451,3 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
     return 0;
 }
 
-/* ---------- Debug: ARM64 page table descriptor dump ---------- */
-
-void guest_dump_ptes(const guest_t *g, uint64_t start, uint64_t end) {
-    uint64_t base = g->ipa_base;
-    uint64_t l0_gpa_off = g->ttbr0 - base;
-    uint64_t *l0 = (uint64_t *)((uint8_t *)g->host_base + l0_gpa_off);
-
-    start = start & ~(PAGE_SIZE - 1);
-    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    fprintf(stderr, "hl: PTE dump for 0x%llx-0x%llx (base=0x%llx):\n",
-            (unsigned long long)start, (unsigned long long)end,
-            (unsigned long long)base);
-
-    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t ipa = base + addr;
-        unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
-
-        if (!(l0[l0_idx] & PT_VALID)) {
-            fprintf(stderr, "  0x%llx: L0[%u] INVALID\n",
-                    (unsigned long long)addr, l0_idx);
-            continue;
-        }
-
-        uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l1 = (uint64_t *)((uint8_t *)g->host_base + (l1_ipa - base));
-        unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
-
-        if (l1_idx >= 512 || !(l1[l1_idx] & PT_VALID)) {
-            fprintf(stderr, "  0x%llx: L1[%u] INVALID\n",
-                    (unsigned long long)addr, l1_idx);
-            continue;
-        }
-
-        uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l2 = (uint64_t *)((uint8_t *)g->host_base + (l2_ipa - base));
-        unsigned l2_idx = (unsigned)((ipa % BLOCK_1GB) / BLOCK_2MB);
-        uint64_t l2_desc = l2[l2_idx];
-
-        if (!(l2_desc & 1)) {
-            fprintf(stderr, "  0x%llx: L2[%u] INVALID (0x%llx)\n",
-                    (unsigned long long)addr, l2_idx,
-                    (unsigned long long)l2_desc);
-            continue;
-        }
-
-        /* Block descriptor: bits[1:0]=01 */
-        if ((l2_desc & 3) == 1) {
-            uint64_t block_ipa = l2_desc & 0xFFFFFFE00000ULL;
-            int perms = desc_to_perms(l2_desc);
-            fprintf(stderr, "  0x%llx: L2 BLOCK ipa=0x%llx perms=%c%c%c "
-                    "desc=0x%llx\n",
-                    (unsigned long long)addr,
-                    (unsigned long long)block_ipa,
-                    (perms & MEM_PERM_R) ? 'R' : '-',
-                    (perms & MEM_PERM_W) ? 'W' : '-',
-                    (perms & MEM_PERM_X) ? 'X' : '-',
-                    (unsigned long long)l2_desc);
-            continue;
-        }
-
-        /* Table descriptor: bits[1:0]=11 → L3 page table */
-        uint64_t l3_ipa = l2_desc & 0xFFFFFFFFF000ULL;
-        uint64_t *l3 = (uint64_t *)((uint8_t *)g->host_base + (l3_ipa - base));
-        unsigned l3_idx = (unsigned)((addr % BLOCK_2MB) / PAGE_SIZE);
-        uint64_t l3_desc = l3[l3_idx];
-
-        if (!(l3_desc & 1)) {
-            fprintf(stderr, "  0x%llx: L3[%u] INVALID (0x%llx) "
-                    "l2=TABLE→0x%llx\n",
-                    (unsigned long long)addr, l3_idx,
-                    (unsigned long long)l3_desc,
-                    (unsigned long long)l3_ipa);
-            continue;
-        }
-
-        uint64_t page_ipa = l3_desc & 0xFFFFFFFFF000ULL;
-        int perms = desc_to_perms(l3_desc);
-
-        /* Verify data through PTE vs direct host_base offset */
-        uint8_t *pte_data = (uint8_t *)g->host_base + (page_ipa - base);
-        uint8_t *direct_data = (uint8_t *)g->host_base + addr;
-        int data_match = (pte_data == direct_data);
-
-        fprintf(stderr, "  0x%llx: L3[%u] ipa=0x%llx perms=%c%c%c "
-                "desc=0x%llx data_%s\n",
-                (unsigned long long)addr, l3_idx,
-                (unsigned long long)page_ipa,
-                (perms & MEM_PERM_R) ? 'R' : '-',
-                (perms & MEM_PERM_W) ? 'W' : '-',
-                (perms & MEM_PERM_X) ? 'X' : '-',
-                (unsigned long long)l3_desc,
-                data_match ? "OK" : "MISMATCH!");
-    }
-}

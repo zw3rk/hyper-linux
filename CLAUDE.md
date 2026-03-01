@@ -22,6 +22,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
 - **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
 - **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
+- **src/crash_report.c/h** — Structured crash report for GitHub issue filing (~250 lines).
 - **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 
@@ -159,14 +160,104 @@ Rosetta is treated as a binfmt_misc interpreter (NOT a PT_INTERP dynamic linker)
 ### Rosetta AOT Translation (rosettad)
 
 Rosetta supports ahead-of-time (AOT) translation via the `rosettad` daemon,
-which is also a static aarch64-linux binary. The AOT flow is essential for
-complex binaries (indirect calls, function pointers) that fail with JIT-only
-("BasicBlock requested for unrecognized address").
+which is also a static aarch64-linux binary. AOT translation produces
+ARM64 code for the x86_64 binary's functions.
+
+**Rosetta TranslationMode Architecture** (reverse-engineered from the binary):
+
+Rosetta has three independent mode concepts:
+1. **BSS[0x474] "translation quality"**: Hardware-dependent, set at init.
+   1=basic (M2, no FEAT_AFP), 2=enhanced (M3+, has FEAT_AFP). Set by
+   checking ID_AA64MMFR1_EL1 bits 44-47 (AFP field) at VA 0x800000030c64.
+2. **TranslationMode enum** (per-translation-unit): 0=Aot, 1=JIT, 2=AOT-assisted JIT, 3=unknown.
+   Stored at object offset 0x18 and stack local [sp,#0x110]/[sp,#0xb4].
+3. **is_aot_mode flag** (per-fragment): Object offset 0x214. Extracted from
+   bit 8 of AOT metadata at fragment header offset 0x88. When set, the
+   translate caller forces mode=2 (AOT-assisted JIT).
+
+**Mode computation** (at VA 0x800000034f78-0x800000034f94):
+```
+and w8, w8, #0xff    ; mask is_aot_mode
+cmp w8, #1           ; compare with 1
+mov w8, #1           ; default = JIT
+cinc w8, w8, eq      ; if is_aot_mode == 1: mode=2 (AOT-assisted)
+```
+The JIT translate path NEVER uses TranslationMode::Aot (0). It only
+produces mode 1 (pure JIT) or mode 2 (AOT-assisted JIT).
+
+**TranslationMode::Aot (0) is a completely separate code path** used by
+TranslationCacheAot.cpp for fully pre-translated AOT cache entries. It
+uses the dispatch at VA 0x800000039e00 (Translator.cpp) and supports
+dyld stub translation (translate_indirect_jmp_dyld_stub at 0x39ed0,
+which asserts _mode==Aot). Mode 0 is set by a lookup function at
+0x29ae4 that searches a table at 0x80000001c380.
+
+**How AOT-assisted JIT (mode 2) prevents block_for_offset failures:**
+- At init (0x46ee8): mode 2 calls `seed_block()` at 0x2a7b0, which
+  pre-registers all blocks from AOT data into the block table
+- In the main translate loop (0x47cdc): mode 2 takes a short path
+  (`b.eq 0x47f8c`) that skips the block list iteration at 0x47ce8-0x47d3c
+- `block_for_offset()` at 0x387d4 uses binary search on the block table;
+  with AOT-seeded blocks, lookups succeed instead of returning NULL
+
+**The "BasicBlock requested for unrecognized address" assertion** at
+VA 0x800000038838 fires in `block_for_offset` (BuilderBase.h:550) when
+the binary search returns NULL. This happens for indirect jumps to
+addresses not pre-registered as block starts. In mode 2, AOT data
+pre-populates all known blocks; in mode 1, only discovered blocks exist.
+
+**Root cause of x86_64 indirect jump failures:** Rosetta's AOT translator
+(rosettad) can statically resolve direct branches but cannot enumerate
+all targets of computed indirect jumps (e.g., musl's `printf_core` uses
+a 56-entry jump table at `.rodata:0x4050a0` for format specifier dispatch).
+In a real VZ VM, the host-side Virtualization.framework provides a runtime
+JIT service (via VZ_ACTIVATE) that translates missed indirect targets
+on-demand. Our hl provides AOT (via rosettad subprocess) but NOT the
+runtime JIT service — so indirect jump targets not covered by AOT assert.
+
+**Observed pattern:** Binaries with only direct control flow (simple write/
+exit, puts, cat, echo) pass. Binaries using printf-family formatting fail
+because `vfprintf` → `printf_core` uses `jmpq *%rax` with a jump table.
+JIT-only mode (caps[0]=0 or ROSETTA_DISABLE_AOT=1) fails on ALL musl-
+linked binaries because even libc startup (`__libc_start_main` → `main`)
+uses indirect calls through `.init_array` function pointers.
+
+**The `_potential_targets` assertion** at VA 0x800000048eac
+(`_mode == TranslationMode::Aot || _potential_targets.empty()`,
+BranchTargetFinderBase.hpp:57) is a defensive check. Within the big
+translate function, `_potential_targets` ([sp,#0x150-0x160]) is only
+ever initialized to zero (0x46e54) and reset to zero (0x4758c). The
+assertion guards against future bugs where potential targets might leak
+into non-Aot modes.
+
+**BSS[0xa04] is the VZ enable flag** — written at VA 0x800000030304
+from caps[0] of the VZ_CAPS ioctl result. When VZ is active (our hl
+sets caps[0]=1), BSS[0xa04]=1, and the runtime AOT code at 0x90afc
+proceeds to connect to rosettad via socket.
+
+**BSS[0xa05]** is a secondary VZ capability flag from caps[108].
+**BSS[0xa06..0xa71]** (108 bytes) stores the rosettad socket path,
+copied from VZ_CAPS caps[1..108].
 
 **VZ mode activation:** Rosetta checks for VZ (Virtualization.framework)
 support via 3 ioctls: VZ_CHECK (0x80456125) returns a 69-byte signature,
 VZ_CAPS (0x80806123) returns 128 bytes of capability data, VZ_ACTIVATE
 (0x6124). These are intercepted in `syscall_io.c`.
+
+**VZ_CAPS buffer layout** (128 bytes, determined empirically via sequential
+byte injection and connect() sockaddr inspection):
+- `caps[0]`: VZ enable flag (1 = active)
+- `caps[1..108]`: Unix socket path for rosettad (`sun_path[108]`).
+  Rosetta copies these bytes directly into `struct sockaddr_un.sun_path`
+  and calls `connect()`. All-zeros produces a Linux abstract socket with
+  empty name. In a real VZ VM, this would be a virtiofs-mounted path
+  (e.g. `/run/rosettad/uds`).
+- `caps[109..127]`: Additional capability flags (purpose unknown)
+
+We set caps[1..108] to zeros (abstract socket) because our implementation
+intercepts `socket(SOCK_SEQPACKET)` and `connect()` via a socketpair.
+Rosetta never actually reaches the socket path; the rosettad protocol
+is handled by `rosettad_handler_thread` on the other end of the pair.
 
 **rosettad protocol** (implemented in `syscall_io.c:rosettad_handler_thread`):
 - Rosetta opens `AF_UNIX SOCK_SEQPACKET` — intercepted in `syscall_net.c`
@@ -311,6 +402,12 @@ MAP_SHARED is treated as MAP_PRIVATE (copy-on-write). Since the guest
 is single-process, shared vs private semantics are equivalent. This
 enables tools like `sort` on large files that use file-backed shared
 mappings.
+
+**MAP_FIXED file-backed mmap** must pread() file contents into guest
+memory. Both the MAP_FIXED and non-fixed paths need this. The MAP_FIXED
+path zeros the region first (for pages beyond EOF), then overlays with
+file data. This is critical for Rosetta's AOT loading — rosetta uses
+MAP_FIXED to map AOT code/data sections from the translated file.
 
 ## Memory Layout
 
@@ -459,3 +556,53 @@ guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
 - PI futexes (priority inheritance) — real-time only
 - CPU affinity (sched_setaffinity) — returns all-CPUs mask
 - clone3 — returns -ENOSYS; musl falls back to clone()
+
+## Ptrace and clone(CLONE_VM) for Rosetta JIT
+
+Rosetta's two-process JIT architecture uses `clone(CLONE_VM)` to create
+an inferior process that shares guest memory, then attaches via
+`PTRACE_SEIZE`. BRK instructions in translated code trigger ptrace-stops,
+allowing the tracer to read/write registers and discover untranslated
+code on-demand.
+
+### clone(CLONE_VM) — In-Process VM-Clone
+
+`sys_clone_vm()` in `src/fork_ipc.c` handles `CLONE_VM` without
+`CLONE_THREAD`. Unlike `sys_clone_thread()` (CLONE_THREAD), VM-clone
+children are waitable via wait4 and have exit semantics (exit_signal,
+vm_exit_status). Unlike the posix_spawn fork path, they share the
+same `guest_t*` (same guest memory, page tables).
+
+### sys_ptrace Operations
+
+Implemented in `src/syscall_proc.c`:
+- **PTRACE_SEIZE**: Attach to thread without stopping; sets `ptraced=1`
+- **PTRACE_CONT**: Resume stopped tracee, optionally inject signal
+- **PTRACE_INTERRUPT**: Force tracee into ptrace-stop via `hv_vcpus_exit()`
+- **PTRACE_GETREGSET** (NT_PRSTATUS): Read tracee's register snapshot
+- **PTRACE_SETREGSET** (NT_PRSTATUS): Write tracee's registers (applied on resume)
+
+### Register Snapshot Protocol
+
+Cross-thread HVF register access may not be supported, so we use a
+snapshot protocol: the tracee snapshots its own vCPU registers into
+`ptrace_regs` before entering ptrace-stop, and applies any dirty
+changes back to the vCPU on resume. This ensures all HVF register
+access happens on the owning thread.
+
+### BRK + Ptrace-Stop Flow
+
+1. Guest executes BRK → shim forwards via HVC #10
+2. If `current_thread->ptraced`: tracee calls `thread_ptrace_stop(SIGTRAP)`
+3. Tracee snapshots regs, sets `ptrace_stopped=1`, broadcasts `ptrace_cond`
+4. Tracer's wait4 returns with `WIFSTOPPED(status)` and `WSTOPSIG==SIGTRAP`
+5. Tracer reads/writes regs via GETREGSET/SETREGSET
+6. Tracer calls PTRACE_CONT → sets `ptrace_stopped=0`, signals `resume_cond`
+7. Tracee applies dirty regs, resumes execution
+
+### wait4 Integration
+
+`sys_wait4()` first checks for ptraced/vm-clone children via
+`thread_ptrace_wait()` before falling through to the process table
+for regular fork children. This handles both ptrace-stopped and
+vm-exited states.

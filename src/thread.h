@@ -19,6 +19,7 @@
 #include <Hypervisor/Hypervisor.h>
 #include <pthread.h>
 #include <stdint.h>
+#include "syscall.h"  /* linux_user_pt_regs_t */
 
 /* Maximum number of concurrent guest threads in one VM. */
 #define MAX_THREADS 64
@@ -37,6 +38,33 @@ typedef struct {
     uint64_t      blocked;         /* Signal mask for this thread */
     uint64_t      saved_blocked;   /* Original mask saved by sigsuspend */
     int           saved_blocked_valid;
+
+    /* ---------- ptrace state ----------
+     * Used by Rosetta's two-process JIT: the tracer attaches via
+     * PTRACE_SEIZE, then uses BRK-triggered SIGTRAP + wait4 to
+     * discover untranslated code on-demand. The tracee snapshots
+     * its own vCPU registers before stopping and applies any
+     * tracer-written changes on resume — this avoids cross-thread
+     * HVF register access (which may not be supported). */
+    int             ptraced;          /* Non-zero if being traced */
+    int64_t         tracer_tid;       /* TID of tracing thread */
+    int             ptrace_stopped;   /* Non-zero when in ptrace-stop */
+    int             ptrace_stop_sig;  /* Signal that caused the stop */
+    pthread_cond_t  ptrace_cond;      /* Tracee stopped → tracer wakes */
+    pthread_cond_t  resume_cond;      /* Tracer CONT → tracee wakes */
+    int             ptrace_cont_sig;  /* Signal to inject on resume (0=none) */
+    linux_user_pt_regs_t ptrace_regs; /* Register snapshot for cross-thread access */
+    int             ptrace_regs_dirty;/* Tracer modified registers */
+
+    /* ---------- VM-clone child state ----------
+     * For clone(CLONE_VM) without CLONE_THREAD: shares guest memory but
+     * has a separate TID, is waitable via wait4, and can be ptraced.
+     * Used by Rosetta's two-process JIT architecture. */
+    int             is_vm_clone;      /* Waitable via wait4 */
+    int64_t         parent_tid;       /* Parent TID for wait4 matching */
+    int             exit_signal;      /* Signal on exit (usually SIGCHLD) */
+    int             vm_exited;        /* Child has exited */
+    int             vm_exit_status;   /* Wait-format exit status */
 } thread_entry_t;
 
 /* Current thread pointer — set once per host pthread at thread start.
@@ -80,5 +108,27 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
  * is running in a tight loop (no syscalls), this forces it to break
  * out of hv_vcpu_run so the signal can be delivered. */
 void thread_interrupt_all(void);
+
+/* ---------- Ptrace helpers ---------- */
+
+/* Initialize ptrace-related fields (conds, zero state). Called from
+ * thread_alloc() and thread_register_main(). */
+void thread_ptrace_init(thread_entry_t *t);
+
+/* Tracee: snapshot vCPU regs, enter ptrace-stop, block until resumed.
+ * Returns the signal to inject (from tracer's PTRACE_CONT), or 0. */
+int thread_ptrace_stop(thread_entry_t *t, int sig);
+
+/* Tracer: resume a stopped tracee with optional signal injection. */
+void thread_ptrace_cont(thread_entry_t *t, int sig);
+
+/* Tracer: wait for a ptraced or vm-clone child to stop or exit.
+ * Returns child TID on success, 0 on WNOHANG with none ready,
+ * or negative Linux errno. Writes wait-format status to *out_status. */
+int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+                            int options);
+
+/* Get the thread table mutex (needed for ptrace wait blocking). */
+pthread_mutex_t *thread_get_lock(void);
 
 #endif /* THREAD_H */

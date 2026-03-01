@@ -22,6 +22,14 @@
       # x86_64-linux to x86_64-linux-musl (same arch, different libc).
       x64CrossPkgs = linuxPkgs.pkgsCross.musl64;
 
+      # aarch64-linux-gnu (glibc) cross packages — for glibc dynamic linking tests.
+      # Uses aarch64-multiplatform (glibc-based, NOT the -musl variant).
+      glibcCrossPkgs = linuxPkgs.pkgsCross.aarch64-multiplatform;
+
+      # x86_64-linux-gnu (glibc) packages — native x86_64-linux packages
+      # (linuxPkgs IS x86_64-linux with glibc), for x86_64 glibc testing via Rosetta.
+      x64GlibcPkgs = linuxPkgs;
+
       # Darwin SDK for Hypervisor.framework
       darwinBuildInputs = [
         darwinPkgs.apple-sdk_15
@@ -200,6 +208,133 @@
       # Dynamically-linked coreutils (default musl, NOT pkgsStatic)
       dynamicCoreutils = crossPkgs.coreutils;
 
+      # ── glibc dynamic linking test infrastructure ────────────────
+
+      # aarch64-linux-gnu (glibc) sysroot: dynamic linker + shared libs
+      # needed by dynamically-linked glibc coreutils.
+      glibcGccLibs = glibcCrossPkgs.stdenv.cc.cc.lib;
+      glibc-sysroot = glibcCrossPkgs.runCommand "glibc-sysroot" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
+        mkdir -p $out/lib $out/lib64
+        # Dynamic linker
+        cp -aL ${glibcCrossPkgs.glibc}/lib/ld-linux-aarch64.so.1    $out/lib/
+        # Core glibc shared libs
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libc.so.6                $out/lib/
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libc.so                  $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libm.so.6                $out/lib/
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libm.so                  $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libpthread.so.0          $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libdl.so.2               $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libresolv.so.2           $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/librt.so.1               $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libmvec.so*              $out/lib/ || true
+        # NSS modules (needed for getpwnam, getgrnam, etc.)
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libnss_files.so*         $out/lib/ || true
+        cp -aL ${glibcCrossPkgs.glibc}/lib/libnss_dns.so*           $out/lib/ || true
+        # GCC runtime: libgcc_s, libatomic
+        cp -aL ${glibcGccLibs}/lib/libgcc_s.so*                     $out/lib/
+        cp -aL ${glibcGccLibs}/lib/libatomic.so*                    $out/lib/ || true
+        # Coreutils deps: acl, attr, gmp
+        cp -aL ${glibcCrossPkgs.acl.out}/lib/libacl.so*             $out/lib/
+        cp -aL ${glibcCrossPkgs.attr.out}/lib/libattr.so*           $out/lib/
+        cp -aL ${glibcCrossPkgs.gmp}/lib/libgmp.so*                 $out/lib/
+        # /lib64 symlink for binaries with /lib64 PT_INTERP
+        ln -sf ../lib/ld-linux-aarch64.so.1 $out/lib64/ld-linux-aarch64.so.1
+
+        # Strip nix store RPATHs
+        chmod -R u+w $out/lib
+        for f in $out/lib/*.so*; do
+          [ -L "$f" ] && continue
+          patchelf --remove-rpath "$f" 2>/dev/null || true
+        done
+      '';
+
+      # Dynamically-linked glibc test binary (aarch64)
+      glibcDynamicTestBinaries = glibcCrossPkgs.stdenv.mkDerivation {
+        pname = "hl-glibc-dynamic-test-binaries";
+        version = "0.1.0";
+        src = ./test;
+        dontConfigure = true;
+        dontFixup = true;
+        buildPhase = ''
+          $CC -O2 -o hello-dynamic hello-dynamic.c
+          file hello-dynamic | grep -q "dynamically linked" || {
+            echo "ERROR: hello-dynamic is not dynamically linked!"
+            exit 1
+          }
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp hello-dynamic $out/bin/
+        '';
+      };
+
+      # Dynamically-linked glibc coreutils (aarch64)
+      glibcDynamicCoreutils = glibcCrossPkgs.coreutils;
+
+      # x86_64-linux-gnu (glibc) sysroot
+      x64GlibcGccLibs = x64GlibcPkgs.stdenv.cc.cc.lib;
+      x64-glibc-sysroot = x64GlibcPkgs.runCommand "x64-glibc-sysroot" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
+        mkdir -p $out/lib $out/lib64
+        # Dynamic linker
+        cp -aL ${x64GlibcPkgs.glibc}/lib/ld-linux-x86-64.so.2      $out/lib/
+        # Core glibc shared libs
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libc.so.6                  $out/lib/
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libc.so                    $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libm.so.6                  $out/lib/
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libm.so                    $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libpthread.so.0            $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libdl.so.2                 $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libresolv.so.2             $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/librt.so.1                 $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libmvec.so*                $out/lib/ || true
+        # NSS modules
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libnss_files.so*           $out/lib/ || true
+        cp -aL ${x64GlibcPkgs.glibc}/lib/libnss_dns.so*             $out/lib/ || true
+        # GCC runtime
+        cp -aL ${x64GlibcGccLibs}/lib/libgcc_s.so*                  $out/lib/
+        cp -aL ${x64GlibcGccLibs}/lib/libatomic.so*                 $out/lib/ || true
+        # Coreutils deps
+        cp -aL ${x64GlibcPkgs.acl.out}/lib/libacl.so*               $out/lib/
+        cp -aL ${x64GlibcPkgs.attr.out}/lib/libattr.so*             $out/lib/
+        cp -aL ${x64GlibcPkgs.gmp}/lib/libgmp.so*                   $out/lib/
+        # /lib64 symlink
+        ln -sf ../lib/ld-linux-x86-64.so.2 $out/lib64/ld-linux-x86-64.so.2
+
+        # Strip nix store RPATHs
+        chmod -R u+w $out/lib
+        for f in $out/lib/*.so*; do
+          [ -L "$f" ] && continue
+          patchelf --remove-rpath "$f" 2>/dev/null || true
+        done
+      '';
+
+      # Dynamically-linked glibc test binary (x86_64)
+      x64GlibcDynamicTestBinaries = x64GlibcPkgs.stdenv.mkDerivation {
+        pname = "hl-x64-glibc-dynamic-test-binaries";
+        version = "0.1.0";
+        src = ./test;
+        dontConfigure = true;
+        dontFixup = true;
+        buildPhase = ''
+          $CC -O2 -o hello-dynamic hello-dynamic.c
+          file hello-dynamic | grep -q "dynamically linked" || {
+            echo "ERROR: hello-dynamic is not dynamically linked!"
+            exit 1
+          }
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp hello-dynamic $out/bin/
+        '';
+      };
+
+      # Dynamically-linked glibc coreutils (x86_64)
+      x64GlibcDynamicCoreutils = x64GlibcPkgs.coreutils;
+
       # ── Haskell test binary ────────────────────────────────────────
       # Static aarch64-linux-musl Haskell "Hello World" to verify hl
       # can run GHC-produced ELF binaries.  Built via nixpkgs cross
@@ -265,6 +400,26 @@
             patchelf --set-interpreter /lib/ld-musl-aarch64.so.1 "$f"
           fi
         done
+
+        # x86_64-linux test binaries (for rosetta testing via test-x64-*)
+        mkdir -p $out/{x64-test-binaries,x64-coreutils,x64-busybox}/bin
+        cp -rL ${x64TestBinaries}/bin/.          $out/x64-test-binaries/bin/
+        cp -rL ${x64GuestBins.coreutils}/bin/.   $out/x64-coreutils/bin/
+        cp -rL ${x64GuestBins.busybox}/bin/.     $out/x64-busybox/bin/
+
+        # aarch64-linux-gnu (glibc) test artifacts
+        mkdir -p $out/{glibc-sysroot/lib,glibc-sysroot/lib64,glibc-dynamic-tests,glibc-dynamic-coreutils}/bin
+        cp -rL ${glibc-sysroot}/lib/.               $out/glibc-sysroot/lib/
+        cp -rL ${glibc-sysroot}/lib64/.              $out/glibc-sysroot/lib64/ || true
+        cp -rL ${glibcDynamicTestBinaries}/bin/.     $out/glibc-dynamic-tests/bin/
+        cp -rL ${glibcDynamicCoreutils}/bin/.        $out/glibc-dynamic-coreutils/bin/
+
+        # x86_64-linux-gnu (glibc) test artifacts
+        mkdir -p $out/{x64-glibc-sysroot/lib,x64-glibc-sysroot/lib64,x64-glibc-dynamic-tests,x64-glibc-dynamic-coreutils}/bin
+        cp -rL ${x64-glibc-sysroot}/lib/.               $out/x64-glibc-sysroot/lib/
+        cp -rL ${x64-glibc-sysroot}/lib64/.              $out/x64-glibc-sysroot/lib64/ || true
+        cp -rL ${x64GlibcDynamicTestBinaries}/bin/.      $out/x64-glibc-dynamic-tests/bin/
+        cp -rL ${x64GlibcDynamicCoreutils}/bin/.         $out/x64-glibc-dynamic-coreutils/bin/
       '';
 
     in {
@@ -318,6 +473,16 @@
           GUEST_X64_COREUTILS = "${x64GuestBins.coreutils}";
           GUEST_X64_BUSYBOX   = "${x64GuestBins.busybox}";
 
+          # glibc dynamic linking tests (aarch64)
+          GUEST_GLIBC_SYSROOT            = "${glibc-sysroot}";
+          GUEST_GLIBC_DYNAMIC_TESTS      = "${glibcDynamicTestBinaries}";
+          GUEST_GLIBC_DYNAMIC_COREUTILS  = "${glibcDynamicCoreutils}";
+
+          # glibc dynamic linking tests (x86_64)
+          GUEST_X64_GLIBC_SYSROOT            = "${x64-glibc-sysroot}";
+          GUEST_X64_GLIBC_DYNAMIC_TESTS      = "${x64GlibcDynamicTestBinaries}";
+          GUEST_X64_GLIBC_DYNAMIC_COREUTILS  = "${x64GlibcDynamicCoreutils}";
+
           # Haskell test binary
           GUEST_HASKELL_HELLO = "${haskellHello}";
 
@@ -341,10 +506,20 @@
             echo "  x64 coreutils: $GUEST_X64_COREUTILS/bin/"
             echo "  x64 busybox:  $GUEST_X64_BUSYBOX/bin/"
             echo ""
-            echo "Dynamic linking tests:"
+            echo "Dynamic linking tests (musl):"
             echo "  sysroot:       $GUEST_SYSROOT/lib/"
             echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
             echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
+            echo ""
+            echo "Dynamic linking tests (glibc aarch64):"
+            echo "  sysroot:       $GUEST_GLIBC_SYSROOT/lib/"
+            echo "  dynamic tests: $GUEST_GLIBC_DYNAMIC_TESTS/bin/"
+            echo "  dynamic coreutils: $GUEST_GLIBC_DYNAMIC_COREUTILS/bin/"
+            echo ""
+            echo "Dynamic linking tests (glibc x86_64):"
+            echo "  sysroot:       $GUEST_X64_GLIBC_SYSROOT/lib/"
+            echo "  dynamic tests: $GUEST_X64_GLIBC_DYNAMIC_TESTS/bin/"
+            echo "  dynamic coreutils: $GUEST_X64_GLIBC_DYNAMIC_COREUTILS/bin/"
             echo ""
             echo "Haskell test binary:"
             echo "  hello-hyper:   $GUEST_HASKELL_HELLO/bin/hello-hyper"

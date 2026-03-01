@@ -16,6 +16,8 @@
  *   #5  Syscall forward   (registers preserved from EL0 SVC #0)
  *   #7  MRS trap          (host reads sysreg from ESR ISS; returns value in x0)
  *   #9  W^X toggle        (x0 = FAR, x1 = type: 0=exec→RX, 1=write→RW)
+ *   #10 BRK from EL0      (host delivers SIGTRAP; GPRs restored before HVC)
+ *   #11 EL0 fault         (host delivers SIGSEGV; GPRs restored before HVC)
  *
  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
  * NOT as a statement separator. Each instruction must be on its own line.
@@ -305,20 +307,30 @@ handle_sysreg_trap:
 /* ================================================================
  * handle_inst_abort — EC=0x20: Instruction abort from lower EL
  *
- * For JIT translators (rosetta): code pages are initially mapped RW
- * (for code generation). When execution is attempted, the permission
- * fault triggers here. We ask the host to flip the page to RX via
- * HVC #9, flush the TLB, then retry the instruction fetch.
+ * Two cases:
+ * 1. Permission fault (IFSC[5:2]=0x03): W^X demand toggle for JIT.
+ *    Code pages are initially RW; execution triggers permission fault.
+ *    Ask host to flip to RX via HVC #9, flush TLB, retry.
  *
- * Only handles permission faults (IFSC[5:2]=0x03). Translation faults
- * and other types fall through to bad_exception.
+ * 2. Translation fault (IFSC[5:2]=0x01) or other non-permission fault:
+ *    Address not mapped in page tables. A real Linux kernel delivers
+ *    SIGSEGV (si_code=SEGV_MAPERR) to the process. Rosetta's SIGSEGV
+ *    handler uses this for fault-driven lazy JIT translation: when
+ *    JIT code branches to an untranslated address, the translation
+ *    fault triggers SIGSEGV, the handler translates the block, then
+ *    resumes execution. Forward to host via HVC #11 for signal delivery.
  * ================================================================ */
 handle_inst_abort:
     and x11, x9, #0x3C       /* IFSC[5:2] */
     cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
-    b.ne restore_and_bad
+    b.eq 1f
 
-    mrs x0, far_el1           /* Faulting address */
+    /* Non-permission fault (translation, access flag, etc.) from EL0.
+     * Restore all GPRs and forward to host for SIGSEGV delivery.
+     * x9 still holds ESR_EL1 for the host to decode fault type. */
+    b handle_el0_fault
+
+1:  mrs x0, far_el1           /* Faulting address */
     mov x1, #0                /* Type 0 = instruction fault → flip to RX */
     hvc #9
     b tlbi_restore_eret
@@ -326,23 +338,75 @@ handle_inst_abort:
 /* ================================================================
  * handle_data_abort — EC=0x24: Data abort from lower EL
  *
- * For JIT translators: when a code page has been flipped to RX,
- * subsequent writes (for new code generation) trigger permission
- * faults. We flip the page back to RW via HVC #9 and retry.
+ * Three cases:
+ * 1. Write permission fault (WnR=1, DFSC[5:2]=0x03): W^X toggle.
+ *    Code page is RX; JIT write triggers permission fault. Flip to RW.
  *
- * Only handles write permission faults (WnR=1, DFSC[5:2]=0x03).
+ * 2. Read/write translation fault (DFSC[5:2]=0x01): Address not mapped.
+ *    Deliver SIGSEGV (SEGV_MAPERR) via host. Rosetta and other programs
+ *    may use SIGSEGV handlers for lazy allocation or guard pages.
+ *
+ * 3. Read permission fault (WnR=0, DFSC[5:2]=0x03): Permission denied.
+ *    Deliver SIGSEGV (SEGV_ACCERR) via host.
  * ================================================================ */
 handle_data_abort:
-    tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
-    b.eq restore_and_bad
     and x11, x9, #0x3C       /* DFSC[5:2] */
-    cmp x11, #0x0C            /* Permission fault? */
-    b.ne restore_and_bad
+    cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
+    b.ne handle_el0_fault     /* Translation/other fault → SIGSEGV */
+
+    tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
+    b.eq handle_el0_fault     /* Read permission fault → SIGSEGV */
 
     mrs x0, far_el1           /* Faulting address */
     mov x1, #1                /* Type 1 = write fault → flip to RW */
     hvc #9
     b tlbi_restore_eret
+
+/* ================================================================
+ * handle_el0_fault — Deliver SIGSEGV for EL0 faults
+ *
+ * Translation faults (unmapped address), access flag faults, and
+ * read permission faults from EL0 code should deliver SIGSEGV to
+ * the guest process, not crash. This is how a real Linux kernel
+ * handles faults — the process gets a signal and can either handle
+ * it (e.g., rosetta's lazy JIT translation) or die from default
+ * disposition.
+ *
+ * Restore all GPRs from the stack frame (host needs the original
+ * EL0 state for the signal frame), then forward to host via HVC #11.
+ * The host decodes the fault type from ESR_EL1 and delivers SIGSEGV
+ * with the appropriate si_code (SEGV_MAPERR or SEGV_ACCERR).
+ * ================================================================ */
+handle_el0_fault:
+    /* Restore all GPRs from stack frame (host needs EL0 state) */
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+
+    /* Forward to host for SIGSEGV delivery.
+     * Host reads ESR_EL1 (fault syndrome), FAR_EL1 (faulting address),
+     * and ELR_EL1 (PC at fault) to decode the fault and build the
+     * signal frame. */
+    hvc #11
+
+    /* Host has set up signal frame (if SIGSEGV handler registered) or
+     * flagged for termination (default SIGSEGV = core dump). ERET to
+     * new PC (handler address or unchanged if terminating). */
+    eret
 
 /* ================================================================
  * Shared exit paths for exception handlers

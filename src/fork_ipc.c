@@ -37,10 +37,12 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
+#define IPC_VERSION       2            /* v2: added VA alias transfer for rosetta fork */
 
 /* IPC header: sent first over socketpair */
 typedef struct {
     uint32_t magic;
+    uint32_t version;        /* Protocol version for forward compatibility */
     uint32_t ipa_bits;       /* IPA width for HVF VM (e.g., 36, 40, 48) */
     int64_t  child_pid;
     int64_t  parent_pid;
@@ -193,6 +195,11 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         fprintf(stderr, "hl: fork-child: bad magic 0x%x\n", hdr.magic);
         return 1;
     }
+    if (hdr.version != IPC_VERSION) {
+        fprintf(stderr, "hl: fork-child: IPC version mismatch "
+                "(got %u, expected %u)\n", hdr.version, IPC_VERSION);
+        return 1;
+    }
 
     if (verbose)
         fprintf(stderr, "hl: fork-child: pid=%lld ppid=%lld\n",
@@ -205,6 +212,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     guest_t g;
     if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
         fprintf(stderr, "hl: fork-child: failed to init guest\n");
+        close(ipc_fd);
         return 1;
     }
 
@@ -310,6 +318,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             return 1;
         }
 
+        if (received_count != (int)num_fds) {
+            fprintf(stderr, "hl: fork-child: fd count mismatch: "
+                    "received %d, expected %u\n",
+                    received_count, num_fds);
+        }
+
         /* Populate fd_table.  Parent sends fd_entries and host_fds in
          * 1:1 correspondence — each entry at index i has its host FD
          * at host_fds[i] (STDIO entries include their FD too, but we
@@ -334,10 +348,13 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                     int dir_fd = dup(host_fds[i]);
                     if (dir_fd >= 0) {
                         DIR *dir = fdopendir(dir_fd);
-                        if (dir)
+                        if (dir) {
                             fd_table[gfd].dir = dir;
-                        else
+                        } else {
                             close(dir_fd);
+                            fprintf(stderr, "hl: fork-child: fdopendir "
+                                    "failed for gfd %d\n", gfd);
+                        }
                     }
                 }
             }
@@ -388,6 +405,25 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         }
     }
     g.nregions = (int)num_guest_regions;
+
+    /* Step 6b2: Read VA aliases (for rosetta high-VA mappings) */
+    uint32_t num_aliases;
+    if (ipc_read_all(ipc_fd, &num_aliases, sizeof(num_aliases)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read alias count\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (num_aliases > GUEST_MAX_ALIASES)
+        num_aliases = GUEST_MAX_ALIASES;
+    if (num_aliases > 0) {
+        if (ipc_read_all(ipc_fd, g.va_aliases,
+                         num_aliases * sizeof(guest_va_alias_t)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read VA aliases\n");
+            guest_destroy(&g);
+            return 1;
+        }
+    }
+    g.naliases = (int)num_aliases;
 
     /* Step 6c: Read signal state (shifted to accommodate region tracking) */
     signal_state_t sig;
@@ -720,8 +756,14 @@ static void *thread_create_and_run(void *arg) {
      * FUTEX_WAIT on this address until it becomes 0. */
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
-        guest_write(g, t->clear_child_tid, &zero, sizeof(zero));
-        futex_wake_one(g, t->clear_child_tid);
+        if (guest_write(g, t->clear_child_tid, &zero, sizeof(zero)) == 0) {
+            futex_wake_one(g, t->clear_child_tid);
+        } else {
+            fprintf(stderr, "hl: warning: thread tid=%lld clear_child_tid "
+                    "write failed (gva=0x%llx)\n",
+                    (long long)t->guest_tid,
+                    (unsigned long long)t->clear_child_tid);
+        }
     }
 
     if (verbose)
@@ -734,6 +776,220 @@ static void *thread_create_and_run(void *arg) {
     return NULL;
 }
 
+/* ---------- CLONE_VM: create a new thread sharing guest memory, waitable via wait4 ---------- */
+
+/* Worker entry for vm-clone child threads. Nearly identical to
+ * thread_create_and_run but sets vm-clone exit semantics. */
+static void *vm_clone_thread_run(void *arg);
+
+static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
+                             uint64_t flags, uint64_t child_stack,
+                             uint64_t ptid_gva, uint64_t tls,
+                             uint64_t ctid_gva, int verbose) {
+    /* Allocate guest TID */
+    int64_t child_tid = proc_alloc_pid();
+
+    /* Allocate thread table slot */
+    thread_entry_t *t = thread_alloc(child_tid);
+    if (!t) {
+        fprintf(stderr, "hl: clone_vm: thread table full\n");
+        return -LINUX_EAGAIN;
+    }
+
+    /* Mark as VM-clone child (waitable via wait4, not CLONE_THREAD) */
+    t->is_vm_clone = 1;
+    t->parent_tid  = current_thread ? current_thread->guest_tid : 0;
+    t->exit_signal = (int)(flags & 0xFF);  /* Low byte = exit signal */
+    if (t->exit_signal == 0)
+        t->exit_signal = LINUX_SIGCHLD;
+
+    /* Inherit parent's signal mask */
+    if (current_thread)
+        t->blocked = current_thread->blocked;
+
+    /* Allocate per-thread EL1 stack */
+    uint64_t child_sp_el1 = thread_alloc_sp_el1();
+    if (child_sp_el1 == 0) {
+        thread_deactivate(t);
+        return -LINUX_ENOMEM;
+    }
+    t->sp_el1 = child_sp_el1;
+
+    /* Capture parent register state */
+    uint64_t parent_elr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
+    uint64_t parent_spsr   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
+    uint64_t parent_vbar   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
+    uint64_t parent_ttbr0  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
+    uint64_t parent_sctlr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
+    uint64_t parent_tcr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
+    uint64_t parent_mair   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
+    uint64_t parent_cpacr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_CPACR_EL1);
+    uint64_t parent_tpidr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TPIDR_EL0);
+
+    uint64_t parent_gprs[31];
+    for (int i = 0; i < 31; i++)
+        parent_gprs[i] = vcpu_get_gpr(parent_vcpu, (unsigned)i);
+
+    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    if (!tca) {
+        thread_deactivate(t);
+        return -LINUX_ENOMEM;
+    }
+
+    tca->thread      = t;
+    tca->guest       = g;
+    tca->verbose     = verbose;
+    tca->child_stack = child_stack ? child_stack :
+                       vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SP_EL0);
+    tca->flags       = flags;
+    tca->tls         = tls;
+    tca->elr         = parent_elr;
+    tca->spsr        = parent_spsr;
+    tca->vbar        = parent_vbar;
+    tca->ttbr0       = parent_ttbr0;
+    tca->sctlr       = parent_sctlr;
+    tca->tcr         = parent_tcr;
+    tca->mair        = parent_mair;
+    tca->cpacr       = parent_cpacr;
+    tca->tpidr       = parent_tpidr;
+    memcpy(tca->gprs, parent_gprs, sizeof(parent_gprs));
+    tca->sp_el1      = child_sp_el1;
+
+    /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
+    if (flags & LINUX_CLONE_PARENT_SETTID) {
+        int32_t tid32 = (int32_t)child_tid;
+        guest_write(g, ptid_gva, &tid32, sizeof(tid32));
+    }
+
+    /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
+    if (flags & LINUX_CLONE_CHILD_CLEARTID)
+        t->clear_child_tid = ctid_gva;
+
+    /* CLONE_CHILD_SETTID: write child TID to child's ctid address */
+    if (flags & LINUX_CLONE_CHILD_SETTID) {
+        int32_t tid32 = (int32_t)child_tid;
+        guest_write(g, ctid_gva, &tid32, sizeof(tid32));
+    }
+
+    /* Create the host pthread */
+    pthread_t host_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    int err = pthread_create(&host_thread, &attr, vm_clone_thread_run, tca);
+    pthread_attr_destroy(&attr);
+
+    if (err != 0) {
+        fprintf(stderr, "hl: clone_vm: pthread_create failed: %s\n",
+                strerror(err));
+        free(tca);
+        thread_deactivate(t);
+        return -LINUX_EAGAIN;
+    }
+
+    t->host_thread = host_thread;
+
+    if (verbose)
+        fprintf(stderr, "hl: clone_vm: child tid=%lld created "
+                "(parent=%lld, flags=0x%llx)\n",
+                (long long)child_tid, (long long)t->parent_tid,
+                (unsigned long long)flags);
+
+    return child_tid;
+}
+
+/* Worker entry for vm-clone children. Sets up vCPU, runs guest code,
+ * then marks exit status for parent's wait4 to collect. */
+static void *vm_clone_thread_run(void *arg) {
+    thread_create_args_t *tca = (thread_create_args_t *)arg;
+    thread_entry_t *t = tca->thread;
+    guest_t *g = tca->guest;
+
+    /* Create vCPU on THIS thread (HVF requirement) */
+    hv_vcpu_t vcpu;
+    hv_vcpu_exit_t *vexit;
+    hv_return_t r = hv_vcpu_create(&vcpu, &vexit, NULL);
+    if (r != HV_SUCCESS) {
+        fprintf(stderr, "hl: vm_clone tid=%lld: hv_vcpu_create failed: %d\n",
+                (long long)t->guest_tid, (int)r);
+        free(tca);
+        thread_deactivate(t);
+        return NULL;
+    }
+
+    t->vcpu  = vcpu;
+    t->vexit = vexit;
+
+    /* Copy system registers from parent */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1,  tca->tcr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
+
+    /* TLS pointer */
+    if (tca->flags & LINUX_CLONE_SETTLS) {
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tls));
+    } else {
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
+    }
+
+    /* ELR_EL1 = clone return point */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, tca->spsr));
+
+    /* Copy all 31 GPRs from parent, set X0=0 (child clone return) */
+    for (int i = 0; i < 31; i++)
+        HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, tca->gprs[i]));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, 0));
+
+    /* Start at clone return point in EL0 */
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, tca->elr));
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+
+    int verbose = tca->verbose;
+    free(tca);
+
+    /* Set per-thread TLS pointer and enter worker run loop */
+    current_thread = t;
+
+    if (verbose)
+        fprintf(stderr, "hl: vm_clone tid=%lld starting on vCPU\n",
+                (long long)t->guest_tid);
+
+    int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0);
+
+    /* CLONE_CHILD_CLEARTID cleanup */
+    if (t->clear_child_tid != 0) {
+        uint32_t zero = 0;
+        if (guest_write(g, t->clear_child_tid, &zero, sizeof(zero)) == 0)
+            futex_wake_one(g, t->clear_child_tid);
+    }
+
+    /* Mark exit status for parent's wait4 to collect.
+     * vm_exit_status uses wait-format: (exit_code << 8) for normal exit. */
+    pthread_mutex_t *lock = thread_get_lock();
+    pthread_mutex_lock(lock);
+    t->vm_exited = 1;
+    t->vm_exit_status = (exit_code & 0xFF) << 8;
+    pthread_cond_broadcast(&t->ptrace_cond);
+    pthread_mutex_unlock(lock);
+
+    if (verbose)
+        fprintf(stderr, "hl: vm_clone tid=%lld exiting (code=%d)\n",
+                (long long)t->guest_tid, exit_code);
+
+    hv_vcpu_destroy(vcpu);
+    /* Don't deactivate yet — parent needs to wait4 to collect status.
+     * The slot is freed when thread_ptrace_wait reads vm_exited. */
+
+    return NULL;
+}
+
 int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
                   uint64_t child_stack, uint64_t ptid_gva,
                   uint64_t tls, uint64_t ctid_gva, int verbose) {
@@ -741,6 +997,14 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     if (flags & LINUX_CLONE_THREAD) {
         return sys_clone_thread(vcpu, g, flags, child_stack,
                                 ptid_gva, tls, ctid_gva, verbose);
+    }
+
+    /* CLONE_VM without CLONE_THREAD: create an in-process VM-clone child.
+     * Used by Rosetta's two-process JIT: the inferior shares guest memory
+     * but has a separate TID and is waitable via wait4/ptrace. */
+    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD)) {
+        return sys_clone_vm(vcpu, g, flags, child_stack,
+                            ptid_gva, tls, ctid_gva, verbose);
     }
 
     /* We only support fork-like clone (SIGCHLD) and posix_spawn-like
@@ -826,6 +1090,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
+        .version = IPC_VERSION,
         .ipa_bits = g->ipa_bits,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
@@ -999,6 +1264,22 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     if (num_guest_regions > 0) {
         if (ipc_write_all(ipc_sock, g->regions,
                           num_guest_regions * sizeof(guest_region_t)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    /* VA aliases (for rosetta high-VA mappings).
+     * Without these, fork children in rosetta mode can't resolve
+     * high virtual addresses via guest_ptr/read/write. */
+    uint32_t num_aliases = (uint32_t)g->naliases;
+    if (ipc_write_all(ipc_sock, &num_aliases, sizeof(num_aliases)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    if (num_aliases > 0) {
+        if (ipc_write_all(ipc_sock, g->va_aliases,
+                          num_aliases * sizeof(guest_va_alias_t)) < 0) {
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }

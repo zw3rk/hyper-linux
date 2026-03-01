@@ -25,6 +25,17 @@
     }                                                              \
 } while (0)
 
+/* HV_CHECK variant that emits a structured crash report before exit.
+ * Use in the vCPU run loop where vcpu and guest_t are available. */
+#define HV_CHECK_CTX(call, vcpu, g) do {                           \
+    hv_return_t _r = (call);                                       \
+    if (_r != HV_SUCCESS) {                                        \
+        fprintf(stderr, "hl: %s failed: %d\n", #call, (int)_r);   \
+        crash_report((vcpu), (g), CRASH_HV_CHECK, #call);         \
+        exit(1);                                                   \
+    }                                                              \
+} while (0)
+
 /* ---------- SCTLR_EL1 bits ----------
  * These are needed by hl.c (initial setup), fork_ipc.c (child MMU
  * enable), and syscall_exec.c (exec MMU re-enable). */

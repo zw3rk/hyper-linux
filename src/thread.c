@@ -9,6 +9,7 @@
  */
 #include "thread.h"
 #include "guest.h"   /* SHIM_DATA_BASE, BLOCK_2MB, GUEST_IPA_BASE */
+#include "hv_util.h" /* vcpu_get_gpr, vcpu_get_sysreg */
 
 #include <stdio.h>
 #include <string.h>
@@ -49,6 +50,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     t->clear_child_tid = 0;
     t->sp_el1          = sp_el1;
     t->active          = 1;
+    thread_ptrace_init(t);
 
     /* Slot 0 is consumed by main thread */
     next_sp_el1_slot = 1;
@@ -69,6 +71,7 @@ thread_entry_t *thread_alloc(int64_t tid) {
             memset(t, 0, sizeof(*t));
             t->guest_tid = tid;
             t->active    = 1;
+            thread_ptrace_init(t);
             result = t;
             break;
         }
@@ -82,6 +85,18 @@ void thread_deactivate(thread_entry_t *t) {
     if (!t) return;
 
     pthread_mutex_lock(&thread_lock);
+
+    /* Destroy ptrace condition variables */
+    pthread_cond_destroy(&t->ptrace_cond);
+    pthread_cond_destroy(&t->resume_cond);
+
+    /* If this is a VM-clone child, mark it as exited and wake the
+     * tracer/parent so wait4 can collect the exit status. */
+    if (t->is_vm_clone) {
+        t->vm_exited = 1;
+        pthread_cond_broadcast(&t->ptrace_cond);
+    }
+
     t->active = 0;
     pthread_mutex_unlock(&thread_lock);
 }
@@ -160,4 +175,150 @@ void thread_interrupt_all(void) {
      * HV_EXIT_REASON_CANCELED and check for pending signals. */
     if (count > 0)
         hv_vcpus_exit(vcpus, (uint32_t)count);
+}
+
+/* ---------- Ptrace helpers ---------- */
+
+pthread_mutex_t *thread_get_lock(void) {
+    return &thread_lock;
+}
+
+void thread_ptrace_init(thread_entry_t *t) {
+    t->ptraced           = 0;
+    t->tracer_tid        = 0;
+    t->ptrace_stopped    = 0;
+    t->ptrace_stop_sig   = 0;
+    t->ptrace_cont_sig   = 0;
+    t->ptrace_regs_dirty = 0;
+    t->is_vm_clone       = 0;
+    t->parent_tid        = 0;
+    t->exit_signal       = 0;
+    t->vm_exited         = 0;
+    t->vm_exit_status    = 0;
+    memset(&t->ptrace_regs, 0, sizeof(t->ptrace_regs));
+    pthread_cond_init(&t->ptrace_cond, NULL);
+    pthread_cond_init(&t->resume_cond, NULL);
+}
+
+int thread_ptrace_stop(thread_entry_t *t, int sig) {
+    pthread_mutex_lock(&thread_lock);
+
+    /* Snapshot vCPU registers into ptrace_regs so the tracer can read
+     * them without cross-thread HVF access. */
+    for (int i = 0; i < 31; i++)
+        t->ptrace_regs.regs[i] = vcpu_get_gpr(t->vcpu, (unsigned)i);
+    t->ptrace_regs.sp     = vcpu_get_sysreg(t->vcpu, HV_SYS_REG_SP_EL0);
+    t->ptrace_regs.pc     = vcpu_get_sysreg(t->vcpu, HV_SYS_REG_ELR_EL1);
+    t->ptrace_regs.pstate = vcpu_get_sysreg(t->vcpu, HV_SYS_REG_SPSR_EL1);
+
+    /* Enter ptrace-stop state */
+    t->ptrace_stopped   = 1;
+    t->ptrace_stop_sig  = sig;
+    t->ptrace_cont_sig  = 0;
+    t->ptrace_regs_dirty = 0;
+
+    /* Wake the tracer (blocked in thread_ptrace_wait) */
+    pthread_cond_broadcast(&t->ptrace_cond);
+
+    /* Block until tracer calls PTRACE_CONT */
+    while (t->ptrace_stopped)
+        pthread_cond_wait(&t->resume_cond, &thread_lock);
+
+    /* Apply register changes if tracer wrote via SETREGSET */
+    if (t->ptrace_regs_dirty) {
+        for (int i = 0; i < 31; i++)
+            vcpu_set_gpr(t->vcpu, (unsigned)i, t->ptrace_regs.regs[i]);
+        vcpu_set_sysreg(t->vcpu, HV_SYS_REG_SP_EL0,   t->ptrace_regs.sp);
+        vcpu_set_sysreg(t->vcpu, HV_SYS_REG_ELR_EL1,  t->ptrace_regs.pc);
+        vcpu_set_sysreg(t->vcpu, HV_SYS_REG_SPSR_EL1, t->ptrace_regs.pstate);
+        t->ptrace_regs_dirty = 0;
+    }
+
+    int cont_sig = t->ptrace_cont_sig;
+    pthread_mutex_unlock(&thread_lock);
+
+    return cont_sig;
+}
+
+void thread_ptrace_cont(thread_entry_t *t, int sig) {
+    pthread_mutex_lock(&thread_lock);
+    t->ptrace_cont_sig = sig;
+    t->ptrace_stopped  = 0;
+    pthread_cond_signal(&t->resume_cond);
+    pthread_mutex_unlock(&thread_lock);
+}
+
+int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+                            int options) {
+    int wnohang = (options & 1); /* WNOHANG = 1 on Linux */
+
+    pthread_mutex_lock(&thread_lock);
+
+    for (;;) {
+        int found_any = 0;  /* Any waitable children at all? */
+
+        for (int i = 0; i < MAX_THREADS; i++) {
+            thread_entry_t *t = &thread_table[i];
+            if (!t->active) continue;
+
+            /* Match: ptraced children of this tracer, or vm-clone children */
+            int is_child = 0;
+            if (t->ptraced && t->tracer_tid == tracer_tid)
+                is_child = 1;
+            if (t->is_vm_clone && t->parent_tid == tracer_tid)
+                is_child = 1;
+            if (!is_child) continue;
+
+            /* If pid > 0, match only specific TID */
+            if (pid > 0 && t->guest_tid != pid) continue;
+
+            found_any = 1;
+
+            /* Check if ptrace-stopped */
+            if (t->ptrace_stopped) {
+                int64_t tid = t->guest_tid;
+                if (out_status)
+                    *out_status = (t->ptrace_stop_sig << 8) | 0x7F;
+                pthread_mutex_unlock(&thread_lock);
+                return tid;
+            }
+
+            /* Check if vm-clone child exited */
+            if (t->vm_exited) {
+                int64_t tid = t->guest_tid;
+                if (out_status)
+                    *out_status = t->vm_exit_status;
+                /* Deactivate the slot (already under lock) */
+                t->active = 0;
+                pthread_mutex_unlock(&thread_lock);
+                return tid;
+            }
+        }
+
+        if (!found_any) {
+            pthread_mutex_unlock(&thread_lock);
+            return 0;  /* No matching children — let caller fall through */
+        }
+
+        if (wnohang) {
+            pthread_mutex_unlock(&thread_lock);
+            return 0;
+        }
+
+        /* Block until some child's ptrace_cond fires.
+         * We wait on the first matching child's cond — for simplicity,
+         * scan again to find one. In practice Rosetta has one tracee. */
+        for (int i = 0; i < MAX_THREADS; i++) {
+            thread_entry_t *t = &thread_table[i];
+            if (!t->active) continue;
+            int is_child = 0;
+            if (t->ptraced && t->tracer_tid == tracer_tid) is_child = 1;
+            if (t->is_vm_clone && t->parent_tid == tracer_tid) is_child = 1;
+            if (!is_child) continue;
+            if (pid > 0 && t->guest_tid != pid) continue;
+
+            pthread_cond_wait(&t->ptrace_cond, &thread_lock);
+            break;  /* Re-scan after wakeup */
+        }
+    }
 }

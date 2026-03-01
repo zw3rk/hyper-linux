@@ -14,7 +14,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/random.h>
-#include <sys/sysctl.h>
 
 /* ---------- Linux aarch64 HWCAP bits (from asm/hwcap.h) ---------- */
 #define HWCAP_FP        (1ULL << 0)
@@ -42,37 +41,71 @@
 #define HWCAP_DIT       (1ULL << 24)
 #define HWCAP_ILRCPC    (1ULL << 26)
 #define HWCAP_FLAGM     (1ULL << 27)
+#define HWCAP_CPUID     (1ULL << 11)  /* MRS emulation of ID registers from EL0 */
 #define HWCAP_SSBS      (1ULL << 28)
 #define HWCAP_SB        (1ULL << 29)
+#define HWCAP_PACA      (1ULL << 30)
+#define HWCAP_PACG      (1ULL << 31)
 
-/* Query a boolean sysctl. Returns 1 if present and non-zero, 0 otherwise. */
-static int sysctl_bool(const char *name) {
-    int val = 0;
-    size_t len = sizeof(val);
-    if (sysctlbyname(name, &val, &len, NULL, 0) == 0)
-        return val != 0;
-    return 0;
+/* ---------- Linux aarch64 HWCAP2 bits (from asm/hwcap.h) ---------- */
+#define HWCAP2_DCPODP   (1ULL << 0)
+#define HWCAP2_FLAGM2   (1ULL << 7)
+#define HWCAP2_FRINT    (1ULL << 8)
+#define HWCAP2_BF16     (1ULL << 14)
+
+/* Build AT_HWCAP value matching VZ-sanitized ID register values.
+ *
+ * These must be consistent with the VZ-sanitized ID register overrides
+ * in syscall_proc.c (MRS trap handler). The Linux kernel derives HWCAP
+ * from ID registers; rosetta reads both HWCAP and ID registers, so they
+ * must agree. Inconsistencies cause rosetta to select wrong JIT paths.
+ *
+ * Derived from:
+ *   ID_AA64ISAR0_EL1 = 0x0021100110212120
+ *   ID_AA64ISAR1_EL1 = 0x0000101110211402
+ *   ID_AA64PFR0_EL1  = 0x0001000000110011
+ *   ID_AA64PFR1_EL1  = 0x0000000000000000
+ *   ID_AA64MMFR2_EL1 = 0x0000000000000000
+ */
+static uint64_t query_hwcap(void) {
+    uint64_t hwcap = HWCAP_FP | HWCAP_ASIMD |       /* PFR0.FP/AdvSIMD != 0xF */
+                     HWCAP_AES | HWCAP_PMULL |       /* ISAR0.AES = 2 */
+                     HWCAP_SHA1 |                    /* ISAR0.SHA1 = 1 */
+                     HWCAP_SHA2 | HWCAP_SHA512 |     /* ISAR0.SHA2 = 2 */
+                     HWCAP_CRC32 |                   /* ISAR0.CRC32 = 1 */
+                     HWCAP_ATOMICS |                 /* ISAR0.Atomic = 2 */
+                     HWCAP_FPHP | HWCAP_ASIMDHP |   /* PFR0.FP/AdvSIMD >= 1 */
+                     HWCAP_CPUID |                   /* always (kernel emulates MRS) */
+                     HWCAP_ASIMDRDM |                /* ISAR0.RDM = 1 */
+                     HWCAP_JSCVT |                   /* ISAR1.JSCVT = 1 */
+                     HWCAP_FCMA |                    /* ISAR1.FCMA = 1 */
+                     HWCAP_LRCPC | HWCAP_ILRCPC |   /* ISAR1.LRCPC = 2 */
+                     HWCAP_DCPOP |                   /* ISAR1.DPB = 2 */
+                     HWCAP_SHA3 |                    /* ISAR0.SHA3 = 1 */
+                     HWCAP_ASIMDDP |                 /* ISAR0.DP = 1 */
+                     HWCAP_FHM |                     /* ISAR0.FHM = 1 */
+                     HWCAP_DIT |                     /* PFR0.DIT = 1 */
+                     HWCAP_FLAGM |                   /* ISAR0.TS = 2 */
+                     HWCAP_SB |                      /* ISAR1.SB = 1 */
+                     HWCAP_PACA |                    /* ISAR1.API = 4 */
+                     HWCAP_PACG;                     /* ISAR1.GPI = 1 */
+    /* NOT set:
+     * HWCAP_SSBS  — PFR1.SSBS = 0 (PFR1 is all zeros in VZ)
+     * HWCAP_EVTSTRM — no generic timer emulation
+     * HWCAP_SVE   — PFR0.SVE = 0
+     * HWCAP_SM3   — ISAR0.SM3 = 0
+     * HWCAP_SM4   — ISAR0.SM4 = 0
+     * HWCAP_USCAT — MMFR2.AT = 0
+     */
+    return hwcap;
 }
 
-/* Build AT_HWCAP value from actual Apple Silicon CPU features.
- * All Apple Silicon (M1+) support FP, ASIMD, AES, PMULL, SHA1, SHA2,
- * CRC32, and LSE atomics. Additional features are queried via sysctl. */
-static uint64_t query_hwcap(void) {
-    /* All Apple Silicon chips guarantee these (ARMv8.4+) */
-    uint64_t hwcap = HWCAP_FP | HWCAP_ASIMD | HWCAP_AES | HWCAP_PMULL |
-                     HWCAP_SHA1 | HWCAP_SHA2 | HWCAP_CRC32 | HWCAP_ATOMICS |
-                     HWCAP_FPHP | HWCAP_ASIMDHP | HWCAP_ASIMDRDM |
-                     HWCAP_JSCVT | HWCAP_FCMA | HWCAP_LRCPC | HWCAP_DCPOP |
-                     HWCAP_ASIMDDP | HWCAP_FHM | HWCAP_DIT | HWCAP_FLAGM |
-                     HWCAP_SSBS | HWCAP_SB | HWCAP_ILRCPC;
-
-    /* Optional features that may vary across chips */
-    if (sysctl_bool("hw.optional.armv8_2_sha3"))
-        hwcap |= HWCAP_SHA3;
-    if (sysctl_bool("hw.optional.armv8_2_sha512"))
-        hwcap |= HWCAP_SHA512;
-
-    return hwcap;
+/* Build AT_HWCAP2 value matching VZ-sanitized ID register values. */
+static uint64_t query_hwcap2(void) {
+    return HWCAP2_DCPODP |    /* ISAR1.DPB = 2 */
+           HWCAP2_FLAGM2 |    /* ISAR0.TS = 2 */
+           HWCAP2_FRINT |     /* ISAR1.FRINTTS = 1 */
+           HWCAP2_BF16;       /* ISAR1.BF16 = 1 */
 }
 
 /* Push a uint64_t onto the stack (growing downward) */
@@ -174,21 +207,21 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     str_ptr &= ~15ULL;
     uint64_t sp = str_ptr;
 
-    /* Count auxv entries: base 14 + optional AT_BASE + AT_EXECFN +
-     * optional AT_SYSINFO_EHDR = up to 17.
+    /* Count auxv entries: base 15 + optional AT_BASE + AT_EXECFN +
+     * optional AT_SYSINFO_EHDR = up to 18.
      * Each auxv entry = 2 words. Plus AT_NULL = 2 words.
      * Total words from auxv = (num_auxv_entries + 1) * 2.
      * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) + argc(1).
      *
-     * Base auxv: 14 entries = 28 words, AT_NULL = 2 words.
+     * Base auxv: 15 entries = 30 words, AT_NULL = 2 words.
      * Optional: AT_BASE (if interp_base != 0) = +2, AT_EXECFN = +2,
      *           AT_SYSINFO_EHDR (if vdso_base != 0) = +2.
-     * Total = 30 + optional + 1 + envc + 1 + argc + 1
+     * Total = 35 + optional + 1 + envc + 1 + argc + 1
      * For 16-byte alignment: total must be even. */
     int extra = 2;  /* AT_EXECFN always present */
     if (interp_base != 0) extra += 2;  /* AT_BASE */
     if (vdso_base != 0) extra += 2;    /* AT_SYSINFO_EHDR */
-    int total_entries = 33 + extra + argc + envc;
+    int total_entries = 35 + extra + argc + envc;
     if (total_entries & 1) {
         push_u64(g, &sp, 0);  /* alignment padding */
     }
@@ -202,8 +235,9 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     push_u64(g, &sp, random_ptr); push_u64(g, &sp, AT_RANDOM);
     push_u64(g, &sp, 100); push_u64(g, &sp, AT_CLKTCK);
 
-    /* HWCAP: actual CPU capabilities queried from Apple Silicon */
+    /* HWCAP/HWCAP2: derived from VZ-sanitized ID register values */
     push_u64(g, &sp, query_hwcap()); push_u64(g, &sp, AT_HWCAP);
+    push_u64(g, &sp, query_hwcap2()); push_u64(g, &sp, AT_HWCAP2);
 
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_EGID);
     push_u64(g, &sp, 1000); push_u64(g, &sp, AT_GID);

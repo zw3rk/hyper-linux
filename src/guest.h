@@ -147,11 +147,18 @@ typedef struct {
  * Distinct from mem_region_t which is used purely for page table construction.
  * Regions are kept sorted by start address in guest_t.regions[]. */
 typedef struct {
-    uint64_t start;       /* GVA start (page-aligned) */
-    uint64_t end;         /* GVA end (exclusive, page-aligned) */
+    uint64_t start;       /* GPA start for gap-finder (page-aligned) */
+    uint64_t end;         /* GPA end (exclusive, page-aligned) */
     int      prot;        /* LINUX_PROT_* flags */
     int      flags;       /* LINUX_MAP_* flags (for /proc/self/maps display) */
     uint64_t offset;      /* File offset (for /proc/self/maps display) */
+    uint64_t display_va;  /* Non-zero: /proc/self/maps shows this VA instead
+                           * of start. Used for high-VA mmaps (e.g., rosetta's
+                           * slab at 240TB) backed by GPA in primary buffer. */
+    uint64_t display_end; /* Non-zero: overrides the computed display end
+                           * (display_va + (end - start)). Used when the
+                           * backing GPA is larger than the actual mmap (e.g.,
+                           * 2MB-aligned GPA for a non-2MB-aligned mmap). */
     char     name[64];    /* Label: "[heap]", "[stack]", ELF path, etc. */
 } guest_region_t;
 
@@ -182,6 +189,7 @@ typedef struct {
     guest_va_alias_t va_aliases[GUEST_MAX_ALIASES];
     int              naliases;
     uint32_t            ipa_bits;  /* IPA bits requested from HVF */
+    int                 is_rosetta; /* Non-zero when running x86_64 via rosetta */
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int            nregions;  /* Number of active regions */
@@ -319,6 +327,14 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
                      int prot, int flags, uint64_t offset,
                      const char *name);
 
+/* Add a preannounced region (appears in /proc/self/maps but is NOT checked
+ * by MAP_FIXED_NOREPLACE). Used for x86_64/rosetta mode where the binary
+ * is pre-mapped by hl but Rosetta still needs to do its own MAP_FIXED.
+ * Sorted by start address; shadowed by actual regions[] in maps output. */
+int guest_preannounce(guest_t *g, uint64_t start, uint64_t end,
+                      int prot, int flags, uint64_t offset,
+                      const char *name);
+
 /* Remove all region coverage in [start, end). Regions fully contained are
  * deleted; partially overlapping regions are trimmed or split. */
 void guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
@@ -333,11 +349,5 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
 
 /* Clear all tracked regions. Used by execve before re-adding new regions. */
 void guest_region_clear(guest_t *g);
-
-/* Debug: dump ARM64 page table entries for a given GPA offset range.
- * Walks L0→L1→L2→L3 and prints descriptor values, permissions, and
- * the actual IPA pointed to by each entry. Useful for verifying that
- * the vCPU sees the correct pages with the correct permissions. */
-void guest_dump_ptes(const guest_t *g, uint64_t start, uint64_t end);
 
 #endif /* GUEST_H */

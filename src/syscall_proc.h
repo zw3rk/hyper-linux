@@ -95,6 +95,14 @@ void proc_register_child(pid_t host_pid, int64_t guest_pid);
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);
 
+/* ---------- ptrace ---------- */
+
+/* Linux ptrace syscall implementation. Supports SEIZE, CONT, INTERRUPT,
+ * GETREGSET, and SETREGSET — sufficient for Rosetta's two-process JIT.
+ * Returns 0 on success or negative Linux errno. */
+int64_t sys_ptrace(guest_t *g, uint64_t request, int64_t pid,
+                   uint64_t addr, uint64_t data);
+
 /* ---------- wait ---------- */
 
 /* Wait for child process. Returns child guest PID or negative errno. */

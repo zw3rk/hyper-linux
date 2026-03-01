@@ -174,91 +174,185 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
     /* /proc/self/maps -> generated from guest region tracking.
      * Addresses are page-aligned (rounded down/up) to match real Linux
      * behavior. Rosetta's VMAllocationTracker asserts page alignment.
+     *
      * Non-identity mapped regions (via sys_mmap_high_va) are tracked by
      * GPA for gap-finder collision avoidance, but /proc/self/maps must
-     * show the VA that was returned to the guest (e.g., 0xf00000000000
-     * for rosetta's 384MB slab). We resolve GPA→VA via the alias table.
+     * show the VA that was returned to the guest. We use display_va for
+     * high-VA regions and va_aliases for rosetta segments.
      *
-     * Preannounced regions (x86_64 binary LOAD segments in rosetta mode)
-     * are merged into the output in sorted order. These entries let
-     * rosetta's JIT validate indirect call targets (function pointers)
-     * before rosetta itself mmaps the binary. Once rosetta's mmaps create
-     * actual regions[] entries, preannounced entries that overlap are
-     * skipped to avoid duplicate lines. */
+     * Output merges consecutive regions with the same display_va prefix,
+     * prot, and flags into a single maps line. This matches real Linux
+     * kernel behavior where a single mmap() call produces one maps entry
+     * even when the backing pages span multiple physical frames.
+     *
+     * Internal regions (shim, shim-data, stack-guard, brk, mmap-rx,
+     * mmap-rw) are hidden from /proc/self/maps in rosetta mode. Real
+     * Linux VMs only show userspace mappings visible to the ELF loader
+     * and runtime. hl's shim/brk/mmap regions are host implementation
+     * details that rosetta should not see. */
     if (strcmp(path, "/proc/self/maps") == 0) {
         char buf[16384];
         int off = 0;
 
-        /* Two-pointer merge of regions[] and preannounced[], both sorted
-         * by start address. Preannounced entries shadowed by actual
-         * regions are skipped. */
-        int ri = 0, pi = 0;
-        while ((ri < g->nregions || pi < g->npreannounced) &&
-               off < (int)sizeof(buf) - 256) {
-            const guest_region_t *r;
-            int from_preannounced = 0;
+        /* Build a flat array of (va_start, va_end, prot, flags, offset,
+         * name) from regions[] + preannounced[] with merging. */
+        typedef struct {
+            uint64_t start, end;
+            int prot, flags;
+            uint64_t offset;
+            char name[64];
+        } maps_entry_t;
+        maps_entry_t entries[256];
+        int nentries = 0;
 
-            /* Pick the next entry in address order */
-            if (ri < g->nregions &&
-                (pi >= g->npreannounced ||
-                 g->regions[ri].start <= g->preannounced[pi].start)) {
-                r = &g->regions[ri++];
-            } else {
-                r = &g->preannounced[pi++];
-                from_preannounced = 1;
-            }
-
-            /* Skip preannounced entries that overlap with actual regions
-             * (rosetta has already mapped them via MAP_FIXED_NOREPLACE). */
-            if (from_preannounced) {
-                int shadowed = 0;
-                for (int j = 0; j < g->nregions; j++) {
-                    if (g->regions[j].start < r->end &&
-                        g->regions[j].end > r->start) {
-                        shadowed = 1;
-                        break;
-                    }
-                }
-                if (shadowed) continue;
-            }
-
+        /* First pass: convert regions[] to VA-space entries */
+        for (int i = 0; i < g->nregions && nentries < 255; i++) {
+            const guest_region_t *r = &g->regions[i];
             uint64_t start = r->start;
             uint64_t end = r->end;
 
-            /* Translate GPA→VA for non-identity mapped regions.
-             * Check if this region's GPA falls within a VA alias. */
-            for (int j = 0; j < g->naliases; j++) {
-                const guest_va_alias_t *a = &g->va_aliases[j];
-                if (start >= a->gpa_start &&
-                    end <= a->gpa_start + a->size) {
-                    uint64_t gpa_off = start - a->gpa_start;
-                    start = a->va_start + gpa_off;
-                    end = start + (r->end - r->start);
-                    break;
+            /* Skip internal hl regions in rosetta mode. These are host
+             * implementation details not visible in a real Linux VM:
+             *   - [shim]: exception vector / EL1 code
+             *   - [shim-data]: EL1 stack / data
+             *   - [stack-guard]: guard page
+             *   - brk/mmap-rx/mmap-rw pre-allocations (no name, low VA,
+             *     no display_va — these are hl's address space layout) */
+            if (g->is_rosetta) {
+                if (r->name[0] == '[' &&
+                    (strncmp(r->name, "[shim", 5) == 0 ||
+                     strcmp(r->name, "[stack-guard]") == 0))
+                    continue;
+                /* Skip large pre-allocated regions with no name that
+                 * are below the rosetta VA range and not guest-visible.
+                 * Keep [stack], [vvar], [vdso] and named regions. */
+                if (r->name[0] == '\0' && r->display_va == 0 &&
+                    start < 0x100000000ULL)
+                    continue;
+            }
+
+            /* Resolve display address */
+            if (r->display_va != 0) {
+                start = r->display_va;
+                end = r->display_end ? r->display_end
+                                     : (start + (r->end - r->start));
+            } else {
+                for (int j = 0; j < g->naliases; j++) {
+                    const guest_va_alias_t *a = &g->va_aliases[j];
+                    if (start >= a->gpa_start &&
+                        end <= a->gpa_start + a->size) {
+                        uint64_t gpa_off = start - a->gpa_start;
+                        start = a->va_start + gpa_off;
+                        end = start + (r->end - r->start);
+                        break;
+                    }
                 }
             }
 
-            start &= ~0xFFFULL;          /* page-align down */
-            end = (end + 0xFFF) & ~0xFFFULL;    /* page-align up */
-            char perms[5];
-            perms[0] = (r->prot & 0x1) ? 'r' : '-'; /* PROT_READ */
-            perms[1] = (r->prot & 0x2) ? 'w' : '-'; /* PROT_WRITE */
-            perms[2] = (r->prot & 0x4) ? 'x' : '-'; /* PROT_EXEC */
-            perms[3] = (r->flags & 0x01) ? 's' : 'p'; /* MAP_SHARED : MAP_PRIVATE */
-            perms[4] = '\0';
-            /* Format: start-end perms offset dev:major inode pathname */
-            off += snprintf(buf + off, sizeof(buf) - off,
-                "%08llx-%08llx %s %08llx 00:00 0",
-                (unsigned long long)start,
-                (unsigned long long)end,
-                perms,
-                (unsigned long long)r->offset);
-            if (r->name[0]) {
-                off += snprintf(buf + off, sizeof(buf) - off,
-                    "          %s", r->name);
+            start &= ~0xFFFULL;
+            end = (end + 0xFFF) & ~0xFFFULL;
+
+            /* Try to merge with previous entry if contiguous and
+             * same prot/flags/name. This collapses the slab's many
+             * 2MB blocks into a single maps line, matching real Linux
+             * kernel behavior. */
+            if (nentries > 0) {
+                maps_entry_t *prev = &entries[nentries - 1];
+                if (start == prev->end &&
+                    r->prot == prev->prot &&
+                    r->flags == prev->flags &&
+                    strcmp(r->name, prev->name) == 0) {
+                    prev->end = end;
+                    continue;
+                }
             }
-            off += snprintf(buf + off, sizeof(buf) - off, "\n");
+
+            maps_entry_t *e = &entries[nentries++];
+            e->start = start;
+            e->end = end;
+            e->prot = r->prot;
+            e->flags = r->flags;
+            e->offset = r->offset;
+            if (r->name[0])
+                strncpy(e->name, r->name, sizeof(e->name) - 1);
+            else
+                e->name[0] = '\0';
         }
+
+        /* Add preannounced entries (if any) */
+        for (int pi = 0; pi < g->npreannounced && nentries < 255; pi++) {
+            const guest_region_t *r = &g->preannounced[pi];
+            /* Skip if shadowed by actual regions */
+            int shadowed = 0;
+            for (int j = 0; j < g->nregions; j++) {
+                if (g->regions[j].start < r->end &&
+                    g->regions[j].end > r->start) {
+                    shadowed = 1;
+                    break;
+                }
+            }
+            if (shadowed) continue;
+            maps_entry_t *e = &entries[nentries++];
+            e->start = r->start & ~0xFFFULL;
+            e->end = (r->end + 0xFFF) & ~0xFFFULL;
+            e->prot = r->prot;
+            e->flags = r->flags;
+            e->offset = r->offset;
+            if (r->name[0])
+                strncpy(e->name, r->name, sizeof(e->name) - 1);
+            else
+                e->name[0] = '\0';
+        }
+
+        /* Sort by start address (regions[] is sorted by GPA but we
+         * translated to VA, and rosetta regions are at high VA) */
+        for (int i = 1; i < nentries; i++) {
+            maps_entry_t tmp = entries[i];
+            int j = i - 1;
+            while (j >= 0 && entries[j].start > tmp.start) {
+                entries[j + 1] = entries[j];
+                j--;
+            }
+            entries[j + 1] = tmp;
+        }
+
+        /* Emit formatted output */
+        for (int i = 0; i < nentries && off < (int)sizeof(buf) - 256; i++) {
+            const maps_entry_t *e = &entries[i];
+            char perms[5];
+            perms[0] = (e->prot & 0x1) ? 'r' : '-';
+            perms[1] = (e->prot & 0x2) ? 'w' : '-';
+            perms[2] = (e->prot & 0x4) ? 'x' : '-';
+            perms[3] = (e->flags & 0x01) ? 's' : 'p';
+            perms[4] = '\0';
+
+            /* Format matches real Linux /proc/<pid>/maps exactly:
+             *   %lx-%lx %s %08lx %02x:%02x %lu  <padding>  %s\n
+             * Verified against strace of rosetta in a real Lima VZ VM. */
+            char line[256];
+            int lineoff = snprintf(line, sizeof(line),
+                "%llx-%llx %s %08llx 00:00 0",
+                (unsigned long long)e->start,
+                (unsigned long long)e->end,
+                perms,
+                (unsigned long long)e->offset);
+            if (e->name[0]) {
+                while (lineoff < 73 && lineoff < (int)sizeof(line) - 1)
+                    line[lineoff++] = ' ';
+                lineoff += snprintf(line + lineoff, sizeof(line) - lineoff,
+                    "%s", e->name);
+            } else {
+                if (lineoff < (int)sizeof(line) - 1)
+                    line[lineoff++] = ' ';
+            }
+            off += snprintf(buf + off, sizeof(buf) - off, "%.*s\n",
+                            lineoff, line);
+        }
+
+        fprintf(stderr, "hl: DEBUG /proc/self/maps (%d bytes, %d entries "
+                "from %d regions):\n%.*s",
+                off, nentries, g->nregions, off, buf);
+
         return proc_synthetic_fd(buf, off);
     }
 
@@ -317,17 +411,20 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address.
      * Rosetta's VMAllocationTracker reads this to determine the lowest
-     * address it can mmap. Standard Linux default is 65536 (0x10000). */
+     * address it can mmap. Real Linux VZ VMs return 32768 (0x8000). */
     if (strcmp(path, "/proc/sys/vm/mmap_min_addr") == 0) {
-        const char *data = "65536\n";
+        const char *data = "32768\n";
         return proc_synthetic_fd(data, strlen(data));
     }
 
-    /* /proc/sys/kernel/randomize_va_space -> ASLR disabled.
-     * Rosetta reads this during initialization. Value 0 = disabled.
-     * In our controlled VM environment, ASLR is not applicable. */
+    /* /proc/sys/kernel/randomize_va_space -> ASLR enabled.
+     * Rosetta reads this during initialization and uses getrandom()
+     * to compute randomized stack/mmap addresses when value is 2.
+     * Real Linux VZ VMs return 2 (full ASLR). Returning 0 would
+     * cause rosetta to use deterministic addresses that may conflict
+     * with hl's fixed memory layout. */
     if (strcmp(path, "/proc/sys/kernel/randomize_va_space") == 0) {
-        const char *data = "0\n";
+        const char *data = "2\n";
         return proc_synthetic_fd(data, strlen(data));
     }
 
