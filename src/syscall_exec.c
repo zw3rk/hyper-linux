@@ -458,7 +458,8 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     uint64_t sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
                                      envp_const, &elf_info,
                                      elf_load_base, interp_base,
-                                     0 /* no vDSO for execve */);
+                                     0 /* no vDSO for execve */,
+                                     -1 /* no AT_EXECFD */);
 
     /* Step 10: Set vCPU state for new process.
      * Entry point: interpreter if dynamic, ELF entry if static. */

@@ -42,6 +42,7 @@
 #define SCTLR_M   (1ULL << 0)   /* MMU enable */
 #define SCTLR_C   (1ULL << 2)   /* Data cache enable */
 #define SCTLR_I   (1ULL << 12)  /* Instruction cache enable */
+#define SCTLR_DZE (1ULL << 14)  /* EL0 access to DC ZVA instruction */
 #define SCTLR_UCT (1ULL << 15)  /* EL0 access to CTR_EL0 (cache type) */
 #define SCTLR_UCI (1ULL << 26)  /* EL0 cache maintenance (IC IVAU, DC CVA*) */
 

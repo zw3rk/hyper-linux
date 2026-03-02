@@ -127,7 +127,8 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            const elf_info_t *elf_info,
                            uint64_t elf_load_base,
                            uint64_t interp_base,
-                           uint64_t vdso_base) {
+                           uint64_t vdso_base,
+                           int execfd) {
     /*
      * Linux initial stack layout (growing from high to low):
      *   [ 16 random bytes for AT_RANDOM ]
@@ -221,6 +222,7 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     int extra = 2;  /* AT_EXECFN always present */
     if (interp_base != 0) extra += 2;  /* AT_BASE */
     if (vdso_base != 0) extra += 2;    /* AT_SYSINFO_EHDR */
+    if (execfd >= 0) extra += 2;       /* AT_EXECFD (binfmt_misc binary fd) */
     int total_entries = 35 + extra + argc + envc;
     if (total_entries & 1) {
         push_u64(g, &sp, 0);  /* alignment padding */
@@ -258,6 +260,13 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     /* AT_BASE: interpreter load base (only present for dynamic linking) */
     if (interp_base != 0) {
         push_u64(g, &sp, interp_base); push_u64(g, &sp, AT_BASE);
+    }
+
+    /* AT_EXECFD: pre-opened binary fd for binfmt_misc interpreters.
+     * The kernel opens the binary and passes the fd via auxv so the
+     * interpreter can mmap it without needing filesystem access. */
+    if (execfd >= 0) {
+        push_u64(g, &sp, (uint64_t)execfd); push_u64(g, &sp, AT_EXECFD);
     }
 
     /* envp: environment variable pointers + NULL terminator */

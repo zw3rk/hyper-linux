@@ -172,8 +172,12 @@ Rosetta has three independent mode concepts:
 2. **TranslationMode enum** (per-translation-unit): 0=Aot, 1=JIT, 2=AOT-assisted JIT, 3=unknown.
    Stored at object offset 0x18 and stack local [sp,#0x110]/[sp,#0xb4].
 3. **is_aot_mode flag** (per-fragment): Object offset 0x214. Extracted from
-   bit 8 of AOT metadata at fragment header offset 0x88. When set, the
-   translate caller forces mode=2 (AOT-assisted JIT).
+   bit 8 of packed AOT metadata at fragment header offset 0x88. The packed
+   field is computed by function at 0x54bf4 from two source uint64 values
+   at [source+0x80] and [source+0x88]: bit 8 of packed = bit 4 of
+   [source+0x88]. When set, the translate caller forces mode=2
+   (AOT-assisted JIT). **Currently always 0** because the AOT files from
+   `rosettad translate` have zeros at offsets 0x80 and 0x88.
 
 **Mode computation** (at VA 0x800000034f78-0x800000034f94):
 ```
@@ -206,14 +210,16 @@ the binary search returns NULL. This happens for indirect jumps to
 addresses not pre-registered as block starts. In mode 2, AOT data
 pre-populates all known blocks; in mode 1, only discovered blocks exist.
 
-**Root cause of x86_64 indirect jump failures:** Rosetta's AOT translator
-(rosettad) can statically resolve direct branches but cannot enumerate
-all targets of computed indirect jumps (e.g., musl's `printf_core` uses
-a 56-entry jump table at `.rodata:0x4050a0` for format specifier dispatch).
-In a real VZ VM, the host-side Virtualization.framework provides a runtime
-JIT service (via VZ_ACTIVATE) that translates missed indirect targets
-on-demand. Our hl provides AOT (via rosettad subprocess) but NOT the
-runtime JIT service — so indirect jump targets not covered by AOT assert.
+**Root cause of x86_64 indirect jump failures:** The AOT files produced
+by `rosettad translate` have zeros at header offsets 0x80 and 0x88. These
+are the source values for the packed flags field that determines
+`is_aot_mode`. Since bit 4 of [source+0x88] is always 0, `is_aot_mode`
+is never set, `seed_block()` never runs, and block tables are never
+pre-populated. When rosetta encounters an indirect jump (e.g., jump tables
+in `printf_core`), `block_for_offset()` fails because the target was never
+registered. In a real VZ VM, Virtualization.framework may provide richer
+AOT metadata through its runtime service, or rosettad may produce
+different output when invoked via the VZ protocol rather than standalone.
 
 **Observed pattern:** Binaries with only direct control flow (simple write/
 exit, puts, cat, echo) pass. Binaries using printf-family formatting fail
@@ -221,6 +227,68 @@ because `vfprintf` → `printf_core` uses `jmpq *%rax` with a jump table.
 JIT-only mode (caps[0]=0 or ROSETTA_DISABLE_AOT=1) fails on ALL musl-
 linked binaries because even libc startup (`__libc_start_main` → `main`)
 uses indirect calls through `.init_array` function pointers.
+
+**AOT file format** (from `rosettad translate` output):
+```
+Offset  Size  Field
+0x00    8     total_size (mapped code+data region size)
+0x08    8     version (always 1)
+0x10    8     orig_size (original x86_64 binary mapped size)
+0x18    8     code_offset (file offset of translated ARM64 code, always 0x1000)
+0x20    8     unknown
+0x28    8     unknown
+0x30    8     unknown
+0x38    8     metadata_offset
+0x40    8     metadata_end
+0x48    8     block_table_end
+0x50    4     code_align (0x1000)
+0x54    4     entry_count (number of translated entry points)
+0x58-0xFFF    zero padding
+0x1000+       translated ARM64 code
+```
+Offsets 0x80 and 0x88 (the `is_aot_mode` source fields) are always zero
+in standalone `rosettad translate` output. hl patches bit 4 of the uint64
+at offset 0x88 after rosettad translate (in `patch_aot_is_aot_mode()`,
+src/syscall_io.c) to enable AOT-assisted JIT mode and `seed_block()`
+pre-population. Additionally, 3 UBFX extraction sites in the rosetta
+binary are patched to `mov wN, #1` (in src/hl.c) to force is_aot_mode=1
+regardless of AOT file contents.
+
+### I-cache / D-cache Coherence (IC IALLU)
+
+ARM64 I-cache and D-cache are not automatically coherent. When rosetta's
+JIT signal handler writes translated code (patching BRK stubs with branch
+instructions), the D-cache is updated but the I-cache retains the old BRK
+instruction. Without explicit I-cache invalidation, the CPU fetches the
+stale BRK from the I-cache, causing infinite re-traps.
+
+The shim executes `IC IALLU; DSB ISH; ISB` after every syscall return
+(post-HVC #5 in handle_svc_0). This ensures that rt_sigreturn from
+rosetta's signal handler flushes the I-cache before the translated code
+executes. IC IALLU is a single-cycle operation on Apple Silicon; the
+ISB pipeline flush (~10 cycles) is negligible vs HVC overhead (~1000+).
+
+Rosetta's binary contains only 1 IC IVAU instruction (at VA 0x2686c)
+which is never called in the JIT path — it relies on external cache
+maintenance, which the shim now provides.
+
+### Rosetta JIT Translation Status
+
+Simple x86_64 binaries (hello-write, echo) run successfully through
+rosetta's AOT-assisted JIT path. Complex binaries with indirect jumps
+(printf jump tables, .init_array function pointers) still fail:
+
+1. First BRK stub: translated and patched successfully (IC IALLU works)
+2. Subsequent BRK: rosetta's signal handler detects a translation failure
+   (block_for_offset returns NULL for indirect jump targets)
+3. Handler calls rt_sigaction(SIGTRAP, SIG_DFL) to reset, then
+   rt_tgsigqueueinfo to re-raise SIGTRAP with SIG_DFL (intentional
+   "give up and die" pattern)
+4. Process terminates cleanly with SIGTRAP default disposition
+
+This is a genuine rosetta limitation also observed in real VZ VMs
+(OrbStack #1396, Docker #7320). The block_for_offset assertion fires
+for addresses not pre-registered as block starts, even with AOT data.
 
 **The `_potential_targets` assertion** at VA 0x800000048eac
 (`_mode == TranslationMode::Aot || _potential_targets.empty()`,
@@ -236,28 +304,43 @@ sets caps[0]=1), BSS[0xa04]=1, and the runtime AOT code at 0x90afc
 proceeds to connect to rosettad via socket.
 
 **BSS[0xa05]** is a secondary VZ capability flag from caps[108].
-**BSS[0xa06..0xa71]** (108 bytes) stores the rosettad socket path,
-copied from VZ_CAPS caps[1..108].
+Must be non-null to allow the rosettad translate path (checked at VA 0x90ba4).
+**BSS[0xa06..0xa71]** (108 bytes) stores the `sun_path` socket path bytes,
+copied from VZ_CAPS caps[1..108]. NOTE: caps[64] (sun_path[63]) MUST be
+non-null — it gates the entire rosettad AOT initialization (VA 0x307a4).
+caps[66..] (sun_path[65..]) holds the null-terminated x86_64 binary path
+that Rosetta passes to rosettad for AOT translation.
 
 **VZ mode activation:** Rosetta checks for VZ (Virtualization.framework)
 support via 3 ioctls: VZ_CHECK (0x80456125) returns a 69-byte signature,
 VZ_CAPS (0x80806123) returns 128 bytes of capability data, VZ_ACTIVATE
 (0x6124). These are intercepted in `syscall_io.c`.
 
-**VZ_CAPS buffer layout** (128 bytes, determined empirically via sequential
-byte injection and connect() sockaddr inspection):
-- `caps[0]`: VZ enable flag (1 = active)
-- `caps[1..108]`: Unix socket path for rosettad (`sun_path[108]`).
-  Rosetta copies these bytes directly into `struct sockaddr_un.sun_path`
-  and calls `connect()`. All-zeros produces a Linux abstract socket with
-  empty name. In a real VZ VM, this would be a virtiofs-mounted path
-  (e.g. `/run/rosettad/uds`).
-- `caps[109..127]`: Additional capability flags (purpose unknown)
+**VZ_CAPS buffer layout** (128 bytes, reverse-engineered from Rosetta binary):
+- `caps[0]`: VZ enable flag (1 = active). Written to BSS[0xa04].
+- `caps[1..64]`: `sun_path[0..63]` — first 64 bytes of socket path.
+  **`caps[64]` (= `sun_path[63]`) MUST be non-null.** At VA 0x800000307a4,
+  Rosetta reads this byte and branches (`cbz w8, 0x3080c`): if zero, the
+  entire rosettad AOT initialization is skipped silently. `[aot_registry+0x70]`
+  is never populated, and the AOT mmap function (0x80000002ec84) always
+  returns without contacting rosettad. We fill caps[1..64] with 63 `'A'`
+  bytes + `'/'` as a fake path prefix; the connect() interception is fd-based
+  so the actual bytes don't matter.
+- `caps[65]`: Null terminator of the socket path (zero).
+- `caps[66..107]`: Null-terminated path to the x86_64 binary being translated
+  (`caps+0x42` in Rosetta notation). At VA 0x800000090bb0, Rosetta calls
+  `openat(AT_FDCWD, caps+0x42, 0, 0)` to open the binary and sends the fd
+  to rosettad via SCM_RIGHTS for AOT translation.
+- `caps[108]`: Written to BSS[0xa05]. Checked at VA 0x800000090ba4
+  (`cbz w23, 0x90ca4`): must be non-null to allow the translate (`'t'`)
+  handler to proceed after the `'?'` handshake. We ensure it's non-null
+  (set to 1 if not already non-zero from the binary path bytes).
+- `caps[109..127]`: Additional capability flags (purpose unknown, left as zero)
 
-We set caps[1..108] to zeros (abstract socket) because our implementation
-intercepts `socket(SOCK_SEQPACKET)` and `connect()` via a socketpair.
-Rosetta never actually reaches the socket path; the rosettad protocol
-is handled by `rosettad_handler_thread` on the other end of the pair.
+Our connect() interception in `syscall_net.c` is fd-based (`rosettad_is_socket()`),
+so Rosetta never reaches the actual socket path bytes in caps[1..108]. The
+rosettad protocol is handled by `rosettad_handler_thread` on the other end
+of the socketpair.
 
 **rosettad protocol** (implemented in `syscall_io.c:rosettad_handler_thread`):
 - Rosetta opens `AF_UNIX SOCK_SEQPACKET` — intercepted in `syscall_net.c`

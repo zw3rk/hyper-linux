@@ -15,6 +15,7 @@
 
 /* ---------- Auxiliary vector types ---------- */
 #define AT_NULL    0
+#define AT_EXECFD  2
 #define AT_PHDR    3
 #define AT_PHENT   4
 #define AT_PHNUM   5
@@ -38,6 +39,7 @@
  * elf_load_base is the base address PIE executables were loaded at (0 for ET_EXEC).
  * interp_base is the load base of the dynamic linker (0 if statically linked).
  * vdso_base is the guest address of the vDSO ELF image (0 if no vDSO).
+ * execfd is the pre-opened binary fd for binfmt_misc (AT_EXECFD); -1 if none.
  * Returns the initial SP (stack pointer) to pass to the guest. */
 uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            int argc, const char **argv,
@@ -45,6 +47,7 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
                            const elf_info_t *elf_info,
                            uint64_t elf_load_base,
                            uint64_t interp_base,
-                           uint64_t vdso_base);
+                           uint64_t vdso_base,
+                           int execfd);
 
 #endif /* STACK_H */

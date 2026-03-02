@@ -613,6 +613,7 @@ int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
  * monitor the protocol. */
 static int rosettad_handler_fd = -1;  /* Our end of the socketpair */
 static int rosettad_client_fd = -1;   /* Rosetta's end (host fd) */
+static char rosettad_binary_path[1024] = {0}; /* x86_64 binary for on-demand AOT */
 
 /* Receive a file descriptor via SCM_RIGHTS ancillary data.
  * Also reads the normal data payload into buf (up to buflen).
@@ -712,6 +713,56 @@ static int run_rosettad_translate(const char *bin_path, const char *aot_path) {
     int status;
     if (waitpid(pid, &status, 0) < 0) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Patch AOT file to enable AOT-assisted JIT mode (is_aot_mode=1).
+ *
+ * rosettad translate produces AOT files with zeros at header offsets
+ * 0x80 and 0x88. These are the source values for the packed flags
+ * field that determines is_aot_mode (bit 4 of [+0x88] → bit 8 of
+ * packed flags → Translator+0x214). When is_aot_mode is 0:
+ *   - seed_block() at VA 0x2a7b0 never runs
+ *   - block tables are never pre-populated from AOT data
+ *   - block_for_offset() at VA 0x387d4 returns NULL for indirect
+ *     jump targets → assertion "BasicBlock requested for unrecognized
+ *     address" (BuilderBase.h:550)
+ *
+ * Setting bit 4 of the uint64 at offset 0x88 enables AOT-assisted
+ * JIT mode (TranslationMode=2), which calls seed_block() to pre-
+ * register all known basic blocks. This prevents the assertion
+ * failure for indirect jumps (function pointers, jump tables). */
+static int patch_aot_is_aot_mode(const char *aot_path) {
+    int fd = open(aot_path, O_RDWR);
+    if (fd < 0) return -1;
+
+    /* Verify file is large enough (header is at least 0x90 bytes) */
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 0x90) {
+        close(fd);
+        return -1;
+    }
+
+    /* Read current value at offset 0x88 */
+    uint64_t val = 0;
+    if (pread(fd, &val, sizeof(val), 0x88) != sizeof(val)) {
+        close(fd);
+        return -1;
+    }
+
+    /* Set bit 4 to enable is_aot_mode */
+    uint64_t patched = val | (1ULL << 4);
+    if (patched != val) {
+        if (pwrite(fd, &patched, sizeof(patched), 0x88) != sizeof(patched)) {
+            close(fd);
+            return -1;
+        }
+        fprintf(stderr, "hl: rosettad: patched AOT is_aot_mode at 0x88: "
+                "0x%llx → 0x%llx\n",
+                (unsigned long long)val, (unsigned long long)patched);
+    }
+
+    close(fd);
+    return 0;
 }
 
 /* ---------- AOT digest cache ---------- */
@@ -852,6 +903,10 @@ static void *rosettad_handler_thread(void *arg) {
                 break;
             }
 
+            /* Enable AOT-assisted JIT: patch before digest computation
+             * so the cached file has the correct is_aot_mode flag. */
+            patch_aot_is_aot_mode(aot_path);
+
             /* Compute SHA256 digest of the AOT output */
             uint8_t digest[32];
             if (compute_file_sha256(aot_path, digest) < 0) {
@@ -949,8 +1004,89 @@ static void *rosettad_handler_thread(void *arg) {
                     goto done;
                 }
                 close(cached_fd);
+            } else if (rosettad_binary_path[0]) {
+                /* Cache miss but binary path known — translate on-demand.
+                 *
+                 * In real VZ VMs, rosettad pre-caches AOT translations so
+                 * the 'd' digest lookup always hits. Rosetta takes a
+                 * different code path for 'd' HIT vs 't' translate — the
+                 * 'd' path correctly handles all block types including
+                 * fall-through continuations, while the 't' path may not
+                 * register all blocks in the runtime lookup table.
+                 *
+                 * By translating on-demand here and returning HIT, we
+                 * match the real VZ behavior where rosetta always gets
+                 * AOT via the 'd' cache path. */
+                fprintf(stderr, "hl: rosettad: digest miss → on-demand "
+                        "translate of %s\n", rosettad_binary_path);
+
+                char aot_path[] = "/tmp/hl-aot-XXXXXX";
+                int aot_fd = mkstemp(aot_path);
+                if (aot_fd < 0) {
+                    fprintf(stderr, "hl: rosettad: mkstemp failed: %s\n",
+                            strerror(errno));
+                    uint8_t resp = 0x00;
+                    if (write(fd, &resp, 1) != 1) goto done;
+                    break;
+                }
+                close(aot_fd);
+
+                int ret = run_rosettad_translate(rosettad_binary_path,
+                                                 aot_path);
+                if (ret != 0) {
+                    fprintf(stderr, "hl: rosettad: on-demand translate "
+                            "failed (exit=%d)\n", ret);
+                    uint8_t resp = 0x00;
+                    if (write(fd, &resp, 1) != 1) {
+                        unlink(aot_path);
+                        goto done;
+                    }
+                    unlink(aot_path);
+                    break;
+                }
+
+                /* Enable AOT-assisted JIT before caching */
+                patch_aot_is_aot_mode(aot_path);
+
+                /* Compute digest and cache for future lookups */
+                uint8_t aot_digest[32];
+                if (compute_file_sha256(aot_path, aot_digest) < 0)
+                    memset(aot_digest, 0, sizeof(aot_digest));
+                aot_cache_put(aot_digest, aot_path);
+
+                aot_fd = open(aot_path, O_RDONLY);
+                if (aot_fd < 0) {
+                    fprintf(stderr, "hl: rosettad: open AOT failed: %s\n",
+                            strerror(errno));
+                    uint8_t resp = 0x00;
+                    if (write(fd, &resp, 1) != 1) {
+                        unlink(aot_path);
+                        goto done;
+                    }
+                    unlink(aot_path);
+                    break;
+                }
+
+                fprintf(stderr, "hl: rosettad: digest on-demand HIT "
+                        "(AOT at %s)\n", aot_path);
+
+                /* Send as 'd' HIT: 0x01 + SCM_RIGHTS fd */
+                uint8_t resp = 0x01;
+                if (write(fd, &resp, 1) != 1) {
+                    close(aot_fd);
+                    goto done;
+                }
+                uint8_t dummy = 0;
+                if (send_fd(fd, &dummy, 1, aot_fd) < 0) {
+                    fprintf(stderr, "hl: rosettad: digest send_fd "
+                            "failed: %s\n", strerror(errno));
+                    close(aot_fd);
+                    goto done;
+                }
+                close(aot_fd);
             } else {
-                fprintf(stderr, "hl: rosettad: digest cache MISS\n");
+                fprintf(stderr, "hl: rosettad: digest cache MISS "
+                        "(no binary path)\n");
                 uint8_t resp = 0x00;
                 if (write(fd, &resp, 1) != 1) goto done;
             }
@@ -983,6 +1119,13 @@ void rosettad_set_socket(int fd) {
 
 void rosettad_set_client_fd(int fd) {
     rosettad_client_fd = fd;
+}
+
+void rosettad_set_binary_path(const char *path) {
+    if (path) {
+        strncpy(rosettad_binary_path, path, sizeof(rosettad_binary_path) - 1);
+        rosettad_binary_path[sizeof(rosettad_binary_path) - 1] = '\0';
+    }
 }
 
 int rosettad_is_socket(int host_fd) {
@@ -1025,34 +1168,77 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     }
 
     case ROSETTA_VZ_CAPS: {
-        /* VZ_CAPS buffer layout (128 bytes), determined empirically:
+        /* VZ_CAPS buffer layout (128 bytes) — reverse-engineered from Rosetta binary:
          *
-         *   caps[0]:       VZ enable flag (1 = VZ mode active)
-         *   caps[1..108]:  Unix socket path for rosettad (sun_path[108])
-         *                  Rosetta copies these bytes directly into a
-         *                  struct sockaddr_un.sun_path and calls connect().
-         *                  All-zeros → Linux abstract socket with empty name.
-         *                  In a real VZ VM this would be a virtiofs-mounted
-         *                  path like "/run/rosettad/uds".
-         *   caps[109]:     Additional capability flag
-         *   caps[110..127]: Reserved / unknown
+         *   caps[0]:       VZ enable flag (1 = VZ mode active).
+         *                  Written to BSS[0xa04]; enables the rosettad AOT path.
          *
-         * We leave caps[1..108] as zeros (abstract socket) because our
-         * implementation intercepts the socket() and connect() calls
-         * directly via a socketpair — rosetta never actually connects
-         * to this path. The rosettad protocol is handled by our
-         * rosettad_handler_thread instead. */
+         *   caps[1..64]:   sun_path[0..63] — first 64 bytes of socket path.
+         *                  CRITICAL: caps[64] (= sun_path[63]) MUST be non-null.
+         *                  At VA 0x800000307a4, Rosetta reads this byte and does:
+         *                    cbz w8, 0x3080c   ; if zero → skip entire rosettad init
+         *                  Setting caps[64]=0 silently disables AOT: translation_mode
+         *                  stays 0 (pure JIT), [aot_registry+0x70] is never populated,
+         *                  and 0x80000002ec84 (AOT mmap/find-or-create) always returns
+         *                  without contacting rosettad.
+         *                  We fill caps[1..64] with a fake path prefix (63 'A's + '/').
+         *                  The connect() interception in syscall_net.c is fd-based
+         *                  (rosettad_is_socket()), so the actual path bytes don't matter.
+         *
+         *   caps[65]:      Null terminator of the socket path (already zero).
+         *
+         *   caps[66..107]: Null-terminated path to the x86_64 binary being translated.
+         *                  At VA 0x800000090bb0, Rosetta calls:
+         *                    openat(AT_FDCWD, caps+0x42, 0, 0)
+         *                  to open the binary file and sends the fd to rosettad via
+         *                  SCM_RIGHTS so rosettad can perform the AOT translation.
+         *                  (caps+0x42 = caps[66]; 0x42 = 66)
+         *
+         *   caps[108]:     Written to BSS[0xa05]. Checked at VA 0x800000090ba4:
+         *                    cbz w23, 0x90ca4   ; if zero → skip translate path
+         *                  Must be non-null to allow the translate ('t') protocol
+         *                  handler to proceed after the '?' handshake.
+         *
+         *   caps[109..127]: Other flags (purpose unknown, leave as zero). */
         uint8_t caps[128] = {0};
-        /* caps[0]: VZ enable flag.
-         * 1 = VZ mode active (enables rosettad AOT path)
-         * 0 = JIT-only mode (no rosettad, in-process translation)
+
+        /* caps[0]: VZ enable flag — activates the rosettad AOT pipeline. */
+        caps[0] = 1;
+
+        /* caps[1..64]: Fake socket path prefix.
+         * caps[64] is the critical gating byte (must be non-null). */
+        memset(&caps[1], 'A', 63);
+        caps[64] = '/';   /* sun_path[63]: non-null → rosettad init proceeds */
+        /* caps[65] = 0: null terminator of socket path (already zero from = {0}) */
+
+        /* caps[66..]: Null-terminated path to x86_64 binary for rosettad.
+         * Rosetta opens this file and sends the fd to rosettad via SCM_RIGHTS. */
+        size_t binpath_len = strlen(rosettad_binary_path);
+        if (binpath_len > 0 && binpath_len <= 128 - 66 - 1) {
+            memcpy(&caps[66], rosettad_binary_path, binpath_len + 1);
+        } else if (binpath_len > 0) {
+            /* Path too long to fit: truncate, ensure null termination at [127] */
+            memcpy(&caps[66], rosettad_binary_path, 128 - 66 - 1);
+            caps[127] = 0;
+        }
+
+        /* caps[108]: BSS[0xa05] gate.
+         * Non-zero: rosetta uses 't' (translate) protocol — sends binary fd
+         *           to rosettad, receives AOT fd back.
+         * Zero:     rosetta uses 'd' (digest) protocol — computes binary hash,
+         *           sends digest to rosettad, receives cached AOT.
          *
-         * Rosetta's JIT uses a two-process ptrace architecture:
-         * clone(CLONE_VM) creates an inferior sharing the address space,
-         * the tracer attaches via PTRACE_SEIZE, and BRK-based on-demand
-         * compilation resolves indirect branches at runtime. */
-        caps[0] = 1;   /* VZ mode active (enables rosettad AOT path) */
-        fprintf(stderr, "hl: rosetta: VZ_CAPS ioctl → caps[0]=%d\n", caps[0]);
+         * Real VZ VMs use the 'd' path (rosettad pre-caches translations).
+         * The 'd' path may activate different AOT registration logic inside
+         * rosetta. Our rosettad handler supports both: 't' translates inline,
+         * 'd' does on-demand translation if no cache entry exists.
+         *
+         * Set to 0 to match real VZ behavior (digest path). */
+        caps[108] = 0;
+
+        fprintf(stderr, "hl: rosetta: VZ_CAPS ioctl → caps[0]=%d caps[64]=0x%02x "
+                "caps[108]=0x%02x binary=%s\n",
+                caps[0], caps[64], caps[108], rosettad_binary_path);
         if (guest_write(g, arg, caps, sizeof(caps)) < 0)
             return -LINUX_EFAULT;
         return 1;  /* Real VZ driver returns 1 on success */

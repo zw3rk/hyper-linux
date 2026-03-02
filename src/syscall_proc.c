@@ -57,6 +57,11 @@ static char hl_path[LINUX_PATH_MAX] = {0};
 /* Sysroot path for dynamic linker library resolution */
 static char sysroot_path[LINUX_PATH_MAX] = {0};
 
+/* W^X toggle counters for JIT debugging */
+static _Atomic uint64_t wxcount_to_rx = 0;  /* RW→RX (exec fault) */
+static _Atomic uint64_t wxcount_to_rw = 0;  /* RX→RW (write fault) */
+static _Atomic uint64_t sysreg_write_count = 0;  /* EC=0x18 Dir=0 (DC CVAU, IC IVAU, etc.) */
+
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
@@ -871,6 +876,36 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 switch (imm) {
                 case 5: {
                     /* HVC #5: Linux syscall forwarding */
+
+                    /* Track rosetta TLS JIT gate flag. Bit 0 of
+                     * [X18+0x1b8] must be set for the SIGTRAP handler
+                     * to perform JIT retranslation. Log when it changes. */
+                    if (verbose && g->is_rosetta) {
+                        static uint32_t prev_jit_gate = 0xDEADBEEF;
+                        static uint64_t prev_x18 = 0;
+                        uint64_t x18_val;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18_val);
+                        if (x18_val != prev_x18) {
+                            fprintf(stderr, "%s: X18 changed: 0x%llx → 0x%llx "
+                                    "(iter %d)\n", prefix,
+                                    (unsigned long long)prev_x18,
+                                    (unsigned long long)x18_val, iter);
+                            prev_x18 = x18_val;
+                            prev_jit_gate = 0xDEADBEEF; /* force re-check */
+                        }
+                        if (x18_val) {
+                            uint32_t jit_gate;
+                            if (guest_read(g, x18_val + 0x1b8, &jit_gate, 4) == 0 &&
+                                jit_gate != prev_jit_gate) {
+                                fprintf(stderr, "%s: JIT gate [0x%llx+0x1b8] "
+                                        "changed: 0x%x → 0x%x (iter %d)\n",
+                                        prefix, (unsigned long long)x18_val,
+                                        prev_jit_gate, jit_gate, iter);
+                                prev_jit_gate = jit_gate;
+                            }
+                        }
+                    }
+
                     int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
                     if (ret == 1)
                         running = 0;
@@ -1143,6 +1178,12 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     uint64_t page_end = page_start + 4096;
                     int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
 
+                    /* Count W^X toggles for JIT debugging */
+                    if (type == 0)
+                        atomic_fetch_add(&wxcount_to_rx, 1);
+                    else
+                        atomic_fetch_add(&wxcount_to_rw, 1);
+
                     if (verbose)
                         fprintf(stderr, "%s: W^X toggle at 0x%llx → %s "
                                 "(page 0x%llx)\n",
@@ -1197,10 +1238,131 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     uint64_t brk_pc;
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
 
-                    if (verbose)
+                    if (verbose) {
                         fprintf(stderr, "%s: BRK at 0x%llx → %s\n",
                                 prefix, (unsigned long long)brk_pc,
                                 current_thread->ptraced ? "ptrace-stop" : "SIGTRAP");
+                        /* Dump memory around BRK for JIT debugging */
+                        uint8_t brk_mem[64];
+                        uint64_t dump_addr = brk_pc & ~0xFULL;
+                        if (guest_read(g, dump_addr, brk_mem, 64) == 0) {
+                            fprintf(stderr, "%s: mem[0x%llx]: ", prefix,
+                                    (unsigned long long)dump_addr);
+                            for (int i = 0; i < 64; i++) {
+                                if (i && (i % 16 == 0))
+                                    fprintf(stderr, "\n%s: mem[0x%llx]: ",
+                                            prefix,
+                                            (unsigned long long)(dump_addr+i));
+                                fprintf(stderr, "%02x ", brk_mem[i]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        /* Dump JIT cache base to see entry point code */
+                        uint8_t jit_base[128];
+                        uint64_t jit_start = 0xeffff7ff8000ULL;
+                        if (guest_read(g, jit_start, jit_base, 128) == 0) {
+                            fprintf(stderr, "%s: JIT base 0x%llx:\n",
+                                    prefix, (unsigned long long)jit_start);
+                            for (int r = 0; r < 128; r += 16) {
+                                fprintf(stderr, "%s: [%04x] ", prefix, r);
+                                for (int c = 0; c < 16; c++)
+                                    fprintf(stderr, "%02x ", jit_base[r+c]);
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                        /* Dump JIT+0x8000 region (where BRK stub is) */
+                        uint8_t jit8k[128];
+                        uint64_t jit8k_addr = 0xeffff8000000ULL;
+                        if (guest_read(g, jit8k_addr, jit8k, 128) == 0) {
+                            fprintf(stderr, "%s: JIT+0x8000 (0x%llx):\n",
+                                    prefix, (unsigned long long)jit8k_addr);
+                            for (int r = 0; r < 128; r += 16) {
+                                fprintf(stderr, "%s: [%04x] ", prefix,
+                                        0x8000 + r);
+                                for (int c = 0; c < 16; c++)
+                                    fprintf(stderr, "%02x ", jit8k[r+c]);
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                        /* W^X toggle stats */
+                        fprintf(stderr, "%s: W^X toggles: to_rx=%llu "
+                                "to_rw=%llu sysreg_writes=%llu\n",
+                                prefix,
+                                (unsigned long long)atomic_load(&wxcount_to_rx),
+                                (unsigned long long)atomic_load(&wxcount_to_rw),
+                                (unsigned long long)atomic_load(&sysreg_write_count));
+                        /* Dump X30 (return addr) and call site code */
+                        uint64_t x30;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X30, &x30);
+                        fprintf(stderr, "%s: X30(LR)=0x%llx\n",
+                                prefix, (unsigned long long)x30);
+                        /* Dump 32 bytes before X30 (the call site) */
+                        uint8_t call_mem[48];
+                        uint64_t call_addr = (x30 - 32) & ~3ULL;
+                        if (guest_read(g, call_addr, call_mem, 48) == 0) {
+                            fprintf(stderr, "%s: call site [0x%llx]:\n",
+                                    prefix, (unsigned long long)call_addr);
+                            for (int r = 0; r < 48; r += 4) {
+                                uint32_t insn = *(uint32_t *)(call_mem + r);
+                                fprintf(stderr, "%s:   0x%llx: %08x\n",
+                                        prefix,
+                                        (unsigned long long)(call_addr + r),
+                                        insn);
+                            }
+                        }
+                        /* Dump BL target (AOT trampoline) */
+                        uint32_t bl_insn;
+                        if (guest_read(g, x30 - 4, &bl_insn, 4) == 0 &&
+                            (bl_insn >> 26) == 0x25) { /* BL opcode */
+                            int32_t imm26 = bl_insn & 0x3ffffff;
+                            if (imm26 & (1 << 25)) imm26 -= (1 << 26);
+                            uint64_t bl_target = (x30 - 4) + (int64_t)imm26 * 4;
+                            uint8_t tramp[64];
+                            if (guest_read(g, bl_target, tramp, 64) == 0) {
+                                fprintf(stderr, "%s: BL target 0x%llx:\n",
+                                        prefix, (unsigned long long)bl_target);
+                                for (int r = 0; r < 64; r += 4) {
+                                    uint32_t ti = *(uint32_t *)(tramp + r);
+                                    fprintf(stderr, "%s:   0x%llx: %08x\n",
+                                            prefix,
+                                            (unsigned long long)(bl_target + r),
+                                            ti);
+                                }
+                            }
+                        }
+
+                        /* Dump rosetta TLS state (X18 context pointer).
+                         * The SIGTRAP handler reads [X18+0x1b8] bit 0
+                         * to decide if JIT lookup should proceed, and
+                         * [X18+0x190] for thread ID. Dump the region
+                         * around these offsets to see if state is valid. */
+                        uint64_t x18;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18);
+                        fprintf(stderr, "%s: X18(TLS)=0x%llx\n",
+                                prefix, (unsigned long long)x18);
+                        if (x18) {
+                            uint8_t tls_data[256];
+                            /* Dump [X18+0x180..X18+0x280] — covers
+                             * +0x190 (tid), +0x1b8 (flags), +0x218 (ctx) */
+                            if (guest_read(g, x18 + 0x180, tls_data, 256) == 0) {
+                                fprintf(stderr, "%s: X18+0x180 (TLS):\n", prefix);
+                                for (int r = 0; r < 256; r += 16) {
+                                    fprintf(stderr, "%s: [+0x%03x] ", prefix,
+                                            0x180 + r);
+                                    for (int c = 0; c < 16; c++)
+                                        fprintf(stderr, "%02x ", tls_data[r+c]);
+                                    /* Show as uint64s too */
+                                    uint64_t v0, v1;
+                                    memcpy(&v0, tls_data + r, 8);
+                                    memcpy(&v1, tls_data + r + 8, 8);
+                                    fprintf(stderr, " | 0x%llx 0x%llx",
+                                            (unsigned long long)v0,
+                                            (unsigned long long)v1);
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                        }
+                    }
 
                     if (current_thread->ptraced) {
                         /* Ptrace-stop: suspend vCPU, notify tracer.
@@ -1213,6 +1375,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         }
                     } else {
                         /* Non-ptraced: deliver SIGTRAP via signal frame */
+
                         signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
                         signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
                         int sig_ret = signal_deliver(vcpu, g, &exit_code);
@@ -1286,6 +1449,45 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     if (sig_ret < 0) {
                         /* Default action: core dump (we just terminate) */
                         running = 0;
+                    }
+                    break;
+                }
+
+                case 12: {
+                    /* HVC #12: System instruction trap (EC=0x18 Direction=0).
+                     * The shim forwards trapped cache maintenance instructions
+                     * (DC CVAU, IC IVAU, etc.) here for logging/counting.
+                     * The shim has already executed IC IALLU and advanced PC. */
+                    atomic_fetch_add(&sysreg_write_count, 1);
+                    if (verbose) {
+                        uint64_t esr;
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+                        uint32_t iss = (uint32_t)(esr & 0x1FFFFFF);
+                        /* Decode ISS for system instruction:
+                         *   Op0[21:20] Op2[19:17] Op1[16:14]
+                         *   CRn[13:10] Rt[9:5] CRm[4:1] Dir[0] */
+                        uint32_t op0 = (iss >> 20) & 0x3;
+                        uint32_t op2 = (iss >> 17) & 0x7;
+                        uint32_t op1 = (iss >> 14) & 0x7;
+                        uint32_t crn = (iss >> 10) & 0xF;
+                        uint32_t crm = (iss >> 1)  & 0xF;
+                        uint32_t rt  = (iss >> 5)  & 0x1F;
+                        /* DC CVAU: Op0=1,Op1=3,CRn=7,CRm=11,Op2=1
+                         * IC IVAU: Op0=1,Op1=3,CRn=7,CRm=5,Op2=1 */
+                        const char *name = "unknown";
+                        if (op0==1 && op1==3 && crn==7 && crm==11 && op2==1)
+                            name = "DC CVAU";
+                        else if (op0==1 && op1==3 && crn==7 && crm==5 && op2==1)
+                            name = "IC IVAU";
+                        else if (op0==1 && op1==3 && crn==7 && crm==10 && op2==1)
+                            name = "DC CVAC";
+                        else if (op0==1 && op1==3 && crn==7 && crm==14 && op2==1)
+                            name = "DC CIVAC";
+                        fprintf(stderr, "%s: sysreg trap #%llu: %s "
+                                "(Op0=%u Op1=%u CRn=%u CRm=%u Op2=%u Rt=X%u)\n",
+                                prefix,
+                                (unsigned long long)atomic_load(&sysreg_write_count),
+                                name, op0, op1, crn, crm, op2, rt);
                     }
                     break;
                 }

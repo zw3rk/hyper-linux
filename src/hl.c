@@ -301,11 +301,19 @@ int main(int argc, const char **argv) {
          * return from kernel VA mmaps. */
         guest_add_va_alias(&g, KBUF_USER_VA, kbuf_gpa, KBUF_SIZE);
 
-        /* NOTE: Rosetta binary is loaded unpatched. In non-VZ mode (JIT),
-         * rosetta's forward-scan translator cannot handle indirect branches
-         * to untranslated code. The solution is AOT translation via rosettad,
-         * enabled by returning success for VZ_CAPS ioctl.
-         * See lode/rosetta.md for detailed analysis. */
+        /* Rosetta's init populates its own signal handler table:
+         *   save_old_handler(5)  → queries rt_sigaction(5,NULL,&old,8)
+         *                          stores old handler (SIG_DFL=0) in BSS[0x488+5*32]
+         *                          sets BSS[0x478] |= (1<<5)
+         *   save_old_handler(11) → same for SIGSEGV
+         *   rt_sigaction(11, handler=0x96490) → installs SIGSEGV
+         *   rt_sigaction(5,  handler=0x96490) → installs SIGTRAP
+         *
+         * The BSS[0x488+sig*32] entry stores the OLD (pre-rosetta) handler,
+         * NOT rosetta's own handler. In the signal dispatch at 0x2e898:
+         *   old_handler < 2 (SIG_DFL/SIG_IGN) → rosetta's JIT handles it
+         *   old_handler >= 2 → forward to pre-existing handler
+         * So the correct BSS state after init is {0,0,0,0} (SIG_DFL). */
     }
 
     /* ---- Step 3: Load ELF segments into guest memory ---- */
@@ -727,6 +735,15 @@ int main(int argc, const char **argv) {
      * the x86_64 binary instead causes corrupt internal data structures
      * and "BasicBlock requested for unrecognized address" JIT failures. */
     proc_set_elf_path(need_rosetta ? ROSETTA_PATH : elf_path);
+    /* For rosetta mode, record the x86_64 binary path so the rosettad
+     * handler thread can perform on-demand AOT translation when the
+     * 'd' digest cache misses. In real VZ VMs, rosettad pre-caches
+     * AOT translations so 'd' always hits. We match that behavior by
+     * translating on-the-fly during the 'd' request. */
+    if (need_rosetta) {
+        extern void rosettad_set_binary_path(const char *path);
+        rosettad_set_binary_path(elf_realpath);
+    }
     proc_set_cmdline(guest_argc, guest_argv);
     if (sysroot)
         proc_set_sysroot(sysroot);
@@ -811,7 +828,8 @@ int main(int argc, const char **argv) {
                                environ, &rosetta_info,
                                0 /* rosetta is ET_EXEC at link addr */,
                                0 /* no dynamic linker for rosetta */,
-                               vdso_addr);
+                               vdso_addr,
+                               3 /* AT_EXECFD: binary pre-opened at fd 3 */);
         free(rosetta_argv);
 
         /* Entry point: rosetta entry (at high IPA) */
@@ -822,7 +840,8 @@ int main(int argc, const char **argv) {
                                guest_argc, guest_argv,
                                environ, &elf_info,
                                elf_load_base, interp_base,
-                               0 /* no vDSO for aarch64 */);
+                               0 /* no vDSO for aarch64 */,
+                               -1 /* no AT_EXECFD */);
 
         /* Entry point: interpreter entry if dynamic, ELF entry if static.
          * For PIE (ET_DYN), elf_info.entry is relative, needs elf_load_base. */
@@ -905,7 +924,7 @@ int main(int argc, const char **argv) {
      * via hv_vcpu_set_sys_reg before start causes permission faults.
      * The shim will HVC #4 to enable M after TLBI/DSB/ISB. */
     sctlr = SCTLR_RES1 | SCTLR_C | SCTLR_I
-          | SCTLR_UCT | SCTLR_UCI;  /* No SCTLR_M here */
+          | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;  /* No SCTLR_M here */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr));
 
     /* -- General purpose registers -- */
@@ -924,7 +943,7 @@ int main(int argc, const char **argv) {
     /* Pass the full SCTLR value (WITH M=1) in X0 for the shim to
      * enable the MMU during execution via HVC #4. */
     uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I
-                            | SCTLR_UCT | SCTLR_UCI;
+                            | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
     HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_X0, sctlr_with_mmu));
 
     if (verbose) {

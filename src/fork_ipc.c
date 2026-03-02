@@ -499,7 +499,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
      * SCTLR must include MMU-enable (M), caches (C, I), RES1 bits,
      * and EL0 cache maintenance access (UCI, UCT) for JIT translators. */
     uint64_t sctlr_with_mmu = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_I
-                             | SCTLR_UCT | SCTLR_UCI;
+                             | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr_with_mmu));
 
     /* Restore all 31 GPRs from parent state, then override X0=0 (child

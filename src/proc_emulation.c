@@ -349,10 +349,6 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
                             lineoff, line);
         }
 
-        fprintf(stderr, "hl: DEBUG /proc/self/maps (%d bytes, %d entries "
-                "from %d regions):\n%.*s",
-                off, nentries, g->nregions, off, buf);
-
         return proc_synthetic_fd(buf, off);
     }
 

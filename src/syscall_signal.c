@@ -388,18 +388,9 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
     if (act_gva) {
         linux_sigaction_t act;
         if (guest_read(g, act_gva, &act, sizeof(act)) < 0) {
-            fprintf(stderr, "hl: rt_sigaction: guest_read failed for "
-                    "act_gva=0x%llx signum=%d\n",
-                    (unsigned long long)act_gva, signum);
             pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
         }
-        fprintf(stderr, "hl: rt_sigaction: signum=%d handler=0x%llx "
-                "flags=0x%llx restorer=0x%llx mask=0x%llx\n",
-                signum, (unsigned long long)act.sa_handler,
-                (unsigned long long)act.sa_flags,
-                (unsigned long long)act.sa_restorer,
-                (unsigned long long)act.sa_mask);
 
         sig_state.actions[idx] = act;
     }
@@ -625,10 +616,6 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     linux_sigaction_t *act = &sig_state.actions[idx];
 
     /* Check handler type */
-    fprintf(stderr, "hl: signal_deliver: signum=%d handler=0x%llx "
-            "flags=0x%llx\n", signum,
-            (unsigned long long)act->sa_handler,
-            (unsigned long long)act->sa_flags);
     if (act->sa_handler == LINUX_SIG_IGN) {
         /* Ignored — discard signal */
         pthread_mutex_unlock(&sig_lock);
@@ -638,8 +625,6 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     if (act->sa_handler == LINUX_SIG_DFL) {
         /* Apply default disposition */
         sig_disposition_t disp = signal_default_disposition(signum);
-        fprintf(stderr, "hl: signal_deliver: signum=%d handler=SIG_DFL "
-                "disp=%d\n", signum, (int)disp);
         switch (disp) {
         case SIG_DISP_TERM:
         case SIG_DISP_CORE:
@@ -808,11 +793,8 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
 
     /* Read the rt_sigframe from guest stack */
     linux_rt_sigframe_t frame;
-    if (guest_read(g, sp, &frame, sizeof(frame)) < 0) {
-        fprintf(stderr, "hl: rt_sigreturn: failed to read frame at 0x%llx\n",
-                (unsigned long long)sp);
+    if (guest_read(g, sp, &frame, sizeof(frame)) < 0)
         return -LINUX_EFAULT;
-    }
 
     /* Restore all 31 GPRs */
     for (int i = 0; i < 31; i++)

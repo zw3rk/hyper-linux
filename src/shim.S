@@ -293,7 +293,51 @@ handle_sysreg_trap:
     str x0, [sp, x10]         /* frame[Rt] = value */
     b 3f
 
-4:  /* System instruction: IC IALLU from EL1 for cache coherency */
+4:  /* System instruction: trapped cache/data operations.
+     * DC ZVA (Data Cache Zero by VA) is trapped when HCR_EL2.TDZ=1
+     * despite SCTLR.DZE=1. DC ZVA zeroes a cache-line-sized block
+     * (64 bytes on Apple Silicon) — rosetta's JIT uses it as fast
+     * memset(0) for code buffers and metadata. Failure to emulate
+     * leaves stale data, corrupting rosetta's block tables.
+     *
+     * DC CVAU, IC IVAU, and other cache maintenance instructions trap
+     * here despite SCTLR.UCI=1 (HVF sets HCR_EL2.TPU=1). We execute
+     * IC IALLU as safety net for I-cache coherency after any of these.
+     *
+     * ISS encoding for system instructions:
+     *   Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
+     * DC ZVA: Op0=01 Op2=001 Op1=011 CRn=0111 CRm=0100 Dir=0
+     *   = (01 << 20) | (001 << 17) | (011 << 14) | (0111 << 10) | (0100 << 1) | 0
+     *   = 0x169C08 + (Rt << 5) */
+
+    /* Check for DC ZVA: extract fields around Rt and compare.
+     * DC ZVA ISS: Op0[21:20]=01 Op2[19:17]=001 Op1[16:14]=011
+     *             CRn[13:10]=0111 Rt[9:5]=xxxxx CRm[4:1]=0100 Dir[0]=0
+     * We check ISS[21:10] = 0x4B7 and ISS[4:0] = 0x08. */
+    ubfx x10, x9, #10, #12        /* x10 = ISS[21:10] */
+    mov x11, #0x4B7                /* Expected upper field value */
+    cmp x10, x11
+    b.ne 5f
+    and x10, x9, #0x1F            /* x10 = ISS[4:0] */
+    cmp x10, #0x08                 /* CRm=0100,Dir=0 → 01000 = 0x08 */
+    b.ne 5f                        /* Not DC ZVA → skip to cache maint */
+
+    /* DC ZVA emulation: zero 64 bytes at aligned address from Xt.
+     * Extract Rt register number and load the VA from saved frame. */
+    ubfx x10, x9, #5, #5          /* Rt = ISS[9:5] */
+    cmp x10, #31
+    b.eq 6f                        /* XZR → address is 0, skip (nop) */
+    lsl x10, x10, #3              /* Byte offset in frame */
+    ldr x11, [sp, x10]            /* x11 = VA from Xt */
+    and x11, x11, #~63            /* Align down to 64-byte cache line */
+    /* Zero 64 bytes using four STP pairs */
+    stp xzr, xzr, [x11, #0]
+    stp xzr, xzr, [x11, #16]
+    stp xzr, xzr, [x11, #32]
+    stp xzr, xzr, [x11, #48]
+6:  /* Forward to host for counting, then I-cache maintenance */
+
+5:  hvc #12
     ic iallu
     dsb ish
     isb
@@ -551,9 +595,28 @@ handle_svc_0:
      * clobbered across SVC, so callers never expect it preserved. */
     cbz x8, 1f
     tlbi vmalle1is
+1:
+    /* Flush I-cache for D/I coherence after every syscall return.
+     *
+     * ARM64 I-cache and D-cache are not coherent: stores update the
+     * D-cache but the I-cache may hold stale data at the same address.
+     * JIT translators (rosetta) write translated code via stores during
+     * signal handlers (SIGTRAP for BRK trampolines, SIGSEGV for lazy
+     * translation), then return via rt_sigreturn to execute the newly
+     * written code.  Without I-cache invalidation, the CPU fetches the
+     * stale BRK/fault instruction from the I-cache, causing infinite
+     * re-traps.
+     *
+     * IC IALLU invalidates all instruction cache entries for this VM.
+     * DSB ISH ensures the invalidation completes before ISB, which
+     * flushes the pipeline so the next fetch sees the new code.
+     * On Apple Silicon, IC IALLU is a single-cycle operation; the real
+     * cost is the ISB pipeline flush (~10 cycles).  This is negligible
+     * compared to the host-side syscall overhead (HVC exit + host
+     * dispatch + HVC return ≈ 1000+ cycles). */
+    ic iallu
     dsb ish
     isb
-1:
     /* Return to EL0 — X0 now holds the syscall return value,
      * X1-X30 retain their original EL0 values. */
     eret

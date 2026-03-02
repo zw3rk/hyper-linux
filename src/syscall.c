@@ -458,6 +458,12 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
     uint64_t va_block_end   = (va + length + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
 
     int alloc_count = 0, skip_count = 0;
+    int total_blocks = (int)((va_block_end - va_block_start) / BLOCK_2MB);
+    if (total_blocks > 2)
+        fprintf(stderr, "hl: mmap_high_va: mapping %d 2MB blocks "
+                "[0x%llx,0x%llx)\n", total_blocks,
+                (unsigned long long)va_block_start,
+                (unsigned long long)va_block_end);
     for (uint64_t bva = va_block_start; bva < va_block_end; bva += BLOCK_2MB) {
         /* Check if this 2MB block already has a page table mapping.
          * guest_ptr uses page table walking for high VAs. */
@@ -516,6 +522,8 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
             }
         }
 
+        alloc_count++;
+
         /* Track for gap-finder collision avoidance. The region is stored
          * at the GPA for the gap finder, with display_va set to the actual
          * high VA so /proc/self/maps shows the correct address.
@@ -554,10 +562,10 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
         /* Update high-water mark */
         if (gpa + BLOCK_2MB > g->mmap_next)
             g->mmap_next = gpa + BLOCK_2MB;
-        alloc_count++;
     }
-    (void)alloc_count;
-    (void)skip_count;
+    if (total_blocks > 2)
+        fprintf(stderr, "hl: mmap_high_va: allocated=%d skipped=%d "
+                "total=%d\n", alloc_count, skip_count, total_blocks);
 
     /* Write data using page-table-resolved host pointers.
      * This is correct even when guest_map_va_range reused an existing L2
@@ -743,6 +751,11 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                 ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
                                    length, offset);
                 if (nr < 0) return linux_errno();
+                fprintf(stderr, "hl:   mmap file-backed: fd=%d(host=%d) "
+                        "off=0x%llx nr=%zd into [0x%llx,+0x%llx)\n",
+                        fd, host_fd, (unsigned long long)offset, nr,
+                        (unsigned long long)addr,
+                        (unsigned long long)length);
             }
         } else {
             /* PROT_NONE with MAP_FIXED: invalidate existing page table
@@ -1063,8 +1076,21 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 }
                 /* Remove region tracking. The gap-finding allocator
                  * will reuse this freed address space for future mmap
-                 * calls. Note: page table entries are NOT reclaimed —
-                 * only semantic region tracking is updated. */
+                 * calls.
+                 *
+                 * Note: TTBR0 page table entries are NOT invalidated here.
+                 * This is intentional — invalidating PTEs on every munmap
+                 * is expensive and unnecessary because:
+                 * 1. The host backing memory is zeroed above (data leak
+                 *    prevention), so stale PTEs only expose zeroed pages
+                 * 2. Future MAP_FIXED mmaps at these addresses will create
+                 *    correct PTEs via guest_extend_page_tables()
+                 * 3. PROT_NONE mmaps at these addresses DO invalidate PTEs
+                 *    (handled in the MAP_FIXED PROT_NONE path above)
+                 *
+                 * Kernel VA (TTBR1) munmap DOES invalidate PTEs — see the
+                 * kbuf path above — because rosetta relies on fault-on-access
+                 * semantics for kernel VA unmaps. */
                 guest_region_remove(g, unmap_off, end);
 
                 /* Reset gap-finder hints if freed space precedes them,
@@ -1519,11 +1545,16 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_rt_tgsigqueueinfo: {
         /* rt_tgsigqueueinfo(tgid, tid, sig, uinfo): send signal with
          * siginfo to a specific thread. Used by Rosetta's runtime_signal_handler
-         * to re-deliver SIGTRAP during BRK-based JIT trap-and-translate. */
+         * to re-deliver SIGTRAP during BRK-based JIT trap-and-translate.
+         *
+         * Critical: we must read the siginfo payload from guest memory and
+         * preserve si_code + fault address. Without this, re-delivered
+         * SIGTRAP lacks the BRK fault address and Rosetta's translate()
+         * cannot find the code to translate. */
         int tgid = (int)x0;
         int tid = (int)x1;
         int sig = (int)x2;
-        /* uint64_t uinfo_gva = x3; — siginfo payload (currently unused) */
+        uint64_t uinfo_gva = x3;
         (void)tgid;  /* Single-process: tgid is always ours */
 
         if (sig < 1 || sig > LINUX_NSIG) {
@@ -1542,9 +1573,39 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             break;
         }
 
-        if (verbose)
-            fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
-                    "sig=%d)\n", tgid, tid, sig);
+        /* Read siginfo from guest memory to preserve fault information */
+        linux_siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (uinfo_gva && guest_read(g, uinfo_gva, &info, sizeof(info)) == 0) {
+            /* For fault-type signals, extract si_addr (uint64_t at byte
+             * offset 16, overlapping si_pid/si_uid in the siginfo union).
+             * Set pending fault info so signal_deliver() populates the
+             * signal frame with the correct fault address. */
+            int is_fault = (sig == LINUX_SIGTRAP || sig == LINUX_SIGSEGV ||
+                            sig == LINUX_SIGBUS  || sig == LINUX_SIGFPE  ||
+                            sig == LINUX_SIGILL);
+            if (is_fault && info.si_code > 0) {
+                uint64_t fault_addr;
+                memcpy(&fault_addr, &info.si_pid, sizeof(fault_addr));
+                signal_set_fault_info(info.si_code, fault_addr);
+
+                if (verbose)
+                    fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                            "sig=%d, si_code=%d, fault_addr=0x%llx)\n",
+                            tgid, tid, sig, info.si_code,
+                            (unsigned long long)fault_addr);
+            } else {
+                if (verbose)
+                    fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                            "sig=%d, si_code=%d)\n",
+                            tgid, tid, sig, info.si_code);
+            }
+        } else {
+            if (verbose)
+                fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                        "sig=%d, uinfo=0x%llx [unreadable])\n",
+                        tgid, tid, sig, (unsigned long long)uinfo_gva);
+        }
 
         signal_queue(sig);
         result = 0;
