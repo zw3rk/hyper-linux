@@ -109,6 +109,7 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa) {
 
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     memset(g, 0, sizeof(*g));
+    g->shm_fd = -1;
     g->ipa_base = GUEST_IPA_BASE;
     g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -169,6 +170,40 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
         return -1;
     }
 
+    /* Upgrade to file-backed shared memory for COW fork support.
+     * mkstemp + unlink + ftruncate + MAP_SHARED|MAP_FIXED replaces the
+     * anonymous mapping with file-backed memory at the same host address.
+     * At fork time, the parent atomically switches to MAP_PRIVATE (freezing
+     * a COW snapshot) and sends the file fd to the child, giving it an
+     * instant copy-on-write clone of all guest memory.
+     *
+     * macOS rejects MAP_PRIVATE on shm_open objects (EINVAL), but regular
+     * file fds support MAP_SHARED, MAP_PRIVATE, and MAP_PRIVATE|MAP_FIXED
+     * correctly. The file is unlinked immediately — the fd keeps it alive.
+     * macOS demand-pages file mappings, so untouched pages cost nothing.
+     * If any step fails, we silently keep the MAP_ANON mapping and fall
+     * back to the IPC region-copy path on fork. */
+    {
+        char tmppath[] = "/tmp/hl-XXXXXX";
+        int sfd = mkstemp(tmppath);
+        if (sfd >= 0) {
+            unlink(tmppath);  /* Unlink immediately; fd keeps file alive */
+            if (ftruncate(sfd, (off_t)size) == 0) {
+                void *p = mmap(g->host_base, size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_FIXED, sfd, 0);
+                if (p != MAP_FAILED) {
+                    g->shm_fd = sfd;
+                } else {
+                    /* MAP_FIXED failed; keep the original MAP_ANON mapping */
+                    close(sfd);
+                }
+            } else {
+                close(sfd);
+            }
+        }
+        /* If shm_fd is still -1, we're on MAP_ANON — fork uses IPC copy */
+    }
+
     /* Create Hypervisor VM with the determined IPA width and map the
      * primary slab at GUEST_IPA_BASE.
      *
@@ -208,6 +243,72 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     fprintf(stderr, "guest: IPA size: %u bits (%lluGB primary, max_ipa=%u)\n",
             vm_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)),
             max_ipa);
+
+    return 0;
+}
+
+int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
+                         uint32_t ipa_bits) {
+    memset(g, 0, sizeof(*g));
+    g->shm_fd = -1;  /* Child doesn't own the shm */
+    g->ipa_base = GUEST_IPA_BASE;
+    g->pt_pool_next = PT_POOL_BASE;
+    g->brk_base = BRK_BASE_DEFAULT;
+    g->brk_current = BRK_BASE_DEFAULT;
+    g->mmap_next = MMAP_BASE;
+    g->mmap_rx_next = MMAP_RX_BASE;
+    g->guest_size = size;
+    g->ipa_bits = ipa_bits;
+
+    /* Compute layout limits (same formula as guest_init) */
+    g->interp_base = size - 0x100000000ULL;
+    g->mmap_limit  = size - 0x200000000ULL;
+
+    /* Map the shm fd MAP_PRIVATE: copy-on-write semantics. Reads see
+     * the parent's frozen snapshot; writes are private to this process.
+     * macOS COW is page-granular — only modified pages are duplicated. */
+    g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE, shm_fd, 0);
+    if (g->host_base == MAP_FAILED) {
+        perror("guest: mmap shm");
+        g->host_base = NULL;
+        close(shm_fd);
+        return -1;
+    }
+
+    /* Close the shm fd — the mapping keeps the pages alive */
+    close(shm_fd);
+
+    /* Create HVF VM with the same IPA width as the parent */
+    hv_return_t ret = HV_ERROR;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        hv_vm_config_t config = hv_vm_config_create();
+        hv_vm_config_set_ipa_size(config, ipa_bits);
+        ret = hv_vm_create(config);
+        os_release(config);
+        if (ret == HV_SUCCESS)
+            break;
+        usleep(500000);
+    }
+    if (ret != HV_SUCCESS) {
+        fprintf(stderr, "guest: hv_vm_create (shm) failed: %d\n", (int)ret);
+        munmap(g->host_base, size);
+        g->host_base = NULL;
+        return -1;
+    }
+
+    ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
+                    HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    if (ret != HV_SUCCESS) {
+        fprintf(stderr, "guest: hv_vm_map (shm) failed: %d\n", (int)ret);
+        hv_vm_destroy();
+        munmap(g->host_base, size);
+        g->host_base = NULL;
+        return -1;
+    }
+
+    fprintf(stderr, "guest: COW fork: mapped %lluGB from shm (ipa=%u bits)\n",
+            (unsigned long long)(size / (1024ULL * 1024 * 1024)), ipa_bits);
 
     return 0;
 }
@@ -303,6 +404,11 @@ void guest_destroy(guest_t *g) {
     if (g->host_base) {
         munmap(g->host_base, g->guest_size);
         g->host_base = NULL;
+    }
+    /* Close the shm fd if we own one (parent with shm backing) */
+    if (g->shm_fd >= 0) {
+        close(g->shm_fd);
+        g->shm_fd = -1;
     }
     /* kbuf lives within host_base — no separate free needed */
     g->kbuf_base = NULL;
@@ -455,10 +561,15 @@ void guest_reset(guest_t *g) {
      * MAP_ANON zero-fill-on-demand state. */
 
     /* Zero tracked regions (ELF segments, heap, stack, mmap allocations).
-     * Skip PROT_NONE regions — they were never touched. */
+     * Skip PROT_NONE regions — they were never touched.
+     * Skip regions with GPAs beyond the primary buffer — these are
+     * high-VA regions (e.g., rosetta at 128TB, kbuf user VA) whose
+     * backing data either lives at a different GPA resolved through
+     * VA aliases, or in extra mappings outside host_base. */
     for (int i = 0; i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
-        if (r->prot != 0 /* PROT_NONE */ && r->end > r->start) {
+        if (r->prot != 0 /* PROT_NONE */ && r->end > r->start &&
+            r->end <= g->guest_size) {
             memset((uint8_t *)g->host_base + r->start, 0,
                    r->end - r->start);
         }
@@ -532,13 +643,34 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
         n++;
     }
 
-    /* mmap region (up to high-water mark). With the gap-finding allocator,
+    /* mmap RW region (up to high-water mark). With the gap-finding allocator,
      * mmap_next is a high-water mark — freed regions within this range may
      * contain PROT_NONE pages (zero-fill, no cost to copy). This is
      * conservative but correct for fork state transfer. */
     if (n < max && g->mmap_next > MMAP_BASE) {
         out[n].offset = MMAP_BASE;
         out[n].size = g->mmap_next - MMAP_BASE;
+        n++;
+    }
+
+    /* mmap RX region (code mappings from dynamic linker, rosetta JIT, etc.) */
+    if (n < max && g->mmap_rx_next > MMAP_RX_BASE) {
+        out[n].offset = MMAP_RX_BASE;
+        out[n].size = g->mmap_rx_next - MMAP_RX_BASE;
+        n++;
+    }
+
+    /* Rosetta segments in primary buffer (loaded near interp_base) */
+    if (n < max && g->rosetta_guest_base != 0 && g->rosetta_size != 0) {
+        out[n].offset = g->rosetta_guest_base;
+        out[n].size = g->rosetta_size;
+        n++;
+    }
+
+    /* Kernel VA buffer (256MB, used by rosetta for JIT code cache etc.) */
+    if (n < max && g->kbuf_gpa != 0) {
+        out[n].offset = g->kbuf_gpa;
+        out[n].size = KBUF_SIZE;
         n++;
     }
 

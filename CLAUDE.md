@@ -56,6 +56,14 @@ value is wrong and the EL0 caller's register state is corrupted after ERET.
 
 Only `bad_exception` vectors may clobber X5 (they halt, so no preservation needed).
 
+## DC ZVA Emulation (Critical for Rosetta)
+
+HVF traps DC ZVA (Data Cache Zero by VA) via HCR_EL2.TDZ=1 even with
+SCTLR_EL1.DZE=1. The shim MUST emulate DC ZVA by zeroing 64 bytes at
+the cache-line-aligned address from the Rt register. Without this,
+rosetta's JIT compiler produces corrupted block tables (stale data in
+memory that DC ZVA was supposed to zero), causing assertion failures.
+
 ## HVC Protocol
 
 | HVC # | Purpose | Registers |
@@ -210,23 +218,24 @@ the binary search returns NULL. This happens for indirect jumps to
 addresses not pre-registered as block starts. In mode 2, AOT data
 pre-populates all known blocks; in mode 1, only discovered blocks exist.
 
-**Root cause of x86_64 indirect jump failures:** The AOT files produced
-by `rosettad translate` have zeros at header offsets 0x80 and 0x88. These
-are the source values for the packed flags field that determines
-`is_aot_mode`. Since bit 4 of [source+0x88] is always 0, `is_aot_mode`
-is never set, `seed_block()` never runs, and block tables are never
-pre-populated. When rosetta encounters an indirect jump (e.g., jump tables
-in `printf_core`), `block_for_offset()` fails because the target was never
-registered. In a real VZ VM, Virtualization.framework may provide richer
-AOT metadata through its runtime service, or rosettad may produce
-different output when invoked via the VZ protocol rather than standalone.
+**Root cause of x86_64 indirect jump failures (RESOLVED):** DC ZVA (Data
+Cache Zero by VA) was trapped by HVF (HCR_EL2.TDZ=1) but not emulated.
+The shim only counted the trap and ran IC IALLU without zeroing memory.
+Rosetta uses DC ZVA as fast memset(0) for JIT code buffers and internal
+metadata. Without actual zeroing, stale data corrupted rosetta's block
+tables, causing `block_for_offset()` to fail on indirect jump targets.
 
-**Observed pattern:** Binaries with only direct control flow (simple write/
-exit, puts, cat, echo) pass. Binaries using printf-family formatting fail
-because `vfprintf` → `printf_core` uses `jmpq *%rax` with a jump table.
-JIT-only mode (caps[0]=0 or ROSETTA_DISABLE_AOT=1) fails on ALL musl-
-linked binaries because even libc startup (`__libc_start_main` → `main`)
-uses indirect calls through `.init_array` function pointers.
+**Fix:** The shim now emulates DC ZVA by decoding the ISS to identify the
+instruction (Op0=1,Op1=3,CRn=7,CRm=4,Op2=1), extracting the Rt register
+from ISS[9:5], loading the VA from the saved register frame, and zeroing
+64 bytes at the cache-line-aligned address using four STP xzr pairs.
+SCTLR_EL1.DZE (bit 14) is also set to allow DC ZVA at EL0.
+
+**Previous incorrect theories (now disproven):**
+- AOT `is_aot_mode` flag / `seed_block()` pre-population: not the cause
+- Rosetta binary patching (TranslationMode, is_aot_mode): wrong approach
+- BSS signal handler pre-population: incorrect (BSS stores OLD handler)
+- rosettad AOT metadata at offsets 0x80/0x88: unrelated to the crash
 
 **AOT file format** (from `rosettad translate` output):
 ```

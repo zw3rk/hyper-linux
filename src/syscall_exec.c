@@ -15,6 +15,9 @@
 #include "elf.h"             /* elf_load, elf_map_segments */
 #include "syscall_signal.h"  /* signal_reset_for_exec */
 #include "stack.h"           /* build_linux_stack */
+#include "rosetta.h"         /* rosetta_prepare, rosetta_finalize */
+#include "hv_util.h"         /* HV_CHECK, SCTLR_*, TCR_EL1_VALUE */
+#include "vdso.h"            /* VDSO_BASE, VDSO_SIZE */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -217,6 +220,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
 
+    /* Detect x86_64 → rosetta transition */
+    int need_rosetta = (elf_info.e_machine == EM_X86_64);
+
     /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
     guest_reset(g);
 
@@ -255,12 +261,13 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         return -LINUX_ENOEXEC;
     }
 
-    /* Step 7b: Load interpreter if the new binary is dynamically linked */
+    /* Step 7b: Load interpreter if aarch64 dynamically linked.
+     * For x86_64 + rosetta, rosetta handles dynamic linking internally. */
     elf_info_t interp_info;
     uint64_t interp_base = 0;
     memset(&interp_info, 0, sizeof(interp_info));
 
-    if (elf_info.interp_path[0] != '\0') {
+    if (!need_rosetta && elf_info.interp_path[0] != '\0') {
         const char *sr = proc_get_sysroot();
         char interp_resolved[LINUX_PATH_MAX];
         elf_resolve_interp(sr, elf_info.interp_path,
@@ -294,19 +301,14 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
 
-    /* Step 7c: Invalidate I-cache for loaded code regions.
-     * ARM64 I-cache and D-cache are not coherent. elf_map_segments writes
-     * code via memcpy (updating D-cache), but the I-cache may still hold
-     * stale instructions from the pre-exec binary at the same addresses.
-     * Without explicit invalidation, the vCPU executes wrong instructions
-     * after ERET — this was the root cause of flaky test-fork-exec failures
-     * (stale I-cache from the pre-exec binary persisted non-deterministically,
-     * depending on cache eviction pressure from intervening memory accesses). */
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        if (elf_info.segments[i].flags & PF_X) {
-            void *host_addr = (uint8_t *)g->host_base +
-                              elf_info.segments[i].gpa + elf_load_base;
-            sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
+    /* Step 7c: Invalidate I-cache for loaded code regions. */
+    if (!need_rosetta) {
+        for (int i = 0; i < elf_info.num_segments; i++) {
+            if (elf_info.segments[i].flags & PF_X) {
+                void *host_addr = (uint8_t *)g->host_base +
+                                  elf_info.segments[i].gpa + elf_load_base;
+                sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
+            }
         }
     }
     for (int i = 0; i < interp_info.num_segments; i++) {
@@ -316,8 +318,6 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
         }
     }
-    /* Also invalidate the reloaded shim code — I-cache lines may have been
-     * evicted and refilled with zeroes during guest_reset(). */
     sys_icache_invalidate((uint8_t *)g->host_base + SHIM_BASE, shim_size);
 
     /* Set brk base after the highest loaded segment */
@@ -331,6 +331,17 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     #define MAX_REGIONS 32
     mem_region_t regions[MAX_REGIONS];
     int nregions = 0;
+
+    /* Rosetta phase 1: load rosetta, set up regions (vDSO + segments) */
+    rosetta_result_t rr;
+    memset(&rr, 0, sizeof(rr));
+    if (need_rosetta) {
+        if (rosetta_prepare(g, path, regions, &nregions,
+                            MAX_REGIONS, verbose, &rr) < 0) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+    }
 
     /* Shim code (RX) */
     regions[nregions++] = (mem_region_t){
@@ -346,17 +357,19 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RW
     };
 
-    /* ELF segments (adjusted by elf_load_base for PIE) */
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        if (nregions >= MAX_REGIONS) break;
-        int perms = MEM_PERM_R;
-        if (elf_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
-        if (elf_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
-        regions[nregions++] = (mem_region_t){
-            .gpa_start = elf_info.segments[i].gpa + elf_load_base,
-            .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
-            .perms     = perms
-        };
+    /* ELF segments (skip in rosetta mode — rosetta maps them via MAP_FIXED) */
+    if (!need_rosetta) {
+        for (int i = 0; i < elf_info.num_segments; i++) {
+            if (nregions >= MAX_REGIONS) break;
+            int perms = MEM_PERM_R;
+            if (elf_info.segments[i].flags & PF_W) perms |= MEM_PERM_W;
+            if (elf_info.segments[i].flags & PF_X) perms |= MEM_PERM_X;
+            regions[nregions++] = (mem_region_t){
+                .gpa_start = elf_info.segments[i].gpa + elf_load_base,
+                .gpa_end   = elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
+                .perms     = perms
+            };
+        }
     }
 
     /* Interpreter segments (if dynamically linked) */
@@ -416,14 +429,18 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MB,
                      LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE,
                      0, "[shim-data]");
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        int seg_prot = LINUX_PROT_READ;
-        if (elf_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
-        if (elf_info.segments[i].flags & PF_X) seg_prot |= LINUX_PROT_EXEC;
-        guest_region_add(g, elf_info.segments[i].gpa + elf_load_base,
-                         elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
-                         seg_prot, LINUX_MAP_PRIVATE,
-                         elf_info.segments[i].offset, path);
+    /* In rosetta mode, don't register x86_64 binary segments (rosetta
+     * reserves them via MAP_FIXED_NOREPLACE) */
+    if (!need_rosetta) {
+        for (int i = 0; i < elf_info.num_segments; i++) {
+            int seg_prot = LINUX_PROT_READ;
+            if (elf_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
+            if (elf_info.segments[i].flags & PF_X) seg_prot |= LINUX_PROT_EXEC;
+            guest_region_add(g, elf_info.segments[i].gpa + elf_load_base,
+                             elf_info.segments[i].gpa + elf_info.segments[i].memsz + elf_load_base,
+                             seg_prot, LINUX_MAP_PRIVATE,
+                             elf_info.segments[i].offset, path);
+        }
     }
     /* Interpreter semantic regions */
     if (interp_info.num_segments > 0) {
@@ -451,21 +468,56 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
 
-    /* Step 9: Build new stack with new argv/envp.
-     * Pass interp_base so AT_BASE is set for the dynamic linker. */
+    /* Step 9: Build new stack with new argv/envp */
     const char **argv_const = (const char **)argv;
     const char **envp_const = (const char **)envp;
-    uint64_t sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
-                                     envp_const, &elf_info,
-                                     elf_load_base, interp_base,
-                                     0 /* no vDSO for execve */,
-                                     -1 /* no AT_EXECFD */);
+    uint64_t sp;
+    uint64_t entry_point;
 
-    /* Step 10: Set vCPU state for new process.
-     * Entry point: interpreter if dynamic, ELF entry if static. */
-    uint64_t entry_point = (interp_base != 0)
-        ? (interp_info.entry + interp_base)
-        : (elf_info.entry + elf_load_base);
+    if (need_rosetta) {
+        /* Rosetta phase 2: kbuf dual-mapping, vDSO, fd 3, argv, proc state */
+        int rosetta_argc;
+        const char **rosetta_argv;
+        uint64_t vdso_addr;
+        if (rosetta_finalize(g, vcpu, path,
+                             argc, argv_const, &rr, verbose,
+                             &rosetta_argc, &rosetta_argv, &vdso_addr) < 0) {
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+
+        sp = build_linux_stack(g, STACK_TOP,
+                               rosetta_argc, rosetta_argv,
+                               envp_const, &rr.rosetta_info,
+                               0 /* rosetta is ET_EXEC at link addr */,
+                               0 /* no dynamic linker for rosetta */,
+                               vdso_addr,
+                               3 /* AT_EXECFD: binary pre-opened at fd 3 */);
+        free(rosetta_argv);
+        entry_point = rr.entry_point;
+        g->is_rosetta = 1;
+    } else {
+        sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
+                               envp_const, &elf_info,
+                               elf_load_base, interp_base,
+                               0 /* no vDSO for aarch64 */,
+                               -1 /* no AT_EXECFD */);
+
+        entry_point = (interp_base != 0)
+            ? (interp_info.entry + interp_base)
+            : (elf_info.entry + elf_load_base);
+
+        /* If transitioning from rosetta → aarch64, disable TTBR1 walks */
+        if (g->is_rosetta) {
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE);
+            g->is_rosetta = 0;
+        }
+
+        /* Update ELF path for /proc/self/exe */
+        proc_set_elf_path(path);
+    }
+
+    /* Step 10: Set vCPU state for new process */
     uint64_t entry_ipa = guest_ipa(g, entry_point);
     uint64_t sp_ipa    = guest_ipa(g, sp);
 
@@ -493,12 +545,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 1);
     g->need_tlbi = 0;
 
-    /* Force HVF to synchronize all register writes. Apple's Hypervisor
-     * framework may batch register updates; reading back each modified
-     * register ensures all preceding set_sys_reg/set_reg calls are
-     * committed before the next hv_vcpu_run(). Without this, the vCPU
-     * may resume with stale ELR_EL1/SPSR_EL1 from the pre-exec state,
-     * causing an undefined instruction at address 0x0. */
+    /* Force HVF to synchronize all register writes */
     {
         uint64_t _sync;
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &_sync);
@@ -510,47 +557,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     }
 
     if (verbose) {
-        /* Read back key registers for debug verification */
-        uint64_t dbg_ttbr0, dbg_elr, dbg_sp0, dbg_spsr, dbg_vbar, dbg_sctlr;
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &dbg_ttbr0);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &dbg_elr);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &dbg_sp0);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &dbg_spsr);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, &dbg_vbar);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &dbg_sctlr);
-        uint64_t dbg_x8;
-        hv_vcpu_get_reg(vcpu, HV_REG_X8, &dbg_x8);
-
-        fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx\n",
-                path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa);
-        fprintf(stderr, "hl: execve: TTBR0=0x%llx ELR=0x%llx SP0=0x%llx "
-                "SPSR=0x%llx VBAR=0x%llx SCTLR=0x%llx X8=%llu\n",
-                (unsigned long long)dbg_ttbr0, (unsigned long long)dbg_elr,
-                (unsigned long long)dbg_sp0, (unsigned long long)dbg_spsr,
-                (unsigned long long)dbg_vbar, (unsigned long long)dbg_sctlr,
-                (unsigned long long)dbg_x8);
-
-        /* Dump L2 entries for the entry point's 2MB block */
-        uint64_t base = g->ipa_base;
-        uint64_t l0_off = dbg_ttbr0 - base;
-        uint64_t *l0 = (uint64_t *)((uint8_t *)g->host_base + l0_off);
-        if (l0[0] & 1) {
-            uint64_t l1_off = (l0[0] & 0xFFFFFFFFF000ULL) - base;
-            uint64_t *l1 = (uint64_t *)((uint8_t *)g->host_base + l1_off);
-            unsigned l1_idx = (unsigned)(entry_ipa / (1ULL << 30));
-            if (l1_idx < 512 && (l1[l1_idx] & 1)) {
-                uint64_t l2_off = (l1[l1_idx] & 0xFFFFFFFFF000ULL) - base;
-                uint64_t *l2 = (uint64_t *)((uint8_t *)g->host_base + l2_off);
-                unsigned l2_idx = (unsigned)((entry_ipa % (1ULL << 30)) / (2ULL << 20));
-                fprintf(stderr, "hl: execve: L1[%u]=0x%llx L2[%u]=0x%llx\n",
-                        l1_idx, (unsigned long long)l1[l1_idx],
-                        l2_idx, (unsigned long long)l2[l2_idx]);
-            }
-        }
+        fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx%s\n",
+                path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa,
+                need_rosetta ? " (via rosetta)" : "");
     }
-
-    /* Update ELF path for /proc/self/exe after successful exec */
-    proc_set_elf_path(path);
 
     free(argv_buf);
     free(envp_buf);

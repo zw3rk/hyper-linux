@@ -179,51 +179,40 @@ build its module list, but the forward scan still starts from the entry
 point and only translates sequentially. Code unreachable by forward scan
 remains untranslated regardless of /proc/self/maps contents.
 
-### Approach 5: Implement ptrace Syscall (NEXT)
+### Approach 5: Implement ptrace + clone(CLONE_VM) (COMPLETE — Not Used by Rosetta)
 
-**Rationale:** Rosetta's real architecture is a two-process ptrace-based
-JIT. In VZ (Tart/Lima), rosetta:
-1. Starts as a single process
-2. Creates an inferior via `clone(CLONE_VM)` (shared address space)
-3. Attaches via `PTRACE_SEIZE`
-4. Inferior runs translated ARM64 code with BRK at untranslated addresses
-5. SIGTRAP stops inferior; parent catches via wait4()
-6. Parent reads registers (PTRACE_GETREGSET), translates the block, patches
-7. Parent continues inferior (PTRACE_CONT)
+**Rationale:** Rosetta was believed to use a two-process ptrace-based JIT.
 
-This architecture dynamically discovers ALL indirect branch targets — the
-"BasicBlock requested" assertion never fires because blocks are created
-on-demand via the ptrace stop/translate/continue cycle. Single-stepping
-through indirect branches discovers targets that static CFG analysis misses.
+**Implementation:** Fully implemented ptrace (SEIZE, CONT, INTERRUPT,
+GETREGSET, SETREGSET) and clone(CLONE_VM) in syscall_proc.c and fork_ipc.c.
 
-**Without ptrace (current hl):** Rosetta falls back to signal-handler mode
-(SIGTRAP/SIGSEGV handlers). But this + AOT creates a broken hybrid state
-where `_potential_targets` is non-empty but incomplete.
+**Result:** Rosetta NEVER calls clone() or ptrace() in traces. The ptrace
+strings in the binary ("ptrace seize failed", "Expected inferior to be
+stopped by SIGTRAP") are for the **GDB debug server** feature
+(ROSETTA_DEBUGSERVER_PORT), NOT for the normal JIT execution path.
 
-**Required ptrace operations:**
-- `PTRACE_SEIZE` (0x4206): Attach without stopping
-- `PTRACE_CONT` (7): Continue stopped process
-- `PTRACE_INTERRUPT` (0x4207): Stop running process
-- `PTRACE_GETREGSET` (0x4204): Read registers (NT_PRSTATUS=1)
-- `PTRACE_SETREGSET` (0x4205): Write registers
-- wait4() must return WIFSTOPPED with SIGTRAP
+**Conclusion:** ptrace infrastructure is correct but irrelevant to the
+core JIT failure. Rosetta's normal JIT uses in-process SIGTRAP signal
+handling, not ptrace.
 
-**Challenge:** ptrace is fundamentally a cross-process mechanism. In hl,
-each thread has its own vCPU. The tracer thread needs to:
-- Intercept BRK-induced SIGTRAP in the inferior vCPU
-- Read/write the inferior vCPU's registers
-- Control inferior vCPU execution (stop/continue)
+### Approach 6: SIGTRAP Signal Handler JIT Retranslation (CURRENT)
 
-This maps naturally to hl's thread table: the "tracer" is a host pthread
-that calls wait4() and the "inferior" is another host pthread running a
-vCPU. The ptrace machinery would intercept between the two.
+**Rationale:** When rosetta encounters an untranslated indirect branch
+target, it hits a BRK stub → SIGTRAP → signal handler attempts
+retranslation. In a real Lima VM, this works. In hl, the handler
+immediately gives up and terminates.
 
-**Key evidence from rosetta binary strings:**
-- `"ptrace seize failed with error %lu"`
-- `"Expected inferior to be stopped by SIGTRAP"`
-- `"handle_jit_breakpoint"`
-- `"returning to the same address after a jit breakpoint fault"`
-- `"Unexpected indirect branch while single stepping"`
+**Observed behavior (from verbose trace):**
+1. BRK #9 fires at 0xeffff8000010 (JIT cache)
+2. hl delivers SIGTRAP to rosetta handler at 0x800000096490
+3. Handler runs, makes NO translation syscalls
+4. Handler calls rt_sigaction(SIGTRAP, SIG_DFL) — resetting handler
+5. Handler calls rt_tgsigqueueinfo(1, 1, 5, siginfo) — re-raises SIGTRAP
+6. Handler calls rt_sigreturn
+7. Re-raised SIGTRAP fires with SIG_DFL → terminate (exit 133)
+
+**The handler gives up immediately without attempting retranslation.**
+Something in the handler's initial data structure lookup fails.
 
 ## AOT Translation Architecture
 

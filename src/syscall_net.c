@@ -161,44 +161,22 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
     int cloexec = extract_sock_cloexec(type);
 
     /* Rosetta uses AF_UNIX SOCK_SEQPACKET to connect to rosettad for AOT
-     * translation. macOS doesn't support SOCK_SEQPACKET for AF_UNIX, and
-     * Linux abstract sockets don't exist on macOS either. Instead, create
-     * a socketpair with SOCK_DGRAM: this preserves message boundaries
-     * (critical for the rosettad framing protocol), which SOCK_STREAM
-     * would not. When rosetta calls connect() on this fd, we return
-     * success immediately. */
+     * translation. macOS doesn't support SOCK_SEQPACKET for AF_UNIX, so
+     * downgrade to SOCK_DGRAM (preserves message boundaries).
+     *
+     * We do NOT intercept the connect() or run a rosettad handler thread.
+     * In real VZ VMs (lima), rosettad's socket often isn't available and
+     * connect() returns -ENOENT. Rosetta handles this gracefully by falling
+     * back to pure JIT mode, which correctly handles indirect branches via
+     * BRK stubs + SIGTRAP. The AOT files from standalone `rosettad translate`
+     * have broken metadata (zeros at offsets 0x80/0x88) that cause
+     * block_for_offset() assertion failures during AOT-assisted translation.
+     * Disabling AOT entirely matches real-world lima behavior and avoids
+     * the broken AOT code path. */
     if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
-        int pair[2];
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
-            return linux_errno();
-
-        /* pair[0] = rosetta's end, pair[1] = our protocol handler end */
-        if (nonblock) {
-            int fl = fcntl(pair[0], F_GETFL);
-            if (fl >= 0) fcntl(pair[0], F_SETFL, fl | O_NONBLOCK);
-        }
-        if (cloexec) fcntl(pair[0], F_SETFD, FD_CLOEXEC);
-
-        int one = 1;
-        setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-
-        int gfd = fd_alloc(FD_SOCKET, pair[0]);
-        if (gfd < 0) { close(pair[0]); close(pair[1]); return -LINUX_EMFILE; }
-
-        int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
-        fd_table[gfd].linux_flags = linux_flags_val;
-
-        /* Save both ends: handler_fd for our protocol thread, client_fd
-         * to recognize rosetta's connect() call later. */
-        extern void rosettad_set_socket(int handler_fd);
-        extern void rosettad_set_client_fd(int client_fd);
-        fprintf(stderr, "hl: rosettad: SEQPACKET socket created as DGRAM "
-                "pair: client_fd=%d(guest=%d), handler_fd=%d\n",
-                pair[0], gfd, pair[1]);
-        rosettad_set_socket(pair[1]);
-        rosettad_set_client_fd(pair[0]);
-
-        return gfd;
+        real_type = SOCK_DGRAM;
+        fprintf(stderr, "hl: rosettad: SEQPACKET→DGRAM (no rosettad handler, "
+                "connect will fail like real VZ)\n");
     }
 
     int fd = socket(mac_domain, real_type, protocol);
@@ -358,30 +336,10 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
     if (guest_read(g, addr_gva, linux_sa, addrlen) < 0) return -LINUX_EFAULT;
 
-    /* Rosettad socketpair: already connected via socketpair(), so
-     * return success immediately when rosetta tries connect(). */
-    extern int rosettad_is_socket(int host_fd);
-    if (rosettad_is_socket(host_fd)) {
-        /* Rosetta constructs a sockaddr_un from VZ_CAPS[1..108] and calls
-         * connect(). We intercept this because the socketpair is already
-         * connected — the path in caps doesn't matter. Log it for debug. */
-        uint16_t sa_family;
-        memcpy(&sa_family, linux_sa, 2);
-        if (sa_family == LINUX_AF_UNIX && addrlen > 2) {
-            const char *path = (const char *)(linux_sa + 2);
-            if (path[0] == '\0')
-                fprintf(stderr, "hl: rosettad: connect intercepted "
-                        "(abstract socket, addrlen=%u) -> success\n", addrlen);
-            else
-                fprintf(stderr, "hl: rosettad: connect intercepted "
-                        "(path: %.*s) -> success\n",
-                        (int)(addrlen - 2), path);
-        } else {
-            fprintf(stderr, "hl: rosettad: connect intercepted "
-                    "(family=%d) -> success\n", sa_family);
-        }
-        return 0;
-    }
+    /* No rosettad interception: let connect() proceed normally.
+     * For rosetta's AF_UNIX connect to the rosettad socket path,
+     * the path doesn't exist on macOS, so connect returns ENOENT.
+     * This matches lima VZ behavior where rosettad is often unavailable. */
 
     struct sockaddr_storage mac_sa;
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);

@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/spawn.h>          /* POSIX_SPAWN_CLOEXEC_DEFAULT (macOS extension) */
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <dirent.h>             /* fdopendir, for DIR* reconstruction in child */
@@ -37,13 +38,14 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
-#define IPC_VERSION       2            /* v2: added VA alias transfer for rosetta fork */
+#define IPC_VERSION       4            /* v4: COW fork via shm_open */
 
 /* IPC header: sent first over socketpair */
 typedef struct {
     uint32_t magic;
     uint32_t version;        /* Protocol version for forward compatibility */
     uint32_t ipa_bits;       /* IPA width for HVF VM (e.g., 36, 40, 48) */
+    uint32_t has_shm;        /* Non-zero: shm fd follows (COW fork path) */
     int64_t  child_pid;
     int64_t  parent_pid;
     /* Guest state */
@@ -54,6 +56,17 @@ typedef struct {
     uint64_t mmap_end;
     uint64_t pt_pool_next;
     uint64_t ttbr0;
+    /* Rosetta state (v3+) */
+    uint32_t is_rosetta;     /* Non-zero when running x86_64 via rosetta */
+    uint32_t pad;
+    uint64_t ttbr1;          /* TTBR1 value for kernel VA page tables */
+    uint64_t kbuf_gpa;       /* GPA of kernel VA buffer in primary region */
+    uint64_t mmap_rx_next;   /* RX mmap high-water mark */
+    uint64_t mmap_rx_end;    /* Current RX mmap limit */
+    /* Rosetta placement (survives guest_reset for execve re-setup) */
+    uint64_t rosetta_guest_base; /* GPA in primary buffer where rosetta is loaded */
+    uint64_t rosetta_va_base;    /* High VA start (e.g. 0x800000000000) */
+    uint64_t rosetta_size;       /* 2MB-aligned total rosetta span */
 } ipc_header_t;
 
 /* IPC register state */
@@ -69,6 +82,7 @@ typedef struct {
     uint64_t cpacr_el1;
     uint64_t tpidr_el0;
     uint64_t sp_el1;
+    uint64_t ttbr1_el1;  /* Kernel VA page tables (rosetta mode) */
     uint64_t x[31];
 } ipc_registers_t;
 
@@ -208,12 +222,34 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     /* Set process identity via accessor (static state lives in syscall_proc.c) */
     proc_set_identity(hdr.child_pid, hdr.parent_pid);
 
-    /* Step 2: Create guest VM with the same size as parent */
+    /* Step 2: Create guest VM — COW path (shm) or legacy path (region copy) */
     guest_t g;
-    if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
-        fprintf(stderr, "hl: fork-child: failed to init guest\n");
-        close(ipc_fd);
-        return 1;
+
+    if (hdr.has_shm) {
+        /* COW fork: receive shm fd via SCM_RIGHTS, then map MAP_PRIVATE.
+         * This gives us an instant copy-on-write snapshot of the parent's
+         * entire guest memory — no region enumeration or byte copying. */
+        int shm_fd = -1;
+        int shm_count = 0;
+        if (recv_fds(ipc_fd, &shm_fd, 1, &shm_count) < 0 || shm_count != 1) {
+            fprintf(stderr, "hl: fork-child: failed to receive shm fd\n");
+            close(ipc_fd);
+            return 1;
+        }
+        if (guest_init_from_shm(&g, shm_fd, hdr.guest_size, hdr.ipa_bits) < 0) {
+            fprintf(stderr, "hl: fork-child: guest_init_from_shm failed\n");
+            close(ipc_fd);
+            return 1;
+        }
+        if (verbose)
+            fprintf(stderr, "hl: fork-child: COW fork via shm fd\n");
+    } else {
+        /* Legacy path: allocate fresh guest memory and receive regions */
+        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to init guest\n");
+            close(ipc_fd);
+            return 1;
+        }
     }
 
     /* Restore guest allocation state */
@@ -222,6 +258,19 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     g.mmap_next = hdr.mmap_next;
     g.mmap_end = hdr.mmap_end;
     g.pt_pool_next = hdr.pt_pool_next;
+    g.ttbr0 = hdr.ttbr0;
+
+    /* Restore rosetta state */
+    g.is_rosetta = (int)hdr.is_rosetta;
+    g.ttbr1 = hdr.ttbr1;
+    g.kbuf_gpa = hdr.kbuf_gpa;
+    g.mmap_rx_next = hdr.mmap_rx_next;
+    g.mmap_rx_end = hdr.mmap_rx_end;
+    g.rosetta_guest_base = hdr.rosetta_guest_base;
+    g.rosetta_va_base    = hdr.rosetta_va_base;
+    g.rosetta_size       = hdr.rosetta_size;
+    if (g.kbuf_gpa != 0)
+        g.kbuf_base = (uint8_t *)g.host_base + g.kbuf_gpa;
 
     /* Step 3: Read registers */
     ipc_registers_t regs;
@@ -231,7 +280,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         return 1;
     }
 
-    /* Step 4: Read memory regions */
+    /* Step 4: Read memory regions (0 regions in COW path) */
     uint32_t num_regions;
     if (ipc_read_all(ipc_fd, &num_regions, sizeof(num_regions)) < 0) {
         fprintf(stderr, "hl: fork-child: failed to read region count\n");
@@ -239,7 +288,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         return 1;
     }
 
-    if (verbose)
+    if (verbose && num_regions > 0)
         fprintf(stderr, "hl: fork-child: receiving %u memory regions\n",
                 num_regions);
 
@@ -425,6 +474,25 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     }
     g.naliases = (int)num_aliases;
 
+    /* Step 6b3: Read preannounced regions (rosetta /proc/self/maps) */
+    uint32_t num_preannounced;
+    if (ipc_read_all(ipc_fd, &num_preannounced, sizeof(num_preannounced)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read preannounced count\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (num_preannounced > GUEST_MAX_PREANNOUNCED)
+        num_preannounced = GUEST_MAX_PREANNOUNCED;
+    if (num_preannounced > 0) {
+        if (ipc_read_all(ipc_fd, g.preannounced,
+                         num_preannounced * sizeof(guest_region_t)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read preannounced\n");
+            guest_destroy(&g);
+            return 1;
+        }
+    }
+    g.npreannounced = (int)num_preannounced;
+
     /* Step 6c: Read signal state (shifted to accommodate region tracking) */
     signal_state_t sig;
     if (ipc_read_all(ipc_fd, &sig, sizeof(sig)) < 0) {
@@ -494,6 +562,11 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, regs.tpidr_el0));
+
+    /* Restore TTBR1 for rosetta kernel VA mappings. Without this, fork
+     * children in rosetta mode can't access kbuf at kernel VA. */
+    if (regs.ttbr1_el1 != 0)
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, regs.ttbr1_el1));
 
     /* Enable MMU directly (page tables already in guest memory from IPC).
      * SCTLR must include MMU-enable (M), caches (C, I), RES1 bits,
@@ -1087,11 +1160,38 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     /* Step 5: Serialize state to child */
 
+    /* Determine if we can use the COW (shm) fast path.
+     * If shm_fd >= 0, we freeze a snapshot via MAP_PRIVATE and send the
+     * shm fd to the child. Otherwise fall back to region-by-region copy. */
+    /* Use COW fork when the guest has file-backed shared memory.
+     * Disabled for rosetta (x86_64) mode: rosetta's JIT runtime maintains
+     * process-local state (TLS, code caches, slab allocators) that can't
+     * survive a snapshot — the child's rosetta would resume with the parent's
+     * stale JIT state, causing corrupted translations. The legacy IPC path
+     * copies only semantic memory regions, allowing rosetta to reinitialize
+     * its JIT cleanly in the child. */
+    int use_shm = (g->shm_fd >= 0) && !g->is_rosetta;
+
+    /* Note: we do NOT remap the parent to MAP_PRIVATE here. The parent
+     * stays on MAP_SHARED — its vCPU continues writing to the shared file.
+     * The child maps MAP_PRIVATE, getting a COW snapshot.
+     *
+     * This is safe because: the IPC is synchronous — the child maps
+     * MAP_PRIVATE before the parent's vCPU resumes. After that, the
+     * child's COW pages are frozen (child writes are private, parent
+     * writes to MAP_SHARED don't affect COW'd child pages).
+     *
+     * We previously tried remapping the parent to MAP_PRIVATE here, but
+     * that breaks HVF: hv_vm_map caches the host VA→PA mapping, and
+     * MAP_FIXED remap invalidates it. The parent's vCPU then reads stale
+     * memory, causing corrupted syscall data (EFAULT on writev). */
+
     /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
         .version = IPC_VERSION,
         .ipa_bits = g->ipa_bits,
+        .has_shm = (uint32_t)use_shm,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
         .guest_size = g->guest_size,
@@ -1101,11 +1201,29 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         .mmap_end = g->mmap_end,
         .pt_pool_next = g->pt_pool_next,
         .ttbr0 = g->ttbr0,
+        /* Rosetta state */
+        .is_rosetta = (uint32_t)g->is_rosetta,
+        .ttbr1 = g->ttbr1,
+        .kbuf_gpa = g->kbuf_gpa,
+        .mmap_rx_next = g->mmap_rx_next,
+        .mmap_rx_end = g->mmap_rx_end,
+        .rosetta_guest_base = g->rosetta_guest_base,
+        .rosetta_va_base    = g->rosetta_va_base,
+        .rosetta_size       = g->rosetta_size,
     };
     if (ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         fprintf(stderr, "hl: clone: failed to send header\n");
         close(ipc_sock);
         return -LINUX_ENOMEM;
+    }
+
+    /* COW path: send shm fd to child via SCM_RIGHTS */
+    if (use_shm) {
+        if (send_fds(ipc_sock, &g->shm_fd, 1) < 0) {
+            fprintf(stderr, "hl: clone: failed to send shm fd\n");
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
     }
 
     /* Registers -- capture current vCPU state */
@@ -1121,6 +1239,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     regs.cpacr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_CPACR_EL1);
     regs.tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
     regs.sp_el1    = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
+    regs.ttbr1_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR1_EL1);
     for (int i = 0; i < 31; i++)
         regs.x[i] = vcpu_get_gpr(vcpu, (unsigned)i);
 
@@ -1130,38 +1249,48 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         return -LINUX_ENOMEM;
     }
 
-    /* Memory regions */
-    #define MAX_USED_REGIONS 16
-    used_region_t used[MAX_USED_REGIONS];
-    unsigned int shim_sz = proc_get_shim_size();
-    int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
-    uint32_t num_regions = (uint32_t)nregions;
-    if (ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0) {
-        close(ipc_sock);
-        return -LINUX_ENOMEM;
-    }
-
-    for (int i = 0; i < nregions; i++) {
-        ipc_region_header_t rhdr = {
-            .offset = used[i].offset,
-            .size = used[i].size,
-        };
-        if (ipc_write_all(ipc_sock, &rhdr, sizeof(rhdr)) < 0) {
+    /* Memory regions — skipped entirely in COW path (child has full snapshot) */
+    if (use_shm) {
+        /* Send 0 regions — child already has all memory via COW */
+        uint32_t zero_regions = 0;
+        if (ipc_write_all(ipc_sock, &zero_regions, sizeof(zero_regions)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+    } else {
+        /* Legacy path: enumerate and send used memory regions */
+        #define MAX_USED_REGIONS 16
+        used_region_t used[MAX_USED_REGIONS];
+        unsigned int shim_sz = proc_get_shim_size();
+        int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
+        uint32_t num_regions = (uint32_t)nregions;
+        if (ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0) {
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }
 
-        /* Send region data in 1MB chunks */
-        uint8_t *src = (uint8_t *)g->host_base + used[i].offset;
-        size_t remaining = used[i].size;
-        while (remaining > 0) {
-            size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
-            if (ipc_write_all(ipc_sock, src, chunk) < 0) {
+        for (int i = 0; i < nregions; i++) {
+            ipc_region_header_t rhdr = {
+                .offset = used[i].offset,
+                .size = used[i].size,
+            };
+            if (ipc_write_all(ipc_sock, &rhdr, sizeof(rhdr)) < 0) {
                 close(ipc_sock);
                 return -LINUX_ENOMEM;
             }
-            src += chunk;
-            remaining -= chunk;
+
+            /* Send region data in 1MB chunks */
+            uint8_t *src = (uint8_t *)g->host_base + used[i].offset;
+            size_t remaining = used[i].size;
+            while (remaining > 0) {
+                size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
+                if (ipc_write_all(ipc_sock, src, chunk) < 0) {
+                    close(ipc_sock);
+                    return -LINUX_ENOMEM;
+                }
+                src += chunk;
+                remaining -= chunk;
+            }
         }
     }
 
@@ -1285,6 +1414,20 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         }
     }
 
+    /* Preannounced regions (rosetta /proc/self/maps entries) */
+    uint32_t num_preannounced = (uint32_t)g->npreannounced;
+    if (ipc_write_all(ipc_sock, &num_preannounced, sizeof(num_preannounced)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    if (num_preannounced > 0) {
+        if (ipc_write_all(ipc_sock, g->preannounced,
+                          num_preannounced * sizeof(guest_region_t)) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+    }
+
     /* Signal state */
     const signal_state_t *sig = signal_get_state();
     if (ipc_write_all(ipc_sock, sig, sizeof(signal_state_t)) < 0) {
@@ -1314,6 +1457,10 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     }
 
     close(ipc_sock);
+
+    /* After COW fork: parent stays on MAP_SHARED (no remap was done).
+     * The shm fd is kept open so subsequent forks can also use COW.
+     * The child has its own MAP_PRIVATE view of the same file. */
 
     /* Step 6: Record child in process table */
     proc_register_child(child_host_pid, child_guest_pid);

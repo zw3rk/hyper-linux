@@ -116,17 +116,12 @@
           $LD -T simple-x86_64.ld -o test-hello hello-x86_64.o
 
           # All C test programs (static musl) — same source as aarch64.
-          # Skip arch-specific tests that use aarch64 inline assembly
-          # (register bindings like __asm__("x0"), svc #0 instructions).
+          # raw-syscall.h and test-signal.c provide dual-arch support via
+          # #ifdef __aarch64__ / __x86_64__ for inline asm and registers.
           for f in *.c; do
             name="''${f%.c}"
             [ "$name" = "test-multi-vcpu" ] && continue   # native macOS (HVF API)
             [ "$name" = "hello-dynamic" ] && continue      # dynamic linking not tested yet
-            [ "$name" = "test-negative" ] && continue      # aarch64 inline asm (svc #0)
-            [ "$name" = "test-stress" ] && continue        # aarch64 inline asm (svc #0)
-            [ "$name" = "test-thread" ] && continue        # aarch64 inline asm (svc #0)
-            [ "$name" = "test-signal" ] && continue        # aarch64 inline asm (register x19-x28)
-            [ "$name" = "test-signal-thread" ] && continue # aarch64 inline asm (svc #0)
 
             extra_flags=""
             [ "$name" = "test-pthread" ] && extra_flags="-lpthread"

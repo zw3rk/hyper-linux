@@ -392,6 +392,18 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
             return -LINUX_EFAULT;
         }
 
+        fprintf(stderr, "hl: rt_sigaction(%d): handler=0x%llx flags=0x%llx "
+                "restorer=0x%llx mask=0x%llx%s%s%s%s\n",
+                signum,
+                (unsigned long long)act.sa_handler,
+                (unsigned long long)act.sa_flags,
+                (unsigned long long)act.sa_restorer,
+                (unsigned long long)act.sa_mask,
+                (act.sa_flags & LINUX_SA_SIGINFO) ? " SA_SIGINFO" : "",
+                (act.sa_flags & LINUX_SA_ONSTACK) ? " SA_ONSTACK" : "",
+                (act.sa_flags & LINUX_SA_RESETHAND) ? " SA_RESETHAND" : "",
+                (act.sa_flags & LINUX_SA_NODEFER) ? " SA_NODEFER" : "");
+
         sig_state.actions[idx] = act;
     }
 

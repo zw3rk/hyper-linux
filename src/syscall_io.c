@@ -715,56 +715,6 @@ static int run_rosettad_translate(const char *bin_path, const char *aot_path) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/* Patch AOT file to enable AOT-assisted JIT mode (is_aot_mode=1).
- *
- * rosettad translate produces AOT files with zeros at header offsets
- * 0x80 and 0x88. These are the source values for the packed flags
- * field that determines is_aot_mode (bit 4 of [+0x88] → bit 8 of
- * packed flags → Translator+0x214). When is_aot_mode is 0:
- *   - seed_block() at VA 0x2a7b0 never runs
- *   - block tables are never pre-populated from AOT data
- *   - block_for_offset() at VA 0x387d4 returns NULL for indirect
- *     jump targets → assertion "BasicBlock requested for unrecognized
- *     address" (BuilderBase.h:550)
- *
- * Setting bit 4 of the uint64 at offset 0x88 enables AOT-assisted
- * JIT mode (TranslationMode=2), which calls seed_block() to pre-
- * register all known basic blocks. This prevents the assertion
- * failure for indirect jumps (function pointers, jump tables). */
-static int patch_aot_is_aot_mode(const char *aot_path) {
-    int fd = open(aot_path, O_RDWR);
-    if (fd < 0) return -1;
-
-    /* Verify file is large enough (header is at least 0x90 bytes) */
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size < 0x90) {
-        close(fd);
-        return -1;
-    }
-
-    /* Read current value at offset 0x88 */
-    uint64_t val = 0;
-    if (pread(fd, &val, sizeof(val), 0x88) != sizeof(val)) {
-        close(fd);
-        return -1;
-    }
-
-    /* Set bit 4 to enable is_aot_mode */
-    uint64_t patched = val | (1ULL << 4);
-    if (patched != val) {
-        if (pwrite(fd, &patched, sizeof(patched), 0x88) != sizeof(patched)) {
-            close(fd);
-            return -1;
-        }
-        fprintf(stderr, "hl: rosettad: patched AOT is_aot_mode at 0x88: "
-                "0x%llx → 0x%llx\n",
-                (unsigned long long)val, (unsigned long long)patched);
-    }
-
-    close(fd);
-    return 0;
-}
-
 /* ---------- AOT digest cache ---------- */
 
 /* Simple cache mapping SHA256 digests to AOT file paths.
@@ -903,10 +853,6 @@ static void *rosettad_handler_thread(void *arg) {
                 break;
             }
 
-            /* Enable AOT-assisted JIT: patch before digest computation
-             * so the cached file has the correct is_aot_mode flag. */
-            patch_aot_is_aot_mode(aot_path);
-
             /* Compute SHA256 digest of the AOT output */
             uint8_t digest[32];
             if (compute_file_sha256(aot_path, digest) < 0) {
@@ -1044,9 +990,6 @@ static void *rosettad_handler_thread(void *arg) {
                     unlink(aot_path);
                     break;
                 }
-
-                /* Enable AOT-assisted JIT before caching */
-                patch_aot_is_aot_mode(aot_path);
 
                 /* Compute digest and cache for future lookups */
                 uint8_t aot_digest[32];

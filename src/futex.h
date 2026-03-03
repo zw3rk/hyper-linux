@@ -5,7 +5,8 @@
  *
  * Hash table of wait queues keyed by guest virtual address. Supports
  * FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET,
- * FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, and FUTEX_WAKE_OP.
+ * FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP, and PI futexes
+ * (FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI).
  * Each waiter has its own condition variable for precise wakeup.
  */
 #ifndef FUTEX_H

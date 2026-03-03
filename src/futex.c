@@ -17,7 +17,9 @@
  * with an absolute deadline. FUTEX_WAIT_BITSET always uses absolute time.
  */
 #include "futex.h"
-#include "syscall.h"  /* LINUX_E*, linux_timespec_t */
+#include "syscall.h"      /* LINUX_E*, linux_timespec_t */
+#include "syscall_proc.h" /* proc_get_pid (fallback TID for PI futex) */
+#include "thread.h"       /* current_thread, guest_tid (for PI futex TID) */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -31,12 +33,27 @@
 #define FUTEX_REQUEUE         3
 #define FUTEX_CMP_REQUEUE     4
 #define FUTEX_WAKE_OP         5
+#define FUTEX_LOCK_PI         6
+#define FUTEX_UNLOCK_PI       7
+#define FUTEX_TRYLOCK_PI      8
 #define FUTEX_WAIT_BITSET     9
 #define FUTEX_WAKE_BITSET    10
 #define FUTEX_PRIVATE_FLAG  128
 #define FUTEX_CMD_MASK      0x7F
 
 #define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFU
+
+/* PI futex word layout (bits):
+ *   0-30: TID of lock holder (0 = unlocked)
+ *   31:   FUTEX_WAITERS — at least one thread is blocked
+ *
+ * Note: Linux kernel uses bit 30 for FUTEX_WAITERS and bit 31 for
+ * FUTEX_OWNER_DIED. Rosetta's UnfairLock.cpp uses bit 31 as FUTEX_WAITERS
+ * (confirmed by assertion: "value=40000001 expected=80000001"). We use
+ * Rosetta's convention since that's our primary consumer. The TID mask
+ * covers bits 0-30 (enough for any practical TID value). */
+#define FUTEX_TID_MASK        0x7FFFFFFFU
+#define FUTEX_WAITERS         0x80000000U
 
 /* ---------- Hash table ---------- */
 
@@ -407,6 +424,215 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
     return woken;
 }
 
+/* ---------- PI (Priority-Inheritance) futex ----------
+ *
+ * PI futexes use the futex word itself as an atomic lock:
+ *   bits 0-29 = owner TID, bit 30 = FUTEX_WAITERS, bit 31 = FUTEX_OWNER_DIED
+ *
+ * We don't implement real priority inheritance (boosting the holder's
+ * priority to the highest waiter's), but we implement the locking
+ * semantics correctly. Rosetta's JIT runtime uses PI futexes for its
+ * internal locks — it only needs the mutex behavior, not the RT priority
+ * boosting. Waiters block on a per-address condition variable (reusing
+ * the same bucket hash table as normal futexes). */
+
+/* FUTEX_LOCK_PI: Block until the lock at uaddr can be acquired.
+ *
+ * The PI futex word stores the owner TID in bits 0-30 and a WAITERS
+ * flag in bit 31. The kernel (us) sets FUTEX_WAITERS when a thread
+ * blocks, so the current owner knows to call FUTEX_UNLOCK_PI (slow
+ * path) instead of just doing a userspace CAS(TID→0) (fast path).
+ *
+ * Flow: try CAS(0→TID). If held by another thread, set WAITERS bit
+ * via CAS, then block. On wakeup, retry acquisition. */
+static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+                              uint64_t timeout_gva) {
+    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
+    if (!word) return -LINUX_EFAULT;
+
+    uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+                                  : (uint32_t)proc_get_pid();
+
+    /* Build deadline (if timeout specified, it's absolute CLOCK_REALTIME) */
+    int has_timeout = (timeout_gva != 0);
+    struct timespec deadline;
+    if (has_timeout) {
+        if (futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline) < 0)
+            return -LINUX_EFAULT;
+    }
+
+    unsigned idx = futex_hash(uaddr);
+    futex_bucket_t *b = &buckets[idx];
+
+    for (;;) {
+        /* Fast path: try to CAS 0 → our TID (uncontended acquisition) */
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(word, &expected, tid,
+                                         /*weak=*/0,
+                                         __ATOMIC_SEQ_CST,
+                                         __ATOMIC_SEQ_CST)) {
+            return 0;  /* Acquired */
+        }
+
+        /* Already own it? Deadlock (Linux returns EDEADLK) */
+        if ((expected & FUTEX_TID_MASK) == tid)
+            return -LINUX_EDEADLK;
+
+        /* Set the WAITERS bit so the owner takes the slow unlock path
+         * (calls FUTEX_UNLOCK_PI instead of just CAS to 0). Retry
+         * the CAS in a loop since the owner may release concurrently. */
+        for (;;) {
+            uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+            if ((cur & FUTEX_TID_MASK) == 0)
+                break;  /* Owner released — retry outer loop */
+            if (cur & FUTEX_WAITERS)
+                break;  /* Already set by another waiter */
+            uint32_t desired = cur | FUTEX_WAITERS;
+            if (__atomic_compare_exchange_n(word, &cur, desired,
+                                             /*weak=*/0,
+                                             __ATOMIC_SEQ_CST,
+                                             __ATOMIC_SEQ_CST))
+                break;  /* WAITERS bit set */
+        }
+
+        /* Re-check after WAITERS bit: if lock is now free, retry */
+        uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if ((cur & FUTEX_TID_MASK) == 0)
+            continue;
+
+        /* Enqueue and block */
+        pthread_mutex_lock(&b->lock);
+
+        /* Double-check under bucket lock: owner may have released
+         * and called UNLOCK_PI between our WAITERS set and lock. */
+        cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if ((cur & FUTEX_TID_MASK) == 0) {
+            pthread_mutex_unlock(&b->lock);
+            continue;
+        }
+
+        futex_waiter_t waiter = {
+            .uaddr  = uaddr,
+            .bitset = FUTEX_BITSET_MATCH_ANY,
+            .woken  = 0,
+            .next   = b->head,
+        };
+        pthread_cond_init(&waiter.cond, NULL);
+        b->head = &waiter;
+
+        while (!waiter.woken) {
+            if (has_timeout) {
+                int rc = pthread_cond_timedwait(&waiter.cond, &b->lock,
+                                                 &deadline);
+                if (rc != 0 && !waiter.woken) {
+                    /* Timeout — dequeue and return */
+                    futex_waiter_t **pp = &b->head;
+                    while (*pp) {
+                        if (*pp == &waiter) { *pp = waiter.next; break; }
+                        pp = &(*pp)->next;
+                    }
+                    pthread_mutex_unlock(&b->lock);
+                    pthread_cond_destroy(&waiter.cond);
+                    /* Clear WAITERS bit if we were the only waiter */
+                    for (;;) {
+                        uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+                        if (!(v & FUTEX_WAITERS)) break;
+                        uint32_t nv = v & ~FUTEX_WAITERS;
+                        if (__atomic_compare_exchange_n(word, &v, nv,
+                                                         /*weak=*/0,
+                                                         __ATOMIC_SEQ_CST,
+                                                         __ATOMIC_SEQ_CST))
+                            break;
+                    }
+                    return -LINUX_ETIMEDOUT;
+                }
+            } else {
+                pthread_cond_wait(&waiter.cond, &b->lock);
+            }
+        }
+
+        /* Dequeue */
+        futex_waiter_t **pp = &b->head;
+        while (*pp) {
+            if (*pp == &waiter) { *pp = waiter.next; break; }
+            pp = &(*pp)->next;
+        }
+        pthread_mutex_unlock(&b->lock);
+        pthread_cond_destroy(&waiter.cond);
+
+        /* Woken: retry acquisition. The WAITERS bit may remain set if
+         * other waiters exist — the CAS(0→TID) will still succeed
+         * since bit 31 is separate from the TID field. */
+    }
+}
+
+/* FUTEX_TRYLOCK_PI: Non-blocking version of LOCK_PI.
+ * CAS 0 → TID; if the lock is held, return -EAGAIN immediately. */
+static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
+    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
+    if (!word) return -LINUX_EFAULT;
+
+    uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+                                  : (uint32_t)proc_get_pid();
+
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(word, &expected, tid,
+                                     /*weak=*/0,
+                                     __ATOMIC_SEQ_CST,
+                                     __ATOMIC_SEQ_CST)) {
+        return 0;  /* Acquired */
+    }
+
+    return -LINUX_EAGAIN;  /* Lock held, can't acquire */
+}
+
+/* FUTEX_UNLOCK_PI: Release the PI lock at uaddr and wake one waiter.
+ *
+ * Called by the lock owner when FUTEX_WAITERS is set (slow unlock path).
+ * Atomically clear the word to 0 (releasing the lock + clearing WAITERS),
+ * then wake one blocked waiter so it can retry CAS(0→TID) acquisition. */
+static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
+    if (!word) return -LINUX_EFAULT;
+
+    uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+                                  : (uint32_t)proc_get_pid();
+
+    /* Verify we own the lock (TID field matches) */
+    uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+    if ((cur & FUTEX_TID_MASK) != tid)
+        return -LINUX_EPERM;
+
+    /* Atomically release: set word to 0 (clear TID + WAITERS flag).
+     * Use CAS loop in case another thread is concurrently setting WAITERS. */
+    for (;;) {
+        uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if (__atomic_compare_exchange_n(word, &v, 0,
+                                         /*weak=*/0,
+                                         __ATOMIC_SEQ_CST,
+                                         __ATOMIC_SEQ_CST))
+            break;
+    }
+
+    /* Wake one waiter so it can retry acquisition */
+    unsigned idx = futex_hash(uaddr);
+    futex_bucket_t *b = &buckets[idx];
+
+    pthread_mutex_lock(&b->lock);
+    futex_waiter_t *w = b->head;
+    while (w) {
+        if (w->uaddr == uaddr) {
+            w->woken = 1;
+            pthread_cond_signal(&w->cond);
+            break;  /* Wake exactly one */
+        }
+        w = w->next;
+    }
+    pthread_mutex_unlock(&b->lock);
+
+    return 0;
+}
+
 /* ---------- Syscall entry point ---------- */
 
 int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
@@ -443,8 +669,17 @@ int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
     case FUTEX_WAKE_BITSET:
         return futex_wake(uaddr, val, val3);
 
+    case FUTEX_LOCK_PI:
+        return futex_lock_pi(g, uaddr, timeout_gva);
+
+    case FUTEX_UNLOCK_PI:
+        return futex_unlock_pi(g, uaddr);
+
+    case FUTEX_TRYLOCK_PI:
+        return futex_trylock_pi(g, uaddr);
+
     default:
-        /* Unimplemented futex operation (PI futexes, robust futexes).
+        /* Unimplemented futex operation (robust futexes, PI requeue).
          * Return ENOSYS so musl knows to fall back. */
         return -LINUX_ENOSYS;
     }

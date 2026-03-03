@@ -915,14 +915,20 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
                     signal_check_timer();
 
-                    /* Diagnostic: log signal state after exec to help
-                     * debug ELR_EL1 corruption from stale handlers. */
+                    /* Diagnostic: log signal state after exec/sigreturn
+                     * to help debug signal delivery issues. */
                     if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
                         const signal_state_t *ss = signal_get_state();
-                        fprintf(stderr, "%s: post-exec signal state: "
-                                "pending=0x%llx blocked=0x%llx\n", prefix,
+                        uint64_t tblocked = current_thread ?
+                            current_thread->blocked : 0xDEAD;
+                        fprintf(stderr, "%s: post-sigreturn state: "
+                                "pending=0x%llx global_blocked=0x%llx "
+                                "thread_blocked=0x%llx "
+                                "signal_pending=%d\n", prefix,
                                 (unsigned long long)ss->pending,
-                                (unsigned long long)ss->blocked);
+                                (unsigned long long)ss->blocked,
+                                (unsigned long long)tblocked,
+                                signal_pending());
                     }
 
                     /* Deliver pending signals after each syscall */
@@ -1375,9 +1381,17 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         }
                     } else {
                         /* Non-ptraced: deliver SIGTRAP via signal frame */
-
                         signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
                         signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                        if (verbose) {
+                            uint64_t thread_blocked = current_thread ?
+                                current_thread->blocked : 0xDEAD;
+                            fprintf(stderr, "%s: BRK: thread_blocked=0x%llx "
+                                    "pending=0x%llx\n",
+                                    prefix,
+                                    (unsigned long long)thread_blocked,
+                                    (unsigned long long)signal_get_state()->pending);
+                        }
                         int sig_ret = signal_deliver(vcpu, g, &exit_code);
                         if (verbose)
                             fprintf(stderr, "%s: signal_deliver returned %d\n",

@@ -11,38 +11,14 @@
  *                     mmap(222), munmap(215), mprotect(226)
  */
 #include "test-harness.h"
+#include "raw-syscall.h"
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 
 int passes = 0, fails = 0;
-
-/* ---------- Inline syscall for testing unknown syscall numbers ---------- */
-
-static long raw_syscall1(long nr, long a) {
-    register long x0 __asm__("x0") = a;
-    register long x8 __asm__("x8") = nr;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x8)
-                     : "memory", "cc");
-    return x0;
-}
-
-static long raw_syscall3(long nr, long a, long b, long c) {
-    register long x0 __asm__("x0") = a;
-    register long x1 __asm__("x1") = b;
-    register long x2 __asm__("x2") = c;
-    register long x8 __asm__("x8") = nr;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x8)
-                     : "memory", "cc");
-    return x0;
-}
 
 /* ---------- Test 1: Invalid FD operations ---------- */
 

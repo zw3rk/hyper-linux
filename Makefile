@@ -64,14 +64,14 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
            syscall_inotify.c syscall_time.c syscall_sys.c \
            syscall_proc.c proc_emulation.c syscall_exec.c \
            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
-           thread.c futex.c vdso.c crash_report.c)
+           thread.c futex.c vdso.c crash_report.c rosetta.c)
 HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_internal.h syscall_fs.h syscall_io.h \
            syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h \
-           thread.h futex.h vdso.h crash_report.h)
+           thread.h futex.h vdso.h crash_report.h rosetta.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -405,28 +405,53 @@ test-x64-all: $(BUILD_DIR)/hl
 		xfail=$$((xfail + 1)); \
 	}; \
 	printf "$(BLUE)── Assembly tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-hello "rosetta: first load segment not at file offset 0"; \
+	run_xfail test-hello "rosetta rejects asm ELF: first load segment not at file offset 0"; \
 	printf "\n$(BLUE)── C tests (x86_64 musl static, via rosetta) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-musl; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-write; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/echo-test hello world; \
-	run_xfail test-argc "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-complex "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-string "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-malloc "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-comprehensive "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-argc arg1 arg2; \
+	expected_rc=42 run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-complex; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fileio CLAUDE.md; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-string; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cat test/hello.S; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-ls test/; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-roundtrip; \
+	run_xfail test-comprehensive "rosetta reports aarch64, test expects x86_64 (also fails in Lima)"; \
 	printf "\n$(BLUE)── Process tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-fork "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-exec $(X64_TEST_DIR)/echo-test exec-works; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fork; \
+	run_xfail test-fork-exec "hl: fork+exec child crashes during rosetta reinit (works in Lima)"; \
+	printf "\n$(BLUE)── Signal tests (x86_64) ──$(RESET)\n"; \
+	run_xfail test-signal "rosetta: SA_RESETHAND not reset (also fails in Lima, 3/4 subtests pass)"; \
 	printf "\n$(BLUE)── Socket tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-socket "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-sysinfo "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-poll "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-file-ops; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sysinfo; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-io-opt; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-poll; \
 	printf "\n$(BLUE)── I/O subsystem tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-eventfd "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
-	run_xfail test-timerfd "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-eventfd; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-signalfd; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-epoll; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-timerfd; \
+	printf "\n$(BLUE)── /proc and /dev emulation tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-proc; \
+	printf "\n$(BLUE)── Network tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-pthread "rosetta: BasicBlock for unrecognized address (indirect jumps)"; \
+	run_xfail test-thread "rosetta: raw clone(CLONE_THREAD) hangs (also hangs in Lima)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-pthread; \
+	printf "\n$(BLUE)── Stress tests (x86_64) ──$(RESET)\n"; \
+	run_xfail test-stress "rosetta: raw clone hangs (also hangs in Lima)"; \
+	printf "\n$(BLUE)── Negative / error-path tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-negative; \
+	printf "\n$(BLUE)── Signal + thread tests (x86_64) ──$(RESET)\n"; \
+	run_xfail test-signal-thread "rosetta: SA_RESETHAND not reset (also fails in Lima, 4/5 subtests pass)"; \
+	printf "\n$(BLUE)── O_CLOEXEC tests (x86_64) ──$(RESET)\n"; \
+	run_xfail test-cloexec "hl: fork child pipe I/O fails under rosetta (works in Lima)"; \
 	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 

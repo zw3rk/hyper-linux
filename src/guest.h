@@ -165,6 +165,7 @@ typedef struct {
 /* ---------- Guest state ---------- */
 typedef struct {
     void       *host_base;    /* Host pointer to allocated guest memory */
+    int         shm_fd;       /* File fd backing host_base for COW fork (-1 if MAP_ANON) */
     uint64_t    guest_size;   /* Total size (determined by IPA capacity) */
     uint64_t    ipa_base;     /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     uint64_t    mmap_limit;   /* Max mmap address (computed from guest_size) */
@@ -190,6 +191,13 @@ typedef struct {
     int              naliases;
     uint32_t            ipa_bits;  /* IPA bits requested from HVF */
     int                 is_rosetta; /* Non-zero when running x86_64 via rosetta */
+    /* Rosetta placement — survives guest_reset() for execve re-setup.
+     * Set by rosetta_prepare() on first load; reused on subsequent loads
+     * (e.g. execve of another x86_64 binary) so segments land at the
+     * same GPA and the existing VA aliases remain valid. */
+    uint64_t  rosetta_guest_base;  /* GPA in primary buffer where rosetta is loaded */
+    uint64_t  rosetta_va_base;     /* High VA start (e.g. 0x800000000000) */
+    uint64_t  rosetta_size;        /* 2MB-aligned total rosetta span */
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int            nregions;  /* Number of active regions */
@@ -211,6 +219,14 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset) {
  * ipa_bits: IPA width for HVF VM (0 = auto-detect).
  * Returns 0 on success, -1 on failure. */
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits);
+
+/* Initialize guest from a POSIX shared memory fd (COW fork path).
+ * Maps shm_fd MAP_PRIVATE (copy-on-write), creates HVF VM, maps to
+ * hypervisor. The child gets an instant COW snapshot of parent's guest
+ * memory without copying. shm_fd is closed after mapping.
+ * Returns 0 on success, -1 on failure. */
+int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
+                         uint32_t ipa_bits);
 
 /* Register a VA alias for a non-identity-mapped region. Allows syscall
  * handlers (guest_ptr/read/write) to resolve high virtual addresses
