@@ -325,6 +325,14 @@ int translate_open_flags(int linux_flags) {
 static uint64_t mmap_rw_gap_hint = 0;
 static uint64_t mmap_rx_gap_hint = 0;
 
+/* Reset mmap gap hints after execve. Without this, the gap-finder starts
+ * searching past the previous binary's allocations, wasting address space
+ * and potentially causing issues with the new dynamic linker. */
+void mmap_reset_hints(void) {
+    mmap_rw_gap_hint = 0;
+    mmap_rx_gap_hint = 0;
+}
+
 static uint64_t find_free_gap_inner(const guest_t *g, uint64_t length,
                                      uint64_t min_addr, uint64_t max_addr) {
     uint64_t gap_start = min_addr;
@@ -511,15 +519,22 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
         }
         uint64_t gpa = (raw_off + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
 
-        /* Create L2 block entry: VA block → GPA block */
-        if (prot != LINUX_PROT_NONE) {
-            if (guest_map_va_range(g, bva, bva + BLOCK_2MB,
-                                    gpa, page_perms) < 0) {
-                fprintf(stderr, "hl: sys_mmap_high_va: guest_map_va_range "
-                        "failed for bva=0x%llx gpa=0x%llx\n",
-                        (unsigned long long)bva, (unsigned long long)gpa);
-                return -LINUX_ENOMEM;
-            }
+        /* Create L2 block entry: VA block → GPA block.
+         * Even PROT_NONE mappings need page table entries so that
+         * guest_ptr() can resolve the VA when a subsequent MAP_FIXED
+         * with real permissions lands within this reserved range.
+         * Rosetta loads PIE x86_64 binaries via a two-phase mmap:
+         *   1. mmap(0x555555554000, PROT_NONE, MAP_FIXED) — reserve
+         *   2. mmap(0x555555554000, PROT_READ, MAP_FIXED, fd) — load
+         * Without page table entries from phase 1, phase 2's
+         * guest_ptr() returns NULL and fails with -ENOMEM. */
+        int map_perms = (prot == LINUX_PROT_NONE) ? MEM_PERM_R : page_perms;
+        if (guest_map_va_range(g, bva, bva + BLOCK_2MB,
+                                gpa, map_perms) < 0) {
+            fprintf(stderr, "hl: sys_mmap_high_va: guest_map_va_range "
+                    "failed for bva=0x%llx gpa=0x%llx\n",
+                    (unsigned long long)bva, (unsigned long long)gpa);
+            return -LINUX_ENOMEM;
         }
 
         alloc_count++;
@@ -566,6 +581,12 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
     if (total_blocks > 2)
         fprintf(stderr, "hl: mmap_high_va: allocated=%d skipped=%d "
                 "total=%d\n", alloc_count, skip_count, total_blocks);
+
+    /* PROT_NONE is purely an address reservation — no data to write.
+     * Page table entries are already created (for guest_ptr resolution),
+     * regions are tracked (for /proc/self/maps). Just return the VA. */
+    if (prot == LINUX_PROT_NONE)
+        return (int64_t)va;
 
     /* Write data using page-table-resolved host pointers.
      * This is correct even when guest_map_va_range reused an existing L2

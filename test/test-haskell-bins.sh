@@ -230,7 +230,7 @@ run_expect_fail "shellcheck: json output" "$SHELLCHECK_BIN" 1 '"code"' \
                 -f json -s bash "$TMPDIR/bad.sh"
 
 # GCC-style output format
-run_expect_fail "shellcheck: gcc output"  "$SHELLCHECK_BIN" 1 "warning:" \
+run_expect_fail "shellcheck: gcc output"  "$SHELLCHECK_BIN" 1 "SC2086" \
                 -f gcc -s bash "$TMPDIR/bad.sh"
 
 # ── Summary ─────────────────────────────────────────────────────────

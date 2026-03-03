@@ -89,7 +89,7 @@ run_pipe() {
     local name
     name=$(printf "%-16s" "$applet")
 
-    if output=$(printf '%s' "$input" | "$HL" "$BB" "$applet" "$@" 2>&1 | head -5); then
+    if output=$(printf '%s' "$input" | timeout 10 "$HL" "$BB" "$applet" "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -221,7 +221,7 @@ run_skip   ping      "needs raw socket / setuid"
 applet="nc"
 name=$(printf "%-16s" "$applet")
 if output=$( (printf 'HEAD / HTTP/1.0\r\nHost: example.com\r\n\r\n'; sleep 2) \
-             | "$HL" "$BB" nc -w 3 example.com 80 2>&1 | head -5 ); then
+             | timeout 10 "$HL" "$BB" nc -w 3 example.com 80 2>&1 ); then
     rc=0
 else
     rc=$?

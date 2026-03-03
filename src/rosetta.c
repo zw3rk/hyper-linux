@@ -115,8 +115,9 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
         g->rosetta_size       = size;
     } else {
         /* ---- Re-setup (after execve): reload segments into existing
-         *      placement.  guest_reset() zeroed the data but VA aliases
-         *      and kbuf allocation survive. ---- */
+         *      placement.  guest_reset() zeroed the data AND the PT pool,
+         *      so TTBR1 page tables must be rebuilt.  VA aliases and the
+         *      kbuf host pointer survive. ---- */
         uint64_t guest_base = g->rosetta_guest_base;
         uint64_t load_base  = guest_base - va_base;
 
@@ -129,6 +130,17 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
         /* Zero kbuf data region — rosetta reinitializes it at startup */
         if (g->kbuf_base)
             memset(g->kbuf_base, 0, KBUF_SIZE);
+
+        /* Rebuild TTBR1 page tables from the reset PT pool.
+         * guest_reset() zeroed pt_pool_next back to PT_POOL_BASE, so
+         * calling guest_init_kbuf() here allocates fresh L0/L1/L2 pages
+         * BEFORE guest_build_page_tables() allocates TTBR0 pages.
+         * Without this, g->ttbr1 would point at stale/overwritten data
+         * and any kernel VA access would fault (rc=128). */
+        if (guest_init_kbuf(g, g->kbuf_gpa) < 0) {
+            fprintf(stderr, "hl: failed to rebuild kbuf page tables\n");
+            return -1;
+        }
 
         if (verbose)
             fprintf(stderr, "hl: rosetta reloaded at GPA 0x%llx (VA 0x%llx), "

@@ -519,11 +519,14 @@ int main(int argc, const char **argv) {
 
     if (need_rosetta) {
         /* Rosetta phase 2: kbuf dual-mapping, vDSO, fd 3, argv, proc state.
-         * Needs vcpu handle for TCR_EL1/TTBR1_EL1 sysreg writes. */
+         * Needs vcpu handle for TCR_EL1/TTBR1_EL1 sysreg writes.
+         * Pass elf_path (not elf_realpath) so multi-call binaries (e.g.
+         * symlinks echo→coreutils) see the correct argv[0]. open() and
+         * rosettad both follow symlinks, so the original path works. */
         int rosetta_argc;
         const char **rosetta_argv;
         uint64_t vdso_addr;
-        if (rosetta_finalize(&g, vcpu, elf_realpath,
+        if (rosetta_finalize(&g, vcpu, elf_path,
                              guest_argc, guest_argv, &rr, verbose,
                              &rosetta_argc, &rosetta_argv, &vdso_addr) < 0) {
             guest_destroy(&g);
@@ -557,13 +560,12 @@ int main(int argc, const char **argv) {
             : (elf_info.entry + elf_load_base);
     }
 
-    if (verbose) {
+    if (verbose)
         fprintf(stderr, "hl: SP=0x%llx, entry=0x%llx%s\n",
                 (unsigned long long)sp,
                 (unsigned long long)entry_point,
                 need_rosetta ? " (via rosetta)" :
                 interp_base ? " (via interpreter)" : "");
-    }
 
     /* All guest-visible addresses are IPA-based: GUEST_IPA_BASE + offset */
     uint64_t shim_ipa  = guest_ipa(&g, SHIM_BASE);

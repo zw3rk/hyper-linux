@@ -376,9 +376,11 @@ so programs like busybox can use `basename(argv[0])` for applet lookup.
 
 ### Fork/IPC Propagation
 
-`fork_ipc.c` propagates `g->ipa_bits` in the IPC header so child processes
-create their VMs with the same IPA width. Extra mappings are NOT currently
-transferred — fork children in rosetta mode may need additional work.
+`fork_ipc.c` propagates `g->ipa_bits`, rosetta placement fields, and kbuf
+state in the IPC header so child processes create their VMs with the same
+IPA width and rosetta configuration. Rosetta fork children use the legacy
+IPC region-copy path (not COW) because rosetta's JIT state is process-local.
+Extra mappings (rosetta segments) are re-created from the IPC header fields.
 
 ## L3 Page Table Splitting
 
@@ -438,13 +440,36 @@ Key points:
 macOS HVF allows only one VM per process. Fork is implemented via:
 1. Parent creates socketpair(AF_UNIX, SOCK_STREAM)
 2. Parent posix_spawn()s new `hl --fork-child <fd>` process
-3. Parent serializes VM state over IPC: header + registers + memory
-   regions (only used regions, not full 4GB) + FD table (via SCM_RIGHTS)
-   + cwd + umask + signal state + shim blob + sentinel
+3. Parent serializes VM state over IPC (two paths, see below)
 4. Child receives state, creates own VM, restores registers directly
    into EL0 (bypasses shim _start to preserve callee-saved GPRs),
    enters vCPU loop with X0=0 (child return from clone)
 5. Parent records child in process table, returns child PID
+
+### COW Fork Path (aarch64, IPC v4)
+
+When `g->shm_fd >= 0` and `!g->is_rosetta`, guest memory is file-backed
+(mkstemp+unlink, MAP_SHARED). Fork sends the backing fd via SCM_RIGHTS:
+- Parent stays on MAP_SHARED (does NOT remap — HVF caches VA→PA)
+- Child maps the fd MAP_PRIVATE → instant COW clone, zero data copy
+- IPC header has `has_shm=1`, `num_regions=0` (skip memory serialization)
+- Child calls `guest_init_from_shm()` instead of `guest_init()`
+- ~50x faster than IPC copy path for large guest memory
+
+**Critical constraints discovered:**
+- macOS rejects MAP_PRIVATE on shm_open fds (EINVAL) — use mkstemp+unlink
+- HVF caches host VA→PA from hv_vm_map; MAP_FIXED remap does NOT update
+  Stage-2, causing vCPU to read stale pages. Parent must NOT remap host_base
+- Child must restore `g->ttbr0` from IPC header (guest_init_from_shm zeroes
+  the struct; without ttbr0, page table walks fail for all high VAs)
+
+### Legacy IPC Copy Path (rosetta, fallback)
+
+When `g->shm_fd < 0` or `g->is_rosetta`:
+- Parent serializes used memory regions in 1MB chunks over the socketpair
+- Child calls `guest_init()` and receives region data into fresh guest memory
+- Rosetta JIT state (TLS, code caches, slab allocators) is process-local
+  and corrupts when COW-copied — rosetta always uses this path
 
 CLOEXEC semantics follow POSIX: all FDs (including CLOEXEC) are inherited
 across fork. CLOEXEC only takes effect at exec (src/syscall_exec.c step 4).

@@ -146,6 +146,25 @@
         busybox   = x64CrossPkgs.pkgsStatic.busybox;
       };
 
+      # Static x86_64-linux-musl binaries for rosetta integration testing.
+      # Mirrors the aarch64 staticBins collection above.
+      # NOTE: diffutils excluded — x86_64-musl static build fails its own
+      # test suite (8/344 gnulib tests fail). The diff test in test-static-bins.sh
+      # will be skipped when the binary is absent.
+      x64StaticBins = x64CrossPkgs.runCommand "hl-x64-static-bins" {} ''
+        mkdir -p $out/bin
+        ln -s ${x64CrossPkgs.pkgsStatic.bash}/bin/bash          $out/bin/bash
+        ln -s ${x64CrossPkgs.pkgsStatic.dash}/bin/dash           $out/bin/dash
+        ln -s ${x64CrossPkgs.pkgsStatic.lua5_4}/bin/lua          $out/bin/lua
+        ln -s ${x64CrossPkgs.pkgsStatic.gawk}/bin/gawk           $out/bin/gawk
+        ln -s ${x64CrossPkgs.pkgsStatic.gnugrep}/bin/grep        $out/bin/grep
+        ln -s ${x64CrossPkgs.pkgsStatic.gnused}/bin/sed          $out/bin/sed
+        ln -s ${x64CrossPkgs.pkgsStatic.findutils}/bin/find      $out/bin/find
+        ln -s ${x64CrossPkgs.pkgsStatic.tree}/bin/tree           $out/bin/tree
+        ln -s ${x64CrossPkgs.pkgsStatic.jq}/bin/jq               $out/bin/jq
+        ln -s ${x64CrossPkgs.pkgsStatic.sqlite}/bin/sqlite3      $out/bin/sqlite3
+      '';
+
       # ── Dynamic linking test infrastructure ──────────────────────
 
       # Musl sysroot: dynamic linker + libc + shared libs needed by
@@ -397,10 +416,11 @@
         done
 
         # x86_64-linux test binaries (for rosetta testing via test-x64-*)
-        mkdir -p $out/{x64-test-binaries,x64-coreutils,x64-busybox}/bin
+        mkdir -p $out/{x64-test-binaries,x64-coreutils,x64-busybox,x64-static-bins}/bin
         cp -rL ${x64TestBinaries}/bin/.          $out/x64-test-binaries/bin/
         cp -rL ${x64GuestBins.coreutils}/bin/.   $out/x64-coreutils/bin/
         cp -rL ${x64GuestBins.busybox}/bin/.     $out/x64-busybox/bin/
+        cp -rL ${x64StaticBins}/bin/.            $out/x64-static-bins/bin/
 
         # aarch64-linux-gnu (glibc) test artifacts
         mkdir -p $out/{glibc-sysroot/lib,glibc-sysroot/lib64,glibc-dynamic-tests,glibc-dynamic-coreutils}/bin
@@ -467,6 +487,7 @@
           GUEST_X64_TEST_BINARIES = "${x64TestBinaries}";
           GUEST_X64_COREUTILS = "${x64GuestBins.coreutils}";
           GUEST_X64_BUSYBOX   = "${x64GuestBins.busybox}";
+          GUEST_X64_STATIC_BINS = "${x64StaticBins}";
 
           # glibc dynamic linking tests (aarch64)
           GUEST_GLIBC_SYSROOT            = "${glibc-sysroot}";
@@ -500,6 +521,7 @@
             echo "  x64 tests:    $GUEST_X64_TEST_BINARIES/bin/"
             echo "  x64 coreutils: $GUEST_X64_COREUTILS/bin/"
             echo "  x64 busybox:  $GUEST_X64_BUSYBOX/bin/"
+            echo "  x64 static:   $GUEST_X64_STATIC_BINS/bin/"
             echo ""
             echo "Dynamic linking tests (musl):"
             echo "  sysroot:       $GUEST_SYSROOT/lib/"

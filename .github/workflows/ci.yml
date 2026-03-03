@@ -141,16 +141,19 @@ jobs:
         run: nix develop .#ci -c make test-x64-all
 
       - name: Run x86_64 coreutils integration tests (Rosetta)
-        continue-on-error: true  # ~42 tools fail with rosetta BasicBlock assertion (needs AOT)
         env:
           X64_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-coreutils/bin
         run: nix develop .#ci -c make test-x64-coreutils
 
       - name: Run x86_64 busybox integration tests (Rosetta)
-        continue-on-error: true  # rosetta JIT limitations, same as coreutils
         env:
           X64_BUSYBOX_BIN: ${{ github.workspace }}/guest-bins/x64-busybox/bin/busybox
         run: nix develop .#ci -c make test-x64-busybox
+
+      - name: Run x86_64 static binary integration tests (Rosetta)
+        env:
+          X64_STATIC_BINS_DIR: ${{ github.workspace }}/guest-bins/x64-static-bins/bin
+        run: nix develop .#ci -c make test-x64-static-bins
 
       - name: Run glibc dynamic linking tests (aarch64)
         env:
@@ -164,7 +167,7 @@ jobs:
           nix develop .#ci -c make test-glibc-coreutils
 
       - name: Run x86_64 glibc dynamic linking tests (Rosetta)
-        continue-on-error: true  # rosetta JIT limitations
+        continue-on-error: true  # glibc+rosetta: most tools fail (rosetta can't load x86_64 glibc ld-linux)
         env:
           X64_GLIBC_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot
           GUEST_X64_GLIBC_SYSROOT: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot

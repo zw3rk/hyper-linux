@@ -227,8 +227,17 @@ int elf_map_segments(const elf_info_t *info, const char *path,
             return -1;
         }
 
-        /* Zero the entire memory region (covers BSS) */
-        memset((uint8_t *)guest_base + gpa, 0, memsz);
+        /* Zero the entire memory region (covers BSS + page tail).
+         * We zero up to the page-aligned end, not just memsz, because
+         * programs like glibc's dynamic linker use a bump allocator
+         * that extends past _end into the page tail. On real Linux,
+         * the kernel maps zero-filled pages beyond memsz. If we only
+         * zero up to memsz, stale data from a previous execve persists
+         * in the page tail and corrupts the new program's allocator. */
+        uint64_t zero_len = (memsz + 4095) & ~4095ULL;
+        if (gpa + zero_len > guest_size)
+            zero_len = guest_size - gpa;
+        memset((uint8_t *)guest_base + gpa, 0, zero_len);
 
         /* Copy file contents */
         if (filesz > 0) {

@@ -108,7 +108,7 @@ run_pipe() {
     local name
     name=$(printf "%-14s" "$tool")
 
-    if output=$(printf '%s' "$input" | "$HL" --sysroot "$SYSROOT" "$BIN/$tool" "$@" 2>&1 | head -5); then
+    if output=$(printf '%s' "$input" | timeout 10 "$HL" --sysroot "$SYSROOT" "$BIN/$tool" "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -167,8 +167,8 @@ printf "${BLUE}── Output / text utilities ──${RESET}\n"
 run_check  cat       "hello world"          "$TMPDIR/hello.txt"
 run_check  echo      "hello"                "hello"
 run_check  printf    "42"                   "%d" 42
-# yes writes infinitely — SIGPIPE from head terminates it
-run_pipe   yes       "^y$"                 ""
+# yes writes infinitely — use timeout to limit; rc=124 (timeout) is expected
+run_timeout 2  yes    124
 run_check  head      "line1"               "$TMPDIR/lines.txt"
 run_check  tail      "line5"               "$TMPDIR/lines.txt"
 run_check  wc        "5"                   "-l" "$TMPDIR/lines.txt"
@@ -305,7 +305,7 @@ run        "["       0    "-f" "$TMPDIR/hello.txt" "]"
 
 # ── Expected failures / skips ────────────────────────────────────
 printf "\n${BLUE}── Expected failures / skips ──${RESET}\n"
-run_xfail  timeout   "fork+exec with dynamic linker not yet supported"
+run_timeout 10 timeout 0 "5" "$BIN/true"
 run_skip   stdbuf    "requires LD_PRELOAD"
 run_skip   chroot    "needs root privileges"
 

@@ -576,6 +576,9 @@ typedef struct {
 /* Initialize the syscall subsystem (FD table, etc.) */
 void syscall_init(void);
 
+/* Reset mmap gap-finder hints after execve. */
+void mmap_reset_hints(void);
+
 /* Dispatch a syscall. Reads X8 (nr) and X0-X5 (args) from vCPU registers.
  * Writes result back to X0. Sets *exit_code if the process should exit.
  * Returns 0 to continue, 1 to exit. */

@@ -225,6 +225,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
 
     /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
     guest_reset(g);
+    mmap_reset_hints();
 
     /* Step 5b: Reset signal state for exec (POSIX requirement).
      * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN),
@@ -298,6 +299,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                     (unsigned long long)interp_base,
                     (unsigned long long)(interp_info.entry + interp_base),
                     interp_info.num_segments);
+
         }
     }
 
@@ -533,6 +535,13 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     /* SPSR_EL1: EL0t, AArch64 */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0);
 
+    /* Reset TPIDR_EL0 (thread-local storage base). The previous program's
+     * TLS pointer must not leak into the new program — glibc's ld-linux
+     * uses TLS very early (GL() macro accesses static TLS), and a stale
+     * TPIDR_EL0 causes it to read garbage for its internal state (link_map
+     * l_relocated flags, scope lists, etc.), breaking relocation. */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, 0);
+
     /* Zero all general purpose registers */
     for (int i = 0; i < 31; i++) {
         hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, 0);
@@ -556,11 +565,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         (void)_sync;
     }
 
-    if (verbose) {
+    if (verbose)
         fprintf(stderr, "hl: execve: loaded %s, entry=0x%llx sp=0x%llx%s\n",
                 path, (unsigned long long)entry_ipa, (unsigned long long)sp_ipa,
                 need_rosetta ? " (via rosetta)" : "");
-    }
 
     free(argv_buf);
     free(envp_buf);
