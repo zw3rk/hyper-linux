@@ -22,7 +22,7 @@
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
        test-matrix-lima-aarch64 test-matrix-lima-x64 \
        lint analyze format \
-       site site-serve help
+       site site-serve release-interactive help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -759,6 +759,10 @@ pkg: $(BUILD_DIR)/hl
 ## Full signed + notarized release (requires SIGN_IDENTITY, INSTALLER_SIGN_IDENTITY)
 release:
 	@sh dist/build-release.sh "$(VERSION)"
+
+## Interactive release: changelog, version bump, tag, push (uses claude)
+release-interactive:
+	@sh dist/release.sh
 
 # ── Website ────────────────────────────────────────────────────────
 
