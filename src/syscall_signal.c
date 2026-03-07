@@ -38,6 +38,7 @@ typedef struct {
     int valid;          /* Non-zero if fault info is pending */
     int si_code;        /* e.g., LINUX_TRAP_BRKPT */
     uint64_t addr;      /* Fault address (BRK PC, segfault addr, etc.) */
+    uint64_t esr;       /* Raw ESR_EL1 value (0 if not applicable) */
 } pending_fault_t;
 
 static _Thread_local pending_fault_t pending_fault;
@@ -181,10 +182,11 @@ void signal_queue(int signum) {
     thread_interrupt_all();
 }
 
-void signal_set_fault_info(int si_code, uint64_t addr) {
+void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr) {
     pending_fault.valid = 1;
     pending_fault.si_code = si_code;
     pending_fault.addr = addr;
+    pending_fault.esr = esr;
 }
 
 void signal_consume(int signum) {
@@ -392,17 +394,18 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
             return -LINUX_EFAULT;
         }
 
-        fprintf(stderr, "hl: rt_sigaction(%d): handler=0x%llx flags=0x%llx "
-                "restorer=0x%llx mask=0x%llx%s%s%s%s\n",
-                signum,
-                (unsigned long long)act.sa_handler,
-                (unsigned long long)act.sa_flags,
-                (unsigned long long)act.sa_restorer,
-                (unsigned long long)act.sa_mask,
-                (act.sa_flags & LINUX_SA_SIGINFO) ? " SA_SIGINFO" : "",
-                (act.sa_flags & LINUX_SA_ONSTACK) ? " SA_ONSTACK" : "",
-                (act.sa_flags & LINUX_SA_RESETHAND) ? " SA_RESETHAND" : "",
-                (act.sa_flags & LINUX_SA_NODEFER) ? " SA_NODEFER" : "");
+        if (g->verbose)
+            fprintf(stderr, "hl: rt_sigaction(%d): handler=0x%llx flags=0x%llx "
+                    "restorer=0x%llx mask=0x%llx%s%s%s%s\n",
+                    signum,
+                    (unsigned long long)act.sa_handler,
+                    (unsigned long long)act.sa_flags,
+                    (unsigned long long)act.sa_restorer,
+                    (unsigned long long)act.sa_mask,
+                    (act.sa_flags & LINUX_SA_SIGINFO) ? " SA_SIGINFO" : "",
+                    (act.sa_flags & LINUX_SA_ONSTACK) ? " SA_ONSTACK" : "",
+                    (act.sa_flags & LINUX_SA_RESETHAND) ? " SA_RESETHAND" : "",
+                    (act.sa_flags & LINUX_SA_NODEFER) ? " SA_NODEFER" : "");
 
         sig_state.actions[idx] = act;
     }
@@ -580,21 +583,44 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva) {
 
 /* FPSIMD context header (required by musl for setjmp/longjmp).
  * Linux places this immediately after sigcontext.__reserved starts. */
-#define FPSIMD_MAGIC      0x46508001U
-#define FPSIMD_CONTEXT_SIZE (8 + 4 + 4 + 32 * 16 + 4 + 4)  /* 528 bytes */
+#define FPSIMD_MAGIC        0x46508001U
+#define FPSIMD_CONTEXT_SIZE (8 + 4 + 4 + 32 * 16)  /* 528 bytes */
 
-/* Build a minimal FPSIMD context block in the __reserved area. */
-static void build_fpsimd_context(uint8_t *reserved) {
-    /* struct fpsimd_context { __u32 head.magic, head.size;
-     *   __u32 fpsr, fpcr; __uint128_t vregs[32]; } */
-    uint32_t magic = FPSIMD_MAGIC;
-    uint32_t size = FPSIMD_CONTEXT_SIZE;
-    memcpy(reserved, &magic, 4);
-    memcpy(reserved + 4, &size, 4);
+/* ESR context header (Linux places this after FPSIMD for synchronous faults).
+ * Rosetta's SIGTRAP handler reads this to determine the BRK immediate value. */
+#define ESR_MAGIC           0x45535201U
+#define ESR_CONTEXT_SIZE    16  /* { __u32 magic, size; __u64 esr; } */
+
+/* Build the extended context chain in the __reserved area.
+ * Linux kernel (arch/arm64/kernel/signal.c) builds:
+ *   1. FPSIMD context (always present)
+ *   2. ESR context (present for synchronous faults: BRK, segfault, etc.)
+ *   3. Terminator (magic=0, size=0)
+ * The esr parameter is the raw ESR_EL1 value; if non-zero, the ESR context
+ * block is included. */
+static void build_sigcontext_reserved(uint8_t *reserved, uint64_t esr) {
+    uint32_t off = 0;
+
+    /* 1. FPSIMD context */
+    uint32_t fpsimd_magic = FPSIMD_MAGIC;
+    uint32_t fpsimd_size = FPSIMD_CONTEXT_SIZE;
+    memcpy(reserved + off, &fpsimd_magic, 4);
+    memcpy(reserved + off + 4, &fpsimd_size, 4);
     /* fpsr=0, fpcr=0, vregs[32]=0 — all zeroed (already zero from memset) */
+    off += FPSIMD_CONTEXT_SIZE;
 
-    /* Terminator: zero magic/size after FPSIMD block */
-    memset(reserved + FPSIMD_CONTEXT_SIZE, 0, 8);
+    /* 2. ESR context (only for synchronous faults with valid ESR) */
+    if (esr != 0) {
+        uint32_t esr_magic = ESR_MAGIC;
+        uint32_t esr_size = ESR_CONTEXT_SIZE;
+        memcpy(reserved + off, &esr_magic, 4);
+        memcpy(reserved + off + 4, &esr_size, 4);
+        memcpy(reserved + off + 8, &esr, 8);
+        off += ESR_CONTEXT_SIZE;
+    }
+
+    /* 3. Terminator: zero magic/size */
+    memset(reserved + off, 0, 8);
 }
 
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
@@ -696,20 +722,28 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
 
     /* sigcontext — save all registers.
      * fault_address: for synchronous faults (BRK, segfault), set to the
-     * faulting address; for asynchronous signals, zero. */
-    frame.uc.uc_mcontext.fault_address =
-        pending_fault.valid ? pending_fault.addr : 0;
+     * faulting address; for asynchronous signals, zero.
+     * frame_esr: raw ESR_EL1 for the extended context chain. Rosetta's
+     * SIGTRAP handler reads this to determine BRK immediate value. */
+    uint64_t frame_esr = 0;
+    if (pending_fault.valid) {
+        frame.uc.uc_mcontext.fault_address = pending_fault.addr;
+        frame_esr = pending_fault.esr;
+        pending_fault.valid = 0;  /* Consume (one-shot) */
+    }
 
-    /* Consume the pending fault info (one-shot) */
-    pending_fault.valid = 0;
     for (int i = 0; i < 31; i++)
         frame.uc.uc_mcontext.regs[i] = saved_regs[i];
     frame.uc.uc_mcontext.sp = saved_sp;
     frame.uc.uc_mcontext.pc = saved_pc;
     frame.uc.uc_mcontext.pstate = saved_pstate;
 
-    /* FPSIMD context in __reserved area (musl reads this) */
-    build_fpsimd_context(frame.uc.uc_mcontext.__reserved);
+    /* Extended context chain in __reserved area (FPSIMD + optional ESR).
+     * The ESR context is critical for rosetta: its SIGTRAP handler reads
+     * the BRK immediate from ESR ISS[15:0] to determine the trap type
+     * (BRK #3=AOT, #7=indirect, #8=retranslate). Without it, rosetta
+     * can't distinguish BRK traps and may mishandle them. */
+    build_sigcontext_reserved(frame.uc.uc_mcontext.__reserved, frame_esr);
 
     /* Save the altstack info in uc_stack so gdb/tools can see it */
     frame.uc.uc_stack = sig_state.altstack;

@@ -240,9 +240,9 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
         return -1;
     }
 
-    fprintf(stderr, "guest: IPA size: %u bits (%lluGB primary, max_ipa=%u)\n",
-            vm_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)),
-            max_ipa);
+    /* Printed by hl.c after setting g->verbose (guest_init runs before
+     * verbose is set, so we can't check g->verbose here). The IPA info
+     * is printed via the verbose block in hl.c main() instead. */
 
     return 0;
 }
@@ -371,12 +371,13 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa) {
     /* Store TTBR1 value (IPA of L0 page, with ASID=0) */
     g->ttbr1 = g->ipa_base + l0_gpa;
 
-    fprintf(stderr, "guest: kbuf initialized: VA 0x%llx-0x%llx → "
-            "GPA 0x%llx (TTBR1=0x%llx)\n",
-            (unsigned long long)KBUF_VA_BASE,
-            (unsigned long long)(KBUF_VA_BASE + KBUF_SIZE - 1),
-            (unsigned long long)kbuf_gpa,
-            (unsigned long long)g->ttbr1);
+    if (g->verbose)
+        fprintf(stderr, "hl: kbuf initialized: VA 0x%llx-0x%llx → "
+                "GPA 0x%llx (TTBR1=0x%llx)\n",
+                (unsigned long long)KBUF_VA_BASE,
+                (unsigned long long)(KBUF_VA_BASE + KBUF_SIZE - 1),
+                (unsigned long long)kbuf_gpa,
+                (unsigned long long)g->ttbr1);
     return 0;
 }
 

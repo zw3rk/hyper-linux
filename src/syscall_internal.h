@@ -54,6 +54,12 @@ int translate_at_flags(int linux_flags);
 /* Translate Linux open flags to macOS equivalents. */
 int translate_open_flags(int linux_flags);
 
+/* ---------- Global verbose flag ---------- */
+/* Set once by hl.c main() from --verbose. Used by detached threads
+ * (rosettad handler) that don't have access to a guest_t. For code
+ * running in syscall context, prefer g->verbose instead. */
+extern int hl_verbose;
+
 /* ---------- Guest memory helpers (from guest.h, used by net module) ---------- */
 /* These are already declared in guest.h but listed here for reference:
  *   void *guest_ptr(guest_t *g, uint64_t gva)

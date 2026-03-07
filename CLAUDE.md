@@ -165,6 +165,20 @@ Rosetta is treated as a binfmt_misc interpreter (NOT a PT_INTERP dynamic linker)
   dynamic linking internally (loading ld-linux-x86-64.so.2 etc.)
 - AT_PLATFORM remains "aarch64" (correct: rosetta produces ARM64 code)
 
+### x86_64 musl AT_BASE Fix
+
+Rosetta reads AT_BASE from its own (host) auxv as a template when constructing
+the x86_64 auxv for dynamically-linked binaries. The Linux kernel always emits
+AT_BASE (value=0 for static binaries). hl's `build_linux_stack()` previously
+omitted AT_BASE when `interp_base == 0` (static binaries like Rosetta), causing
+Rosetta to skip AT_BASE in the x86_64 auxv. musl's `_dlstart_c` then fell back
+to scanning AT_PHDR for PT_DYNAMIC, found the wrong base → SIGFPE.
+
+Fix in `src/stack.c`: always emit `AT_BASE` (matching Linux kernel behavior).
+This lets Rosetta copy the entry and fill in the correct interpreter address.
+glibc is unaffected (uses `__ehdr_start` for base computation, independent of
+AT_BASE).
+
 ### Rosetta AOT Translation (rosettad)
 
 Rosetta supports ahead-of-time (AOT) translation via the `rosettad` daemon,

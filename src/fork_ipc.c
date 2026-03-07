@@ -269,6 +269,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     g.rosetta_guest_base = hdr.rosetta_guest_base;
     g.rosetta_va_base    = hdr.rosetta_va_base;
     g.rosetta_size       = hdr.rosetta_size;
+    g.verbose            = verbose;
     if (g.kbuf_gpa != 0)
         g.kbuf_base = (uint8_t *)g.host_base + g.kbuf_gpa;
 

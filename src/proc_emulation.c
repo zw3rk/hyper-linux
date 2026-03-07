@@ -349,7 +349,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
                             lineoff, line);
         }
 
-        fprintf(stderr, "hl: /proc/self/maps (%d bytes):\n%.*s", off, off, buf);
+        if (g->verbose)
+            fprintf(stderr, "hl: /proc/self/maps (%d bytes):\n%.*s", off, off, buf);
         return proc_synthetic_fd(buf, off);
     }
 

@@ -775,7 +775,8 @@ static int aot_cache_lookup(const uint8_t digest[CC_SHA256_DIGEST_LENGTH]) {
  */
 static void *rosettad_handler_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
-    fprintf(stderr, "hl: rosettad: handler thread started (fd=%d)\n", fd);
+    if (hl_verbose)
+        fprintf(stderr, "hl: rosettad: handler thread started (fd=%d)\n", fd);
 
     for (;;) {
         uint8_t cmd;
@@ -791,7 +792,8 @@ static void *rosettad_handler_thread(void *arg) {
             /* Handshake: respond 0x01 to enable AOT translation.
              * 0x01 = ready (enables rosettad AOT path)
              * 0x00 = not ready (JIT-only, no AOT) */
-            fprintf(stderr, "hl: rosettad: handshake '?'\n");
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: handshake '?'\n");
             uint8_t resp = 0x01;
             if (write(fd, &resp, 1) != 1) {
                 fprintf(stderr, "hl: rosettad: handshake write failed\n");
@@ -803,7 +805,8 @@ static void *rosettad_handler_thread(void *arg) {
         case 't': {
             /* Translate request: rosetta sends the binary fd via sendmsg
              * (SCM_RIGHTS) with a data payload. */
-            fprintf(stderr, "hl: rosettad: translate request 't'\n");
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: translate request 't'\n");
             uint8_t params[256];
             int bin_fd = -1;
 
@@ -815,8 +818,9 @@ static void *rosettad_handler_thread(void *arg) {
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
-            fprintf(stderr, "hl: rosettad: recv_fd got fd=%d, %zd bytes data\n",
-                    bin_fd, rn);
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: recv_fd got fd=%d, %zd bytes data\n",
+                        bin_fd, rn);
 
             /* Get the binary's path via F_GETPATH */
             char bin_path[1024];
@@ -829,7 +833,8 @@ static void *rosettad_handler_thread(void *arg) {
                 break;
             }
             close(bin_fd);
-            fprintf(stderr, "hl: rosettad: translating %s\n", bin_path);
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: translating %s\n", bin_path);
 
             /* Create temp file for AOT output */
             char aot_path[] = "/tmp/hl-aot-XXXXXX";
@@ -873,12 +878,14 @@ static void *rosettad_handler_thread(void *arg) {
             }
             /* Cache the AOT for future 'd' digest lookups */
             aot_cache_put(digest, aot_path);
-            fprintf(stderr, "hl: rosettad: cached AOT at %s\n", aot_path);
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: cached AOT at %s\n", aot_path);
 
             struct stat st;
             fstat(aot_fd, &st);
-            fprintf(stderr, "hl: rosettad: AOT ready (%lld bytes) for %s\n",
-                    (long long)st.st_size, bin_path);
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: AOT ready (%lld bytes) for %s\n",
+                        (long long)st.st_size, bin_path);
 
             /* Rosetta expects THREE separate messages for the translate
              * response (matching SOCK_SEQPACKET semantics where each
@@ -912,8 +919,9 @@ static void *rosettad_handler_thread(void *arg) {
                 close(aot_fd);
                 goto done;
             }
-            fprintf(stderr, "hl: rosettad: sent AOT fd=%d (%zd bytes meta)\n",
-                    aot_fd, sent);
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: sent AOT fd=%d (%zd bytes meta)\n",
+                        aot_fd, sent);
             close(aot_fd);
             break;
         }
@@ -938,7 +946,8 @@ static void *rosettad_handler_thread(void *arg) {
 
             int cached_fd = aot_cache_lookup(digest);
             if (cached_fd >= 0) {
-                fprintf(stderr, "hl: rosettad: digest cache HIT\n");
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: digest cache HIT\n");
                 uint8_t resp = 0x01;
                 if (write(fd, &resp, 1) != 1) { close(cached_fd); goto done; }
                 /* Send AOT fd via SCM_RIGHTS (same as 't' response msg 3) */
@@ -963,8 +972,9 @@ static void *rosettad_handler_thread(void *arg) {
                  * By translating on-demand here and returning HIT, we
                  * match the real VZ behavior where rosetta always gets
                  * AOT via the 'd' cache path. */
-                fprintf(stderr, "hl: rosettad: digest miss → on-demand "
-                        "translate of %s\n", rosettad_binary_path);
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: digest miss → on-demand "
+                            "translate of %s\n", rosettad_binary_path);
 
                 char aot_path[] = "/tmp/hl-aot-XXXXXX";
                 int aot_fd = mkstemp(aot_path);
@@ -1010,8 +1020,9 @@ static void *rosettad_handler_thread(void *arg) {
                     break;
                 }
 
-                fprintf(stderr, "hl: rosettad: digest on-demand HIT "
-                        "(AOT at %s)\n", aot_path);
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: digest on-demand HIT "
+                            "(AOT at %s)\n", aot_path);
 
                 /* Send as 'd' HIT: 0x01 + SCM_RIGHTS fd */
                 uint8_t resp = 0x01;
@@ -1028,8 +1039,9 @@ static void *rosettad_handler_thread(void *arg) {
                 }
                 close(aot_fd);
             } else {
-                fprintf(stderr, "hl: rosettad: digest cache MISS "
-                        "(no binary path)\n");
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: digest cache MISS "
+                            "(no binary path)\n");
                 uint8_t resp = 0x00;
                 if (write(fd, &resp, 1) != 1) goto done;
             }
@@ -1037,7 +1049,8 @@ static void *rosettad_handler_thread(void *arg) {
         }
 
         case 'q':
-            fprintf(stderr, "hl: rosettad: quit 'q'\n");
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: quit 'q'\n");
             goto done;
 
         default:
@@ -1047,14 +1060,16 @@ static void *rosettad_handler_thread(void *arg) {
     }
 
 done:
-    fprintf(stderr, "hl: rosettad: handler thread exiting\n");
+    if (hl_verbose)
+        fprintf(stderr, "hl: rosettad: handler thread exiting\n");
     close(fd);
     return NULL;
 }
 
 void rosettad_set_socket(int fd) {
     rosettad_handler_fd = fd;
-    fprintf(stderr, "hl: rosettad: starting handler thread (handler_fd=%d)\n", fd);
+    if (hl_verbose)
+        fprintf(stderr, "hl: rosettad: starting handler thread (handler_fd=%d)\n", fd);
     pthread_t thr;
     pthread_create(&thr, NULL, rosettad_handler_thread, (void *)(intptr_t)fd);
     pthread_detach(thr);
@@ -1101,7 +1116,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
          * This MUST succeed — without it, rosetta prints "Rosetta is only
          * intended to run on Apple Silicon with a macOS host using
          * Virtualization.framework with Rosetta mode enabled" and aborts. */
-        fprintf(stderr, "hl: rosetta: VZ_CHECK ioctl\n");
+        if (g->verbose)
+            fprintf(stderr, "hl: rosetta: VZ_CHECK ioctl\n");
         static const char rosetta_sig[69] =
             "Our hard work\nby these words guarded\n"
             "please don't steal\n\xc2\xa9 Apple Inc";
@@ -1179,9 +1195,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
          * Set to 0 to match real VZ behavior (digest path). */
         caps[108] = 0;
 
-        fprintf(stderr, "hl: rosetta: VZ_CAPS ioctl → caps[0]=%d caps[64]=0x%02x "
-                "caps[108]=0x%02x binary=%s\n",
-                caps[0], caps[64], caps[108], rosettad_binary_path);
+        if (g->verbose)
+            fprintf(stderr, "hl: rosetta: VZ_CAPS ioctl → caps[0]=%d caps[64]=0x%02x "
+                    "caps[108]=0x%02x binary=%s\n",
+                    caps[0], caps[64], caps[108], rosettad_binary_path);
         if (guest_write(g, arg, caps, sizeof(caps)) < 0)
             return -LINUX_EFAULT;
         return 1;  /* Real VZ driver returns 1 on success */
@@ -1189,7 +1206,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
 
     case ROSETTA_VZ_ACTIVATE:
         /* Rosetta JIT activation / hypervisor handshake. */
-        fprintf(stderr, "hl: rosetta: VZ_ACTIVATE ioctl\n");
+        if (g->verbose)
+            fprintf(stderr, "hl: rosetta: VZ_ACTIVATE ioctl\n");
         return 1;  /* Real VZ driver returns 1 on success */
 
     case LINUX_TIOCGWINSZ: {

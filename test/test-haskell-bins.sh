@@ -8,13 +8,19 @@
 # Haskell programs that stress the GHC runtime: threaded RTS, heavy
 # allocation, Lua FFI (pandoc), regex engines (shellcheck).
 #
-# Usage: test/test-haskell-bins.sh <hl-binary> <haskell-bins-dir>
+# Usage: test/test-haskell-bins.sh <hl-binary> <haskell-bins-dir> [<sysroot>] [<guest-extra-args>]
 #        where <haskell-bins-dir> contains: pandoc, shellcheck
+#        <sysroot> is optional; when set, dynamically-linked binaries
+#        (pandoc) are run with --sysroot <sysroot>.
+#        <guest-extra-args> is optional; passed to every guest binary
+#        (e.g. "+RTS -xr4G -RTS" to shrink GHC's VA reservation on M1).
 
 set -euo pipefail
 
-HL="${1:?Usage: $0 <hl-binary> <haskell-bins-dir>}"
-BINDIR="${2:?Usage: $0 <hl-binary> <haskell-bins-dir>}"
+HL="${1:?Usage: $0 <hl-binary> <haskell-bins-dir> [<sysroot>] [<guest-extra-args>]}"
+BINDIR="${2:?Usage: $0 <hl-binary> <haskell-bins-dir> [<sysroot>] [<guest-extra-args>]}"
+SYSROOT="${3:-}"
+GUEST_EXTRA="${4:-}"
 
 # Colors
 GREEN='\033[0;32m'
@@ -44,6 +50,9 @@ find_bin() {
 }
 
 # Run a test, checking that output contains a pattern.
+# First 3 args: label, hl-args (array as string), bin, pattern, [extra args...]
+# The HL_ARGS variable can be set per-section (e.g. "--sysroot /path") and
+# is expanded into the hl command line before the binary path.
 run_check() {
     local label="$1"; shift
     local bin="$1"; shift
@@ -57,7 +66,8 @@ run_check() {
         return
     fi
 
-    if output=$("$HL" "$bin" "$@" 2>&1); then
+    # shellcheck disable=SC2086
+    if output=$("$HL" $HL_ARGS "$bin" $GUEST_EXTRA "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -88,7 +98,8 @@ run_pipe() {
         return
     fi
 
-    if output=$(printf '%s' "$input" | "$HL" "$bin" "$@" 2>&1); then
+    # shellcheck disable=SC2086
+    if output=$(printf '%s' "$input" | "$HL" $HL_ARGS "$bin" $GUEST_EXTRA "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -119,7 +130,8 @@ run_expect_fail() {
         return
     fi
 
-    if output=$("$HL" "$bin" "$@" 2>&1); then
+    # shellcheck disable=SC2086
+    if output=$("$HL" $HL_ARGS "$bin" $GUEST_EXTRA "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -152,7 +164,8 @@ run_pipe_expect_fail() {
         return
     fi
 
-    if output=$(printf '%s' "$input" | "$HL" "$bin" "$@" 2>&1); then
+    # shellcheck disable=SC2086
+    if output=$(printf '%s' "$input" | "$HL" $HL_ARGS "$bin" $GUEST_EXTRA "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -173,32 +186,67 @@ run_pipe_expect_fail() {
 PANDOC_BIN=$(find_bin pandoc)
 SHELLCHECK_BIN=$(find_bin shellcheck)
 
+# Both pandoc and shellcheck are dynamically linked with glibc
+# (justStaticExecutables strips Haskell libs, not system libs).
+# Use --sysroot when a sysroot is provided.
+if [ -n "$SYSROOT" ]; then
+    HL_ARGS="--sysroot $SYSROOT"
+else
+    HL_ARGS=""
+fi
+
+# pandoc data directory: nix compiles a nix store path into the binary
+# for Cabal data-files lookup, which doesn't exist on non-NixOS hosts
+# (e.g., the CI runner). Pass --data-dir to override when available.
+PANDOC_DATA_DIR=""
+for candidate in \
+    "$BINDIR/../share/pandoc-data" \
+    "$BINDIR/../../share/pandoc-data" \
+    "$(dirname "$BINDIR")/share/pandoc-data"; do
+    if [ -d "$candidate" ]; then
+        PANDOC_DATA_DIR="$(cd "$candidate" && pwd)"
+        break
+    fi
+done
+
 printf "\n${BLUE}━━━ Haskell binary integration tests ━━━${RESET}\n\n"
 
 # ── pandoc ──────────────────────────────────────────────────────────
 printf "${BLUE}── pandoc ──${RESET}\n"
 
+# Build pandoc extra args: --data-dir when bundled data is available.
+# The nix-built pandoc binary has a hardcoded nix store path for Cabal
+# data-files — this doesn't exist on non-NixOS hosts (CI runners).
+PANDOC_EXTRA=""
+if [ -n "$PANDOC_DATA_DIR" ]; then
+    PANDOC_EXTRA="--data-dir $PANDOC_DATA_DIR"
+fi
+
 # Version check — confirms binary loads, GHC RTS initialises
 run_check  "pandoc: version"          "$PANDOC_BIN" "pandoc"          --version
 
 # Markdown → HTML conversion
+# shellcheck disable=SC2086
 run_pipe   "pandoc: md→html"          "$PANDOC_BIN" "<strong>bold</strong>" \
-           "**bold** text" -f markdown -t html
+           "**bold** text" $PANDOC_EXTRA -f markdown -t html
 
 # HTML → Markdown conversion (reverse)
+# shellcheck disable=SC2086
 run_pipe   "pandoc: html→md"          "$PANDOC_BIN" "\\*\\*hello\\*\\*" \
-           "<p><strong>hello</strong> world</p>" -f html -t markdown
+           "<p><strong>hello</strong> world</p>" $PANDOC_EXTRA -f html -t markdown
 
 # Markdown → JSON AST output (exercises aeson/JSON serialisation)
+# shellcheck disable=SC2086
 run_pipe   "pandoc: md→json"          "$PANDOC_BIN" '"Str"' \
-           "hello world" -f markdown -t json
+           "hello world" $PANDOC_EXTRA -f markdown -t json
 
 # List all output formats (exercises Lua initialisation)
 run_check  "pandoc: list formats"     "$PANDOC_BIN" "html"            --list-output-formats
 
 # Markdown → plain text (strip formatting)
+# shellcheck disable=SC2086
 run_pipe   "pandoc: md→plain"         "$PANDOC_BIN" "heading" \
-           "# heading" -f markdown -t plain
+           "# heading" $PANDOC_EXTRA -f markdown -t plain
 
 # ── shellcheck ──────────────────────────────────────────────────────
 printf "\n${BLUE}── shellcheck ──${RESET}\n"

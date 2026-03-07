@@ -58,6 +58,9 @@ static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 *
  * File descriptor operations from concurrent threads must be serialized. */
 static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 
+/* ---------- Global verbose flag (set by hl.c main) ---------- */
+int hl_verbose = 0;
+
 /* ---------- FD table ---------- */
 fd_entry_t fd_table[FD_TABLE_SIZE];
 
@@ -612,8 +615,12 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
         uint64_t chunk = (length - written < block_remain)
                        ? length - written : block_remain;
 
-        if (is_anon)
-            memset(ptr, 0, chunk);
+        /* Always zero first, then overlay with file data. This matches
+         * Linux MAP_FIXED semantics: pages beyond EOF are zeroed, and
+         * MAP_ANONYMOUS regions are zero-filled. Without this, GPA
+         * memory that was previously used (e.g., by a prior mmap that
+         * was munmapped) could contain stale data. */
+        memset(ptr, 0, chunk);
 
         if (!is_anon && fd >= 0) {
             int host_fd = fd_to_host(fd);
@@ -667,7 +674,14 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
          * kernel VA's TTBR1 mapping, so CPU access works either way. */
         if (addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
             uint64_t koff = addr - KBUF_VA_BASE;
-            if (koff + length > KBUF_SIZE) return -LINUX_ENOMEM;
+            if (koff + length > KBUF_SIZE) {
+                fprintf(stderr, "hl: mmap: kernel buffer exhausted "
+                        "(koff=0x%llx + len=0x%llx > KBUF_SIZE=0x%llx)\n",
+                        (unsigned long long)koff,
+                        (unsigned long long)length,
+                        (unsigned long long)KBUF_SIZE);
+                return -LINUX_ENOMEM;
+            }
 
             /* File-backed: pread data into kbuf */
             if (!is_anon && fd >= 0) {
@@ -772,11 +786,6 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                 ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
                                    length, offset);
                 if (nr < 0) return linux_errno();
-                fprintf(stderr, "hl:   mmap file-backed: fd=%d(host=%d) "
-                        "off=0x%llx nr=%zd into [0x%llx,+0x%llx)\n",
-                        fd, host_fd, (unsigned long long)offset, nr,
-                        (unsigned long long)addr,
-                        (unsigned long long)length);
             }
         } else {
             /* PROT_NONE with MAP_FIXED: invalidate existing page table
@@ -799,7 +808,15 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission. */
             result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
-            if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+            if (result_off == UINT64_MAX) {
+                fprintf(stderr, "hl: mmap: RX address space exhausted "
+                        "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)\n",
+                        (unsigned long long)length,
+                        (unsigned long long)g->mmap_limit,
+                        g->ipa_bits,
+                        (unsigned long long)(g->guest_size >> 30));
+                return -LINUX_ENOMEM;
+            }
             /* High-water mark for fork IPC state transfer */
             uint64_t rx_hwm = result_off + length;
             if (rx_hwm > g->mmap_rx_next) g->mmap_rx_next = rx_hwm;
@@ -818,7 +835,15 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             }
             if (result_off == UINT64_MAX)
                 result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
-            if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+            if (result_off == UINT64_MAX) {
+                fprintf(stderr, "hl: mmap: RW address space exhausted "
+                        "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)\n",
+                        (unsigned long long)length,
+                        (unsigned long long)g->mmap_limit,
+                        g->ipa_bits,
+                        (unsigned long long)(g->guest_size >> 30));
+                return -LINUX_ENOMEM;
+            }
             /* High-water mark for fork IPC state transfer */
             uint64_t rw_hwm = result_off + length;
             if (rw_hwm > g->mmap_next) g->mmap_next = rw_hwm;
@@ -844,6 +869,10 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             if (guest_extend_page_tables(g, ext_start, ext_end,
                                           MEM_PERM_RX) < 0)
                 return -LINUX_ENOMEM;
+            /* Re-validate any previously-invalidated L3 entries (see
+             * the RW path comment below for the full explanation). */
+            guest_update_perms(g, result_off, result_off + length,
+                               MEM_PERM_RX);
             if (ext_end > g->mmap_rx_end)
                 g->mmap_rx_end = ext_end;
         } else {
@@ -861,13 +890,15 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             if (guest_extend_page_tables(g, ext_start, ext_end,
                                           ext_perms) < 0)
                 return -LINUX_ENOMEM;
-            /* For RWX: update any pre-existing blocks to add execute.
-             * guest_extend_page_tables skips already-mapped blocks, so
-             * blocks created during initial page table setup with RW
-             * permissions need explicit update. */
-            if (ext_perms & MEM_PERM_X)
-                guest_update_perms(g, result_off, result_off + length,
-                                   ext_perms);
+            /* Update permissions on the allocated range. This handles two cases:
+             * 1. RWX: pre-existing RW blocks need execute permission added
+             * 2. L3 split entries: if an L2 block was previously split into
+             *    L3 page entries (e.g., via mprotect(PROT_NONE) on a sub-block
+             *    range), guest_extend_page_tables skips the L2 entry (it sees
+             *    a valid table descriptor). The L3 entries may be invalidated,
+             *    so we must re-create them with the correct permissions. */
+            guest_update_perms(g, result_off, result_off + length,
+                               ext_perms);
             if (ext_end > g->mmap_end)
                 g->mmap_end = ext_end;
         }
@@ -1156,16 +1187,6 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             uint64_t mprot_off = mprot_addr - g->ipa_base;
             if (mprot_off + mprot_len <= g->guest_size) {
                 /* Low VA: within primary buffer (identity-mapped) */
-
-                /* DEBUG: trace mprotect in binary+AOT range */
-                if (mprot_off >= 0x400000 && mprot_off < 0x600000) {
-                    fprintf(stderr, "hl: mprotect 0x%llx+0x%llx prot=%d(%s%s%s)\n",
-                            (unsigned long long)mprot_addr,
-                            (unsigned long long)mprot_len, mprot_prot,
-                            (mprot_prot & LINUX_PROT_READ) ? "R" : "",
-                            (mprot_prot & LINUX_PROT_WRITE) ? "W" : "",
-                            (mprot_prot & LINUX_PROT_EXEC) ? "X" : "");
-                }
 
                 /* Update region tracking with new protection bits */
                 guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
@@ -1608,7 +1629,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             if (is_fault && info.si_code > 0) {
                 uint64_t fault_addr;
                 memcpy(&fault_addr, &info.si_pid, sizeof(fault_addr));
-                signal_set_fault_info(info.si_code, fault_addr);
+                signal_set_fault_info(info.si_code, fault_addr, 0);
 
                 if (verbose)
                     fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "

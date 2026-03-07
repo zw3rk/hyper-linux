@@ -1248,126 +1248,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         fprintf(stderr, "%s: BRK at 0x%llx → %s\n",
                                 prefix, (unsigned long long)brk_pc,
                                 current_thread->ptraced ? "ptrace-stop" : "SIGTRAP");
-                        /* Dump memory around BRK for JIT debugging */
-                        uint8_t brk_mem[64];
-                        uint64_t dump_addr = brk_pc & ~0xFULL;
-                        if (guest_read(g, dump_addr, brk_mem, 64) == 0) {
-                            fprintf(stderr, "%s: mem[0x%llx]: ", prefix,
-                                    (unsigned long long)dump_addr);
-                            for (int i = 0; i < 64; i++) {
-                                if (i && (i % 16 == 0))
-                                    fprintf(stderr, "\n%s: mem[0x%llx]: ",
-                                            prefix,
-                                            (unsigned long long)(dump_addr+i));
-                                fprintf(stderr, "%02x ", brk_mem[i]);
-                            }
-                            fprintf(stderr, "\n");
-                        }
-                        /* Dump JIT cache base to see entry point code */
-                        uint8_t jit_base[128];
-                        uint64_t jit_start = 0xeffff7ff8000ULL;
-                        if (guest_read(g, jit_start, jit_base, 128) == 0) {
-                            fprintf(stderr, "%s: JIT base 0x%llx:\n",
-                                    prefix, (unsigned long long)jit_start);
-                            for (int r = 0; r < 128; r += 16) {
-                                fprintf(stderr, "%s: [%04x] ", prefix, r);
-                                for (int c = 0; c < 16; c++)
-                                    fprintf(stderr, "%02x ", jit_base[r+c]);
-                                fprintf(stderr, "\n");
-                            }
-                        }
-                        /* Dump JIT+0x8000 region (where BRK stub is) */
-                        uint8_t jit8k[128];
-                        uint64_t jit8k_addr = 0xeffff8000000ULL;
-                        if (guest_read(g, jit8k_addr, jit8k, 128) == 0) {
-                            fprintf(stderr, "%s: JIT+0x8000 (0x%llx):\n",
-                                    prefix, (unsigned long long)jit8k_addr);
-                            for (int r = 0; r < 128; r += 16) {
-                                fprintf(stderr, "%s: [%04x] ", prefix,
-                                        0x8000 + r);
-                                for (int c = 0; c < 16; c++)
-                                    fprintf(stderr, "%02x ", jit8k[r+c]);
-                                fprintf(stderr, "\n");
-                            }
-                        }
-                        /* W^X toggle stats */
-                        fprintf(stderr, "%s: W^X toggles: to_rx=%llu "
-                                "to_rw=%llu sysreg_writes=%llu\n",
-                                prefix,
-                                (unsigned long long)atomic_load(&wxcount_to_rx),
-                                (unsigned long long)atomic_load(&wxcount_to_rw),
-                                (unsigned long long)atomic_load(&sysreg_write_count));
-                        /* Dump X30 (return addr) and call site code */
-                        uint64_t x30;
-                        hv_vcpu_get_reg(vcpu, HV_REG_X30, &x30);
-                        fprintf(stderr, "%s: X30(LR)=0x%llx\n",
-                                prefix, (unsigned long long)x30);
-                        /* Dump 32 bytes before X30 (the call site) */
-                        uint8_t call_mem[48];
-                        uint64_t call_addr = (x30 - 32) & ~3ULL;
-                        if (guest_read(g, call_addr, call_mem, 48) == 0) {
-                            fprintf(stderr, "%s: call site [0x%llx]:\n",
-                                    prefix, (unsigned long long)call_addr);
-                            for (int r = 0; r < 48; r += 4) {
-                                uint32_t insn = *(uint32_t *)(call_mem + r);
-                                fprintf(stderr, "%s:   0x%llx: %08x\n",
-                                        prefix,
-                                        (unsigned long long)(call_addr + r),
-                                        insn);
-                            }
-                        }
-                        /* Dump BL target (AOT trampoline) */
-                        uint32_t bl_insn;
-                        if (guest_read(g, x30 - 4, &bl_insn, 4) == 0 &&
-                            (bl_insn >> 26) == 0x25) { /* BL opcode */
-                            int32_t imm26 = bl_insn & 0x3ffffff;
-                            if (imm26 & (1 << 25)) imm26 -= (1 << 26);
-                            uint64_t bl_target = (x30 - 4) + (int64_t)imm26 * 4;
-                            uint8_t tramp[64];
-                            if (guest_read(g, bl_target, tramp, 64) == 0) {
-                                fprintf(stderr, "%s: BL target 0x%llx:\n",
-                                        prefix, (unsigned long long)bl_target);
-                                for (int r = 0; r < 64; r += 4) {
-                                    uint32_t ti = *(uint32_t *)(tramp + r);
-                                    fprintf(stderr, "%s:   0x%llx: %08x\n",
-                                            prefix,
-                                            (unsigned long long)(bl_target + r),
-                                            ti);
-                                }
-                            }
-                        }
-
-                        /* Dump rosetta TLS state (X18 context pointer).
-                         * The SIGTRAP handler reads [X18+0x1b8] bit 0
-                         * to decide if JIT lookup should proceed, and
-                         * [X18+0x190] for thread ID. Dump the region
-                         * around these offsets to see if state is valid. */
-                        uint64_t x18;
-                        hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18);
-                        fprintf(stderr, "%s: X18(TLS)=0x%llx\n",
-                                prefix, (unsigned long long)x18);
-                        if (x18) {
-                            uint8_t tls_data[256];
-                            /* Dump [X18+0x180..X18+0x280] — covers
-                             * +0x190 (tid), +0x1b8 (flags), +0x218 (ctx) */
-                            if (guest_read(g, x18 + 0x180, tls_data, 256) == 0) {
-                                fprintf(stderr, "%s: X18+0x180 (TLS):\n", prefix);
-                                for (int r = 0; r < 256; r += 16) {
-                                    fprintf(stderr, "%s: [+0x%03x] ", prefix,
-                                            0x180 + r);
-                                    for (int c = 0; c < 16; c++)
-                                        fprintf(stderr, "%02x ", tls_data[r+c]);
-                                    /* Show as uint64s too */
-                                    uint64_t v0, v1;
-                                    memcpy(&v0, tls_data + r, 8);
-                                    memcpy(&v1, tls_data + r + 8, 8);
-                                    fprintf(stderr, " | 0x%llx 0x%llx",
-                                            (unsigned long long)v0,
-                                            (unsigned long long)v1);
-                                    fprintf(stderr, "\n");
-                                }
-                            }
-                        }
                     }
 
                     if (current_thread->ptraced) {
@@ -1380,8 +1260,13 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             if (sr < 0) running = 0;
                         }
                     } else {
-                        /* Non-ptraced: deliver SIGTRAP via signal frame */
-                        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
+                        /* Non-ptraced: deliver SIGTRAP via signal frame.
+                         * Read ESR_EL1 to include in sigcontext — rosetta's
+                         * handler reads the BRK immediate from the ESR to
+                         * determine the trap type (#3=AOT, #7=indirect, etc). */
+                        uint64_t brk_esr;
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
+                        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc, brk_esr);
                         signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
                         if (verbose) {
                             uint64_t thread_blocked = current_thread ?
@@ -1454,7 +1339,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 fsc, code_name);
                     }
 
-                    signal_set_fault_info(si_code, far_addr);
+                    signal_set_fault_info(si_code, far_addr, esr);
                     signal_queue(LINUX_SIGSEGV);
                     int sig_ret = signal_deliver(vcpu, g, &exit_code);
                     if (verbose)

@@ -51,10 +51,11 @@
           $LD -T simple.ld -o test-hello hello.o
 
           # All C test programs (static musl).
-          # Skip test-multi-vcpu.c — it's a native macOS binary (Hypervisor.framework).
+          # Skip native macOS binaries (Hypervisor.framework).
           for f in *.c; do
             name="''${f%.c}"
             [ "$name" = "test-multi-vcpu" ] && continue
+            [ "$name" = "test-rwx" ] && continue
 
             # test-pthread needs -lpthread for musl static pthread support
             extra_flags=""
@@ -121,6 +122,7 @@
           for f in *.c; do
             name="''${f%.c}"
             [ "$name" = "test-multi-vcpu" ] && continue   # native macOS (HVF API)
+            [ "$name" = "test-rwx" ] && continue           # native macOS (HVF API)
             [ "$name" = "hello-dynamic" ] && continue      # dynamic linking not tested yet
 
             extra_flags=""
@@ -221,6 +223,61 @@
 
       # Dynamically-linked coreutils (default musl, NOT pkgsStatic)
       dynamicCoreutils = crossPkgs.coreutils;
+
+      # ── x86_64 musl dynamic linking test infrastructure ─────────
+
+      # x86_64-linux-musl sysroot: dynamic linker + libc + shared libs
+      # needed by dynamically-linked x86_64 musl coreutils and Haskell
+      # binaries. Mirrors the aarch64 musl-sysroot above.
+      x64GccLibs = x64CrossPkgs.stdenv.cc.cc.lib;
+      x64-musl-sysroot = x64CrossPkgs.runCommand "x64-musl-sysroot" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
+        mkdir -p $out/lib
+        cp -a  ${x64CrossPkgs.musl}/lib/ld-musl-x86_64.so.1       $out/lib/
+        cp -a  ${x64CrossPkgs.musl}/lib/libc.so                    $out/lib/
+        # coreutils: acl, attr, gmp
+        cp -aL ${x64CrossPkgs.acl.out}/lib/libacl.so*              $out/lib/
+        cp -aL ${x64CrossPkgs.attr.out}/lib/libattr.so*            $out/lib/
+        cp -aL ${x64CrossPkgs.gmp}/lib/libgmp.so*                  $out/lib/
+        # GHC RTS: libffi, libnuma
+        cp -aL ${x64CrossPkgs.libffi}/lib/libffi.so*               $out/lib/
+        cp -aL ${x64CrossPkgs.numactl}/lib/libnuma.so*             $out/lib/
+        # GCC runtime: libatomic, libgcc_s (needed by libnuma, libffi)
+        cp -aL ${x64GccLibs}/lib/libatomic.so*                     $out/lib/
+        cp -aL ${x64GccLibs}/lib/libgcc_s.so*                      $out/lib/
+
+        # Strip nix store RPATHs so the musl dynamic linker resolves
+        # deps from /lib (the sysroot root).
+        chmod -R u+w $out/lib
+        for f in $out/lib/*.so*; do
+          [ -L "$f" ] && continue  # skip symlinks
+          patchelf --remove-rpath "$f" 2>/dev/null || true
+        done
+      '';
+
+      # Dynamically-linked x86_64 musl test binaries
+      x64MuslDynamicTestBinaries = x64CrossPkgs.stdenv.mkDerivation {
+        pname = "hl-x64-musl-dynamic-test-binaries";
+        version = "0.1.0";
+        src = ./test;
+        dontConfigure = true;
+        dontFixup = true;
+        buildPhase = ''
+          $CC -O2 -o hello-dynamic hello-dynamic.c
+          file hello-dynamic | grep -q "dynamically linked" || {
+            echo "ERROR: hello-dynamic is not dynamically linked!"
+            exit 1
+          }
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          cp hello-dynamic $out/bin/
+        '';
+      };
+
+      # Dynamically-linked x86_64 musl coreutils
+      x64MuslDynamicCoreutils = x64CrossPkgs.coreutils;
 
       # ── glibc dynamic linking test infrastructure ────────────────
 
@@ -364,6 +421,19 @@
         license = linuxPkgs.lib.licenses.asl20;
       };
 
+      # x86_64-linux-musl Haskell "Hello World" — mirrors haskellHello
+      # above but targets x86_64-linux-musl via x64CrossPkgs.
+      x64HaskellHello = x64CrossPkgs.haskellPackages.mkDerivation {
+        pname = "hello-hyper";
+        version = "0.1.0";
+        src = ./test/haskell;
+        isExecutable = true;
+        isLibrary = false;
+        enableSharedExecutables = false;
+        enableSharedLibraries = false;
+        license = linuxPkgs.lib.licenses.asl20;
+      };
+
       # ── Haskell integration test binaries (native aarch64-linux) ──
       # pandoc and shellcheck exercise the GHC runtime seriously:
       # threaded RTS, heavy allocation, Lua FFI (pandoc), regex
@@ -378,23 +448,226 @@
         let
           hlib = aarch64LinuxPkgs.haskell.lib;
           hpkgs = aarch64LinuxPkgs.haskellPackages;
-        in aarch64LinuxPkgs.runCommand "hl-haskell-bins" {} ''
-          mkdir -p $out/bin
-          ln -s ${hlib.justStaticExecutables hpkgs.pandoc}/bin/pandoc $out/bin/pandoc
-          ln -s ${hlib.justStaticExecutables hpkgs.ShellCheck}/bin/shellcheck $out/bin/shellcheck
+          # pandoc: use pandoc-cli (the executable package).  The library
+          # package (hpkgs.pandoc) has no bin/ output.  pandoc-cli is
+          # dynamically linked with glibc — needs --sysroot at runtime.
+          pandoc-cli = hpkgs.pandoc-cli;
+          pandoc-data = hpkgs.pandoc.data;
+          shellcheck = hlib.justStaticExecutables hpkgs.ShellCheck;
+        in aarch64LinuxPkgs.runCommand "hl-haskell-bins" {
+          nativeBuildInputs = [
+            aarch64LinuxPkgs.patchelf
+            aarch64LinuxPkgs.removeReferencesTo
+          ];
+        } ''
+          mkdir -p $out/bin $out/share/pandoc-data
+          # pandoc-cli: copy, patch interpreter to sysroot-relative path,
+          # and nuke GHC store references so the closure stays small.
+          cp -L ${pandoc-cli}/bin/pandoc $out/bin/pandoc
+          chmod +w $out/bin/pandoc
+          patchelf --set-interpreter /lib/ld-linux-aarch64.so.1 $out/bin/pandoc
+          patchelf --remove-rpath $out/bin/pandoc
+          remove-references-to -t ${hpkgs.ghc} $out/bin/pandoc
+          chmod -w $out/bin/pandoc
+          # pandoc data files (abbreviations, templates, etc.) — the nix
+          # pandoc package compiles in a nix store path for data-files, so
+          # binaries run on non-NixOS hosts need --data-dir at runtime.
+          datadir=$(dirname $(find ${pandoc-data}/share -name abbreviations | head -1))
+          cp -rL "$datadir"/. $out/share/pandoc-data/
+          # shellcheck: justStaticExecutables strips Haskell libs but the
+          # binary is still dynamically linked with glibc — needs --sysroot.
+          cp -L ${shellcheck}/bin/shellcheck $out/bin/shellcheck
+          chmod +w $out/bin/shellcheck
+          patchelf --set-interpreter /lib/ld-linux-aarch64.so.1 $out/bin/shellcheck
+          patchelf --remove-rpath $out/bin/shellcheck
+          remove-references-to -t ${hpkgs.ghc} $out/bin/shellcheck
+          chmod -w $out/bin/shellcheck
         '';
+
+      # Sysroot for dynamically-linked Haskell binaries (pandoc).
+      # Extends glibc-sysroot with GHC RTS deps (libffi, libnuma) and
+      # pandoc-specific deps (libz, liblua).
+      haskellSysroot =
+        let
+          p = aarch64LinuxPkgs;
+          gccLibs = p.stdenv.cc.cc.lib;
+        in p.runCommand "hl-haskell-sysroot" {
+          nativeBuildInputs = [ p.patchelf ];
+        } ''
+          mkdir -p $out/lib $out/lib64
+          # Dynamic linker
+          cp -aL ${p.glibc}/lib/ld-linux-aarch64.so.1    $out/lib/
+          # Core glibc
+          cp -aL ${p.glibc}/lib/libc.so.6                $out/lib/
+          cp -aL ${p.glibc}/lib/libm.so.6                $out/lib/
+          cp -aL ${p.glibc}/lib/libpthread.so.0          $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libdl.so.2               $out/lib/ || true
+          cp -aL ${p.glibc}/lib/librt.so.1               $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libresolv.so.2           $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libmvec.so*              $out/lib/ || true
+          # GCC runtime
+          cp -aL ${gccLibs}/lib/libgcc_s.so*             $out/lib/
+          cp -aL ${gccLibs}/lib/libatomic.so*            $out/lib/ || true
+          # GHC RTS deps
+          cp -aL ${p.gmp}/lib/libgmp.so*                 $out/lib/
+          cp -aL ${p.libffi}/lib/libffi.so*              $out/lib/
+          cp -aL ${p.numactl}/lib/libnuma.so*            $out/lib/
+          # Pandoc deps
+          cp -aL ${p.zlib}/lib/libz.so*                  $out/lib/
+          cp -aL ${p.lua5_4}/lib/liblua.so*              $out/lib/
+          # liblua transitive deps: readline, ncurses
+          cp -aL ${p.readline}/lib/libreadline.so*       $out/lib/
+          cp -aL ${p.readline}/lib/libhistory.so*        $out/lib/ || true
+          cp -aL ${p.ncurses}/lib/libncursesw.so*        $out/lib/
+          cp -aL ${p.ncurses}/lib/libtinfo.so*           $out/lib/ || true
+          # /lib64 symlink
+          ln -sf ../lib/ld-linux-aarch64.so.1 $out/lib64/ld-linux-aarch64.so.1
+          # Strip nix store RPATHs
+          chmod -R u+w $out/lib
+          for f in $out/lib/*.so*; do
+            [ -L "$f" ] && continue
+            patchelf --remove-rpath "$f" 2>/dev/null || true
+          done
+        '';
+
+      # ── CI haskell bundle (native aarch64-linux) ─────────────────
+      # Packaged haskellBins + haskellSysroot for CI artifact transfer.
+      # Built on aarch64-linux runners (ubuntu-24.04-arm) and uploaded
+      # as a CI artifact for the macOS test job to download.
+      haskellBundle = aarch64LinuxPkgs.runCommand "hl-haskell-bundle" {
+        nativeBuildInputs = [ aarch64LinuxPkgs.patchelf ];
+      } ''
+        mkdir -p $out/{haskell-bins/bin,haskell-bins/share/pandoc-data,haskell-sysroot/lib,haskell-sysroot/lib64}
+        cp -rL ${haskellBins}/bin/.       $out/haskell-bins/bin/
+        cp -rL ${haskellBins}/share/pandoc-data/. $out/haskell-bins/share/pandoc-data/
+        cp -rL ${haskellSysroot}/lib/.    $out/haskell-sysroot/lib/
+        cp -rL ${haskellSysroot}/lib64/.  $out/haskell-sysroot/lib64/ || true
+
+        # aarch64-linux-musl Haskell hello (dynamically linked, needs sysroot).
+        mkdir -p $out/haskell-hello/bin
+        cp -rL ${haskellHello}/bin/.         $out/haskell-hello/bin/
+        chmod -R u+w $out/haskell-hello/
+        for f in $out/haskell-hello/bin/*; do
+          if patchelf --print-interpreter "$f" 2>/dev/null | grep -q nix; then
+            patchelf --set-interpreter /lib/ld-musl-aarch64.so.1 "$f"
+          fi
+        done
+      '';
+
+      # ── x86_64-linux Haskell integration test binaries ─────────────
+      # Same as aarch64 haskellBins but built natively on x86_64-linux.
+      # GHC Template Haskell can't cross-compile, so these run on
+      # ubuntu-latest (x86_64) runners in CI.
+      x64HaskellBins =
+        let
+          hlib = linuxPkgs.haskell.lib;
+          hpkgs = linuxPkgs.haskellPackages;
+          pandoc-cli = hpkgs.pandoc-cli;
+          pandoc-data = hpkgs.pandoc.data;
+          shellcheck = hlib.justStaticExecutables hpkgs.ShellCheck;
+        in linuxPkgs.runCommand "hl-x64-haskell-bins" {
+          nativeBuildInputs = [
+            linuxPkgs.patchelf
+            linuxPkgs.removeReferencesTo
+          ];
+        } ''
+          mkdir -p $out/bin $out/share/pandoc-data
+          # pandoc-cli: copy, patch interpreter, nuke GHC store refs
+          cp -L ${pandoc-cli}/bin/pandoc $out/bin/pandoc
+          chmod +w $out/bin/pandoc
+          patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 $out/bin/pandoc
+          patchelf --remove-rpath $out/bin/pandoc
+          remove-references-to -t ${hpkgs.ghc} $out/bin/pandoc
+          chmod -w $out/bin/pandoc
+          # pandoc data files (same as aarch64 — see comment there)
+          datadir=$(dirname $(find ${pandoc-data}/share -name abbreviations | head -1))
+          cp -rL "$datadir"/. $out/share/pandoc-data/
+          # shellcheck: same treatment
+          cp -L ${shellcheck}/bin/shellcheck $out/bin/shellcheck
+          chmod +w $out/bin/shellcheck
+          patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 $out/bin/shellcheck
+          patchelf --remove-rpath $out/bin/shellcheck
+          remove-references-to -t ${hpkgs.ghc} $out/bin/shellcheck
+          chmod -w $out/bin/shellcheck
+        '';
+
+      # Sysroot for x86_64-linux dynamically-linked Haskell binaries.
+      # Same library set as aarch64 haskellSysroot but for x86_64 glibc.
+      x64HaskellSysroot =
+        let
+          p = linuxPkgs;
+          gccLibs = p.stdenv.cc.cc.lib;
+        in p.runCommand "hl-x64-haskell-sysroot" {
+          nativeBuildInputs = [ p.patchelf ];
+        } ''
+          mkdir -p $out/lib $out/lib64
+          # Dynamic linker
+          cp -aL ${p.glibc}/lib/ld-linux-x86-64.so.2     $out/lib64/
+          # Core glibc
+          cp -aL ${p.glibc}/lib/libc.so.6                $out/lib/
+          cp -aL ${p.glibc}/lib/libm.so.6                $out/lib/
+          cp -aL ${p.glibc}/lib/libpthread.so.0          $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libdl.so.2               $out/lib/ || true
+          cp -aL ${p.glibc}/lib/librt.so.1               $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libresolv.so.2           $out/lib/ || true
+          cp -aL ${p.glibc}/lib/libmvec.so*              $out/lib/ || true
+          # GCC runtime
+          cp -aL ${gccLibs}/lib/libgcc_s.so*             $out/lib/
+          cp -aL ${gccLibs}/lib/libatomic.so*            $out/lib/ || true
+          # GHC RTS deps
+          cp -aL ${p.gmp}/lib/libgmp.so*                 $out/lib/
+          cp -aL ${p.libffi}/lib/libffi.so*              $out/lib/
+          cp -aL ${p.numactl}/lib/libnuma.so*            $out/lib/
+          # Pandoc deps
+          cp -aL ${p.zlib}/lib/libz.so*                  $out/lib/
+          cp -aL ${p.lua5_4}/lib/liblua.so*              $out/lib/
+          # liblua transitive deps: readline, ncurses
+          cp -aL ${p.readline}/lib/libreadline.so*       $out/lib/
+          cp -aL ${p.readline}/lib/libhistory.so*        $out/lib/ || true
+          cp -aL ${p.ncurses}/lib/libncursesw.so*        $out/lib/
+          cp -aL ${p.ncurses}/lib/libtinfo.so*           $out/lib/ || true
+          # Strip nix store RPATHs
+          chmod -R u+w $out/lib $out/lib64
+          for f in $out/lib/*.so* $out/lib64/*.so*; do
+            [ -L "$f" ] && continue
+            patchelf --remove-rpath "$f" 2>/dev/null || true
+          done
+        '';
+
+      # ── CI x86_64 haskell bundle ─────────────────────────────────
+      x64HaskellBundle = linuxPkgs.runCommand "hl-x64-haskell-bundle" {
+        nativeBuildInputs = [ linuxPkgs.patchelf ];
+      } ''
+        mkdir -p $out/{haskell-bins/bin,haskell-bins/share/pandoc-data,haskell-sysroot/lib,haskell-sysroot/lib64}
+        cp -rL ${x64HaskellBins}/bin/.          $out/haskell-bins/bin/
+        cp -rL ${x64HaskellBins}/share/pandoc-data/. $out/haskell-bins/share/pandoc-data/
+        cp -rL ${x64HaskellSysroot}/lib/.       $out/haskell-sysroot/lib/
+        cp -rL ${x64HaskellSysroot}/lib64/.     $out/haskell-sysroot/lib64/ || true
+
+        # x86_64-linux-musl Haskell hello (dynamically linked, needs sysroot).
+        # Built here (native x86_64-linux) to avoid pulling GHC into the
+        # cross-compiled guest-bundle, which exhausts disk on CI runners.
+        mkdir -p $out/haskell-hello/bin
+        cp -rL ${x64HaskellHello}/bin/.         $out/haskell-hello/bin/
+        chmod -R u+w $out/haskell-hello/
+        for f in $out/haskell-hello/bin/*; do
+          if patchelf --print-interpreter "$f" 2>/dev/null | grep -q nix; then
+            patchelf --set-interpreter /lib/ld-musl-x86_64.so.1 "$f"
+          fi
+        done
+      '';
 
       # ── CI guest bundle ──────────────────────────────────────────
       # Self-contained archive of all cross-compiled guest binaries.
       # Deep-copies (dereferences symlinks) so the output has no nix
       # store references — safe to tar up and transfer as a CI artifact.
-      # Excludes haskellBins (native aarch64-linux, can't build on
-      # the x86_64-linux CI runner).
+      # Excludes haskellBins (native aarch64-linux, built separately
+      # by the haskell-bins CI job on aarch64-linux runners).
       guestBundle = crossPkgs.runCommand "hl-guest-bundle" {
         nativeBuildInputs = [ linuxPkgs.patchelf ];
       } ''
         mkdir -p $out/{test-binaries,coreutils,busybox,static-bins}/bin
-        mkdir -p $out/{sysroot/lib,dynamic-tests,dynamic-coreutils,haskell-hello}/bin
+        mkdir -p $out/{sysroot/lib,dynamic-tests,dynamic-coreutils}/bin
         cp -rL ${testBinaries}/bin/.         $out/test-binaries/bin/
         cp -rL ${guestBins.coreutils}/bin/.  $out/coreutils/bin/
         cp -rL ${guestBins.busybox}/bin/.    $out/busybox/bin/
@@ -402,18 +675,6 @@
         cp -rL ${musl-sysroot}/lib/.         $out/sysroot/lib/
         cp -rL ${dynamicTestBinaries}/bin/.  $out/dynamic-tests/bin/
         cp -rL ${dynamicCoreutils}/bin/.     $out/dynamic-coreutils/bin/
-        cp -rL ${haskellHello}/bin/.         $out/haskell-hello/bin/
-
-        # Patch haskell-hello interpreter to use sysroot-relative path.
-        # GHC cross-musl produces dynamically-linked binaries with nix
-        # store interpreter paths; rewrite to /lib/ld-musl-aarch64.so.1
-        # so hl --sysroot can find the dynamic linker.
-        chmod -R u+w $out/haskell-hello/
-        for f in $out/haskell-hello/bin/*; do
-          if patchelf --print-interpreter "$f" 2>/dev/null | grep -q nix; then
-            patchelf --set-interpreter /lib/ld-musl-aarch64.so.1 "$f"
-          fi
-        done
 
         # x86_64-linux test binaries (for rosetta testing via test-x64-*)
         mkdir -p $out/{x64-test-binaries,x64-coreutils,x64-busybox,x64-static-bins}/bin
@@ -421,6 +682,12 @@
         cp -rL ${x64GuestBins.coreutils}/bin/.   $out/x64-coreutils/bin/
         cp -rL ${x64GuestBins.busybox}/bin/.     $out/x64-busybox/bin/
         cp -rL ${x64StaticBins}/bin/.            $out/x64-static-bins/bin/
+
+        # x86_64-linux-musl dynamic linking test artifacts
+        mkdir -p $out/{x64-musl-sysroot/lib,x64-musl-dynamic-tests,x64-musl-dynamic-coreutils}/bin
+        cp -rL ${x64-musl-sysroot}/lib/.               $out/x64-musl-sysroot/lib/
+        cp -rL ${x64MuslDynamicTestBinaries}/bin/.      $out/x64-musl-dynamic-tests/bin/
+        cp -rL ${x64MuslDynamicCoreutils}/bin/.         $out/x64-musl-dynamic-coreutils/bin/
 
         # aarch64-linux-gnu (glibc) test artifacts
         mkdir -p $out/{glibc-sysroot/lib,glibc-sysroot/lib64,glibc-dynamic-tests,glibc-dynamic-coreutils}/bin
@@ -442,13 +709,23 @@
       packages.${linuxSystem} = {
         test-binaries = testBinaries;
         guest-bundle = guestBundle;
+        haskell-x64-bundle = x64HaskellBundle;
       };
 
-      # Hydra jobset — ensures ci.zw3rk.com builds guest-bundle and
-      # pushes it to cache.zw3rk.com so GHA self-hosted runners can
-      # fetch pre-built binaries without needing a Linux builder.
+      # aarch64-linux packages (built on aarch64-linux runners)
+      packages.aarch64-linux = {
+        haskell-bundle = haskellBundle;
+      };
+
+      # Hydra jobset — ci.zw3rk.com builds these and pushes to
+      # cache.zw3rk.com so GHA self-hosted runners can fetch
+      # pre-built binaries without needing a Linux builder.
       hydraJobs.${linuxSystem} = {
         guest-bundle = guestBundle;
+        haskell-x64-bundle = x64HaskellBundle;
+      };
+      hydraJobs.aarch64-linux = {
+        haskell-bundle = haskellBundle;
       };
       hydraJobs.${darwinSystem} = {
         hl = self.packages.${darwinSystem}.default;
@@ -489,6 +766,14 @@
           GUEST_X64_BUSYBOX   = "${x64GuestBins.busybox}";
           GUEST_X64_STATIC_BINS = "${x64StaticBins}";
 
+          # x86_64 musl dynamic linking tests
+          GUEST_X64_MUSL_SYSROOT            = "${x64-musl-sysroot}";
+          GUEST_X64_MUSL_DYNAMIC_TESTS      = "${x64MuslDynamicTestBinaries}";
+          GUEST_X64_MUSL_DYNAMIC_COREUTILS  = "${x64MuslDynamicCoreutils}";
+
+          # x86_64 Haskell hello (musl, dynamically linked)
+          GUEST_X64_HASKELL_HELLO = "${x64HaskellHello}";
+
           # glibc dynamic linking tests (aarch64)
           GUEST_GLIBC_SYSROOT            = "${glibc-sysroot}";
           GUEST_GLIBC_DYNAMIC_TESTS      = "${glibcDynamicTestBinaries}";
@@ -504,6 +789,12 @@
 
           # Haskell integration test binaries (pandoc, shellcheck)
           GUEST_HASKELL_BINS = "${haskellBins}";
+          # Sysroot for dynamically-linked Haskell binaries (pandoc)
+          GUEST_HASKELL_SYSROOT = "${haskellSysroot}";
+
+          # x86_64 Haskell integration test binaries
+          GUEST_X64_HASKELL_BINS = "${x64HaskellBins}";
+          GUEST_X64_HASKELL_SYSROOT = "${x64HaskellSysroot}";
 
           shellHook = ''
             echo "hl development environment"
@@ -528,6 +819,14 @@
             echo "  dynamic tests: $GUEST_DYNAMIC_TESTS/bin/"
             echo "  dynamic coreutils: $GUEST_DYNAMIC_COREUTILS/bin/"
             echo ""
+            echo "x86_64 dynamic linking tests (musl):"
+            echo "  sysroot:       $GUEST_X64_MUSL_SYSROOT/lib/"
+            echo "  dynamic tests: $GUEST_X64_MUSL_DYNAMIC_TESTS/bin/"
+            echo "  dynamic coreutils: $GUEST_X64_MUSL_DYNAMIC_COREUTILS/bin/"
+            echo ""
+            echo "x86_64 Haskell test binary:"
+            echo "  hello-hyper:   $GUEST_X64_HASKELL_HELLO/bin/hello-hyper"
+            echo ""
             echo "Dynamic linking tests (glibc aarch64):"
             echo "  sysroot:       $GUEST_GLIBC_SYSROOT/lib/"
             echo "  dynamic tests: $GUEST_GLIBC_DYNAMIC_TESTS/bin/"
@@ -542,8 +841,14 @@
             echo "  hello-hyper:   $GUEST_HASKELL_HELLO/bin/hello-hyper"
             echo ""
             echo "Haskell integration binaries (native aarch64-linux):"
-            echo "  pandoc:        $GUEST_HASKELL_BINS/bin/pandoc"
-            echo "  shellcheck:    $GUEST_HASKELL_BINS/bin/shellcheck"
+            echo "  pandoc:        $GUEST_HASKELL_BINS/bin/pandoc (needs --sysroot)"
+            echo "  shellcheck:    $GUEST_HASKELL_BINS/bin/shellcheck (needs --sysroot)"
+            echo "  haskell sysroot: $GUEST_HASKELL_SYSROOT/lib/"
+            echo ""
+            echo "Haskell integration binaries (native x86_64-linux):"
+            echo "  pandoc:        $GUEST_X64_HASKELL_BINS/bin/pandoc (needs --sysroot)"
+            echo "  shellcheck:    $GUEST_X64_HASKELL_BINS/bin/shellcheck (needs --sysroot)"
+            echo "  haskell sysroot: $GUEST_X64_HASKELL_SYSROOT/lib/"
           '';
         };
 

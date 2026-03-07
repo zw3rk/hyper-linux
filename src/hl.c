@@ -95,6 +95,7 @@ int main(int argc, const char **argv) {
         if (strcmp(argv[arg_start], "--verbose") == 0 ||
             strcmp(argv[arg_start], "-v") == 0) {
             verbose = 1;
+            hl_verbose = 1;  /* Global flag for detached threads */
             arg_start++;
         } else if ((strcmp(argv[arg_start], "--timeout") == 0 ||
                     strcmp(argv[arg_start], "-t") == 0) &&
@@ -167,6 +168,13 @@ int main(int argc, const char **argv) {
         return 1;
     }
     g.is_rosetta = need_rosetta;
+    g.verbose = verbose;
+
+    if (verbose) {
+        fprintf(stderr, "hl: IPA size: %u bits (%lluGB primary)\n",
+                g.ipa_bits,
+                (unsigned long long)(g.guest_size / (1024ULL * 1024 * 1024)));
+    }
 
     /* ---- Step 3: Load ELF segments into guest memory ---- */
     /* PIE executables (ET_DYN) have virtual addresses starting near 0,

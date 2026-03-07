@@ -254,10 +254,30 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
+    /* Sysroot redirect: try sysroot+path first for absolute paths,
+     * then sysroot/lib/basename as fallback (mirrors sys_openat). */
+    const char *stat_path = path;
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *sr = proc_get_sysroot();
+    if (sr && path[0] == '/') {
+        snprintf(sysroot_buf, sizeof(sysroot_buf), "%s%s", sr, path);
+        if (access(sysroot_buf, F_OK) == 0) {
+            stat_path = sysroot_buf;
+        } else {
+            const char *base = strrchr(path, '/');
+            if (base) {
+                snprintf(sysroot_buf, sizeof(sysroot_buf),
+                         "%s/lib/%s", sr, base + 1);
+                if (access(sysroot_buf, F_OK) == 0)
+                    stat_path = sysroot_buf;
+            }
+        }
+    }
+
     /* Translate Linux AT_* flags to macOS equivalents */
     int mac_flags = translate_at_flags(flags);
     struct stat mac_st;
-    if (fstatat(host_dirfd, path, &mac_st, mac_flags) < 0)
+    if (fstatat(host_dirfd, stat_path, &mac_st, mac_flags) < 0)
         return linux_errno();
 
     linux_stat_t lin_st;
@@ -843,7 +863,27 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
-    if (faccessat(host_dirfd, path, mode, 0) < 0)
+    /* Sysroot redirect: try sysroot+path first for absolute paths,
+     * then sysroot/lib/basename as fallback (mirrors sys_openat). */
+    const char *check_path = path;
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *sr = proc_get_sysroot();
+    if (sr && path[0] == '/') {
+        snprintf(sysroot_buf, sizeof(sysroot_buf), "%s%s", sr, path);
+        if (access(sysroot_buf, F_OK) == 0) {
+            check_path = sysroot_buf;
+        } else {
+            const char *base = strrchr(path, '/');
+            if (base) {
+                snprintf(sysroot_buf, sizeof(sysroot_buf),
+                         "%s/lib/%s", sr, base + 1);
+                if (access(sysroot_buf, F_OK) == 0)
+                    check_path = sysroot_buf;
+            }
+        }
+    }
+
+    if (faccessat(host_dirfd, check_path, mode, 0) < 0)
         return linux_errno();
 
     return 0;

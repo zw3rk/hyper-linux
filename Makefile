@@ -15,7 +15,9 @@
        test-perf test-multi-vcpu test-rwx test-haskell test-haskell-bins \
        test-x64-hello test-x64-all test-x64-coreutils test-x64-busybox \
        test-x64-static-bins \
+       test-x64-musl-dynamic test-x64-musl-coreutils \
        test-x64-glibc-dynamic test-x64-glibc-coreutils \
+       test-x64-haskell test-x64-haskell-bins \
        test-full \
        site site-serve help
 
@@ -226,8 +228,16 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signal-thread; \
 	printf "\n$(BLUE)── Fork edge cases ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fork-exec $(TEST_DIR)/echo-test; \
+	printf "\n$(BLUE)── COW fork isolation tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── O_CLOEXEC tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cloexec; \
+	printf "\n$(BLUE)── Guard page / mmap edge cases ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-guard-page; \
+	printf "\n$(BLUE)── Scatter-gather I/O tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-readv-writev; \
+	printf "\n$(BLUE)── inotify emulation tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-inotify; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
@@ -350,6 +360,7 @@ test-haskell: $(BUILD_DIR)/hl
 # ── Haskell binary integration tests ────────────────────────────────
 
 HASKELL_BINS_DIR ?= $(GUEST_HASKELL_BINS)/bin
+HASKELL_SYSROOT_DIR ?= $(GUEST_HASKELL_SYSROOT)
 
 ## Run Haskell binary integration tests (pandoc, shellcheck)
 test-haskell-bins: $(BUILD_DIR)/hl
@@ -357,7 +368,7 @@ test-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR)
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR) $(HASKELL_SYSROOT_DIR)
 
 # ── x86_64-linux via Rosetta tests ─────────────────────────────────
 
@@ -386,7 +397,7 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test() { \
 		name=$$(basename "$$2"); \
 		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
-		if output=$$($$@ 2>&1); then \
+		if output=$$(timeout 60 $$@ 2>&1); then \
 			printf "$(GREEN)✓ PASS$(RESET)\n"; \
 			pass=$$((pass + 1)); \
 		else \
@@ -394,6 +405,9 @@ test-x64-all: $(BUILD_DIR)/hl
 			if [ "$$expected_rc" != "" ] && [ "$$rc" = "$$expected_rc" ]; then \
 				printf "$(GREEN)✓ PASS$(RESET) (exit $$rc)\n"; \
 				pass=$$((pass + 1)); \
+			elif [ "$$rc" = "124" ]; then \
+				printf "$(RED)✗ FAIL$(RESET) (timeout after 60s)\n"; \
+				fail=$$((fail + 1)); \
 			else \
 				printf "$(RED)✗ FAIL$(RESET) (exit $$rc)\n"; \
 				printf "  %s\n" "$$output" | head -5; \
@@ -407,7 +421,7 @@ test-x64-all: $(BUILD_DIR)/hl
 		xfail=$$((xfail + 1)); \
 	}; \
 	printf "$(BLUE)── Assembly tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-hello "rosetta rejects asm ELF: first load segment not at file offset 0"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-hello; \
 	printf "\n$(BLUE)── C tests (x86_64 musl static, via rosetta) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-musl; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-write; \
@@ -420,7 +434,7 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cat test/hello.S; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-ls test/; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-roundtrip; \
-	run_xfail test-comprehensive "rosetta reports aarch64, test expects x86_64 (also fails in Lima)"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-comprehensive; \
 	printf "\n$(BLUE)── Process tests (x86_64) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-exec $(X64_TEST_DIR)/echo-test exec-works; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fork; \
@@ -454,6 +468,14 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_xfail test-signal-thread "rosetta: SA_RESETHAND not reset (also fails in Lima, 4/5 subtests pass)"; \
 	printf "\n$(BLUE)── O_CLOEXEC tests (x86_64) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cloexec; \
+	printf "\n$(BLUE)── Guard page / mmap edge cases (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-guard-page; \
+	printf "\n$(BLUE)── Scatter-gather I/O tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-readv-writev; \
+	printf "\n$(BLUE)── inotify emulation tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-inotify; \
+	printf "\n$(BLUE)── COW fork isolation tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
@@ -483,6 +505,45 @@ test-x64-static-bins: $(BUILD_DIR)/hl
 	fi
 	@bash test/test-static-bins.sh $(BUILD_DIR)/hl $(X64_STATIC_BINS_DIR)
 
+# ── x86_64 musl dynamic linking tests (Rosetta) ──────────────────
+
+X64_MUSL_SYSROOT_DIR ?= $(GUEST_X64_MUSL_SYSROOT)
+X64_MUSL_DYNAMIC_COREUTILS_BIN ?= $(GUEST_X64_MUSL_DYNAMIC_COREUTILS)/bin
+
+## Run x86_64 musl dynamic linking smoke test (via rosetta --sysroot)
+test-x64-musl-dynamic: $(BUILD_DIR)/hl
+	@if [ -z "$(X64_MUSL_SYSROOT_DIR)" ] || [ ! -d "$(X64_MUSL_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 musl sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) x86_64 musl hello-dynamic (via rosetta --sysroot)\n"
+	$(BUILD_DIR)/hl --sysroot $(X64_MUSL_SYSROOT_DIR) $(GUEST_X64_MUSL_DYNAMIC_TESTS)/bin/hello-dynamic
+
+## Run x86_64 musl dynamically-linked coreutils tests (via rosetta --sysroot)
+test-x64-musl-coreutils: $(BUILD_DIR)/hl
+	@if [ -z "$(X64_MUSL_SYSROOT_DIR)" ] || [ ! -d "$(X64_MUSL_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 musl sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@if [ ! -d "$(X64_MUSL_DYNAMIC_COREUTILS_BIN)" ]; then \
+		printf "$(RED)✗ x86_64 musl dynamic coreutils not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-dynamic-coreutils.sh $(BUILD_DIR)/hl $(X64_MUSL_SYSROOT_DIR) $(X64_MUSL_DYNAMIC_COREUTILS_BIN)
+
+# ── x86_64 Haskell hello test ─────────────────────────────────────
+
+X64_HASKELL_HELLO ?= $(GUEST_X64_HASKELL_HELLO)/bin/hello-hyper
+
+## Run x86_64 Haskell hello world via rosetta (GHC-produced x86_64-linux-musl ELF)
+test-x64-haskell: $(BUILD_DIR)/hl
+	@if [ ! -x "$(X64_HASKELL_HELLO)" ]; then \
+		printf "$(RED)✗ x86_64 Haskell hello not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) x86_64 Haskell hello-hyper (via rosetta)\n"
+	$(BUILD_DIR)/hl --sysroot $(X64_MUSL_SYSROOT_DIR) $(X64_HASKELL_HELLO)
+
 # ── x86_64 glibc dynamic linking tests (Rosetta) ─────────────────
 
 X64_GLIBC_SYSROOT_DIR ?= $(GUEST_X64_GLIBC_SYSROOT)
@@ -509,6 +570,19 @@ test-x64-glibc-coreutils: $(BUILD_DIR)/hl
 	fi
 	@bash test/test-x64-glibc-coreutils.sh $(BUILD_DIR)/hl $(X64_GLIBC_SYSROOT_DIR) $(X64_GLIBC_DYNAMIC_COREUTILS_BIN)
 
+# ── x86_64 Haskell binary integration tests ────────────────────────
+
+X64_HASKELL_BINS_DIR ?= $(GUEST_X64_HASKELL_BINS)/bin
+X64_HASKELL_SYSROOT_DIR ?= $(GUEST_X64_HASKELL_SYSROOT)
+
+## Run x86_64 Haskell binary integration tests (pandoc, shellcheck via rosetta)
+test-x64-haskell-bins: $(BUILD_DIR)/hl
+	@if [ ! -d "$(X64_HASKELL_BINS_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR) $(X64_HASKELL_SYSROOT_DIR) "+RTS -xr4G -RTS"
+
 # ── Full test suite ──────────────────────────────────────────────────
 
 ## Run the complete test suite (aarch64 + x86_64 + coreutils + busybox + static + dynamic + haskell)
@@ -517,33 +591,41 @@ test-full: $(BUILD_DIR)/hl
 	@printf "$(CYAN)║              hl full test suite                      ║$(RESET)\n"
 	@printf "$(CYAN)╚══════════════════════════════════════════════════════╝$(RESET)\n"
 	@fail=0; \
-	printf "\n$(BLUE)━━━ [1/12] aarch64 unit tests ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [1/16] aarch64 unit tests ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-all || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [2/12] aarch64 coreutils (static musl) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [2/16] aarch64 coreutils (static musl) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [3/12] aarch64 busybox ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [3/16] aarch64 busybox ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-busybox || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [4/12] aarch64 static bins (bash, jq, sqlite, lua, ...) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [4/16] aarch64 static bins (bash, jq, sqlite, lua, ...) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-static-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [5/12] aarch64 dynamic coreutils (musl --sysroot) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [5/16] aarch64 dynamic coreutils (musl --sysroot) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-dynamic-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [6/12] aarch64 dynamic coreutils (glibc --sysroot) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [6/16] aarch64 dynamic coreutils (glibc --sysroot) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-glibc-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [7/12] aarch64 haskell bins (pandoc, shellcheck) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [7/16] aarch64 haskell bins (pandoc, shellcheck) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-haskell-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [8/12] x86_64 unit tests (via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [8/16] x86_64 unit tests (via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-all || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [9/12] x86_64 coreutils (static musl, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [9/16] x86_64 coreutils (static musl, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [10/12] x86_64 busybox (via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [10/16] x86_64 busybox (via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-busybox || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [11/12] x86_64 static bins (bash, jq, sqlite, lua, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [11/16] x86_64 static bins (bash, jq, sqlite, lua, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-static-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [12/12] x86_64 dynamic coreutils (glibc, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [12/16] x86_64 dynamic coreutils (musl, via rosetta) ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-x64-musl-coreutils || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [13/16] x86_64 dynamic coreutils (glibc, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-glibc-coreutils || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [14/16] x86_64 haskell hello (via rosetta) ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-x64-haskell || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [15/16] aarch64 haskell hello ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-haskell || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [16/16] x86_64 haskell bins (pandoc, shellcheck, via rosetta) ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-x64-haskell-bins || fail=$$((fail + 1)); \
 	printf "\n$(CYAN)╔══════════════════════════════════════════════════════╗$(RESET)\n"; \
 	if [ "$$fail" -eq 0 ]; then \
-		printf "$(CYAN)║  $(GREEN)✓ All 12 suites passed$(CYAN)                              ║$(RESET)\n"; \
+		printf "$(CYAN)║  $(GREEN)✓ All 16 suites passed$(CYAN)                              ║$(RESET)\n"; \
 	else \
 		printf "$(CYAN)║  $(RED)✗ $$fail suite(s) had failures$(CYAN)                        ║$(RESET)\n"; \
 	fi; \

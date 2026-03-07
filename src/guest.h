@@ -205,6 +205,7 @@ typedef struct {
      * See GUEST_MAX_PREANNOUNCED comment above. */
     guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
     int            npreannounced;
+    int            verbose;       /* Non-zero: print debug diagnostics to stderr */
 } guest_t;
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */

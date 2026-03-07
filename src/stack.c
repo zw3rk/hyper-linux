@@ -215,12 +215,11 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
      * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) + argc(1).
      *
      * Base auxv: 15 entries = 30 words, AT_NULL = 2 words.
-     * Optional: AT_BASE (if interp_base != 0) = +2, AT_EXECFN = +2,
+     * Optional: AT_EXECFN = +2,
      *           AT_SYSINFO_EHDR (if vdso_base != 0) = +2.
      * Total = 35 + optional + 1 + envc + 1 + argc + 1
      * For 16-byte alignment: total must be even. */
-    int extra = 2;  /* AT_EXECFN always present */
-    if (interp_base != 0) extra += 2;  /* AT_BASE */
+    int extra = 2 + 2;  /* AT_EXECFN + AT_BASE always present */
     if (vdso_base != 0) extra += 2;    /* AT_SYSINFO_EHDR */
     if (execfd >= 0) extra += 2;       /* AT_EXECFD (binfmt_misc binary fd) */
     int total_entries = 35 + extra + argc + envc;
@@ -257,10 +256,12 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
         push_u64(g, &sp, vdso_base); push_u64(g, &sp, AT_SYSINFO_EHDR);
     }
 
-    /* AT_BASE: interpreter load base (only present for dynamic linking) */
-    if (interp_base != 0) {
-        push_u64(g, &sp, interp_base); push_u64(g, &sp, AT_BASE);
-    }
+    /* AT_BASE: interpreter load base. Always emitted (matching Linux kernel
+     * behavior) — value is 0 when no interpreter is loaded. Rosetta reads
+     * this entry from its host auxv as a template; omitting it causes
+     * Rosetta to skip AT_BASE in the x86_64 auxv it constructs, breaking
+     * musl's _dlstart_c bootstrap (SIGFPE from NULL hashtab). */
+    push_u64(g, &sp, interp_base); push_u64(g, &sp, AT_BASE);
 
     /* AT_EXECFD: pre-opened binary fd for binfmt_misc interpreters.
      * The kernel opens the binary and passes the fd via auxv so the

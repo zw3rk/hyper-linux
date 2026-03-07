@@ -199,10 +199,12 @@ void signal_reset_for_exec(void);
 void signal_queue(int signum);
 
 /* Set fault info for the next signal delivery. When set, signal_deliver()
- * populates si_code, si_addr, and fault_address from these values instead
- * of using the default SI_USER/si_pid fields. Consumed (cleared) after
- * one delivery. Used for synchronous faults: BRK→SIGTRAP, etc. */
-void signal_set_fault_info(int si_code, uint64_t addr);
+ * populates si_code, si_addr, fault_address, and ESR context from these
+ * values instead of using the default SI_USER/si_pid fields. Consumed
+ * (cleared) after one delivery. Used for synchronous faults: BRK→SIGTRAP,
+ * SIGSEGV, etc. The esr parameter is the raw ESR_EL1 value; if non-zero,
+ * an esr_context block is appended to __reserved after FPSIMD. */
+void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr);
 
 /* Consume (clear) a pending signal. Used by signalfd reads. */
 void signal_consume(int signum);

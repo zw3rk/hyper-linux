@@ -175,8 +175,9 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
      * the broken AOT code path. */
     if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
         real_type = SOCK_DGRAM;
-        fprintf(stderr, "hl: rosettad: SEQPACKET→DGRAM (no rosettad handler, "
-                "connect will fail like real VZ)\n");
+        if (g->verbose)
+            fprintf(stderr, "hl: rosettad: SEQPACKET→DGRAM (no rosettad handler, "
+                    "connect will fail like real VZ)\n");
     }
 
     int fd = socket(mac_domain, real_type, protocol);
@@ -875,7 +876,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
                         fds[i] = gfd;
                         /* Log SCM_RIGHTS fd reception for rosettad debugging */
                         extern int rosettad_is_socket(int host_fd);
-                        if (rosettad_is_socket(fd_to_host(fd))) {
+                        if (g->verbose && rosettad_is_socket(fd_to_host(fd))) {
                             fprintf(stderr, "hl: rosettad: recvmsg SCM_RIGHTS "
                                     "host_fd=%d → guest_fd=%d\n",
                                     host_recv_fd, gfd);
