@@ -36,10 +36,12 @@
 #define ELF_DEFAULT_BASE     0x00400000ULL   /* Typical ELF load base */
 #define PIE_LOAD_BASE        0x00400000ULL   /* PIE (ET_DYN) executable base (4MB) */
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
-#define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
-#define STACK_BASE           0x07800000ULL   /* Bottom of 8MB stack region (4×2MB blocks).
+#define STACK_SIZE           0x00800000ULL   /* 8MB stack (4×2MB blocks).
                                               * macOS demand-pages HVF backing memory, so
                                               * unused stack pages consume no host RAM. */
+#define STACK_TOP_DEFAULT    0x08000000ULL   /* Default stack top (128MB) — used when
+                                              * brk_start is below this.  Otherwise stack
+                                              * is placed dynamically above brk. */
 #define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
                                               * Below 8GB — only code goes here, not
@@ -173,6 +175,8 @@ typedef struct {
     uint64_t    pt_pool_next; /* Next free page table page in pool */
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
+    uint64_t    stack_base;   /* Bottom of stack region (dynamic, above brk) */
+    uint64_t    stack_top;    /* Top of stack (stack grows down from here) */
     uint64_t    mmap_next;    /* RW mmap high-water mark (for fork IPC state transfer) */
     uint64_t    mmap_end;     /* Current page-table-covered RW mmap limit */
     uint64_t    mmap_rx_next; /* RX mmap high-water mark (for fork IPC state transfer) */

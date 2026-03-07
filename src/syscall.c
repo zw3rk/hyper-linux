@@ -89,6 +89,7 @@ void syscall_init(void) {
     signalfd_init();
     timerfd_init();
     inotify_init();
+    wakeup_pipe_init();
 
     /* Mark all FDs as free in bitmap */
     memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
@@ -470,7 +471,7 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
 
     int alloc_count = 0, skip_count = 0;
     int total_blocks = (int)((va_block_end - va_block_start) / BLOCK_2MB);
-    if (total_blocks > 2)
+    if (total_blocks > 2 && hl_verbose)
         fprintf(stderr, "hl: mmap_high_va: mapping %d 2MB blocks "
                 "[0x%llx,0x%llx)\n", total_blocks,
                 (unsigned long long)va_block_start,
@@ -495,12 +496,13 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
             uint64_t update_end = (va + length < bva + BLOCK_2MB)
                                   ? va + length : bva + BLOCK_2MB;
             if (update_start < update_end && page_perms != 0) {
-                fprintf(stderr, "hl: mmap_high_va: upgrading block "
-                        "0x%llx perms for [0x%llx,0x%llx) perms=%d\n",
-                        (unsigned long long)bva,
-                        (unsigned long long)update_start,
-                        (unsigned long long)update_end,
-                        page_perms);
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap_high_va: upgrading block "
+                            "0x%llx perms for [0x%llx,0x%llx) perms=%d\n",
+                            (unsigned long long)bva,
+                            (unsigned long long)update_start,
+                            (unsigned long long)update_end,
+                            page_perms);
                 guest_split_block(g, bva);
                 guest_update_perms(g, update_start, update_end, page_perms);
                 g->need_tlbi = 1;
@@ -581,7 +583,7 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
         if (gpa + BLOCK_2MB > g->mmap_next)
             g->mmap_next = gpa + BLOCK_2MB;
     }
-    if (total_blocks > 2)
+    if (total_blocks > 2 && hl_verbose)
         fprintf(stderr, "hl: mmap_high_va: allocated=%d skipped=%d "
                 "total=%d\n", alloc_count, skip_count, total_blocks);
 
@@ -809,12 +811,14 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
              * permission. */
             result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
             if (result_off == UINT64_MAX) {
-                fprintf(stderr, "hl: mmap: RX address space exhausted "
-                        "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)\n",
-                        (unsigned long long)length,
-                        (unsigned long long)g->mmap_limit,
-                        g->ipa_bits,
-                        (unsigned long long)(g->guest_size >> 30));
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap: RX address space exhausted "
+                            "(len=0x%llx, limit=0x%llx, %u-bit IPA "
+                            "/ %lluGB)\n",
+                            (unsigned long long)length,
+                            (unsigned long long)g->mmap_limit,
+                            g->ipa_bits,
+                            (unsigned long long)(g->guest_size >> 30));
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
@@ -836,12 +840,14 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             if (result_off == UINT64_MAX)
                 result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
             if (result_off == UINT64_MAX) {
-                fprintf(stderr, "hl: mmap: RW address space exhausted "
-                        "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)\n",
-                        (unsigned long long)length,
-                        (unsigned long long)g->mmap_limit,
-                        g->ipa_bits,
-                        (unsigned long long)(g->guest_size >> 30));
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap: RW address space exhausted "
+                            "(len=0x%llx, limit=0x%llx, %u-bit IPA "
+                            "/ %lluGB)\n",
+                            (unsigned long long)length,
+                            (unsigned long long)g->mmap_limit,
+                            g->ipa_bits,
+                            (unsigned long long)(g->guest_size >> 30));
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
@@ -1002,6 +1008,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          * worker vCPUs so they break out of hv_vcpu_run. */
         exit_group_code = (int)x0;
         exit_group_requested = 1;
+
+        /* Wake threads blocked in host poll/select/kevent so they can
+         * see exit_group_requested and exit. hv_vcpus_exit only cancels
+         * hv_vcpu_run — threads in host blocking syscalls need this. */
+        wakeup_pipe_signal();
 
         /* Force-cancel all worker vCPUs. The main thread's vCPU is
          * handled by the normal should_exit path below. */
@@ -1683,13 +1694,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          * LOCK_NB=4 — so no flag translation is needed. */
         int host_fd = fd_to_host((int)x0);
         if (host_fd < 0) { result = -LINUX_EBADF; break; }
-        /* DEBUG: trace flock calls (temporary) */
-        fprintf(stderr, "hl: flock(guest_fd=%llu, host_fd=%d, op=%llu [%s%s%s%s])\n",
-                (unsigned long long)x0, host_fd, (unsigned long long)x1,
-                (x1 & 1) ? "LOCK_SH" : "", (x1 & 2) ? "LOCK_EX" : "",
-                (x1 & 4) ? "|NB" : "", (x1 & 8) ? "LOCK_UN" : "");
         result = flock(host_fd, (int)x1) < 0 ? linux_errno() : 0;
-        fprintf(stderr, "hl: flock → %lld\n", (long long)result);
         break;
     }
     case SYS_setuid:
@@ -1766,7 +1771,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             }
             /* Write the resolved path into guest memory temporarily.
              * Use the top of the stack scratch area (above stack_top). */
-            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            uint64_t tmp_gva = g->stack_top + 0x1000;
             size_t pathlen = strlen(fd_path) + 1;
             if (guest_write(g, tmp_gva, fd_path, pathlen) < 0) {
                 result = -LINUX_EFAULT;
@@ -1794,7 +1799,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 break;
             }
             close(tmp_fd);
-            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            uint64_t tmp_gva = g->stack_top + 0x1000;
             size_t pathlen = strlen(resolved) + 1;
             if (guest_write(g, tmp_gva, resolved, pathlen) < 0) {
                 result = -LINUX_EFAULT;

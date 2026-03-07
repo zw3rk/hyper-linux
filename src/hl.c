@@ -203,6 +203,18 @@ int main(int argc, const char **argv) {
     g.brk_base = brk_start;
     g.brk_current = brk_start;
 
+    /* Place stack above brk, 2MB-aligned.  For small binaries the stack
+     * stays at the default 128MB position.  For large binaries (e.g.,
+     * 200MB pandoc) the stack moves up so it doesn't overlap the binary's
+     * address space — rosetta uses MAP_FIXED_NOREPLACE to reserve the
+     * binary range and will fail with EEXIST if the stack is in the way. */
+    uint64_t stack_top = (brk_start + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
+    stack_top += STACK_SIZE;                     /* room for 8MB stack */
+    if (stack_top < STACK_TOP_DEFAULT)
+        stack_top = STACK_TOP_DEFAULT;
+    g.stack_top  = stack_top;
+    g.stack_base = stack_top - STACK_SIZE;
+
     /* ---- Step 3b: Load dynamic linker if PT_INTERP present ---- */
     elf_info_t interp_info;
     uint64_t interp_base = 0;
@@ -368,10 +380,10 @@ int main(int argc, const char **argv) {
         .perms     = MEM_PERM_RW
     };
 
-    /* Stack (RW) */
+    /* Stack (RW) — position is dynamic (above brk) */
     regions[nregions++] = (mem_region_t){
-        .gpa_start = STACK_BASE,
-        .gpa_end   = STACK_TOP,
+        .gpa_start = g.stack_base,
+        .gpa_end   = g.stack_top,
         .perms     = MEM_PERM_RW
     };
 
@@ -457,12 +469,12 @@ int main(int argc, const char **argv) {
     }
 
     /* Stack guard page: PROT_NONE at bottom to catch overflow */
-    guest_invalidate_ptes(&g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE);
-    guest_region_add(&g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE,
+    guest_invalidate_ptes(&g, g.stack_base, g.stack_base + STACK_GUARD_SIZE);
+    guest_region_add(&g, g.stack_base, g.stack_base + STACK_GUARD_SIZE,
                      LINUX_PROT_NONE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack-guard]");
-    guest_region_add(&g, STACK_BASE + STACK_GUARD_SIZE, STACK_TOP,
+    guest_region_add(&g, g.stack_base + STACK_GUARD_SIZE, g.stack_top,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
@@ -543,7 +555,7 @@ int main(int argc, const char **argv) {
 
         /* Stack auxv describes rosetta as the main binary (binfmt_misc
          * semantics: AT_PHDR/PHENT/PHNUM/ENTRY all refer to rosetta). */
-        sp = build_linux_stack(&g, STACK_TOP,
+        sp = build_linux_stack(&g, g.stack_top,
                                rosetta_argc, rosetta_argv,
                                environ, &rr.rosetta_info,
                                0 /* rosetta is ET_EXEC at link addr */,
@@ -555,7 +567,7 @@ int main(int argc, const char **argv) {
     } else {
         /* Normal aarch64 mode */
         proc_set_cmdline(guest_argc, guest_argv);
-        sp = build_linux_stack(&g, STACK_TOP,
+        sp = build_linux_stack(&g, g.stack_top,
                                guest_argc, guest_argv,
                                environ, &elf_info,
                                elf_load_base, interp_base,

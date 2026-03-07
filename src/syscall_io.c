@@ -71,11 +71,11 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     void *buf = guest_ptr(g, buf_gva);
     if (!buf) return -LINUX_EFAULT;
 
-    /* DEBUG: detect rosetta assertion message and dump thread context.
+    /* Detect rosetta assertion message and dump thread context when verbose.
      * Rosetta writes "BasicBlock requested for unrecognized address" to
      * stderr (fd 2) right before crashing. Dump X18 (thread context ptr)
      * and the saved registers to help identify the failing x86 target. */
-    if (host_fd == STDERR_FILENO && count > 10 && count < 256) {
+    if (hl_verbose && host_fd == STDERR_FILENO && count > 10 && count < 256) {
         if (memmem(buf, count, "BasicBlock", 10) != NULL) {
             fprintf(stderr, "hl: DEBUG assertion intercepted: %.*s\n",
                     (int)count, (char *)buf);
@@ -477,6 +477,25 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
 }
 
 int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+    /* Special FD types need their custom read handlers — glibc may use
+     * readv() instead of read() for the same logical operation. Delegate
+     * to the first iov entry's buffer (eventfd/timerfd/signalfd always
+     * produce a single contiguous result). */
+    if (fd >= 0 && fd < FD_TABLE_SIZE) {
+        int type = fd_table[fd].type;
+        if (type == FD_EVENTFD || type == FD_SIGNALFD ||
+            type == FD_TIMERFD || type == FD_INOTIFY) {
+            if (iovcnt <= 0) return -LINUX_EINVAL;
+            linux_iovec_t *giov = guest_ptr(g, iov_gva);
+            if (!giov) return -LINUX_EFAULT;
+            /* Compute total length across all iovecs */
+            uint64_t total = 0;
+            for (int i = 0; i < iovcnt; i++) total += giov[i].iov_len;
+            /* Delegate to the scalar read handler using first iov */
+            return sys_read(g, fd, giov[0].iov_base, total);
+        }
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
@@ -502,6 +521,18 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
 }
 
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+    /* Special FD types: glibc may use writev() for eventfd wakeup writes.
+     * Delegate to sys_write (which handles eventfd counter + pipe signal)
+     * using the first iov entry. eventfd expects exactly 8 bytes. */
+    if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD) {
+        if (iovcnt <= 0) return -LINUX_EINVAL;
+        linux_iovec_t *giov = guest_ptr(g, iov_gva);
+        if (!giov) return -LINUX_EFAULT;
+        uint64_t total = 0;
+        for (int i = 0; i < iovcnt; i++) total += giov[i].iov_len;
+        return eventfd_write(fd, g, giov[0].iov_base, total);
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
@@ -782,8 +813,9 @@ static void *rosettad_handler_thread(void *arg) {
         uint8_t cmd;
         ssize_t n = read(fd, &cmd, 1);
         if (n <= 0) {
-            fprintf(stderr, "hl: rosettad: read returned %zd (%s), exiting\n",
-                    n, n < 0 ? strerror(errno) : "EOF");
+            if (hl_verbose)
+                fprintf(stderr, "hl: rosettad: read returned %zd (%s), "
+                        "exiting\n", n, n < 0 ? strerror(errno) : "EOF");
             break;
         }
 

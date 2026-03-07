@@ -103,6 +103,10 @@ uint64_t thread_alloc_sp_el1(void);
  * Holds the thread table lock during iteration. */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
 
+/* Count active VM-clone threads (is_vm_clone && !vm_exited).
+ * Used to detect when the last rosetta tracee exits. */
+int thread_count_active_vm_clones(void);
+
 /* Interrupt all active vCPUs by calling hv_vcpus_exit().
  * Used for signal preemption: when a signal is queued while a vCPU
  * is running in a tight loop (no syscalls), this forces it to break

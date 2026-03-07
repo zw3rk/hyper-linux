@@ -10,16 +10,42 @@
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "syscall_signal.h"
+#include "syscall_proc.h"  /* exit_group_requested */
 #include "guest.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <sys/event.h>
 #include <poll.h>
+
+/* Global wakeup pipe: write end signals exit_group/futex_interrupt to
+ * threads blocked in host poll/select/kevent. The read end is added to
+ * every blocking wait with infinite timeout. */
+int wakeup_pipe_rd = -1;
+static int wakeup_pipe_wr = -1;
+
+void wakeup_pipe_init(void) {
+    int pipefd[2];
+    if (pipe(pipefd) == 0) {
+        fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+        fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+        wakeup_pipe_rd = pipefd[0];
+        wakeup_pipe_wr = pipefd[1];
+    }
+}
+
+void wakeup_pipe_signal(void) {
+    if (wakeup_pipe_wr >= 0) {
+        uint8_t byte = 1;
+        write(wakeup_pipe_wr, &byte, 1);
+    }
+}
 
 /* ---------- polling/select ---------- */
 
@@ -40,6 +66,27 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         host_fds[i].fd = fd_to_host(guest_fds[i].fd);
         host_fds[i].events = guest_fds[i].events;
         host_fds[i].revents = 0;
+    }
+
+    /* Log fd types for shutdown diagnostics (verbose only) */
+    if (hl_verbose && timeout_gva == 0) {
+        fprintf(stderr, "hl: ppoll: nfds=%u infinite timeout, fds=[", nfds);
+        for (uint32_t i = 0; i < nfds && i < 8; i++) {
+            int gfd = guest_fds[i].fd;
+            const char *type = "?";
+            if (gfd >= 0 && gfd < FD_TABLE_SIZE) {
+                switch (fd_table[gfd].type) {
+                case FD_EVENTFD: type = "efd"; break;
+                case FD_TIMERFD: type = "tfd"; break;
+                case FD_EPOLL:   type = "epoll"; break;
+                case FD_SIGNALFD: type = "sfd"; break;
+                default: type = "fd"; break;
+                }
+            }
+            fprintf(stderr, "%s%d(%s→%d)", i?",":"", gfd, type,
+                    host_fds[i].fd);
+        }
+        fprintf(stderr, "]\n");
     }
 
     /* Convert timeout (compute in int64_t to avoid overflow, clamp to INT_MAX) */
@@ -64,8 +111,43 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         }
     }
 
-    int ret = poll(host_fds, nfds, timeout_ms);
+    /* For indefinite polls, add the wakeup pipe so exit_group can
+     * interrupt threads blocked in host poll(). Without this, threads
+     * in poll(timeout=-1) can't be interrupted by hv_vcpus_exit()
+     * because they're not in hv_vcpu_run(). */
+    int added_wakeup = 0;
+    if (timeout_ms < 0 && wakeup_pipe_rd >= 0 && nfds < 256) {
+        host_fds[nfds].fd = wakeup_pipe_rd;
+        host_fds[nfds].events = POLLIN;
+        host_fds[nfds].revents = 0;
+        added_wakeup = 1;
+    }
+
+    extern _Atomic int futex_interrupt_requested;
+    int ret;
+    do {
+        ret = poll(host_fds, nfds + added_wakeup, timeout_ms < 0 ? 200 : timeout_ms);
+
+        /* Check for exit_group / futex_interrupt after waking */
+        if (atomic_load(&exit_group_requested) ||
+            atomic_load(&futex_interrupt_requested)) {
+            ret = -1;
+            errno = EINTR;
+            break;
+        }
+
+        /* If we used a short timeout (200ms) on an infinite poll and
+         * nothing happened, loop back. If the caller had a real timeout,
+         * we only called poll once with that timeout, so break. */
+    } while (ret == 0 && timeout_ms < 0);
+
     int saved_errno = errno;
+
+    /* Drain the wakeup pipe if it fired (non-blocking) */
+    if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
+        uint8_t drain;
+        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+    }
 
     /* Restore original signal mask */
     if (mask_installed)
@@ -125,14 +207,14 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         }
     }
 
-    struct timespec ts, *tsp = NULL;
-    if (timeout_gva != 0) {
+    int has_timeout = (timeout_gva != 0);
+    struct timespec ts;
+    if (has_timeout) {
         linux_timespec_t lts;
         if (guest_read(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
         ts.tv_sec = lts.tv_sec;
         ts.tv_nsec = lts.tv_nsec;
-        tsp = &ts;
     }
 
     /* Apply signal mask atomically around the select.
@@ -154,12 +236,40 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         }
     }
 
-    int ret = pselect(max_host_fd + 1,
+    /* For indefinite selects, add the wakeup pipe and use a short
+     * timeout so exit_group can interrupt. */
+    int added_wakeup = 0;
+    if (!has_timeout && wakeup_pipe_rd >= 0) {
+        FD_SET(wakeup_pipe_rd, &read_set);
+        if (wakeup_pipe_rd > max_host_fd) max_host_fd = wakeup_pipe_rd;
+        added_wakeup = 1;
+    }
+
+    extern _Atomic int futex_interrupt_requested;
+    struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
+    int ret;
+    do {
+        ret = pselect(max_host_fd + 1,
                       readfds_gva ? &read_set : NULL,
                       writefds_gva ? &write_set : NULL,
                       exceptfds_gva ? &except_set : NULL,
-                      tsp, NULL);
+                      has_timeout ? &ts : &poll_ts, NULL);
+
+        if (atomic_load(&exit_group_requested) ||
+            atomic_load(&futex_interrupt_requested)) {
+            ret = -1;
+            errno = EINTR;
+            break;
+        }
+    } while (ret == 0 && !has_timeout);
+
     int save_errno = errno;
+
+    /* Drain wakeup pipe if it fired */
+    if (added_wakeup && FD_ISSET(wakeup_pipe_rd, &read_set)) {
+        uint8_t drain;
+        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+    }
 
     /* Restore original signal mask */
     if (mask_applied)
@@ -379,20 +489,66 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
     }
 
     /* Convert timeout */
-    struct timespec ts, *tsp = NULL;
-    if (timeout_ms >= 0) {
+    int has_timeout = (timeout_ms >= 0);
+    struct timespec ts;
+    if (has_timeout) {
         ts.tv_sec = timeout_ms / 1000;
         ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
-        tsp = &ts;
     }
 
-    /* Collect kqueue events */
+    /* For indefinite waits, register the wakeup pipe with the kqueue
+     * so exit_group can interrupt threads blocked in kevent(). */
+    int added_wakeup = 0;
+    if (!has_timeout && wakeup_pipe_rd >= 0) {
+        struct kevent wake_ev;
+        EV_SET(&wake_ev, wakeup_pipe_rd, EVFILT_READ, EV_ADD | EV_ONESHOT,
+               0, 0, (void *)(uintptr_t)-1);
+        kevent(kq_fd, &wake_ev, 1, NULL, 0, NULL);
+        added_wakeup = 1;
+    }
+
+    /* Collect kqueue events. For indefinite waits, use a short timeout
+     * and loop so exit_group can interrupt. */
     int cap = maxevents * 2; /* Each epoll fd can produce 2 kevents */
     if (cap > 256) cap = 256;
+    /* Reserve one slot for the wakeup pipe event */
+    if (added_wakeup && cap < 256) cap++;
     struct kevent kevents[256];
 
-    int nready = kevent(kq_fd, NULL, 0, kevents, cap, tsp);
+    extern _Atomic int futex_interrupt_requested;
+    struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
+    int nready;
+    do {
+        nready = kevent(kq_fd, NULL, 0, kevents, cap,
+                        has_timeout ? &ts : &poll_ts);
+
+        if (atomic_load(&exit_group_requested) ||
+            atomic_load(&futex_interrupt_requested)) {
+            nready = -1;
+            errno = EINTR;
+            break;
+        }
+    } while (nready == 0 && !has_timeout);
+
     int saved_errno = errno;
+
+    /* Remove wakeup pipe registration and drain if it fired */
+    if (added_wakeup) {
+        struct kevent del_ev;
+        EV_SET(&del_ev, wakeup_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(kq_fd, &del_ev, 1, NULL, 0, NULL);
+        /* Drain the wakeup pipe */
+        uint8_t drain;
+        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        /* Filter out wakeup pipe events from results */
+        for (int i = 0; i < nready; i++) {
+            if ((uintptr_t)kevents[i].udata == (uintptr_t)-1) {
+                kevents[i] = kevents[nready - 1];
+                nready--;
+                i--;
+            }
+        }
+    }
 
     /* Restore original signal mask after the blocking wait */
     if (mask_installed)

@@ -22,10 +22,17 @@
 #include "thread.h"       /* current_thread, guest_tid (for PI futex TID) */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+
+/* Interrupt flag: when set, futex_wait returns -EINTR. Used to
+ * simulate SIGCHLD delivery when all CLONE_THREAD workers exit —
+ * wakes the main thread from blocking futex_wait without triggering
+ * a full exit_group. */
+_Atomic int futex_interrupt_requested = 0;
 
 /* ---------- Futex operations (from Linux uapi) ---------- */
 #define FUTEX_WAIT            0
@@ -166,6 +173,20 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
 
     /* Wait until woken or timeout */
     int ret = 0;
+
+    /* Record start time for the no-timeout path. On real Linux, any
+     * pending signal interrupts futex_wait with -EINTR. Without a
+     * timer signal (SIGVTALRM from timer_create/setitimer), multi-
+     * threaded programs like GHC can deadlock when a thread blocks in
+     * futex_wait and no wakeup arrives (e.g., shutdown signal sent to
+     * the wrong I/O manager). We return -EINTR after 1 second of
+     * blocking to simulate periodic signal delivery. All futex callers
+     * (musl, GHC RTS) handle -EINTR correctly by re-checking their
+     * condition and retrying. */
+    struct timeval wait_start;
+    if (!has_timeout)
+        gettimeofday(&wait_start, NULL);
+
     while (!waiter.woken) {
         if (has_timeout) {
             int rc = pthread_cond_timedwait(&waiter.cond, &b->lock, &deadline);
@@ -175,7 +196,38 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
                 break;
             }
         } else {
-            pthread_cond_wait(&waiter.cond, &b->lock);
+            /* No timeout specified — poll every 100ms to check for
+             * exit_group, futex_interrupt (simulated SIGCHLD), or
+             * excessive wait time (simulated signal interruption). */
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            struct timespec poll_ts = {
+                .tv_sec  = now.tv_sec,
+                .tv_nsec = now.tv_usec * 1000 + 100000000L, /* +100ms */
+            };
+            if (poll_ts.tv_nsec >= 1000000000L) {
+                poll_ts.tv_sec  += 1;
+                poll_ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+
+            if (atomic_load(&exit_group_requested) ||
+                atomic_load(&futex_interrupt_requested)) {
+                ret = -LINUX_EINTR;
+                break;
+            }
+
+            /* Simulate periodic signal delivery: return -EINTR after
+             * 1 second of blocking. This prevents deadlocks in multi-
+             * threaded runtimes (GHC) that rely on signal-interrupted
+             * futex_wait for scheduler context switching. */
+            gettimeofday(&now, NULL);
+            long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000
+                            + (now.tv_usec - wait_start.tv_usec) / 1000;
+            if (elapsed_ms >= 1000) {
+                ret = -LINUX_EINTR;
+                break;
+            }
         }
     }
 
@@ -478,6 +530,19 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
         if ((expected & FUTEX_TID_MASK) == tid)
             return -LINUX_EDEADLK;
 
+        /* Check if the owner thread has exited without releasing the lock.
+         * Linux kernel handles this via PI futex cleanup on thread exit;
+         * we detect it lazily here since we don't track PI ownership
+         * per-thread. Clear the futex word and retry acquisition. */
+        uint32_t owner_tid = expected & FUTEX_TID_MASK;
+        if (owner_tid != 0 && !thread_find((int64_t)owner_tid)) {
+            __atomic_compare_exchange_n(word, &expected, 0,
+                                         /*weak=*/0,
+                                         __ATOMIC_SEQ_CST,
+                                         __ATOMIC_SEQ_CST);
+            continue;  /* Retry acquisition */
+        }
+
         /* Set the WAITERS bit so the owner takes the slow unlock path
          * (calls FUTEX_UNLOCK_PI instead of just CAS to 0). Retry
          * the CAS in a loop since the owner may release concurrently. */
@@ -520,6 +585,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
         pthread_cond_init(&waiter.cond, NULL);
         b->head = &waiter;
 
+        int owner_died = 0;
         while (!waiter.woken) {
             if (has_timeout) {
                 int rc = pthread_cond_timedwait(&waiter.cond, &b->lock,
@@ -547,11 +613,44 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
                     return -LINUX_ETIMEDOUT;
                 }
             } else {
-                pthread_cond_wait(&waiter.cond, &b->lock);
+                /* No timeout: poll every 100ms to check exit_group
+                 * and dead lock owners. */
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                struct timespec poll_ts = {
+                    .tv_sec  = now.tv_sec,
+                    .tv_nsec = now.tv_usec * 1000 + 100000000L,
+                };
+                if (poll_ts.tv_nsec >= 1000000000L) {
+                    poll_ts.tv_sec  += 1;
+                    poll_ts.tv_nsec -= 1000000000L;
+                }
+                pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+
+                if (atomic_load(&exit_group_requested)) {
+                    /* Dequeue and return */
+                    futex_waiter_t **pp2 = &b->head;
+                    while (*pp2) {
+                        if (*pp2 == &waiter) { *pp2 = waiter.next; break; }
+                        pp2 = &(*pp2)->next;
+                    }
+                    pthread_mutex_unlock(&b->lock);
+                    pthread_cond_destroy(&waiter.cond);
+                    return -LINUX_EINTR;
+                }
+
+                /* Check if the owner thread has died while we were
+                 * waiting. If so, clear the lock and retry. */
+                uint32_t check = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+                uint32_t check_tid = check & FUTEX_TID_MASK;
+                if (check_tid != 0 && !thread_find((int64_t)check_tid)) {
+                    owner_died = 1;
+                    break;
+                }
             }
         }
 
-        /* Dequeue */
+        /* Dequeue waiter from bucket list */
         futex_waiter_t **pp = &b->head;
         while (*pp) {
             if (*pp == &waiter) { *pp = waiter.next; break; }
@@ -559,6 +658,16 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
         }
         pthread_mutex_unlock(&b->lock);
         pthread_cond_destroy(&waiter.cond);
+
+        if (owner_died) {
+            /* Clear the dead owner's lock word and retry acquisition */
+            uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+            __atomic_compare_exchange_n(word, &v, 0,
+                                         /*weak=*/0,
+                                         __ATOMIC_SEQ_CST,
+                                         __ATOMIC_SEQ_CST);
+            continue;
+        }
 
         /* Woken: retry acquisition. The WAITERS bit may remain set if
          * other waiters exist — the CAS(0→TID) will still succeed

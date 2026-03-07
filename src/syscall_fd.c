@@ -141,6 +141,15 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
     int64_t value_us = its.it_value_sec * 1000000LL + its.it_value_nsec / 1000;
     int64_t interval_ns = its.it_interval_sec * 1000000000LL + its.it_interval_nsec;
 
+    if (hl_verbose)
+        fprintf(stderr, "hl: timerfd_settime: gfd=%d value=%lld.%09lld "
+                "interval=%lld.%09lld (value_us=%lld interval_ns=%lld "
+                "oneshot=%d)\n",
+                fd, (long long)its.it_value_sec, (long long)its.it_value_nsec,
+                (long long)its.it_interval_sec, (long long)its.it_interval_nsec,
+                (long long)value_us, (long long)interval_ns,
+                interval_ns == 0);
+
     if (value_us == 0 && its.it_value_nsec == 0) {
         /* Disarm timer */
         struct kevent kev;
@@ -277,7 +286,14 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     uint64_t val = timerfd_state[slot].expirations;
     timerfd_state[slot].expirations = 0;
+    int armed = timerfd_state[slot].armed;
+    int64_t intv = timerfd_state[slot].interval_ns;
     pthread_mutex_unlock(&sfd_lock);
+
+    if (hl_verbose)
+        fprintf(stderr, "hl: timerfd_read: gfd=%d expirations=%llu armed=%d "
+                "interval_ns=%lld\n",
+                guest_fd, (unsigned long long)val, armed, (long long)intv);
 
     if (guest_write(g, buf_gva, &val, 8) < 0)
         return -LINUX_EFAULT;
@@ -285,14 +301,18 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     return 8;
 }
 
-/* Clean up timerfd state when guest closes the fd. */
+/* Clean up timerfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent timerfd_read. */
 void timerfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
-    if (slot < 0) return;
-    /* kq_fd is closed by sys_close() as host_fd */
-    timerfd_state[slot].guest_fd = -1;
-    timerfd_state[slot].expirations = 0;
-    timerfd_state[slot].armed = 0;
+    if (slot >= 0) {
+        /* kq_fd is closed by sys_close() as host_fd */
+        timerfd_state[slot].guest_fd = -1;
+        timerfd_state[slot].expirations = 0;
+        timerfd_state[slot].armed = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 /* ================================================================
@@ -376,14 +396,18 @@ int64_t sys_eventfd2(unsigned int initval, int flags) {
     return gfd;
 }
 
-/* Clean up eventfd state when guest closes the fd. */
+/* Clean up eventfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent eventfd_write/eventfd_read. */
 void eventfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
-    if (slot < 0) return;
-    close(eventfd_state[slot].pipe_wr);
-    /* pipe_rd is closed by sys_close() as host_fd */
-    eventfd_state[slot].guest_fd = -1;
-    eventfd_state[slot].counter = 0;
+    if (slot >= 0) {
+        close(eventfd_state[slot].pipe_wr);
+        /* pipe_rd is closed by sys_close() as host_fd */
+        eventfd_state[slot].guest_fd = -1;
+        eventfd_state[slot].counter = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 /* Read from eventfd: return 8-byte counter value, then reset to 0.
@@ -401,12 +425,16 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return -LINUX_EAGAIN;
         }
         /* Blocking mode: release lock, block on pipe, re-lock.
+         * The pipe is O_NONBLOCK — temporarily make it blocking so
+         * read() actually waits for the writer. Matches signalfd_read.
          * Another thread may close the fd while we wait — read()
          * returns EBADF in that case, and we re-validate the slot. */
         int rd_fd = eventfd_state[slot].pipe_rd;
         pthread_mutex_unlock(&sfd_lock);
         uint8_t byte;
+        fcntl(rd_fd, F_SETFL, 0);          /* Make temporarily blocking */
         ssize_t r = read(rd_fd, &byte, 1);
+        fcntl(rd_fd, F_SETFL, O_NONBLOCK); /* Restore non-blocking */
         if (r < 0) return linux_errno();
         pthread_mutex_lock(&sfd_lock);
         /* Re-validate: slot may have been freed by eventfd_close() */
@@ -470,11 +498,27 @@ int64_t eventfd_write(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
     int was_zero = (eventfd_state[slot].counter == 0);
     eventfd_state[slot].counter += val;
 
-    /* Signal readability via pipe if counter transitioned from 0 */
+    /* Signal readability via pipe if counter transitioned from 0.
+     * The pipe is non-blocking; retry on EINTR and warn on other errors
+     * since a missed wakeup here can deadlock ppoll/epoll waiters. */
     if (was_zero && eventfd_state[slot].counter > 0) {
         uint8_t byte = 1;
-        write(eventfd_state[slot].pipe_wr, &byte, 1);
+        ssize_t wr;
+        do {
+            wr = write(eventfd_state[slot].pipe_wr, &byte, 1);
+        } while (wr < 0 && errno == EINTR);
+        if (wr < 0)
+            fprintf(stderr, "hl: eventfd_write: pipe write failed: %s "
+                    "(gfd=%d pipe_wr=%d)\n",
+                    strerror(errno), guest_fd, eventfd_state[slot].pipe_wr);
     }
+    /* Always log eventfd writes — critical for diagnosing shutdown hangs */
+    if (hl_verbose)
+        fprintf(stderr, "hl: eventfd_write: gfd=%d val=%llu counter=%llu "
+                "was_zero=%d pipe_wr=%d\n",
+                guest_fd, (unsigned long long)val,
+                (unsigned long long)eventfd_state[slot].counter,
+                was_zero, eventfd_state[slot].pipe_wr);
     pthread_mutex_unlock(&sfd_lock);
 
     return 8;
@@ -549,14 +593,18 @@ static int signalfd_slot_alloc(void) {
     return -1;
 }
 
-/* Clean up signalfd state when guest closes the fd. */
+/* Clean up signalfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent signalfd_notify. */
 void signalfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find(guest_fd);
-    if (slot < 0) return;
-    close(signalfd_state[slot].pipe_wr);
-    /* pipe_rd is closed by sys_close() as host_fd */
-    signalfd_state[slot].guest_fd = -1;
-    signalfd_state[slot].mask = 0;
+    if (slot >= 0) {
+        close(signalfd_state[slot].pipe_wr);
+        /* pipe_rd is closed by sys_close() as host_fd */
+        signalfd_state[slot].guest_fd = -1;
+        signalfd_state[slot].mask = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,

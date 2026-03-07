@@ -329,6 +329,14 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     g->brk_base = brk_start;
     g->brk_current = brk_start;
 
+    /* Recompute stack position above brk (same logic as hl.c startup) */
+    uint64_t stack_top = (brk_start + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
+    stack_top += STACK_SIZE;
+    if (stack_top < STACK_TOP_DEFAULT)
+        stack_top = STACK_TOP_DEFAULT;
+    g->stack_top  = stack_top;
+    g->stack_base = stack_top - STACK_SIZE;
+
     /* Step 8: Rebuild page tables */
     #define MAX_REGIONS 32
     mem_region_t regions[MAX_REGIONS];
@@ -394,10 +402,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         .perms     = MEM_PERM_RW
     };
 
-    /* Stack (RW) */
+    /* Stack (RW) — position is dynamic (stored in guest_t) */
     regions[nregions++] = (mem_region_t){
-        .gpa_start = STACK_BASE,
-        .gpa_end   = STACK_TOP,
+        .gpa_start = g->stack_base,
+        .gpa_end   = g->stack_top,
         .perms     = MEM_PERM_RW
     };
 
@@ -460,12 +468,12 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
     /* Stack guard page: PROT_NONE at bottom to catch overflow */
-    guest_invalidate_ptes(g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE);
-    guest_region_add(g, STACK_BASE, STACK_BASE + STACK_GUARD_SIZE,
+    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
+    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
                      LINUX_PROT_NONE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack-guard]");
-    guest_region_add(g, STACK_BASE + STACK_GUARD_SIZE, STACK_TOP,
+    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
                      LINUX_PROT_READ | LINUX_PROT_WRITE,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
@@ -488,7 +496,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             return -LINUX_ENOEXEC;
         }
 
-        sp = build_linux_stack(g, STACK_TOP,
+        sp = build_linux_stack(g, g->stack_top,
                                rosetta_argc, rosetta_argv,
                                envp_const, &rr.rosetta_info,
                                0 /* rosetta is ET_EXEC at link addr */,
@@ -499,7 +507,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         entry_point = rr.entry_point;
         g->is_rosetta = 1;
     } else {
-        sp = build_linux_stack(g, STACK_TOP, argc, argv_const,
+        sp = build_linux_stack(g, g->stack_top, argc, argv_const,
                                envp_const, &elf_info,
                                elf_load_base, interp_base,
                                0 /* no vDSO for aarch64 */,

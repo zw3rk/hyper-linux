@@ -128,6 +128,21 @@ int thread_active_count(void) {
     return count;
 }
 
+int thread_count_active_vm_clones(void) {
+    int count = 0;
+
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_table[i].active &&
+            thread_table[i].is_vm_clone &&
+            !thread_table[i].vm_exited)
+            count++;
+    }
+    pthread_mutex_unlock(&thread_lock);
+
+    return count;
+}
+
 uint64_t thread_alloc_sp_el1(void) {
     uint64_t sp = 0;
 

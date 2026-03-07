@@ -12,6 +12,7 @@
 #include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
 #include "syscall.h"         /* syscall_init, FD_CLOSED, FD_STDIO, etc. */
 #include "syscall_signal.h"  /* signal_get_state, signal_set_state, signal_state_t */
+#include "syscall_poll.h"    /* wakeup_pipe_signal */
 #include "hv_util.h"         /* HV_CHECK, SCTLR_* constants */
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
 #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
@@ -52,6 +53,8 @@ typedef struct {
     uint64_t guest_size;     /* IPA-derived address space size (child must match) */
     uint64_t brk_base;
     uint64_t brk_current;
+    uint64_t stack_base;     /* Dynamic stack position (v4+) */
+    uint64_t stack_top;      /* Dynamic stack top */
     uint64_t mmap_next;
     uint64_t mmap_end;
     uint64_t pt_pool_next;
@@ -255,6 +258,8 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     /* Restore guest allocation state */
     g.brk_base = hdr.brk_base;
     g.brk_current = hdr.brk_current;
+    g.stack_base = hdr.stack_base;
+    g.stack_top = hdr.stack_top;
     g.mmap_next = hdr.mmap_next;
     g.mmap_end = hdr.mmap_end;
     g.pt_pool_next = hdr.pt_pool_next;
@@ -847,6 +852,25 @@ static void *thread_create_and_run(void *arg) {
     hv_vcpu_destroy(vcpu);
     thread_deactivate(t);
 
+    /* When all CLONE_THREAD workers have exited and only the main
+     * thread remains, interrupt its futex_wait. Under rosetta, the
+     * main thread (JIT tracer) may hang forever in an internal
+     * futex_wait. In real Linux, child exit delivers SIGCHLD which
+     * interrupts futex_wait with -EINTR. We simulate this via the
+     * futex_interrupt_requested flag — it interrupts futex_wait
+     * without triggering a full exit_group, allowing the main thread
+     * to continue processing and call exit_group with the correct
+     * exit code naturally. */
+    if (thread_active_count() == 1) {
+        if (verbose)
+            fprintf(stderr, "hl: last worker exited, interrupting "
+                    "main thread futex_wait/poll\n");
+        extern _Atomic int futex_interrupt_requested;
+        atomic_store(&futex_interrupt_requested, 1);
+        wakeup_pipe_signal();
+        thread_interrupt_all();
+    }
+
     return NULL;
 }
 
@@ -1057,6 +1081,26 @@ static void *vm_clone_thread_run(void *arg) {
         fprintf(stderr, "hl: vm_clone tid=%lld exiting (code=%d)\n",
                 (long long)t->guest_tid, exit_code);
 
+    /* Check if this was the last VM-clone child BEFORE destroying the
+     * vCPU — thread_interrupt_all needs valid vCPU handles. In real
+     * Linux, child exit delivers exit_signal (SIGCHLD) which interrupts
+     * the parent's futex_wait with -EINTR. We simulate this by
+     * requesting exit_group and interrupting all vCPUs. */
+    int last_clone = (thread_count_active_vm_clones() == 0);
+
+    if (last_clone) {
+        if (verbose)
+            fprintf(stderr, "hl: last vm_clone exited, triggering exit_group\n");
+        atomic_store(&exit_group_requested, 1);
+        atomic_store(&exit_group_code, exit_code);
+        /* Interrupt all vCPUs while ours is still valid. The main
+         * thread's vCPU may be blocked in hv_vcpu_run — this forces
+         * it out so it can check exit_group_requested. Our own vCPU
+         * is not in hv_vcpu_run (loop already exited) so the exit
+         * call on it is a harmless no-op. */
+        thread_interrupt_all();
+    }
+
     hv_vcpu_destroy(vcpu);
     /* Don't deactivate yet — parent needs to wait4 to collect status.
      * The slot is freed when thread_ptrace_wait reads vm_exited. */
@@ -1198,6 +1242,8 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         .guest_size = g->guest_size,
         .brk_base = g->brk_base,
         .brk_current = g->brk_current,
+        .stack_base = g->stack_base,
+        .stack_top = g->stack_top,
         .mmap_next = g->mmap_next,
         .mmap_end = g->mmap_end,
         .pt_pool_next = g->pt_pool_next,

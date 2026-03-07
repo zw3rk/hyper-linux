@@ -451,9 +451,16 @@
           # pandoc: use pandoc-cli (the executable package).  The library
           # package (hpkgs.pandoc) has no bin/ output.  pandoc-cli is
           # dynamically linked with glibc — needs --sysroot at runtime.
-          pandoc-cli = hpkgs.pandoc-cli;
+          # Both pandoc-cli and shellcheck are built with -rtsopts so
+          # GHC RTS options (+RTS -xr4G -RTS) can shrink the VA
+          # reservation for rosetta on Apple Silicon.
+          pandoc-cli = hlib.overrideCabal hpkgs.pandoc-cli (old: {
+            configureFlags = (old.configureFlags or []) ++ ["--ghc-option=-rtsopts"];
+          });
           pandoc-data = hpkgs.pandoc.data;
-          shellcheck = hlib.justStaticExecutables hpkgs.ShellCheck;
+          shellcheck = hlib.justStaticExecutables (hlib.overrideCabal hpkgs.ShellCheck (old: {
+            configureFlags = (old.configureFlags or []) ++ ["--ghc-option=-rtsopts"];
+          }));
         in aarch64LinuxPkgs.runCommand "hl-haskell-bins" {
           nativeBuildInputs = [
             aarch64LinuxPkgs.patchelf
@@ -562,9 +569,13 @@
         let
           hlib = linuxPkgs.haskell.lib;
           hpkgs = linuxPkgs.haskellPackages;
-          pandoc-cli = hpkgs.pandoc-cli;
+          pandoc-cli = hlib.overrideCabal hpkgs.pandoc-cli (old: {
+            configureFlags = (old.configureFlags or []) ++ ["--ghc-option=-rtsopts"];
+          });
           pandoc-data = hpkgs.pandoc.data;
-          shellcheck = hlib.justStaticExecutables hpkgs.ShellCheck;
+          shellcheck = hlib.justStaticExecutables (hlib.overrideCabal hpkgs.ShellCheck (old: {
+            configureFlags = (old.configureFlags or []) ++ ["--ghc-option=-rtsopts"];
+          }));
         in linuxPkgs.runCommand "hl-x64-haskell-bins" {
           nativeBuildInputs = [
             linuxPkgs.patchelf
@@ -626,6 +637,13 @@
           cp -aL ${p.readline}/lib/libhistory.so*        $out/lib/ || true
           cp -aL ${p.ncurses}/lib/libncursesw.so*        $out/lib/
           cp -aL ${p.ncurses}/lib/libtinfo.so*           $out/lib/ || true
+          # elfutils (x86_64 GHC links against libelf/libdw for DWARF)
+          cp -aL ${p.elfutils.out}/lib/libelf.so*        $out/lib/
+          cp -aL ${p.elfutils.out}/lib/libdw.so*         $out/lib/
+          # libdw transitive deps
+          cp -aL ${p.zstd.out}/lib/libzstd.so*           $out/lib/
+          cp -aL ${p.xz.out}/lib/liblzma.so*             $out/lib/
+          cp -aL ${p.bzip2.out}/lib/libbz2.so*           $out/lib/
           # Strip nix store RPATHs
           chmod -R u+w $out/lib $out/lib64
           for f in $out/lib/*.so* $out/lib64/*.so*; do

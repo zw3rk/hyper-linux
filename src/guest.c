@@ -27,6 +27,7 @@
  *   L2 entry covers 2MB  — block descriptors with final permissions
  */
 #include "guest.h"
+#include "syscall_internal.h"  /* hl_verbose */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,11 +86,12 @@ static uint64_t pt_alloc_page(guest_t *g) {
     uint64_t used = gpa + PAGE_SIZE - PT_POOL_BASE;
     uint64_t total = PT_POOL_END - PT_POOL_BASE;
     if (!pt_pool_warned && used > (total * 4 / 5)) {
-        fprintf(stderr, "guest: warning: page table pool at %llu%% "
-                "(%llu / %llu bytes)\n",
-                (unsigned long long)(used * 100 / total),
-                (unsigned long long)used,
-                (unsigned long long)total);
+        if (hl_verbose)
+            fprintf(stderr, "guest: warning: page table pool at %llu%% "
+                    "(%llu / %llu bytes)\n",
+                    (unsigned long long)(used * 100 / total),
+                    (unsigned long long)used,
+                    (unsigned long long)total);
         pt_pool_warned = 1;
     }
 
@@ -307,8 +309,11 @@ int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
         return -1;
     }
 
-    fprintf(stderr, "guest: COW fork: mapped %lluGB from shm (ipa=%u bits)\n",
-            (unsigned long long)(size / (1024ULL * 1024 * 1024)), ipa_bits);
+    if (hl_verbose)
+        fprintf(stderr, "guest: COW fork: mapped %lluGB from shm "
+                "(ipa=%u bits)\n",
+                (unsigned long long)(size / (1024ULL * 1024 * 1024)),
+                ipa_bits);
 
     return 0;
 }
@@ -637,10 +642,10 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
         n++;
     }
 
-    /* Stack (2MB block) */
+    /* Stack (dynamic position, stored in guest_t) */
     if (n < max) {
-        out[n].offset = STACK_BASE;
-        out[n].size = STACK_TOP - STACK_BASE;
+        out[n].offset = g->stack_base;
+        out[n].size = g->stack_top - g->stack_base;
         n++;
     }
 
