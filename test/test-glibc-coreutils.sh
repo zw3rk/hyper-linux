@@ -306,8 +306,8 @@ run        "["       0    "-f" "$TMPDIR/hello.txt" "]"
 # ── Expected failures / skips ────────────────────────────────────
 printf "\n${BLUE}── Expected failures / skips ──${RESET}\n"
 run_timeout 10 timeout 0 "5" "$BIN/true"
-run_skip   stdbuf    "requires LD_PRELOAD"
-run_skip   chroot    "needs root privileges"
+run_check  stdbuf    "hello"                "-oL" "$BIN/echo" hello
+run        chroot    0                     "/" "$BIN/true"
 
 # ── Summary ──────────────────────────────────────────────────────
 total=$((pass + fail + expected_fail + skip))

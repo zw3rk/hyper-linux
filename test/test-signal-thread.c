@@ -184,6 +184,6 @@ int main(void) {
     test_tgkill_bad_tid();
     test_sa_resethand();
 
-    printf("\ntest-signal-thread: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-signal-thread");
     return fails > 0 ? 1 : 0;
 }

@@ -28,9 +28,7 @@
 #include "syscall_proc.h"
 #include "proc_emulation.h"
 #include "hv_util.h"
-
-/* rosettad_set_binary_path is defined in syscall_io.c (no header) */
-extern void rosettad_set_binary_path(const char *path);
+#include "syscall_io.h"
 
 /* ------------------------------------------------------------------ */
 /*  Phase 1: rosetta_prepare — before page table build                */
@@ -269,7 +267,9 @@ int rosetta_finalize(guest_t *g, hv_vcpu_t vcpu,
     }
 
     /* ---- Build binfmt_misc argv ---- */
-    int rosetta_argc = guest_argc + 1;  /* rosetta_path + binary_path + argv[1:] */
+    /* rosetta_argv = [rosetta_path, binary_path, guest_argv[1:], NULL]
+     * Minimum 2 entries even when guest_argc == 0 (no argv[0]). */
+    int rosetta_argc = (guest_argc > 0) ? guest_argc + 1 : 2;
     const char **rosetta_argv = malloc(sizeof(char *) * (rosetta_argc + 1));
     if (!rosetta_argv) {
         fprintf(stderr, "hl: malloc failed for rosetta argv\n");

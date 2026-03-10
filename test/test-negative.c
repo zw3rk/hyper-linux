@@ -230,6 +230,6 @@ int main(void) {
     test_lseek_pipe();
     test_write_only_read();
 
-    printf("\ntest-negative: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-negative");
     return fails > 0 ? 1 : 0;
 }

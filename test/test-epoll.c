@@ -188,6 +188,6 @@ int main(void) {
         close(epfd);
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-epoll");
     return fails > 0 ? 1 : 0;
 }

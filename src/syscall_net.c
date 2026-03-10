@@ -13,6 +13,7 @@
 #include "syscall_net.h"
 #include "syscall_internal.h"
 #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
+#include "syscall_io.h"      /* rosettad_is_socket */
 
 #include <stdio.h>
 #include <string.h>
@@ -141,13 +142,44 @@ static int translate_sockopt(int linux_optname) {
 }
 
 /* Translate Linux MSG_* flags to macOS equivalents.
- * Most values are identical on both platforms. */
+ * Several flags have DIFFERENT numeric values on Linux vs macOS:
+ *   Flag            Linux   macOS
+ *   MSG_OOB         0x01    0x01    (same)
+ *   MSG_PEEK        0x02    0x02    (same)
+ *   MSG_DONTROUTE   0x04    0x04    (same)
+ *   MSG_CTRUNC      0x08    0x20    (output only — not translated for send)
+ *   MSG_TRUNC       0x20    0x10    (output only — not translated for send)
+ *   MSG_DONTWAIT    0x40    0x80
+ *   MSG_EOR         0x80    0x08
+ *   MSG_WAITALL     0x100   0x40
+ *   MSG_NOSIGNAL    0x4000  N/A     (handled via SO_NOSIGPIPE)
+ *   MSG_CMSG_CLOEXEC 0x40000000  N/A (handled by fd table)
+ */
 static int translate_msg_flags(int linux_flags) {
-    /* MSG_DONTWAIT(0x40), MSG_NOSIGNAL(0x4000), MSG_PEEK(0x2),
-     * MSG_WAITALL(0x100) — identical on macOS and Linux for common ones.
-     * MSG_NOSIGNAL doesn't exist on macOS, but we ignore SIGPIPE via
-     * SO_NOSIGPIPE on the socket. */
-    return linux_flags & ~0x4000; /* Strip MSG_NOSIGNAL */
+    int mac_flags = 0;
+    if (linux_flags & 0x01)    mac_flags |= MSG_OOB;
+    if (linux_flags & 0x02)    mac_flags |= MSG_PEEK;
+    if (linux_flags & 0x04)    mac_flags |= MSG_DONTROUTE;
+    if (linux_flags & 0x40)    mac_flags |= MSG_DONTWAIT;   /* 0x40 → 0x80 */
+    if (linux_flags & 0x80)    mac_flags |= MSG_EOR;        /* 0x80 → 0x08 */
+    if (linux_flags & 0x100)   mac_flags |= MSG_WAITALL;    /* 0x100 → 0x40 */
+    /* MSG_NOSIGNAL(0x4000): stripped, handled via SO_NOSIGPIPE on socket */
+    /* MSG_CMSG_CLOEXEC(0x40000000): stripped, handled by fd table CLOEXEC */
+    return mac_flags;
+}
+
+/* Translate macOS MSG_* flags back to Linux values (for recvmsg msg_flags). */
+static int mac_to_linux_msg_flags(int mac_flags) {
+    int linux_flags = 0;
+    if (mac_flags & MSG_OOB)       linux_flags |= 0x01;
+    if (mac_flags & MSG_PEEK)      linux_flags |= 0x02;
+    if (mac_flags & MSG_DONTROUTE) linux_flags |= 0x04;
+    if (mac_flags & MSG_CTRUNC)    linux_flags |= 0x08;     /* 0x20 → 0x08 */
+    if (mac_flags & MSG_TRUNC)     linux_flags |= 0x20;     /* 0x10 → 0x20 */
+    if (mac_flags & MSG_DONTWAIT)  linux_flags |= 0x40;     /* 0x80 → 0x40 */
+    if (mac_flags & MSG_EOR)       linux_flags |= 0x80;     /* 0x08 → 0x80 */
+    if (mac_flags & MSG_WAITALL)   linux_flags |= 0x100;    /* 0x40 → 0x100 */
+    return linux_flags;
 }
 
 /* ---------- Syscall implementations ---------- */
@@ -161,23 +193,41 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
     int cloexec = extract_sock_cloexec(type);
 
     /* Rosetta uses AF_UNIX SOCK_SEQPACKET to connect to rosettad for AOT
-     * translation. macOS doesn't support SOCK_SEQPACKET for AF_UNIX, so
-     * downgrade to SOCK_DGRAM (preserves message boundaries).
-     *
-     * We do NOT intercept the connect() or run a rosettad handler thread.
-     * In real VZ VMs (lima), rosettad's socket often isn't available and
-     * connect() returns -ENOENT. Rosetta handles this gracefully by falling
-     * back to pure JIT mode, which correctly handles indirect branches via
-     * BRK stubs + SIGTRAP. The AOT files from standalone `rosettad translate`
-     * have broken metadata (zeros at offsets 0x80/0x88) that cause
-     * block_for_offset() assertion failures during AOT-assisted translation.
-     * Disabling AOT entirely matches real-world lima behavior and avoids
-     * the broken AOT code path. */
+     * (ahead-of-time) translation. macOS doesn't support SOCK_SEQPACKET
+     * for AF_UNIX. Instead, create a socketpair(SOCK_STREAM) and spawn
+     * our rosettad handler thread on one end. Rosetta gets the other end.
+     * When rosetta later calls connect(), we return success immediately
+     * (the socketpair is already connected). */
     if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
-        real_type = SOCK_DGRAM;
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0)
+            return linux_errno();
+
+        /* pair[0] = rosetta's end, pair[1] = our handler thread's end */
+        if (nonblock) {
+            int fl = fcntl(pair[0], F_GETFL);
+            if (fl >= 0) fcntl(pair[0], F_SETFL, fl | O_NONBLOCK);
+        }
+        if (cloexec) fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+
+        int one = 1;
+        setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+        int gfd = fd_alloc(FD_SOCKET, pair[0]);
+        if (gfd < 0) { close(pair[0]); close(pair[1]); return -LINUX_EMFILE; }
+
+        int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
+        fd_table[gfd].linux_flags = linux_flags_val;
+
+        /* Start the rosettad handler thread on pair[1] and track pair[0]
+         * so connect() can be intercepted. */
+        rosettad_start_handler(pair[1], pair[0]);
+
         if (g->verbose)
-            fprintf(stderr, "hl: rosettad: SEQPACKET→DGRAM (no rosettad handler, "
-                    "connect will fail like real VZ)\n");
+            fprintf(stderr, "hl: rosettad: SEQPACKET → socketpair "
+                    "(client_fd=%d guest=%d, handler_fd=%d)\n",
+                    pair[0], gfd, pair[1]);
+        return gfd;
     }
 
     int fd = socket(mac_domain, real_type, protocol);
@@ -229,9 +279,13 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
     }
 
     int gfd0 = fd_alloc(FD_SOCKET, fds[0]);
-    int gfd1 = fd_alloc(FD_SOCKET, fds[1]);
-    if (gfd0 < 0 || gfd1 < 0) {
+    if (gfd0 < 0) {
         close(fds[0]); close(fds[1]);
+        return -LINUX_EMFILE;
+    }
+    int gfd1 = fd_alloc(FD_SOCKET, fds[1]);
+    if (gfd1 < 0) {
+        fd_mark_closed(gfd0); close(fds[0]); close(fds[1]);
         return -LINUX_EMFILE;
     }
 
@@ -240,8 +294,11 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
     fd_table[gfd1].linux_flags = linux_flags;
 
     int32_t guest_fds[2] = { gfd0, gfd1 };
-    if (guest_write(g, sv_gva, guest_fds, 8) < 0)
+    if (guest_write(g, sv_gva, guest_fds, 8) < 0) {
+        fd_mark_closed(gfd0); close(fds[0]);
+        fd_mark_closed(gfd1); close(fds[1]);
         return -LINUX_EFAULT;
+    }
 
     return 0;
 }
@@ -297,7 +354,9 @@ static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
     if (gfd < 0) { close(new_fd); return -LINUX_EMFILE; }
     fd_table[gfd].linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
 
-    /* Write back peer address if requested */
+    /* Write back peer address if requested. The accept has already
+     * succeeded and gfd is valid; EFAULT here mirrors Linux kernel
+     * behavior (close the new fd and return -EFAULT). */
     if (addr_gva && addrlen_gva) {
         uint32_t guest_addrlen;
         if (guest_read(g, addrlen_gva, &guest_addrlen, 4) == 0) {
@@ -306,10 +365,16 @@ static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
                 (struct sockaddr *)&mac_sa, mac_len,
                 linux_sa, (uint32_t)sizeof(linux_sa));
             if (out_len > 0) {
-                uint32_t write_len = (uint32_t)out_len;
+                uint32_t actual_len = (uint32_t)out_len;
+                uint32_t write_len = actual_len;
                 if (write_len > guest_addrlen) write_len = guest_addrlen;
-                guest_write(g, addr_gva, linux_sa, write_len);
-                guest_write(g, addrlen_gva, &write_len, 4);
+                /* Write back actual (not truncated) length per Linux semantics */
+                if (guest_write(g, addr_gva, linux_sa, write_len) < 0 ||
+                    guest_write(g, addrlen_gva, &actual_len, 4) < 0) {
+                    close(new_fd);
+                    fd_mark_closed(gfd);
+                    return -LINUX_EFAULT;
+                }
             }
         }
     }
@@ -337,10 +402,15 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
     if (guest_read(g, addr_gva, linux_sa, addrlen) < 0) return -LINUX_EFAULT;
 
-    /* No rosettad interception: let connect() proceed normally.
-     * For rosetta's AF_UNIX connect to the rosettad socket path,
-     * the path doesn't exist on macOS, so connect returns ENOENT.
-     * This matches lima VZ behavior where rosettad is often unavailable. */
+    /* Rosettad socketpair: already connected, return success immediately.
+     * The socketpair was created in sys_socket() when SOCK_SEQPACKET was
+     * detected; the handler thread is already running on the other end. */
+    if (rosettad_is_socket(host_fd)) {
+        if (g->verbose)
+            fprintf(stderr, "hl: rosettad: connect intercepted (guest_fd=%d, "
+                    "host_fd=%d) → success\n", fd, host_fd);
+        return 0;
+    }
 
     struct sockaddr_storage mac_sa;
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
@@ -372,11 +442,13 @@ int64_t sys_getsockname(guest_t *g, int fd, uint64_t addr_gva,
         linux_sa, (uint32_t)sizeof(linux_sa));
     if (out_len < 0) return -LINUX_EINVAL;
 
-    uint32_t write_len = (uint32_t)out_len;
+    uint32_t actual_len = (uint32_t)out_len;
+    uint32_t write_len = actual_len;
     if (write_len > guest_addrlen) write_len = guest_addrlen;
     if (guest_write(g, addr_gva, linux_sa, write_len) < 0)
         return -LINUX_EFAULT;
-    if (guest_write(g, addrlen_gva, &write_len, 4) < 0)
+    /* Write back actual (not truncated) length per Linux semantics */
+    if (guest_write(g, addrlen_gva, &actual_len, 4) < 0)
         return -LINUX_EFAULT;
 
     return 0;
@@ -403,25 +475,30 @@ int64_t sys_getpeername(guest_t *g, int fd, uint64_t addr_gva,
         linux_sa, (uint32_t)sizeof(linux_sa));
     if (out_len < 0) return -LINUX_EINVAL;
 
-    uint32_t write_len = (uint32_t)out_len;
+    uint32_t actual_len = (uint32_t)out_len;
+    uint32_t write_len = actual_len;
     if (write_len > guest_addrlen) write_len = guest_addrlen;
     if (guest_write(g, addr_gva, linux_sa, write_len) < 0)
         return -LINUX_EFAULT;
-    if (guest_write(g, addrlen_gva, &write_len, 4) < 0)
+    /* Write back actual (not truncated) length per Linux semantics */
+    if (guest_write(g, addrlen_gva, &actual_len, 4) < 0)
         return -LINUX_EFAULT;
 
     return 0;
 }
 
 int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
-                   int flags, uint64_t dest_gva, uint32_t addrlen) {
+                   int linux_flags, uint64_t dest_gva, uint32_t addrlen) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
     void *buf = guest_ptr(g, buf_gva);
     if (!buf && len > 0) return -LINUX_EFAULT;
 
-    int mac_flags = translate_msg_flags(flags);
+    int mac_flags = translate_msg_flags(linux_flags);
+    /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE.
+     * macOS has no MSG_NOSIGNAL; we handle it by not queuing SIGPIPE. */
+    int suppress_sigpipe = (linux_flags & 0x4000);
 
     if (dest_gva && addrlen > 0) {
         uint8_t linux_sa[128];
@@ -436,14 +513,16 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
         ssize_t ret = sendto(host_fd, buf, len, mac_flags,
                               (struct sockaddr *)&mac_sa, (socklen_t)mac_len);
         if (ret < 0) {
-            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            if (errno == EPIPE && !suppress_sigpipe)
+                signal_queue(LINUX_SIGPIPE);
             return linux_errno();
         }
         return ret;
     } else {
         ssize_t ret = send(host_fd, buf, len, mac_flags);
         if (ret < 0) {
-            if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+            if (errno == EPIPE && !suppress_sigpipe)
+                signal_queue(LINUX_SIGPIPE);
             return linux_errno();
         }
         return ret;
@@ -481,10 +560,15 @@ int64_t sys_recvfrom(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
                 (struct sockaddr *)&mac_sa, mac_len,
                 linux_sa, (uint32_t)sizeof(linux_sa));
             if (out_len > 0) {
-                uint32_t write_len = (uint32_t)out_len;
+                uint32_t actual_len = (uint32_t)out_len;
+                uint32_t write_len = actual_len;
                 if (write_len > guest_addrlen) write_len = guest_addrlen;
-                guest_write(g, src_gva, linux_sa, write_len);
-                guest_write(g, addrlen_gva, &write_len, 4);
+                if (guest_write(g, src_gva, linux_sa, write_len) < 0)
+                    return -LINUX_EFAULT;
+                /* Write back actual length (Linux returns full size even
+                 * if the address was truncated to fit the buffer) */
+                if (guest_write(g, addrlen_gva, &actual_len, 4) < 0)
+                    return -LINUX_EFAULT;
             }
         }
     }
@@ -582,11 +666,26 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
         *type_val &= 0xF;  /* Keep only the base socket type */
     }
 
-    uint32_t write_len = (uint32_t)mac_optlen;
+    /* SO_ERROR: macOS returns a macOS errno value; translate to Linux. */
+    if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR
+        && mac_optlen >= (socklen_t)sizeof(int)) {
+        int *err_val = (int *)optval;
+        if (*err_val != 0) {
+            errno = *err_val;
+            *err_val = (int)(-linux_errno());
+        }
+    }
+
+    /* Write option value, truncating to guest buffer size if needed.
+     * Write back actual length (not truncated) per Linux semantics —
+     * Linux getsockopt returns the real option size so the caller can
+     * detect truncation and retry with a larger buffer. */
+    uint32_t actual_len = (uint32_t)mac_optlen;
+    uint32_t write_len = actual_len;
     if (write_len > guest_optlen) write_len = guest_optlen;
     if (guest_write(g, optval_gva, optval, write_len) < 0)
         return -LINUX_EFAULT;
-    if (guest_write(g, optlen_gva, &write_len, 4) < 0)
+    if (guest_write(g, optlen_gva, &actual_len, 4) < 0)
         return -LINUX_EFAULT;
 
     return 0;
@@ -602,7 +701,7 @@ int64_t sys_shutdown(int fd, int how) {
     return 0;
 }
 
-int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -610,7 +709,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
     if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
         return -LINUX_EFAULT;
 
-    int mac_flags = translate_msg_flags(flags);
+    int mac_flags = translate_msg_flags(linux_flags);
+    int suppress_sigpipe = (linux_flags & 0x4000);
 
     /* Translate destination address */
     struct sockaddr_storage mac_sa;
@@ -708,14 +808,17 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
             cmsg->cmsg_type = mac_type;
             memcpy(CMSG_DATA(cmsg), linux_ctrl + lpos + 16, ldata_len);
 
-            /* For SCM_RIGHTS: translate guest fds to host fds */
+            /* For SCM_RIGHTS: translate guest fds to host fds.
+             * Validate ALL fds before overwriting any — a partial translation
+             * would leave the buffer in an inconsistent state on error. */
             if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
                 int *fds = (int *)CMSG_DATA(cmsg);
                 size_t nfds = ldata_len / sizeof(int);
                 for (size_t i = 0; i < nfds; i++) {
-                    int hfd = fd_to_host(fds[i]);
-                    if (hfd < 0) return -LINUX_EBADF;
-                    fds[i] = hfd;
+                    if (fd_to_host(fds[i]) < 0) return -LINUX_EBADF;
+                }
+                for (size_t i = 0; i < nfds; i++) {
+                    fds[i] = fd_to_host(fds[i]);
                 }
             }
 
@@ -743,7 +846,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
 
     ssize_t ret = sendmsg(host_fd, &msg, mac_flags);
     if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        if (errno == EPIPE && !suppress_sigpipe)
+            signal_queue(LINUX_SIGPIPE);
         return linux_errno();
     }
     return ret;
@@ -813,18 +917,20 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
     if (ret < 0) return linux_errno();
 
     /* Write back source address to guest */
-    if (lmsg.msg_name && msg.msg_namelen > 0) {
-        uint8_t linux_sa[128];
-        int out_len = mac_to_linux_sockaddr(
-            (struct sockaddr *)&mac_sa, msg.msg_namelen,
-            linux_sa, (uint32_t)sizeof(linux_sa));
-        if (out_len > 0) {
-            uint32_t write_len = (uint32_t)out_len;
-            if (write_len > lmsg.msg_namelen) write_len = lmsg.msg_namelen;
-            if (guest_write(g, lmsg.msg_name, linux_sa, write_len) < 0)
-                return -LINUX_EFAULT;
+    if (lmsg.msg_name) {
+        if (msg.msg_namelen > 0) {
+            uint8_t linux_sa[128];
+            int out_len = mac_to_linux_sockaddr(
+                (struct sockaddr *)&mac_sa, msg.msg_namelen,
+                linux_sa, (uint32_t)sizeof(linux_sa));
+            if (out_len > 0) {
+                uint32_t write_len = (uint32_t)out_len;
+                if (write_len > lmsg.msg_namelen) write_len = lmsg.msg_namelen;
+                if (guest_write(g, lmsg.msg_name, linux_sa, write_len) < 0)
+                    return -LINUX_EFAULT;
+            }
         }
-        /* Update msg_namelen in guest (offset 8 in linux_msghdr_t) */
+        /* Always write back msg_namelen (even if 0, e.g. SOCK_STREAM) */
         uint32_t nl = (uint32_t)msg.msg_namelen;
         if (guest_write(g, msg_gva + 8, &nl, 4) < 0)
             return -LINUX_EFAULT;
@@ -844,6 +950,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         struct cmsghdr *cmsg;
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
              cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_len < CMSG_LEN(0)) continue; /* malformed */
             size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
             /* Linux CMSG_LEN = 16 + data_len */
             uint64_t lcmsg_len = 16 + data_len;
@@ -874,8 +981,10 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
                         fds[i] = -1;
                     } else {
                         fds[i] = gfd;
+                        /* MSG_CMSG_CLOEXEC (0x40000000): set CLOEXEC on received fds */
+                        if (flags & 0x40000000)
+                            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
                         /* Log SCM_RIGHTS fd reception for rosettad debugging */
-                        extern int rosettad_is_socket(int host_fd);
                         if (g->verbose && rosettad_is_socket(fd_to_host(fd))) {
                             fprintf(stderr, "hl: rosettad: recvmsg SCM_RIGHTS "
                                     "host_fd=%d → guest_fd=%d\n",
@@ -915,8 +1024,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
             return -LINUX_EFAULT;
     }
 
-    /* Update msg_flags in guest (offset 48 in linux_msghdr_t) */
-    int32_t mflags = msg.msg_flags;
+    /* Update msg_flags in guest (offset 48 in linux_msghdr_t).
+     * macOS msg_flags use macOS values — translate to Linux. */
+    int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
     if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
         return -LINUX_EFAULT;
 
@@ -946,7 +1056,8 @@ int64_t sys_sendmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
         }
         /* Write msg_len field at offset 56 in mmsghdr */
         uint32_t msg_len = (uint32_t)ret;
-        guest_write(g, hdr_gva + 56, &msg_len, 4);
+        if (guest_write(g, hdr_gva + 56, &msg_len, 4) < 0)
+            return sent > 0 ? (int64_t)sent : -LINUX_EFAULT;
         sent++;
     }
     return (int64_t)sent;
@@ -966,7 +1077,8 @@ int64_t sys_recvmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
             return received > 0 ? (int64_t)received : ret;
         }
         uint32_t msg_len = (uint32_t)ret;
-        guest_write(g, hdr_gva + 56, &msg_len, 4);
+        if (guest_write(g, hdr_gva + 56, &msg_len, 4) < 0)
+            return received > 0 ? (int64_t)received : -LINUX_EFAULT;
         received++;
     }
     return (int64_t)received;

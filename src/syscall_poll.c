@@ -95,6 +95,9 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         linux_timespec_t lts;
         if (guest_read(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
+        /* Linux returns EINVAL for negative timeout values */
+        if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000LL)
+            return -LINUX_EINVAL;
         int64_t ms64 = lts.tv_sec * (int64_t)1000 + lts.tv_nsec / 1000000;
         timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int)ms64;
     }
@@ -143,10 +146,12 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
 
     int saved_errno = errno;
 
-    /* Drain the wakeup pipe if it fired (non-blocking) */
+    /* Drain the wakeup pipe if it fired, and subtract from count since
+     * the wakeup pipe is not visible to the guest. */
     if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
         uint8_t drain;
         while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        if (ret > 0) ret--;
     }
 
     /* Restore original signal mask */
@@ -182,20 +187,26 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     int max_host_fd = -1;
 
-    /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask. */
+    /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask.
+     * FD_TABLE_SIZE=1024 → max 16 uint64_t words (128 bytes). */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        /* For simplicity with small fd counts, read the bitmask and translate */
-        uint64_t rbits[2] = {0}, wbits[2] = {0}, ebits[2] = {0};
-        if (readfds_gva)
-            guest_read(g, readfds_gva, rbits, ((nfds + 63) / 64) * 8);
-        if (writefds_gva)
-            guest_read(g, writefds_gva, wbits, ((nfds + 63) / 64) * 8);
-        if (exceptfds_gva)
-            guest_read(g, exceptfds_gva, ebits, ((nfds + 63) / 64) * 8);
+        uint64_t rbits[FD_TABLE_SIZE / 64] = {0};
+        uint64_t wbits[FD_TABLE_SIZE / 64] = {0};
+        uint64_t ebits[FD_TABLE_SIZE / 64] = {0};
+        size_t bitmask_bytes = ((nfds + 63) / 64) * 8;
+        if (readfds_gva && guest_read(g, readfds_gva, rbits, bitmask_bytes) < 0)
+            return -LINUX_EFAULT;
+        if (writefds_gva && guest_read(g, writefds_gva, wbits, bitmask_bytes) < 0)
+            return -LINUX_EFAULT;
+        if (exceptfds_gva && guest_read(g, exceptfds_gva, ebits, bitmask_bytes) < 0)
+            return -LINUX_EFAULT;
 
         for (int i = 0; i < nfds; i++) {
             int host_fd = fd_to_host(i);
             if (host_fd < 0) continue;
+            /* Guard against host fds exceeding FD_SETSIZE (macOS stack
+             * buffer overflow if the host fd number is >= FD_SETSIZE). */
+            if (host_fd >= FD_SETSIZE) continue;
             if (host_fd > max_host_fd) max_host_fd = host_fd;
 
             if (rbits[i / 64] & (1ULL << (i % 64)))
@@ -213,6 +224,9 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         linux_timespec_t lts;
         if (guest_read(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
+        /* Linux returns EINVAL for negative or out-of-range timeout values */
+        if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000LL)
+            return -LINUX_EINVAL;
         ts.tv_sec = lts.tv_sec;
         ts.tv_nsec = lts.tv_nsec;
     }
@@ -247,8 +261,25 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     extern _Atomic int futex_interrupt_requested;
     struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
+
+    /* Save fd_sets — pselect modifies them in-place to indicate ready fds.
+     * Without saving/restoring, the indefinite retry loop would operate on
+     * corrupted (zeroed) fd_sets after a 200ms timeout iteration. */
+    fd_set saved_read, saved_write, saved_except;
+    if (!has_timeout) {
+        saved_read   = read_set;
+        saved_write  = write_set;
+        saved_except = except_set;
+    }
+
     int ret;
     do {
+        if (!has_timeout) {
+            read_set   = saved_read;
+            write_set  = saved_write;
+            except_set = saved_except;
+        }
+
         ret = pselect(max_host_fd + 1,
                       readfds_gva ? &read_set : NULL,
                       writefds_gva ? &write_set : NULL,
@@ -265,10 +296,13 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     int save_errno = errno;
 
-    /* Drain wakeup pipe if it fired */
+    /* Drain wakeup pipe if it fired, and subtract from count since
+     * the wakeup pipe is not visible to the guest. */
     if (added_wakeup && FD_ISSET(wakeup_pipe_rd, &read_set)) {
         uint8_t drain;
         while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        FD_CLR(wakeup_pipe_rd, &read_set);
+        if (ret > 0) ret--;
     }
 
     /* Restore original signal mask */
@@ -279,10 +313,13 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     /* Write back result fd_sets (zero then set bits for matching fds) */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        uint64_t rbits[2] = {0}, wbits[2] = {0}, ebits[2] = {0};
+        uint64_t rbits[FD_TABLE_SIZE / 64] = {0};
+        uint64_t wbits[FD_TABLE_SIZE / 64] = {0};
+        uint64_t ebits[FD_TABLE_SIZE / 64] = {0};
         for (int i = 0; i < nfds; i++) {
             int host_fd = fd_to_host(i);
             if (host_fd < 0) continue;
+            if (host_fd >= FD_SETSIZE) continue;  /* Must match setup loop guard */
             if (readfds_gva && FD_ISSET(host_fd, &read_set))
                 rbits[i / 64] |= (1ULL << (i % 64));
             if (writefds_gva && FD_ISSET(host_fd, &write_set))
@@ -377,6 +414,9 @@ int64_t sys_epoll_create1(int flags) {
 
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
                        uint64_t event_gva) {
+    /* Linux returns EINVAL when trying to add an epoll fd to itself */
+    if (fd == epfd) return -LINUX_EINVAL;
+
     int kq_fd = fd_to_host(epfd);
     if (kq_fd < 0) return -LINUX_EBADF;
     if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
@@ -390,11 +430,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
     epoll_reg_t *reg = &inst->regs[fd];
 
     if (op == LINUX_EPOLL_CTL_DEL) {
-        /* Remove all filters for this fd */
+        /* Linux returns ENOENT when removing an unregistered fd */
+        if (!reg->active) return -LINUX_ENOENT;
+
+        /* Remove all filters for this fd. EPOLLRDHUP alone registers
+         * EVFILT_READ (see ADD path), so check both EPOLLIN and EPOLLRDHUP. */
         struct kevent changes[2];
         int nchanges = 0;
-        if (reg->active) {
-            if (reg->events & LINUX_EPOLLIN) {
+        {
+            if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
                 EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
@@ -411,16 +455,23 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
         return 0;
     }
 
+    /* Linux semantics: ADD fails with EEXIST if already registered;
+     * MOD fails with ENOENT if not registered. */
+    if (op == LINUX_EPOLL_CTL_ADD && reg->active) return -LINUX_EEXIST;
+    if (op == LINUX_EPOLL_CTL_MOD && !reg->active) return -LINUX_ENOENT;
+
     /* ADD or MOD: read the epoll_event from guest */
     linux_epoll_event_t ev;
     if (guest_read(g, event_gva, &ev, sizeof(ev)) < 0)
         return -LINUX_EFAULT;
 
-    /* For MOD, remove old registrations first */
+    /* For MOD, remove old registrations first.
+     * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check
+     * both EPOLLIN and EPOLLRDHUP — same logic as CTL_DEL. */
     if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
         struct kevent del[2];
         int ndel = 0;
-        if (reg->events & LINUX_EPOLLIN) {
+        if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
             EV_SET(&del[ndel], host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
             ndel++;
         }
@@ -508,7 +559,9 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
     }
 
     /* Collect kqueue events. For indefinite waits, use a short timeout
-     * and loop so exit_group can interrupt. */
+     * and loop so exit_group can interrupt. Cap maxevents before multiply
+     * to avoid signed integer overflow when maxevents is very large. */
+    if (maxevents > 128) maxevents = 128;
     int cap = maxevents * 2; /* Each epoll fd can produce 2 kevents */
     if (cap > 256) cap = 256;
     /* Reserve one slot for the wakeup pipe event */
@@ -580,8 +633,12 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
                     out[j].events |= LINUX_EPOLLIN;
                 if (kevents[i].filter == EVFILT_WRITE)
                     out[j].events |= LINUX_EPOLLOUT;
-                if (kevents[i].flags & EV_EOF)
+                if (kevents[i].flags & EV_EOF) {
                     out[j].events |= LINUX_EPOLLHUP;
+                    if (kevents[i].filter == EVFILT_READ &&
+                        (reg->events & LINUX_EPOLLRDHUP))
+                        out[j].events |= LINUX_EPOLLRDHUP;
+                }
                 if (kevents[i].flags & EV_ERROR)
                     out[j].events |= LINUX_EPOLLERR;
                 merged = 1;
@@ -598,8 +655,12 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
                 out[nout].events |= LINUX_EPOLLIN;
             if (kevents[i].filter == EVFILT_WRITE)
                 out[nout].events |= LINUX_EPOLLOUT;
-            if (kevents[i].flags & EV_EOF)
+            if (kevents[i].flags & EV_EOF) {
                 out[nout].events |= LINUX_EPOLLHUP;
+                if (kevents[i].filter == EVFILT_READ &&
+                    (reg->events & LINUX_EPOLLRDHUP))
+                    out[nout].events |= LINUX_EPOLLRDHUP;
+            }
             if (kevents[i].flags & EV_ERROR)
                 out[nout].events |= LINUX_EPOLLERR;
             nout++;

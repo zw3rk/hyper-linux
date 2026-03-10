@@ -273,6 +273,12 @@ void proc_set_cmdline(int argc, const char **argv) {
     cmdline_len = off;
 }
 
+void proc_set_cmdline_raw(const char *buf, size_t len) {
+    if (len > sizeof(cmdline_buf)) len = sizeof(cmdline_buf);
+    memcpy(cmdline_buf, buf, len);
+    cmdline_len = len;
+}
+
 const char *proc_get_cmdline(size_t *len_out) {
     if (cmdline_len == 0) return NULL;
     if (len_out) *len_out = cmdline_len;
@@ -538,7 +544,8 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
         if (ptrace_tid > 0) {
             if (status_gva) {
                 int32_t ls = ptrace_status;
-                guest_write(g, status_gva, &ls, sizeof(ls));
+                if (guest_write(g, status_gva, &ls, sizeof(ls)) < 0)
+                    return -LINUX_EFAULT;
             }
             return ptrace_tid;
         }
@@ -548,23 +555,32 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
     /* Translate Linux wait options */
     int mac_options = 0;
-    if (options & 1) mac_options |= WNOHANG;   /* WNOHANG = 1 on both */
-    if (options & 2) mac_options |= WUNTRACED; /* WUNTRACED = 2 on both */
+    if (options & 1) mac_options |= WNOHANG;     /* WNOHANG = 1 on both */
+    if (options & 2) mac_options |= WUNTRACED;   /* WUNTRACED = 2 on both */
+    if (options & 8) mac_options |= WCONTINUED;  /* WCONTINUED: Linux=8, macOS=0x10 */
 
     pthread_mutex_lock(&pid_lock);
 
     if (pid == -1) {
-        /* Wait for any child. Find any active entry in process table. */
-        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
-            if (proc_table[i].active) {
+        /* Wait for any child.  Always poll with WNOHANG first so we
+         * don't block on one specific child while another exits.  If
+         * blocking (no WNOHANG) and no child is ready, sleep briefly
+         * and retry — this gives correct "wait for any" semantics. */
+        for (;;) {
+            int found_any_child = 0;
+            for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+                if (!proc_table[i].active)
+                    continue;
+                found_any_child = 1;
                 if (proc_table[i].exited) {
                     /* Already reaped (from CLONE_VFORK wait) */
                     int64_t gpid = proc_table[i].guest_pid;
                     int32_t linux_status = proc_table[i].exit_status;
                     proc_table[i].active = 0;
                     pthread_mutex_unlock(&pid_lock);
-                    if (status_gva)
-                        guest_write(g, status_gva, &linux_status, 4);
+                    if (status_gva &&
+                        guest_write(g, status_gva, &linux_status, 4) < 0)
+                        return -LINUX_EFAULT;
                     return gpid;
                 }
 
@@ -575,33 +591,57 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
                 int status;
                 struct rusage ru;
-                pid_t ret = wait4(host_pid, &status, mac_options,
+                pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
                                   rusage_gva ? &ru : NULL);
                 if (ret > 0) {
                     if (status_gva) {
                         int32_t linux_status = status;
-                        guest_write(g, status_gva, &linux_status, 4);
+                        if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                            /* Child already reaped — match Linux: return EFAULT */
+                            pthread_mutex_lock(&pid_lock);
+                            if (proc_table[slot].active &&
+                                proc_table[slot].host_pid == host_pid)
+                                proc_table[slot].active = 0;
+                            pthread_mutex_unlock(&pid_lock);
+                            return -LINUX_EFAULT;
+                        }
                     }
-                    if (rusage_gva)
-                        write_rusage_to_guest(g, rusage_gva, &ru);
+                    if (rusage_gva &&
+                        write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                        pthread_mutex_lock(&pid_lock);
+                        if (proc_table[slot].active &&
+                            proc_table[slot].host_pid == host_pid)
+                            proc_table[slot].active = 0;
+                        pthread_mutex_unlock(&pid_lock);
+                        return -LINUX_EFAULT;
+                    }
                     pthread_mutex_lock(&pid_lock);
-                    /* Re-validate slot: another thread may have reaped it */
                     if (proc_table[slot].active &&
                         proc_table[slot].host_pid == host_pid)
                         proc_table[slot].active = 0;
                     pthread_mutex_unlock(&pid_lock);
                     return gpid;
-                } else if (ret == 0) {
-                    /* WNOHANG and child not yet exited */
-                    return 0;
                 }
-                /* waitpid failed — try next child */
+                /* ret == 0 (not exited) or ret < 0 (error): try next */
                 pthread_mutex_lock(&pid_lock);
             }
+
+            if (!found_any_child) {
+                pthread_mutex_unlock(&pid_lock);
+                return -LINUX_ECHILD;
+            }
+            if (mac_options & WNOHANG) {
+                pthread_mutex_unlock(&pid_lock);
+                return 0;
+            }
+
+            /* Blocking mode: no child exited yet.  Sleep briefly and
+             * retry rather than blocking on one specific host PID (which
+             * could miss a different child exiting first). */
+            pthread_mutex_unlock(&pid_lock);
+            usleep(10000); /* 10ms */
+            pthread_mutex_lock(&pid_lock);
         }
-        pthread_mutex_unlock(&pid_lock);
-        /* No children */
-        return -LINUX_ECHILD;
     }
 
     /* Wait for specific guest PID */
@@ -612,8 +652,9 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                 int32_t linux_status = proc_table[i].exit_status;
                 proc_table[i].active = 0;
                 pthread_mutex_unlock(&pid_lock);
-                if (status_gva)
-                    guest_write(g, status_gva, &linux_status, 4);
+                if (status_gva &&
+                    guest_write(g, status_gva, &linux_status, 4) < 0)
+                    return -LINUX_EFAULT;
                 return gpid;
             }
 
@@ -629,10 +670,24 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
             if (ret > 0) {
                 if (status_gva) {
                     int32_t linux_status = status;
-                    guest_write(g, status_gva, &linux_status, 4);
+                    if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                        pthread_mutex_lock(&pid_lock);
+                        if (proc_table[slot].active &&
+                            proc_table[slot].host_pid == host_pid)
+                            proc_table[slot].active = 0;
+                        pthread_mutex_unlock(&pid_lock);
+                        return -LINUX_EFAULT;
+                    }
                 }
-                if (rusage_gva)
-                    write_rusage_to_guest(g, rusage_gva, &ru);
+                if (rusage_gva &&
+                    write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                    pthread_mutex_lock(&pid_lock);
+                    if (proc_table[slot].active &&
+                        proc_table[slot].host_pid == host_pid)
+                        proc_table[slot].active = 0;
+                    pthread_mutex_unlock(&pid_lock);
+                    return -LINUX_EFAULT;
+                }
                 pthread_mutex_lock(&pid_lock);
                 /* Re-validate slot: another thread may have reaped it */
                 if (proc_table[slot].active &&
@@ -676,10 +731,11 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
 int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                    uint64_t infop_gva, int options) {
-    /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2 */
+    /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8 */
     int mac_options = 0;
     if (options & 1) mac_options |= WNOHANG;
     if (options & 2) mac_options |= WUNTRACED;
+    if (options & 8) mac_options |= WCONTINUED;
     /* WEXITED (4) is implied by waitpid */
 
     /* Convert idtype+id to a waitpid-compatible pid argument */
@@ -744,11 +800,15 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
             memcpy(si + SIGINFO_OFF_UID, &uid, 4);
             memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
 
-            guest_write(g, infop_gva, si, SIGINFO_SIZE);
+            if (guest_write(g, infop_gva, si, SIGINFO_SIZE) < 0)
+                return -LINUX_EFAULT;
         }
 
-        /* Don't remove from table if WNOWAIT is set */
-        if (!(options & 0x01000000))
+        /* Don't remove from table if WNOWAIT is set.
+         * Re-validate slot after re-locking (another thread may have
+         * reused it while we released the lock for waitpid). */
+        if (!(options & 0x01000000) &&
+            proc_table[i].active && proc_table[i].host_pid == ret)
             proc_table[i].active = 0;
 
         pthread_mutex_unlock(&pid_lock);
@@ -881,8 +941,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                      * [X18+0x1b8] must be set for the SIGTRAP handler
                      * to perform JIT retranslation. Log when it changes. */
                     if (verbose && g->is_rosetta) {
-                        static uint32_t prev_jit_gate = 0xDEADBEEF;
-                        static uint64_t prev_x18 = 0;
+                        static _Thread_local uint32_t prev_jit_gate = 0xDEADBEEF;
+                        static _Thread_local uint64_t prev_x18 = 0;
                         uint64_t x18_val;
                         hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18_val);
                         if (x18_val != prev_x18) {
@@ -1267,7 +1327,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         uint64_t brk_esr;
                         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
                         signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc, brk_esr);
-                        signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                        signal_queue(LINUX_SIGTRAP);
                         if (verbose) {
                             uint64_t thread_blocked = current_thread ?
                                 current_thread->blocked : 0xDEAD;
@@ -1314,7 +1374,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
 
-                    uint32_t ec = (uint32_t)((esr >> 26) & 0x3F);
+                    uint32_t fault_ec = (uint32_t)((esr >> 26) & 0x3F);
                     uint32_t fsc = (uint32_t)(esr & 0x3F);
                     uint32_t fsc_type = (fsc >> 2) & 0xF;  /* xFSC[5:2] */
 
@@ -1328,7 +1388,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
 
                     if (verbose) {
                         const char *fault_type =
-                            (ec == 0x20) ? "inst" : "data";
+                            (fault_ec == 0x20) ? "inst" : "data";
                         const char *code_name =
                             (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
                         fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
@@ -1417,7 +1477,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             (unsigned long long)sp_el0);
                     for (int ri = 4; ri <= 30; ri++) {
                         /* Skip X5 (clobbered by shim for vec offset) */
-                        if (ri >= 0 && ri <= 3) continue;
                         if (ri == 5) continue;
                         uint64_t rv;
                         hv_vcpu_get_reg(vcpu,

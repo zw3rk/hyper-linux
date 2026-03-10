@@ -159,11 +159,15 @@ int main(int argc, const char **argv) {
     memset(&rr, 0, sizeof(rr));
 
     /* ---- Step 2: Initialize guest memory and VM ---- */
-    /* Auto-detect IPA size (36/40-bit). Rosetta's high VA (128TB) is
-     * handled via page tables mapping to a low GPA within the primary
-     * buffer — no high IPA needed. */
+    /* For rosetta mode, request 48-bit IPA even on M2 (which defaults to
+     * 36-bit). This gives a 1TB primary buffer (buf_bits = min(48, 40) = 40)
+     * instead of 64GB, providing ~1008GB of mmap backing space for rosetta's
+     * high-VA JIT allocations that would otherwise exhaust the 48GB M2 pool.
+     * The VM's Stage-2 IPA width also needs 48-bit for rosetta's page tables
+     * to map VAs above 64GB (e.g., PIE base at 85TB). For native aarch64,
+     * auto-detect (36/40-bit) is sufficient. */
     guest_t g;
-    if (guest_init(&g, 0, 0) < 0) {
+    if (guest_init(&g, 0, need_rosetta ? 48 : 0) < 0) {
         fprintf(stderr, "hl: failed to initialize guest\n");
         return 1;
     }
@@ -309,6 +313,7 @@ int main(int argc, const char **argv) {
      * vDSO + rosetta segment regions for the page table builder. */
     /* Resolve ELF path early — needed by rosetta_prepare/finalize */
     char elf_realpath[LINUX_PATH_MAX];
+    memset(elf_realpath, 0, sizeof(elf_realpath));
     if (!realpath(elf_path, elf_realpath))
         strncpy(elf_realpath, elf_path, sizeof(elf_realpath) - 1);
 
@@ -549,6 +554,7 @@ int main(int argc, const char **argv) {
         if (rosetta_finalize(&g, vcpu, elf_path,
                              guest_argc, guest_argv, &rr, verbose,
                              &rosetta_argc, &rosetta_argv, &vdso_addr) < 0) {
+            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }

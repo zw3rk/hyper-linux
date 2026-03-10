@@ -11,19 +11,37 @@ set -euo pipefail
 
 MODE="${1:?Usage: $0 <hl-aarch64|hl-x64|lima-aarch64|lima-x64|all>}"
 
-# ── Paths ─────────────────────────────────────────────────────────
-HL=_build/hl
-LIMACTL=/nix/store/75nyrllrdr96sbbfnwc3vxgmnbhhkar9-lima-2.0.3/bin/limactl
-LIMA_VM=hl-rosetta
+# ── Paths (all from environment, typically set by flake.nix) ──────
+HL="${HL:-_build/hl}"
+LIMACTL="${LIMACTL:-limactl}"
+LIMA_VM="${LIMA_VM:-hl-rosetta}"
 
-AARCH64_TEST_BIN=/nix/store/c58xq21arripb2raafjw8gr2yn3wv908-hl-test-binaries-aarch64-unknown-linux-musl-0.1.0/bin
-AARCH64_COREUTILS=/nix/store/z2s6b6sghq3ax72mlwva4iabkjigd102-coreutils-aarch64-unknown-linux-musl-9.9/bin
-AARCH64_BUSYBOX=/nix/store/pqz4ip0p7d911dqk8wsy90sbw63mcqzn-busybox-static-aarch64-unknown-linux-musl-1.37.0/bin/busybox
-AARCH64_STATIC=/nix/store/r5mdx3mm79nql4wksg881f8ra7kxzghr-hl-static-bins/bin
+# Static binaries — required for the selected mode (validated at runtime)
+AARCH64_TEST_BIN="${GUEST_TEST_BINARIES:+${GUEST_TEST_BINARIES}/bin}"
+AARCH64_COREUTILS="${GUEST_COREUTILS:+${GUEST_COREUTILS}/bin}"
+AARCH64_BUSYBOX="${GUEST_BUSYBOX:+${GUEST_BUSYBOX}/bin/busybox}"
+AARCH64_STATIC="${GUEST_STATIC_BINS:+${GUEST_STATIC_BINS}/bin}"
 
-X64_TEST_BIN=/nix/store/m1ncs5x28i0igcdzlkx7kr37rs1c05hw-hl-x64-test-binaries-x86_64-unknown-linux-musl-0.1.0/bin
-X64_COREUTILS=/nix/store/a15g0vkrw5w7izkf5a37qrb6ymrdpkwy-coreutils-static-x86_64-unknown-linux-musl-9.9/bin
-X64_BUSYBOX=/nix/store/aflblv48yhibafwyvh2qfl0r1xx41d6v-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin/busybox
+X64_TEST_BIN="${GUEST_X64_TEST_BINARIES:+${GUEST_X64_TEST_BINARIES}/bin}"
+X64_COREUTILS="${GUEST_X64_COREUTILS:+${GUEST_X64_COREUTILS}/bin}"
+X64_BUSYBOX="${GUEST_X64_BUSYBOX:+${GUEST_X64_BUSYBOX}/bin/busybox}"
+X64_STATIC="${GUEST_X64_STATIC_BINS:+${GUEST_X64_STATIC_BINS}/bin}"
+
+# Dynamic linking paths — optional (suites skipped if unset)
+AARCH64_MUSL_SYSROOT="${GUEST_SYSROOT:-}"
+AARCH64_MUSL_DYN_COREUTILS="${GUEST_DYNAMIC_COREUTILS:+${GUEST_DYNAMIC_COREUTILS}/bin}"
+AARCH64_GLIBC_SYSROOT="${GUEST_GLIBC_SYSROOT:-}"
+AARCH64_GLIBC_DYN_COREUTILS="${GUEST_GLIBC_DYNAMIC_COREUTILS:+${GUEST_GLIBC_DYNAMIC_COREUTILS}/bin}"
+X64_MUSL_SYSROOT="${GUEST_X64_MUSL_SYSROOT:-}"
+X64_MUSL_DYN_COREUTILS="${GUEST_X64_MUSL_DYNAMIC_COREUTILS:+${GUEST_X64_MUSL_DYNAMIC_COREUTILS}/bin}"
+X64_GLIBC_SYSROOT="${GUEST_X64_GLIBC_SYSROOT:-}"
+X64_GLIBC_DYN_COREUTILS="${GUEST_X64_GLIBC_DYNAMIC_COREUTILS:+${GUEST_X64_GLIBC_DYNAMIC_COREUTILS}/bin}"
+
+# Haskell paths — optional (suites skipped if unset)
+AARCH64_HASKELL_HELLO="${GUEST_HASKELL_HELLO:+${GUEST_HASKELL_HELLO}/bin/hello-hyper}"
+AARCH64_HASKELL_BINS="${GUEST_HASKELL_BINS:+${GUEST_HASKELL_BINS}/bin}"
+X64_HASKELL_HELLO="${GUEST_X64_HASKELL_HELLO:+${GUEST_X64_HASKELL_HELLO}/bin/hello-hyper}"
+X64_HASKELL_BINS="${GUEST_X64_HASKELL_BINS:+${GUEST_X64_HASKELL_BINS}/bin}"
 
 # ── Colors ────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -92,6 +110,23 @@ run_hl() {
 # Run binary directly in Lima VM (stderr suppressed to avoid limactl warnings)
 run_lima() {
     timeout 60 "$LIMACTL" shell "$LIMA_VM" -- "$@" 2>/dev/null
+}
+
+# Run binary via hl with --sysroot.  Uses global _SYSROOT for the sysroot
+# path, _HL_TIMEOUT for the timeout (default 30s), and _GUEST_EXTRA for
+# extra guest arguments (e.g. "+RTS -xr4G -RTS" to shrink GHC VA reservation).
+_SYSROOT=""
+_HL_TIMEOUT=30
+_GUEST_EXTRA=""
+
+run_hl_sysroot() {
+    local bin="$1"; shift
+    local sysroot_args=""
+    if [ -n "$_SYSROOT" ]; then
+        sysroot_args="--sysroot $_SYSROOT"
+    fi
+    # shellcheck disable=SC2086
+    timeout "$_HL_TIMEOUT" "$HL" $sysroot_args "$bin" $_GUEST_EXTRA "$@" 2>/dev/null
 }
 
 # Generic test: run binary, check output contains pattern
@@ -404,29 +439,76 @@ run_static_tests() {
     fi
 }
 
+# ── Test suite: haskell bins ──────────────────────────────────────
+run_haskell_bins_tests() {
+    local runner="$1"
+    local bindir="$2"
+
+    # shellcheck tests (quick, reliable)
+    if [ -f "$bindir/shellcheck" ]; then
+        test_check "$runner" "shellcheck --version" "[Ss]hell[Cc]heck" "$bindir/shellcheck" --version
+        test_pipe  "$runner" "shellcheck: bad script" "SC2086" \
+                   $'#!/bin/bash\necho $foo' "$bindir/shellcheck" -s bash -
+        test_pipe  "$runner" "shellcheck: json" "2086" \
+                   $'#!/bin/bash\necho $foo' "$bindir/shellcheck" -f json -s bash -
+    fi
+
+    # pandoc tests (large binary, may be slow under rosetta JIT)
+    if [ -f "$bindir/pandoc" ]; then
+        test_check "$runner" "pandoc --version"      "pandoc"   "$bindir/pandoc" --version
+        test_check "$runner" "pandoc --list-formats"  "markdown" "$bindir/pandoc" --list-output-formats
+    fi
+}
+
 # ── Run the selected mode ─────────────────────────────────────────
 run_suite() {
     local mode="$1"
     local runner test_bin coreutils_bin busybox_bin static_bin
+    local dyn_runner musl_sysroot musl_dyn_coreutils glibc_sysroot glibc_dyn_coreutils
+    local haskell_hello haskell_hello_sysroot haskell_bins haskell_extra
 
     # Create test fixtures in a location accessible to the runner.
     cleanup_fixtures
     setup_fixtures "$mode"
 
     case "$mode" in
+        hl-aarch64|lima-aarch64)
+            [ -z "$AARCH64_TEST_BIN" ] && { echo "error: set GUEST_TEST_BINARIES, GUEST_COREUTILS, GUEST_BUSYBOX, GUEST_STATIC_BINS"; exit 1; }
+            ;;&
+        hl-x64|lima-x64)
+            [ -z "$X64_TEST_BIN" ] && { echo "error: set GUEST_X64_TEST_BINARIES, GUEST_X64_COREUTILS, GUEST_X64_BUSYBOX, GUEST_X64_STATIC_BINS"; exit 1; }
+            ;;&
         hl-aarch64)
             runner="run_hl"
             test_bin="$AARCH64_TEST_BIN"
             coreutils_bin="$AARCH64_COREUTILS"
             busybox_bin="$AARCH64_BUSYBOX"
             static_bin="$AARCH64_STATIC"
+            dyn_runner="run_hl_sysroot"
+            musl_sysroot="$AARCH64_MUSL_SYSROOT"
+            musl_dyn_coreutils="$AARCH64_MUSL_DYN_COREUTILS"
+            glibc_sysroot="$AARCH64_GLIBC_SYSROOT"
+            glibc_dyn_coreutils="$AARCH64_GLIBC_DYN_COREUTILS"
+            haskell_hello="$AARCH64_HASKELL_HELLO"
+            haskell_hello_sysroot="$AARCH64_MUSL_SYSROOT"
+            haskell_bins="$AARCH64_HASKELL_BINS"
+            haskell_extra=""
             ;;
         hl-x64)
             runner="run_hl"
             test_bin="$X64_TEST_BIN"
             coreutils_bin="$X64_COREUTILS"
             busybox_bin="$X64_BUSYBOX"
-            static_bin=""  # no x64 static bins
+            static_bin="$X64_STATIC"
+            dyn_runner="run_hl_sysroot"
+            musl_sysroot="$X64_MUSL_SYSROOT"
+            musl_dyn_coreutils="$X64_MUSL_DYN_COREUTILS"
+            glibc_sysroot="$X64_GLIBC_SYSROOT"
+            glibc_dyn_coreutils="$X64_GLIBC_DYN_COREUTILS"
+            haskell_hello="$X64_HASKELL_HELLO"
+            haskell_hello_sysroot="$X64_MUSL_SYSROOT"
+            haskell_bins="$X64_HASKELL_BINS"
+            haskell_extra="+RTS -xr4G -RTS"
             ;;
         lima-aarch64)
             runner="run_lima"
@@ -434,13 +516,31 @@ run_suite() {
             coreutils_bin="$AARCH64_COREUTILS"
             busybox_bin="$AARCH64_BUSYBOX"
             static_bin="$AARCH64_STATIC"
+            dyn_runner="run_lima"
+            musl_sysroot=""
+            musl_dyn_coreutils="$AARCH64_MUSL_DYN_COREUTILS"
+            glibc_sysroot=""
+            glibc_dyn_coreutils="$AARCH64_GLIBC_DYN_COREUTILS"
+            haskell_hello="$AARCH64_HASKELL_HELLO"
+            haskell_hello_sysroot=""
+            haskell_bins="$AARCH64_HASKELL_BINS"
+            haskell_extra=""
             ;;
         lima-x64)
             runner="run_lima"
             test_bin="$X64_TEST_BIN"
             coreutils_bin="$X64_COREUTILS"
             busybox_bin="$X64_BUSYBOX"
-            static_bin=""  # no x64 static bins
+            static_bin="$X64_STATIC"
+            dyn_runner="run_lima"
+            musl_sysroot=""
+            musl_dyn_coreutils="$X64_MUSL_DYN_COREUTILS"
+            glibc_sysroot=""
+            glibc_dyn_coreutils="$X64_GLIBC_DYN_COREUTILS"
+            haskell_hello="$X64_HASKELL_HELLO"
+            haskell_hello_sysroot=""
+            haskell_bins="$X64_HASKELL_BINS"
+            haskell_extra=""
             ;;
         *)
             echo "Unknown mode: $mode"
@@ -467,6 +567,45 @@ run_suite() {
         printf "\n${BLUE}═══ Static bins ═══${RESET}\n"
         run_static_tests "$runner" "$static_bin"
     fi
+
+    # Dynamic coreutils (musl) — skip if sysroot missing (hl) or dir missing
+    if [ -d "$musl_dyn_coreutils" ]; then
+        if [ "$dyn_runner" = "run_hl_sysroot" ] && [ -z "$musl_sysroot" ]; then
+            printf "\n${BLUE}═══ Dynamic coreutils (musl) — SKIP (no sysroot) ═══${RESET}\n"
+        else
+            printf "\n${BLUE}═══ Dynamic coreutils (musl) ═══${RESET}\n"
+            _SYSROOT="$musl_sysroot"; _HL_TIMEOUT=30; _GUEST_EXTRA=""
+            run_coreutils_tests "$dyn_runner" "$musl_dyn_coreutils"
+        fi
+    fi
+
+    # Dynamic coreutils (glibc)
+    if [ -d "$glibc_dyn_coreutils" ]; then
+        if [ "$dyn_runner" = "run_hl_sysroot" ] && [ -z "$glibc_sysroot" ]; then
+            printf "\n${BLUE}═══ Dynamic coreutils (glibc) — SKIP (no sysroot) ═══${RESET}\n"
+        else
+            printf "\n${BLUE}═══ Dynamic coreutils (glibc) ═══${RESET}\n"
+            _SYSROOT="$glibc_sysroot"; _HL_TIMEOUT=30; _GUEST_EXTRA=""
+            run_coreutils_tests "$dyn_runner" "$glibc_dyn_coreutils"
+        fi
+    fi
+
+    # Haskell hello (dynamically linked, uses musl sysroot)
+    if [ -f "$haskell_hello" ]; then
+        printf "\n${BLUE}═══ Haskell hello ═══${RESET}\n"
+        _SYSROOT="$haskell_hello_sysroot"; _HL_TIMEOUT=60; _GUEST_EXTRA=""
+        test_check "$dyn_runner" "hello-hyper" "Hello" "$haskell_hello"
+    fi
+
+    # Haskell bins (pandoc, shellcheck — nix interpreter, no sysroot needed)
+    if [ -d "$haskell_bins" ]; then
+        printf "\n${BLUE}═══ Haskell bins ═══${RESET}\n"
+        _SYSROOT=""; _HL_TIMEOUT=120; _GUEST_EXTRA="$haskell_extra"
+        run_haskell_bins_tests "$dyn_runner" "$haskell_bins"
+    fi
+
+    # Reset runner globals
+    _SYSROOT=""; _HL_TIMEOUT=30; _GUEST_EXTRA=""
 
     printf "\n${CYAN}━━━ %s Results: %d passed, %d failed, %d timeout, %d skipped ━━━${RESET}\n\n" \
         "$mode" "$pass" "$fail" "$timeout_count" "$skip"

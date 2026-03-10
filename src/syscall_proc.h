@@ -55,6 +55,10 @@ const char *proc_get_hl_path(void);
  * argv is a NULL-terminated array of strings. */
 void proc_set_cmdline(int argc, const char **argv);
 
+/* Set cmdline from a raw pre-formatted buffer (NUL-separated args).
+ * Used by fork_child_main to restore parent's cmdline from IPC. */
+void proc_set_cmdline_raw(const char *buf, size_t len);
+
 /* Get the stored cmdline buffer and its length. Returns NULL if not set. */
 const char *proc_get_cmdline(size_t *len_out);
 

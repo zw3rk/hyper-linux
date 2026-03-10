@@ -117,6 +117,6 @@ int main(void) {
         } else FAIL("timerfd_create failed");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-timerfd");
     return fails > 0 ? 1 : 0;
 }

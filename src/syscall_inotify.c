@@ -21,6 +21,7 @@
 #include "syscall_inotify.h"
 #include "syscall.h"
 #include "syscall_internal.h"
+#include "syscall_proc.h"   /* exit_group_requested */
 #include "guest.h"
 
 #include <stdio.h>
@@ -28,7 +29,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 
@@ -45,7 +48,10 @@
 #define IN_DELETE        0x00000200
 #define IN_DELETE_SELF   0x00000400
 #define IN_MOVE_SELF     0x00000800
-#define IN_NONBLOCK      0x00000800  /* Same as O_NONBLOCK on aarch64 */
+#define IN_NONBLOCK      0x00000800  /* Same value as IN_MOVE_SELF — intentional.
+                                      * IN_NONBLOCK is only used in inotify_init1()
+                                      * flags, never in add_watch() event masks.
+                                      * Equals O_NONBLOCK on aarch64-linux. */
 #define IN_CLOEXEC       0x00080000  /* Same as O_CLOEXEC on aarch64 */
 
 /* Linux struct inotify_event layout:
@@ -312,6 +318,7 @@ int64_t sys_inotify_init1(int flags) {
     int slot = inotify_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
+        fd_mark_closed(gfd);
         close(kq);
         close(pipefd[0]);
         close(pipefd[1]);
@@ -373,7 +380,11 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
         return -LINUX_ENOSPC;
     }
 
-    int wd = inst->wd_counter++;
+    int wd = inst->wd_counter;
+    if (inst->wd_counter >= INT_MAX)
+        inst->wd_counter = 1;  /* wrap safely, skip 0 */
+    else
+        inst->wd_counter++;
     inotify_watch_t *w = &inst->watches[widx];
     w->wd = wd;
     w->host_fd = host_fd;
@@ -445,8 +456,9 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd) {
 
 int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
                       uint64_t count) {
+    pthread_mutex_lock(&inotify_lock);
     int slot = inotify_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&inotify_lock); return -LINUX_EBADF; }
 
     inotify_instance_t *inst = &inotify_state[slot];
 
@@ -455,23 +467,38 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
         int n = collect_events(inst);
 
         if (n == 0) {
-            if (inst->nonblock)
+            if (inst->nonblock) {
+                pthread_mutex_unlock(&inotify_lock);
                 return -LINUX_EAGAIN;
+            }
 
-            /* Blocking read: wait on the kqueue for events.
+            /* Blocking read: release lock, wait on the kqueue for events.
              * The self-pipe makes poll/select/epoll work, but for direct
              * read() calls we poll the kqueue with a moderate timeout and
              * retry to avoid hanging indefinitely (allows signal delivery). */
+            int kq_fd = inst->kq_fd;
+            pthread_mutex_unlock(&inotify_lock);
+
             struct kevent kev;
             struct timespec ts = {1, 0};  /* 1 second per attempt */
-            int nev;
+            int nev = 0;
             for (int attempt = 0; attempt < 300; attempt++) {
-                nev = kevent(inst->kq_fd, NULL, 0, &kev, 1, &ts);
+                nev = kevent(kq_fd, NULL, 0, &kev, 1, &ts);
                 if (nev > 0) break;
                 if (nev < 0 && errno != EINTR) return linux_errno();
+                if (atomic_load(&exit_group_requested))
+                    return -LINUX_EINTR;
             }
             if (nev <= 0)
                 return -LINUX_EAGAIN;
+
+            /* Re-acquire lock and re-validate slot */
+            pthread_mutex_lock(&inotify_lock);
+            if (inotify_state[slot].guest_fd != guest_fd) {
+                pthread_mutex_unlock(&inotify_lock);
+                return -LINUX_EBADF;
+            }
+            inst = &inotify_state[slot];
 
             /* Process the received event */
             int host_fd = (int)kev.ident;
@@ -488,32 +515,35 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
         }
     }
 
-    if (inst->event_used == 0)
+    if (inst->event_used == 0) {
+        pthread_mutex_unlock(&inotify_lock);
         return -LINUX_EAGAIN;
+    }
 
-    /* Copy buffered events to guest, up to count bytes.
-     * Only copy whole events (don't split an event across reads). */
+    /* Copy buffered events to a local buffer under lock, then write to
+     * guest after releasing the lock (guest_write doesn't need lock). */
     size_t copied = 0;
     size_t pos = 0;
 
+    /* First pass: compute how much we can copy */
     while (pos < inst->event_used && copied + INOTIFY_EVENT_HEADER_SIZE <= count) {
-        /* Read the name_len field to determine this event's total size */
         uint32_t name_len;
         memcpy(&name_len, inst->event_buf + pos + 12, 4);
         size_t event_size = INOTIFY_EVENT_HEADER_SIZE + name_len;
 
         if (copied + event_size > count)
-            break;  /* Would exceed buffer — stop here */
-
-        if (guest_write(g, buf_gva + copied, inst->event_buf + pos,
-                         event_size) < 0)
-            return -LINUX_EFAULT;
+            break;
 
         copied += event_size;
         pos += event_size;
     }
 
-    /* Compact remaining events in the buffer */
+    /* Copy event data to a local buffer (max 4KB) */
+    uint8_t local_buf[INOTIFY_BUFSIZE];
+    if (copied > 0)
+        memcpy(local_buf, inst->event_buf, copied);
+
+    /* Compact remaining events in the instance buffer */
     if (pos > 0 && pos < inst->event_used) {
         memmove(inst->event_buf, inst->event_buf + pos,
                 inst->event_used - pos);
@@ -525,6 +555,14 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
     /* Drain self-pipe if buffer is now empty */
     if (inst->event_used == 0)
         pipe_drain(inst);
+
+    pthread_mutex_unlock(&inotify_lock);
+
+    /* Write to guest memory outside the lock */
+    if (copied > 0) {
+        if (guest_write(g, buf_gva, local_buf, copied) < 0)
+            return -LINUX_EFAULT;
+    }
 
     return (int64_t)copied;
 }

@@ -82,13 +82,28 @@ int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size) {
 int64_t sys_sched_getaffinity(guest_t *g, int pid, uint64_t size,
                               uint64_t mask_gva) {
     (void)pid;
-    /* Single-vCPU model: return a 1-CPU affinity mask.
-     * The mask is a bitmask where bit 0 = CPU 0. */
+    /* Return a 1-CPU affinity mask for simplicity.
+     * sched_setaffinity is not implemented; all threads see CPU 0. */
     if (size < 8) return -LINUX_EINVAL;
 
     uint64_t mask = 1;  /* CPU 0 only */
     if (guest_write(g, mask_gva, &mask, 8) < 0)
         return -LINUX_EFAULT;
+
+    /* Linux zeroes remaining bytes past the 8-byte mask.
+     * Use guest_write in chunks for bounds safety. */
+    if (size > 8) {
+        uint8_t zeros[256] = {0};
+        uint64_t off = 8;
+        uint64_t rem = size - 8;
+        while (rem > 0) {
+            size_t chunk = (rem > sizeof(zeros)) ? sizeof(zeros) : (size_t)rem;
+            if (guest_write(g, mask_gva + off, zeros, chunk) < 0)
+                return -LINUX_EFAULT;
+            off += chunk;
+            rem -= chunk;
+        }
+    }
 
     return 8;  /* Returns size of written mask */
 }
@@ -113,6 +128,10 @@ int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva) {
 }
 
 int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva) {
+    /* Linux RUSAGE_SELF=0, RUSAGE_CHILDREN=-1, RUSAGE_THREAD=1.
+     * macOS has the same values. Reject unknown values early. */
+    if (who != 0 && who != -1 && who != 1) return -LINUX_EINVAL;
+
     struct rusage mac_usage;
     if (getrusage(who, &mac_usage) < 0)
         return linux_errno();
@@ -170,9 +189,11 @@ int64_t sys_sysinfo(guest_t *g, uint64_t info_gva) {
     /* Free RAM from vm_statistics64 (scaled proportionally to capped total) */
     vm_statistics64_data_t vmstat;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+    static mach_port_t host_port = 0;
+    if (!host_port) host_port = mach_host_self();
+    if (host_statistics64(host_port, HOST_VM_INFO64,
                           (host_info64_t)&vmstat, &count) == KERN_SUCCESS) {
-        uint64_t page_size = 4096;
+        uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
         uint64_t real_free = (uint64_t)vmstat.free_count * page_size;
         /* Scale freeram proportionally if we capped totalram */
         if (memsize > 0 && memsize > si.totalram) {

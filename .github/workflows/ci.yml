@@ -1,6 +1,7 @@
-# CI — build, test, and release hl
+# CI — build, lint, test, and release hl
 #
 # Pipeline:
+#   lint (macOS)                          (independent)
 #   build (macOS)                      ──┐
 #   guest-bins (x86_64-linux)          ──├──▸ test (macOS, HVF)
 #   haskell-bins (aarch64-linux)       ──┤
@@ -44,6 +45,23 @@ jobs:
 
       - name: Build hl (make)
         run: nix develop .#ci -c make hl
+
+  # ── Lint & static analysis (macOS, self-hosted) ─────────────────
+  # Runs clang-tidy for lint checks.  scan-build (make analyze) and
+  # clang-format (make format) are available locally but not in CI yet:
+  # scan-build needs ccc-analyzer (not in Apple SDK clang), and format
+  # has 5000+ violations requiring a dedicated reformatting pass.
+  lint:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Run clang-tidy
+        run: nix develop .#ci -c make lint
 
   # ── Guest binaries (x86_64-linux, GitHub-hosted) ────────────────
   guest-bins:
@@ -243,7 +261,6 @@ jobs:
         if: always()
         env:
           HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-bins/haskell-bins/bin
-          HASKELL_SYSROOT_DIR: ${{ github.workspace }}/haskell-bins/haskell-sysroot
         run: nix develop .#ci -c make test-haskell-bins
 
       # ── x86_64-linux tests (via Rosetta) ────────────────────────
@@ -323,7 +340,6 @@ jobs:
         continue-on-error: true
         env:
           X64_HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-x64-bins/haskell-bins/bin
-          X64_HASKELL_SYSROOT_DIR: ${{ github.workspace }}/haskell-x64-bins/haskell-sysroot
         run: nix develop .#ci -c make test-x64-haskell-bins
 
       # ── Test summary ──────────────────────────────────────────────

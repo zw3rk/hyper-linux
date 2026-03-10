@@ -134,6 +134,6 @@ int main(void) {
     unlink(src_path);
     unlink(dst_path);
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-io-opt");
     return fails > 0 ? 1 : 0;
 }

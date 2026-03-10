@@ -274,6 +274,6 @@ int main(void) {
     test_mprotect_cycling();
     test_large_mmap();
 
-    printf("\ntest-stress: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-stress");
     return fails > 0 ? 1 : 0;
 }

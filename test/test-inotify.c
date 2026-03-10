@@ -189,6 +189,6 @@ int main(void) {
     test_nonblock();
     test_dir_create();
 
-    printf("\ntest-inotify: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-inotify");
     return fails > 0 ? 1 : 0;
 }

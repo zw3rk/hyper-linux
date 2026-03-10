@@ -68,6 +68,9 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
+    /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
+    if (count == 0) return 0;
+
     void *buf = guest_ptr(g, buf_gva);
     if (!buf) return -LINUX_EFAULT;
 
@@ -134,7 +137,7 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
                         (unsigned long long)saved_lr);
                 /* Also dump the callee-saved regs at FP-N */
                 /* X19-X28 are saved below FP by ARM64 convention */
-                for (int j = 0; j < 10 && j < 5; j++) {
+                for (int j = 0; j < 5; j++) {
                     uint64_t reg = 0;
                     void *rp = guest_ptr(g, fp - (j + 1) * 16);
                     if (!rp) break;
@@ -323,17 +326,17 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
 
                     /* Dump TranslationBuilder state from self (x19) */
                     if (bfo_x19) {
-                        void *p;
+                        void *bp;
                         uint64_t cur_off = 0, blk_begin = 0, blk_end = 0;
                         uint64_t code_buf = 0;
-                        p = guest_ptr(g, bfo_x19 + 0x10);
-                        if (p) memcpy(&cur_off, p, 8);
-                        p = guest_ptr(g, bfo_x19 + 0x178);
-                        if (p) memcpy(&blk_begin, p, 8);
-                        p = guest_ptr(g, bfo_x19 + 0x180);
-                        if (p) memcpy(&blk_end, p, 8);
-                        p = guest_ptr(g, bfo_x19 + 0x1c0);
-                        if (p) memcpy(&code_buf, p, 8);
+                        bp = guest_ptr(g, bfo_x19 + 0x10);
+                        if (bp) memcpy(&cur_off, bp, 8);
+                        bp = guest_ptr(g, bfo_x19 + 0x178);
+                        if (bp) memcpy(&blk_begin, bp, 8);
+                        bp = guest_ptr(g, bfo_x19 + 0x180);
+                        if (bp) memcpy(&blk_end, bp, 8);
+                        bp = guest_ptr(g, bfo_x19 + 0x1c0);
+                        if (bp) memcpy(&code_buf, bp, 8);
 
                         uint64_t nblocks = (blk_end > blk_begin) ?
                                            (blk_end - blk_begin) / 8 : 0;
@@ -353,12 +356,12 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
                         /* Dump all BasicBlock x86_offsets */
                         for (uint64_t i = 0; i < nblocks && i < 64; i++) {
                             uint64_t bb_ptr = 0;
-                            p = guest_ptr(g, blk_begin + i * 8);
-                            if (!p) break;
-                            memcpy(&bb_ptr, p, 8);
+                            bp = guest_ptr(g, blk_begin + i * 8);
+                            if (!bp) break;
+                            memcpy(&bb_ptr, bp, 8);
                             uint32_t x86_off = 0;
-                            p = guest_ptr(g, bb_ptr + 0x40);
-                            if (p) memcpy(&x86_off, p, 4);
+                            bp = guest_ptr(g, bb_ptr + 0x40);
+                            if (bp) memcpy(&x86_off, bp, 4);
                             fprintf(stderr, "  block[%llu] ptr=0x%llx "
                                     "x86_off=0x%x\n",
                                     (unsigned long long)i,
@@ -372,8 +375,8 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
                                 "fields:\n");
                         for (int off = 0; off < 0x200; off += 8) {
                             uint64_t val = 0;
-                            p = guest_ptr(g, bfo_x19 + off);
-                            if (p) memcpy(&val, p, 8);
+                            bp = guest_ptr(g, bfo_x19 + off);
+                            if (bp) memcpy(&val, bp, 8);
                             if (val != 0)
                                 fprintf(stderr, "  +0x%03x: 0x%llx\n",
                                         off, (unsigned long long)val);
@@ -441,6 +444,9 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
+    /* Linux: read(fd, NULL, 0) returns 0, not EFAULT */
+    if (count == 0) return 0;
+
     void *buf = guest_ptr(g, buf_gva);
     if (!buf) return -LINUX_EFAULT;
 
@@ -452,6 +458,9 @@ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
                     uint64_t count, int64_t offset) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
+
+    /* Linux: pread(fd, NULL, 0, off) returns 0, not EFAULT */
+    if (count == 0) return 0;
 
     void *buf = guest_ptr(g, buf_gva);
     if (!buf) return -LINUX_EFAULT;
@@ -465,98 +474,13 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
+    /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
+    if (count == 0) return 0;
+
     void *buf = guest_ptr(g, buf_gva);
     if (!buf) return -LINUX_EFAULT;
 
     ssize_t ret = pwrite(host_fd, buf, count, offset);
-    if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-        return linux_errno();
-    }
-    return ret;
-}
-
-int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
-    /* Special FD types need their custom read handlers — glibc may use
-     * readv() instead of read() for the same logical operation. Delegate
-     * to the first iov entry's buffer (eventfd/timerfd/signalfd always
-     * produce a single contiguous result). */
-    if (fd >= 0 && fd < FD_TABLE_SIZE) {
-        int type = fd_table[fd].type;
-        if (type == FD_EVENTFD || type == FD_SIGNALFD ||
-            type == FD_TIMERFD || type == FD_INOTIFY) {
-            if (iovcnt <= 0) return -LINUX_EINVAL;
-            linux_iovec_t *giov = guest_ptr(g, iov_gva);
-            if (!giov) return -LINUX_EFAULT;
-            /* Compute total length across all iovecs */
-            uint64_t total = 0;
-            for (int i = 0; i < iovcnt; i++) total += giov[i].iov_len;
-            /* Delegate to the scalar read handler using first iov */
-            return sys_read(g, fd, giov[0].iov_base, total);
-        }
-    }
-
-    int host_fd = fd_to_host(fd);
-    if (host_fd < 0) return -LINUX_EBADF;
-    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
-
-    linux_iovec_t *guest_iov = guest_ptr(g, iov_gva);
-    if (!guest_iov) return -LINUX_EFAULT;
-
-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
-    for (int i = 0; i < iovcnt; i++) {
-        void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base) return -LINUX_EFAULT;
-        /* Validate the entire buffer is within guest memory */
-        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
-        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT; /* overflow */
-        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
-            return -LINUX_EFAULT;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = guest_iov[i].iov_len;
-    }
-
-    ssize_t ret = readv(host_fd, host_iov, iovcnt);
-    return ret < 0 ? linux_errno() : ret;
-}
-
-int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
-    /* Special FD types: glibc may use writev() for eventfd wakeup writes.
-     * Delegate to sys_write (which handles eventfd counter + pipe signal)
-     * using the first iov entry. eventfd expects exactly 8 bytes. */
-    if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD) {
-        if (iovcnt <= 0) return -LINUX_EINVAL;
-        linux_iovec_t *giov = guest_ptr(g, iov_gva);
-        if (!giov) return -LINUX_EFAULT;
-        uint64_t total = 0;
-        for (int i = 0; i < iovcnt; i++) total += giov[i].iov_len;
-        return eventfd_write(fd, g, giov[0].iov_base, total);
-    }
-
-    int host_fd = fd_to_host(fd);
-    if (host_fd < 0) return -LINUX_EBADF;
-    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
-
-    /* Read iovec array from guest */
-    linux_iovec_t *guest_iov = guest_ptr(g, iov_gva);
-    if (!guest_iov) return -LINUX_EFAULT;
-
-    /* Build host iovec array */
-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
-
-    for (int i = 0; i < iovcnt; i++) {
-        void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base) return -LINUX_EFAULT;
-        /* Validate the entire buffer is within guest memory */
-        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
-        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT; /* overflow */
-        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
-            return -LINUX_EFAULT;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = guest_iov[i].iov_len;
-    }
-
-    ssize_t ret = writev(host_fd, host_iov, iovcnt);
     if (ret < 0) {
         if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
         return linux_errno();
@@ -572,7 +496,7 @@ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
     if (!guest_iov) return -LINUX_EFAULT;
     for (int i = 0; i < iovcnt; i++) {
         void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base) return -LINUX_EFAULT;
+        if (!base && guest_iov[i].iov_len > 0) return -LINUX_EFAULT;
         uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
         if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT;
         if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
@@ -581,6 +505,63 @@ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
         host_iov[i].iov_len = guest_iov[i].iov_len;
     }
     return 0;
+}
+
+int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+    /* Special FD types need their custom read handlers — glibc may use
+     * readv() instead of read() for the same logical operation. Delegate
+     * to the first iov entry's buffer.  Use the first iov's length (not
+     * the sum of all iovs) because the data goes into giov[0].iov_base
+     * which is only giov[0].iov_len bytes long. */
+    if (fd >= 0 && fd < FD_TABLE_SIZE) {
+        int type = fd_table[fd].type;
+        if (type == FD_EVENTFD || type == FD_SIGNALFD ||
+            type == FD_TIMERFD || type == FD_INOTIFY) {
+            if (iovcnt <= 0) return -LINUX_EINVAL;
+            linux_iovec_t *giov = guest_ptr(g, iov_gva);
+            if (!giov) return -LINUX_EFAULT;
+            return sys_read(g, fd, giov[0].iov_base, giov[0].iov_len);
+        }
+    }
+
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+
+    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+    if (err < 0) return err;
+
+    ssize_t ret = readv(host_fd, host_iov, iovcnt);
+    return ret < 0 ? linux_errno() : ret;
+}
+
+int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+    /* Special FD types: glibc may use writev() for eventfd wakeup writes.
+     * Delegate using the first iov entry.  Use giov[0].iov_len (not the
+     * sum of all iovs) — the data is at giov[0].iov_base which is only
+     * giov[0].iov_len bytes.  eventfd expects exactly 8 bytes. */
+    if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD) {
+        if (iovcnt <= 0) return -LINUX_EINVAL;
+        linux_iovec_t *giov = guest_ptr(g, iov_gva);
+        if (!giov) return -LINUX_EFAULT;
+        return eventfd_write(fd, g, giov[0].iov_base, giov[0].iov_len);
+    }
+
+    int host_fd = fd_to_host(fd);
+    if (host_fd < 0) return -LINUX_EBADF;
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+
+    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+    if (err < 0) return err;
+
+    ssize_t ret = writev(host_fd, host_iov, iovcnt);
+    if (ret < 0) {
+        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return ret;
 }
 
 int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
@@ -637,14 +618,14 @@ int64_t sys_pwritev2(guest_t *g, int fd, uint64_t iov_gva,
 
 /* ---------- rosettad socket tracking ---------- */
 
-/* Rosetta connects to rosettad via a Unix socket for AOT translation.
- * Since macOS doesn't support Linux abstract sockets, we use a socketpair
- * to intercept this communication. These functions track which host fd
- * is the rosettad socketpair end so we can intercept connect() and
- * monitor the protocol. */
-static int rosettad_handler_fd = -1;  /* Our end of the socketpair */
-static int rosettad_client_fd = -1;   /* Rosetta's end (host fd) */
-static char rosettad_binary_path[1024] = {0}; /* x86_64 binary for on-demand AOT */
+/* Rosetta connects to rosettad via AF_UNIX SOCK_SEQPACKET for AOT
+ * (ahead-of-time) translation. macOS doesn't support SOCK_SEQPACKET
+ * for AF_UNIX, so we intercept the socket creation in sys_socket()
+ * (syscall_net.c) with a socketpair(SOCK_STREAM). One end goes to
+ * rosetta (the client), the other to our rosettad_handler_thread.
+ * connect() is intercepted to return success immediately. */
+static char rosettad_binary_path[LINUX_PATH_MAX] = {0}; /* x86_64 binary for on-demand AOT */
+static int rosettad_client_fd = -1;  /* Rosetta's end of socketpair (host fd) */
 
 /* Receive a file descriptor via SCM_RIGHTS ancillary data.
  * Also reads the normal data payload into buf (up to buflen).
@@ -664,7 +645,8 @@ static ssize_t recv_fd(int sock, void *buf, size_t buflen, int *recv_fd_out) {
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
-        cmsg->cmsg_type == SCM_RIGHTS) {
+        cmsg->cmsg_type == SCM_RIGHTS &&
+        cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
         memcpy(recv_fd_out, CMSG_DATA(cmsg), sizeof(int));
     }
     return n;
@@ -691,11 +673,11 @@ static ssize_t send_fd(int sock, const void *buf, size_t buflen, int send_fd_val
     return sendmsg(sock, &msg, 0);
 }
 
-/* Compute SHA256 digest of a file.
+/* Compute SHA256 digest of a file by fd (seeks back to start after).
  * Returns 0 on success, -1 on error. */
-static int compute_file_sha256(const char *path, uint8_t digest[CC_SHA256_DIGEST_LENGTH]) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+static int compute_fd_sha256(int fd, uint8_t digest[CC_SHA256_DIGEST_LENGTH]) {
+    off_t saved = lseek(fd, 0, SEEK_CUR);
+    lseek(fd, 0, SEEK_SET);
 
     CC_SHA256_CTX ctx;
     CC_SHA256_Init(&ctx);
@@ -705,11 +687,68 @@ static int compute_file_sha256(const char *path, uint8_t digest[CC_SHA256_DIGEST
     while ((n = read(fd, buf, sizeof(buf))) > 0)
         CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
 
-    close(fd);
+    lseek(fd, saved, SEEK_SET);
     if (n < 0) return -1;
 
     CC_SHA256_Final(digest, &ctx);
     return 0;
+}
+
+/* ---------- Persistent AOT cache ---------- */
+
+/* Cache directory: ~/.cache/hl-rosettad/
+ * Files: <sha256_hex>.aot — keyed by SHA256 of the original x86_64 binary.
+ * This matches real rosettad behavior: the digest rosetta stores in .flu
+ * files (and sends via 'd') is the SHA256 of the binary, not the AOT. */
+static char aot_cache_dir[PATH_MAX] = {0};
+
+/* Initialize the persistent AOT cache directory.
+ * Creates ~/.cache/hl-rosettad/ if it doesn't exist. */
+static void aot_cache_init(void) {
+    if (aot_cache_dir[0]) return;  /* already initialized */
+
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+
+    snprintf(aot_cache_dir, sizeof(aot_cache_dir),
+             "%s/.cache/hl-rosettad", home);
+    mkdir(aot_cache_dir, 0700);  /* ignore EEXIST */
+}
+
+/* Format a SHA256 digest as hex into buf (must be >= 65 bytes). */
+static void digest_to_hex(const uint8_t digest[32], char *buf) {
+    for (int i = 0; i < 32; i++)
+        snprintf(buf + i * 2, 3, "%02x", digest[i]);
+}
+
+/* Look up a cached AOT file by binary SHA256 digest.
+ * Returns an open fd on hit, -1 on miss. */
+static int aot_cache_lookup(const uint8_t digest[32]) {
+    aot_cache_init();
+    char hex[65];
+    digest_to_hex(digest, hex);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.aot", aot_cache_dir, hex);
+    return open(path, O_RDONLY);
+}
+
+/* Store an AOT file in the persistent cache, keyed by binary SHA256.
+ * Moves (hard-links + unlinks) the temp file into the cache dir. */
+static void aot_cache_store(const uint8_t digest[32], const char *aot_path) {
+    aot_cache_init();
+    char hex[65];
+    digest_to_hex(digest, hex);
+
+    char dest[PATH_MAX];
+    snprintf(dest, sizeof(dest), "%s/%s.aot", aot_cache_dir, hex);
+
+    /* Try link+unlink for atomicity; fall back to rename */
+    if (link(aot_path, dest) == 0) {
+        unlink(aot_path);
+    } else {
+        rename(aot_path, dest);  /* cross-device fallback */
+    }
 }
 
 /* Run 'hl rosettad translate <input> <output>' via posix_spawn().
@@ -742,61 +781,18 @@ static int run_rosettad_translate(const char *bin_path, const char *aot_path) {
     }
 
     int status;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-/* ---------- AOT digest cache ---------- */
-
-/* Simple cache mapping SHA256 digests to AOT file paths.
- * Real rosettad stores these at /var/cache/rosettad/<sha256>.aotcache.
- * We keep them in /tmp and index by digest.
- * Protected by aot_cache_lock for thread safety. */
-#define AOT_CACHE_MAX 16
-typedef struct {
-    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
-    char    path[256];
-    int     valid;
-} aot_cache_entry_t;
-static aot_cache_entry_t aot_cache[AOT_CACHE_MAX];
-static int aot_cache_count = 0;
-static pthread_mutex_t aot_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Store an AOT file in the cache. */
-static void aot_cache_put(const uint8_t digest[CC_SHA256_DIGEST_LENGTH],
-                           const char *path) {
-    pthread_mutex_lock(&aot_cache_lock);
-    int slot = aot_cache_count < AOT_CACHE_MAX ?
-               aot_cache_count++ : AOT_CACHE_MAX - 1;
-    memcpy(aot_cache[slot].digest, digest, CC_SHA256_DIGEST_LENGTH);
-    strncpy(aot_cache[slot].path, path, sizeof(aot_cache[slot].path) - 1);
-    aot_cache[slot].path[sizeof(aot_cache[slot].path) - 1] = '\0';
-    aot_cache[slot].valid = 1;
-    pthread_mutex_unlock(&aot_cache_lock);
-}
-
-/* Look up an AOT file by digest. Returns fd on hit, -1 on miss. */
-static int aot_cache_lookup(const uint8_t digest[CC_SHA256_DIGEST_LENGTH]) {
-    pthread_mutex_lock(&aot_cache_lock);
-    for (int i = 0; i < aot_cache_count; i++) {
-        if (aot_cache[i].valid &&
-            memcmp(aot_cache[i].digest, digest,
-                   CC_SHA256_DIGEST_LENGTH) == 0) {
-            int fd = open(aot_cache[i].path, O_RDONLY);
-            pthread_mutex_unlock(&aot_cache_lock);
-            return fd;  /* -1 if file was deleted */
-        }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
     }
-    pthread_mutex_unlock(&aot_cache_lock);
-    return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 /* Handle the rosettad protocol on our end of the socketpair.
  *
  * Rosetta connects to rosettad via AF_UNIX SOCK_SEQPACKET for AOT
  * (ahead-of-time) translation of x86_64 code. Since macOS doesn't
- * support SOCK_SEQPACKET, we emulate via SOCK_DGRAM (preserving
- * message boundaries — critical for the framing protocol).
+ * support SOCK_SEQPACKET for AF_UNIX, we intercept via socketpair
+ * (SOCK_STREAM) and frame messages by individual write() calls.
  *
  * Protocol:
  *   '?' → respond 0x01 (ready)
@@ -836,7 +832,10 @@ static void *rosettad_handler_thread(void *arg) {
 
         case 't': {
             /* Translate request: rosetta sends the binary fd via sendmsg
-             * (SCM_RIGHTS) with a data payload. */
+             * (SCM_RIGHTS) with a data payload. We compute the binary's
+             * SHA256, check the persistent cache, and translate only on
+             * cache miss. This matches real rosettad behavior where the
+             * digest is always the SHA256 of the original binary. */
             if (hl_verbose)
                 fprintf(stderr, "hl: rosettad: translate request 't'\n");
             uint8_t params[256];
@@ -846,6 +845,7 @@ static void *rosettad_handler_thread(void *arg) {
             if (rn <= 0 || bin_fd < 0) {
                 fprintf(stderr, "hl: rosettad: recv_fd failed: n=%zd fd=%d (%s)\n",
                         rn, bin_fd, rn < 0 ? strerror(errno) : "no fd");
+                if (bin_fd >= 0) close(bin_fd);
                 uint8_t resp = 0x00;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
@@ -854,7 +854,64 @@ static void *rosettad_handler_thread(void *arg) {
                 fprintf(stderr, "hl: rosettad: recv_fd got fd=%d, %zd bytes data\n",
                         bin_fd, rn);
 
-            /* Get the binary's path via F_GETPATH */
+            /* Skip AOT for large binaries (>100MB) early — avoid computing
+             * SHA256 of 200MB+ files. Rosetta's AOT code path allocates
+             * high-VA regions that exceed hl's current page table capacity
+             * for very large binaries (e.g., pandoc at 217MB). */
+            struct stat bin_st;
+            if (fstat(bin_fd, &bin_st) == 0 && bin_st.st_size > 100 * 1024 * 1024) {
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: skipping translate for "
+                            "large binary (%lld bytes)\n",
+                            (long long)bin_st.st_size);
+                close(bin_fd);
+                uint8_t resp = 0x00;
+                if (write(fd, &resp, 1) != 1) goto done;
+                break;
+            }
+
+            /* Compute SHA256 of the original binary (not the AOT output).
+             * This is the digest rosetta stores in .flu files and sends
+             * via 'd' for subsequent cache lookups. */
+            uint8_t bin_digest[32];
+            if (compute_fd_sha256(bin_fd, bin_digest) < 0) {
+                fprintf(stderr, "hl: rosettad: SHA256 of binary failed\n");
+                close(bin_fd);
+                uint8_t resp = 0x00;
+                if (write(fd, &resp, 1) != 1) goto done;
+                break;
+            }
+
+            /* Check persistent cache — skip translation if already cached */
+            int cached_fd = aot_cache_lookup(bin_digest);
+            if (cached_fd >= 0) {
+                if (hl_verbose) {
+                    char hex[65];
+                    digest_to_hex(bin_digest, hex);
+                    fprintf(stderr, "hl: rosettad: cache HIT for %s\n", hex);
+                }
+                close(bin_fd);
+
+                /* Send cached AOT: success + digest + fd */
+                uint8_t resp = 0x01;
+                if (write(fd, &resp, 1) != 1) { close(cached_fd); goto done; }
+                if (write(fd, bin_digest, 32) != 32) { close(cached_fd); goto done; }
+                uint8_t dummy = 0;
+                ssize_t sent = send_fd(fd, &dummy, 1, cached_fd);
+                if (sent < 0) {
+                    fprintf(stderr, "hl: rosettad: send_fd (cached) failed: %s\n",
+                            strerror(errno));
+                    close(cached_fd);
+                    goto done;
+                }
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: sent cached AOT fd=%d\n",
+                            cached_fd);
+                close(cached_fd);
+                break;
+            }
+
+            /* Get the binary's path via F_GETPATH for translation */
             char bin_path[1024];
             if (fcntl(bin_fd, F_GETPATH, bin_path) < 0) {
                 fprintf(stderr, "hl: rosettad: F_GETPATH failed: %s\n",
@@ -890,59 +947,42 @@ static void *rosettad_handler_thread(void *arg) {
                 break;
             }
 
-            /* Compute SHA256 digest of the AOT output */
-            uint8_t digest[32];
-            if (compute_file_sha256(aot_path, digest) < 0) {
-                fprintf(stderr, "hl: rosettad: SHA256 failed for %s\n",
-                        aot_path);
-                memset(digest, 0, sizeof(digest));
-            }
+            /* Store AOT in persistent cache (moves temp file into cache dir) */
+            aot_cache_store(bin_digest, aot_path);
 
-            /* Open the AOT file and send it back */
-            aot_fd = open(aot_path, O_RDONLY);
+            /* Open the cached AOT file for sending */
+            aot_fd = aot_cache_lookup(bin_digest);
             if (aot_fd < 0) {
-                fprintf(stderr, "hl: rosettad: open AOT failed: %s\n",
-                        strerror(errno));
+                /* Fallback: try the original temp path (store may have failed) */
+                aot_fd = open(aot_path, O_RDONLY);
+            }
+            if (aot_fd < 0) {
+                fprintf(stderr, "hl: rosettad: open AOT failed after translate\n");
                 uint8_t resp = 0x00;
-                if (write(fd, &resp, 1) != 1) { unlink(aot_path); goto done; }
-                unlink(aot_path);
+                if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
-            /* Cache the AOT for future 'd' digest lookups */
-            aot_cache_put(digest, aot_path);
-            if (hl_verbose)
-                fprintf(stderr, "hl: rosettad: cached AOT at %s\n", aot_path);
-
-            struct stat st;
-            fstat(aot_fd, &st);
-            if (hl_verbose)
-                fprintf(stderr, "hl: rosettad: AOT ready (%lld bytes) for %s\n",
-                        (long long)st.st_size, bin_path);
+            if (hl_verbose) {
+                struct stat st;
+                if (fstat(aot_fd, &st) == 0)
+                    fprintf(stderr, "hl: rosettad: AOT ready (%lld bytes) for %s\n",
+                            (long long)st.st_size, bin_path);
+            }
 
             /* Rosetta expects THREE separate messages for the translate
              * response (matching SOCK_SEQPACKET semantics where each
              * send/write creates a distinct message):
              *   1. Success byte (0x01)
-             *   2. SHA256 digest (32 bytes)
-             *   3. AOT fd via SCM_RIGHTS + metadata
+             *   2. SHA256 digest of original binary (32 bytes)
+             *   3. AOT fd via SCM_RIGHTS + 1-byte dummy
              *
              * IMPORTANT: Do NOT combine into one sendmsg — rosetta reads
-             * these as three separate recvmsg/read calls. Verified by
-             * testing: atomic sendmsg causes rosetta to hang. */
+             * these as three separate recvmsg/read calls. */
             uint8_t resp = 0x01;
             if (write(fd, &resp, 1) != 1) { close(aot_fd); goto done; }
-            if (write(fd, digest, 32) != 32) { close(aot_fd); goto done; }
+            if (write(fd, bin_digest, 32) != 32) { close(aot_fd); goto done; }
 
-            /* Send AOT fd via SCM_RIGHTS with 1-byte dummy payload.
-             * sendmsg() requires at least 1 byte of normal data to carry
-             * ancillary data. Rosetta's recv_fd expects iov_len=1 and
-             * controllen=24 (CMSG_SPACE(sizeof(int))).
-             *
-             * IMPORTANT: Must send exactly 1 byte — rosetta's recvmsg
-             * allocates a 1-byte iov buffer. Extra bytes would trigger
-             * MSG_TRUNC on SOCK_DGRAM, causing rosetta to reject the
-             * message. Verified by disassembly of rosettad send_fd
-             * (VMA 0x22a3d0) and rosetta recv_fd (VMA 0x8000000910a8). */
+            /* Send AOT fd via SCM_RIGHTS with 1-byte dummy payload. */
             uint8_t dummy = 0;
             ssize_t sent = send_fd(fd, &dummy, 1, aot_fd);
             if (sent < 0) {
@@ -959,17 +999,15 @@ static void *rosettad_handler_thread(void *arg) {
         }
 
         case 'd': {
-            /* Digest lookup: receive 32-byte SHA256, check AOT cache.
+            /* Digest lookup: receive 32-byte SHA256 of the original binary,
+             * look up the persistent AOT cache.
              *
-             * Real rosettad protocol for 'd' cache hit:
-             *   1. Success byte (0x01)
-             *   2. AOT fd via SCM_RIGHTS + 1-byte dummy
-             *
-             * Cache miss: single byte 0x00.
-             *
-             * This matters because rosetta takes a different code path
-             * for cached vs freshly-translated AOTs. The real rosettad
-             * caches AOTs at /var/cache/rosettad/<sha256>.aotcache. */
+             * This matches real rosettad behavior: rosetta caches the binary
+             * SHA256 in .flu files (~/.cache/rosetta/) and sends it via 'd'
+             * on subsequent invocations. On HIT, we send the cached AOT fd
+             * directly — this avoids re-translation and uses the 'd' HIT
+             * code path in rosetta (which handles large binaries better
+             * than the 't' response path). */
             uint8_t digest[32];
             if (read(fd, digest, 32) != 32) {
                 fprintf(stderr, "hl: rosettad: digest read short\n");
@@ -978,102 +1016,35 @@ static void *rosettad_handler_thread(void *arg) {
 
             int cached_fd = aot_cache_lookup(digest);
             if (cached_fd >= 0) {
-                if (hl_verbose)
-                    fprintf(stderr, "hl: rosettad: digest cache HIT\n");
+                if (hl_verbose) {
+                    char hex[65];
+                    digest_to_hex(digest, hex);
+                    fprintf(stderr, "hl: rosettad: digest lookup → HIT (%s)\n",
+                            hex);
+                }
+
+                /* HIT response: success byte + AOT fd via SCM_RIGHTS */
                 uint8_t resp = 0x01;
                 if (write(fd, &resp, 1) != 1) { close(cached_fd); goto done; }
-                /* Send AOT fd via SCM_RIGHTS (same as 't' response msg 3) */
                 uint8_t dummy = 0;
-                if (send_fd(fd, &dummy, 1, cached_fd) < 0) {
-                    fprintf(stderr, "hl: rosettad: digest send_fd failed: %s\n",
+                ssize_t sent = send_fd(fd, &dummy, 1, cached_fd);
+                if (sent < 0) {
+                    fprintf(stderr, "hl: rosettad: send_fd (digest) failed: %s\n",
                             strerror(errno));
                     close(cached_fd);
                     goto done;
                 }
+                if (hl_verbose)
+                    fprintf(stderr, "hl: rosettad: sent cached AOT fd=%d\n",
+                            cached_fd);
                 close(cached_fd);
-            } else if (rosettad_binary_path[0]) {
-                /* Cache miss but binary path known — translate on-demand.
-                 *
-                 * In real VZ VMs, rosettad pre-caches AOT translations so
-                 * the 'd' digest lookup always hits. Rosetta takes a
-                 * different code path for 'd' HIT vs 't' translate — the
-                 * 'd' path correctly handles all block types including
-                 * fall-through continuations, while the 't' path may not
-                 * register all blocks in the runtime lookup table.
-                 *
-                 * By translating on-demand here and returning HIT, we
-                 * match the real VZ behavior where rosetta always gets
-                 * AOT via the 'd' cache path. */
-                if (hl_verbose)
-                    fprintf(stderr, "hl: rosettad: digest miss → on-demand "
-                            "translate of %s\n", rosettad_binary_path);
-
-                char aot_path[] = "/tmp/hl-aot-XXXXXX";
-                int aot_fd = mkstemp(aot_path);
-                if (aot_fd < 0) {
-                    fprintf(stderr, "hl: rosettad: mkstemp failed: %s\n",
-                            strerror(errno));
-                    uint8_t resp = 0x00;
-                    if (write(fd, &resp, 1) != 1) goto done;
-                    break;
-                }
-                close(aot_fd);
-
-                int ret = run_rosettad_translate(rosettad_binary_path,
-                                                 aot_path);
-                if (ret != 0) {
-                    fprintf(stderr, "hl: rosettad: on-demand translate "
-                            "failed (exit=%d)\n", ret);
-                    uint8_t resp = 0x00;
-                    if (write(fd, &resp, 1) != 1) {
-                        unlink(aot_path);
-                        goto done;
-                    }
-                    unlink(aot_path);
-                    break;
-                }
-
-                /* Compute digest and cache for future lookups */
-                uint8_t aot_digest[32];
-                if (compute_file_sha256(aot_path, aot_digest) < 0)
-                    memset(aot_digest, 0, sizeof(aot_digest));
-                aot_cache_put(aot_digest, aot_path);
-
-                aot_fd = open(aot_path, O_RDONLY);
-                if (aot_fd < 0) {
-                    fprintf(stderr, "hl: rosettad: open AOT failed: %s\n",
-                            strerror(errno));
-                    uint8_t resp = 0x00;
-                    if (write(fd, &resp, 1) != 1) {
-                        unlink(aot_path);
-                        goto done;
-                    }
-                    unlink(aot_path);
-                    break;
-                }
-
-                if (hl_verbose)
-                    fprintf(stderr, "hl: rosettad: digest on-demand HIT "
-                            "(AOT at %s)\n", aot_path);
-
-                /* Send as 'd' HIT: 0x01 + SCM_RIGHTS fd */
-                uint8_t resp = 0x01;
-                if (write(fd, &resp, 1) != 1) {
-                    close(aot_fd);
-                    goto done;
-                }
-                uint8_t dummy = 0;
-                if (send_fd(fd, &dummy, 1, aot_fd) < 0) {
-                    fprintf(stderr, "hl: rosettad: digest send_fd "
-                            "failed: %s\n", strerror(errno));
-                    close(aot_fd);
-                    goto done;
-                }
-                close(aot_fd);
             } else {
-                if (hl_verbose)
-                    fprintf(stderr, "hl: rosettad: digest cache MISS "
-                            "(no binary path)\n");
+                if (hl_verbose) {
+                    char hex[65];
+                    digest_to_hex(digest, hex);
+                    fprintf(stderr, "hl: rosettad: digest lookup → MISS (%s)\n",
+                            hex);
+                }
                 uint8_t resp = 0x00;
                 if (write(fd, &resp, 1) != 1) goto done;
             }
@@ -1098,24 +1069,22 @@ done:
     return NULL;
 }
 
-void rosettad_set_socket(int fd) {
-    rosettad_handler_fd = fd;
-    if (hl_verbose)
-        fprintf(stderr, "hl: rosettad: starting handler thread (handler_fd=%d)\n", fd);
-    pthread_t thr;
-    pthread_create(&thr, NULL, rosettad_handler_thread, (void *)(intptr_t)fd);
-    pthread_detach(thr);
-}
-
-void rosettad_set_client_fd(int fd) {
-    rosettad_client_fd = fd;
-}
-
 void rosettad_set_binary_path(const char *path) {
     if (path) {
         strncpy(rosettad_binary_path, path, sizeof(rosettad_binary_path) - 1);
         rosettad_binary_path[sizeof(rosettad_binary_path) - 1] = '\0';
     }
+}
+
+void rosettad_start_handler(int handler_fd, int client_fd) {
+    rosettad_client_fd = client_fd;
+    if (hl_verbose)
+        fprintf(stderr, "hl: rosettad: starting handler thread "
+                "(handler_fd=%d, client_fd=%d)\n", handler_fd, client_fd);
+    pthread_t thr;
+    pthread_create(&thr, NULL, rosettad_handler_thread,
+                   (void *)(intptr_t)handler_fd);
+    pthread_detach(thr);
 }
 
 int rosettad_is_socket(int host_fd) {
@@ -1159,36 +1128,29 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     }
 
     case ROSETTA_VZ_CAPS: {
-        /* VZ_CAPS buffer layout (128 bytes) — reverse-engineered from Rosetta binary:
+        /* VZ_CAPS buffer layout (128 bytes).
+         *
+         * Verified via strace + ioctl dump in a real Lima VZ VM:
+         *   Real Apple VZ returns: caps[0]=1,
+         *   caps[1..27]="/run/rosettad/rosetta.sock\0",
+         *   caps[28..127]=all zeros (including caps[64] and caps[108]).
          *
          *   caps[0]:       VZ enable flag (1 = VZ mode active).
          *                  Written to BSS[0xa04]; enables the rosettad AOT path.
          *
-         *   caps[1..64]:   sun_path[0..63] — first 64 bytes of socket path.
-         *                  CRITICAL: caps[64] (= sun_path[63]) MUST be non-null.
-         *                  At VA 0x800000307a4, Rosetta reads this byte and does:
-         *                    cbz w8, 0x3080c   ; if zero → skip entire rosettad init
-         *                  Setting caps[64]=0 silently disables AOT: translation_mode
-         *                  stays 0 (pure JIT), [aot_registry+0x70] is never populated,
-         *                  and 0x80000002ec84 (AOT mmap/find-or-create) always returns
-         *                  without contacting rosettad.
-         *                  We fill caps[1..64] with a fake path prefix (63 'A's + '/').
-         *                  The connect() interception in syscall_net.c is fd-based
-         *                  (rosettad_is_socket()), so the actual path bytes don't matter.
+         *   caps[1..64]:   sun_path[0..63] — socket path for rosettad.
+         *                  Must be non-empty (caps[1] != 0) for rosettad init
+         *                  to proceed. The actual path doesn't matter because
+         *                  connect() is intercepted in sys_connect() via
+         *                  rosettad_is_socket() — the socketpair is pre-connected.
          *
-         *   caps[65]:      Null terminator of the socket path (already zero).
+         *   caps[66..107]: Null-terminated path to the x86_64 binary.
+         *                  Rosetta opens this (caps+0x42) and sends the fd to
+         *                  rosettad via SCM_RIGHTS for AOT translation.
          *
-         *   caps[66..107]: Null-terminated path to the x86_64 binary being translated.
-         *                  At VA 0x800000090bb0, Rosetta calls:
-         *                    openat(AT_FDCWD, caps+0x42, 0, 0)
-         *                  to open the binary file and sends the fd to rosettad via
-         *                  SCM_RIGHTS so rosettad can perform the AOT translation.
-         *                  (caps+0x42 = caps[66]; 0x42 = 66)
-         *
-         *   caps[108]:     Written to BSS[0xa05]. Checked at VA 0x800000090ba4:
-         *                    cbz w23, 0x90ca4   ; if zero → skip translate path
-         *                  Must be non-null to allow the translate ('t') protocol
-         *                  handler to proceed after the '?' handshake.
+         *   caps[108]:     Written to BSS[0xa05]. Real VZ has this as 0.
+         *                  Both 't' (translate) and 'd' (digest) protocol
+         *                  commands work with caps[108]=0 (verified by strace).
          *
          *   caps[109..127]: Other flags (purpose unknown, leave as zero). */
         uint8_t caps[128] = {0};
@@ -1196,11 +1158,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         /* caps[0]: VZ enable flag — activates the rosettad AOT pipeline. */
         caps[0] = 1;
 
-        /* caps[1..64]: Fake socket path prefix.
-         * caps[64] is the critical gating byte (must be non-null). */
-        memset(&caps[1], 'A', 63);
-        caps[64] = '/';   /* sun_path[63]: non-null → rosettad init proceeds */
-        /* caps[65] = 0: null terminator of socket path (already zero from = {0}) */
+        /* caps[1..]: Socket path — must be non-empty for rosettad init.
+         * We use a short placeholder; connect() is intercepted fd-based. */
+        static const char fake_sock_path[] = "/run/rosettad/rosetta.sock";
+        memcpy(&caps[1], fake_sock_path, sizeof(fake_sock_path));
 
         /* caps[66..]: Null-terminated path to x86_64 binary for rosettad.
          * Rosetta opens this file and sends the fd to rosettad via SCM_RIGHTS. */
@@ -1213,18 +1174,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
             caps[127] = 0;
         }
 
-        /* caps[108]: BSS[0xa05] gate.
-         * Non-zero: rosetta uses 't' (translate) protocol — sends binary fd
-         *           to rosettad, receives AOT fd back.
-         * Zero:     rosetta uses 'd' (digest) protocol — computes binary hash,
-         *           sends digest to rosettad, receives cached AOT.
-         *
-         * Real VZ VMs use the 'd' path (rosettad pre-caches translations).
-         * The 'd' path may activate different AOT registration logic inside
-         * rosetta. Our rosettad handler supports both: 't' translates inline,
-         * 'd' does on-demand translation if no cache entry exists.
-         *
-         * Set to 0 to match real VZ behavior (digest path). */
+        /* caps[108]: Match real VZ behavior (0). Both 't' and 'd' protocol
+         * commands work with this value, verified by strace in Lima VM. */
         caps[108] = 0;
 
         if (g->verbose)
@@ -1259,18 +1210,48 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     }
 
     case LINUX_TCGETS: {
-        /* Get terminal attributes */
+        /* Get terminal attributes.
+         * Linux and macOS use different c_cc index assignments for control
+         * characters (e.g., Linux VINTR=0, macOS VINTR=8). Must translate. */
         struct termios t;
         if (tcgetattr(host_fd, &t) < 0)
             return -LINUX_ENOTTY;
+        /* macOS c_cc index → Linux c_cc index mapping.
+         * Linux: VINTR=0 VQUIT=1 VERASE=2 VKILL=3 VEOF=4 VTIME=5
+         *        VMIN=6 VSWTC=7 VSTART=8 VSTOP=9 VSUSP=10 VEOL=11
+         *        VREPRINT=12 VDISCARD=13 VWERASE=14 VLNEXT=15 VEOL2=16
+         * macOS: VEOF=0 VEOL=1 VEOL2=2 VERASE=3 VWERASE=4 VKILL=5
+         *        VREPRINT=6 (7=spare) VINTR=8 VQUIT=9 VSUSP=10 VDSUSP=11
+         *        VSTART=12 VSTOP=13 VLNEXT=14 VDISCARD=15 VMIN=16 VTIME=17 */
+        static const int mac_to_linux_cc[19] = {
+            /*[linux 0  VINTR]    = mac*/  8,
+            /*[linux 1  VQUIT]    = mac*/  9,
+            /*[linux 2  VERASE]   = mac*/  3,
+            /*[linux 3  VKILL]    = mac*/  5,
+            /*[linux 4  VEOF]     = mac*/  0,
+            /*[linux 5  VTIME]    = mac*/ 17,
+            /*[linux 6  VMIN]     = mac*/ 16,
+            /*[linux 7  VSWTC]    = mac*/ -1, /* no macOS equivalent */
+            /*[linux 8  VSTART]   = mac*/ 12,
+            /*[linux 9  VSTOP]    = mac*/ 13,
+            /*[linux 10 VSUSP]    = mac*/ 10,
+            /*[linux 11 VEOL]     = mac*/  1,
+            /*[linux 12 VREPRINT] = mac*/  6,
+            /*[linux 13 VDISCARD] = mac*/ 15,
+            /*[linux 14 VWERASE]  = mac*/  4,
+            /*[linux 15 VLNEXT]   = mac*/ 14,
+            /*[linux 16 VEOL2]    = mac*/  2,
+            -1, -1, /* unused slots 17-18 */
+        };
         linux_termios_t lt = {0};
         lt.c_iflag = (uint32_t)t.c_iflag;
         lt.c_oflag = (uint32_t)t.c_oflag;
         lt.c_cflag = (uint32_t)t.c_cflag;
         lt.c_lflag = (uint32_t)t.c_lflag;
-        /* Copy cc values (min of both sizes) */
-        for (int i = 0; i < 19 && i < NCCS; i++)
-            lt.c_cc[i] = t.c_cc[i];
+        for (int i = 0; i < 19; i++) {
+            int mac_idx = mac_to_linux_cc[i];
+            lt.c_cc[i] = (mac_idx >= 0 && mac_idx < NCCS) ? t.c_cc[mac_idx] : 0;
+        }
         lt.c_ispeed = (uint32_t)cfgetispeed(&t);
         lt.c_ospeed = (uint32_t)cfgetospeed(&t);
         if (guest_write(g, arg, &lt, sizeof(lt)) < 0)
@@ -1281,7 +1262,27 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     case LINUX_TCSETS:
     case LINUX_TCSETSW:
     case LINUX_TCSETSF: {
-        /* Set terminal attributes (TCSETS=immediate, TCSETSW=drain, TCSETSF=flush) */
+        /* Set terminal attributes with c_cc index translation (see TCGETS) */
+        static const int linux_to_mac_cc[19] = {
+            /*[linux 0  VINTR]    → mac*/  8,
+            /*[linux 1  VQUIT]    → mac*/  9,
+            /*[linux 2  VERASE]   → mac*/  3,
+            /*[linux 3  VKILL]    → mac*/  5,
+            /*[linux 4  VEOF]     → mac*/  0,
+            /*[linux 5  VTIME]    → mac*/ 17,
+            /*[linux 6  VMIN]     → mac*/ 16,
+            /*[linux 7  VSWTC]    → mac*/ -1,
+            /*[linux 8  VSTART]   → mac*/ 12,
+            /*[linux 9  VSTOP]    → mac*/ 13,
+            /*[linux 10 VSUSP]    → mac*/ 10,
+            /*[linux 11 VEOL]     → mac*/  1,
+            /*[linux 12 VREPRINT] → mac*/  6,
+            /*[linux 13 VDISCARD] → mac*/ 15,
+            /*[linux 14 VWERASE]  → mac*/  4,
+            /*[linux 15 VLNEXT]   → mac*/ 14,
+            /*[linux 16 VEOL2]    → mac*/  2,
+            -1, -1,
+        };
         linux_termios_t lt;
         if (guest_read(g, arg, &lt, sizeof(lt)) < 0)
             return -LINUX_EFAULT;
@@ -1292,8 +1293,11 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         t.c_oflag = lt.c_oflag;
         t.c_cflag = lt.c_cflag;
         t.c_lflag = lt.c_lflag;
-        for (int i = 0; i < 19 && i < NCCS; i++)
-            t.c_cc[i] = lt.c_cc[i];
+        for (int i = 0; i < 19; i++) {
+            int mac_idx = linux_to_mac_cc[i];
+            if (mac_idx >= 0 && mac_idx < NCCS)
+                t.c_cc[mac_idx] = lt.c_cc[i];
+        }
         cfsetispeed(&t, lt.c_ispeed);
         cfsetospeed(&t, lt.c_ospeed);
         int action = (request == LINUX_TCSETSF) ? TCSAFLUSH
@@ -1359,6 +1363,9 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
+    /* Linux validates offset >= 0 and len > 0 */
+    if (offset < 0 || len <= 0) return -LINUX_EINVAL;
+
     /* mode 0 = basic allocation → ftruncate fallback.
      * Other modes (FALLOC_FL_PUNCH_HOLE etc.) not supported. */
     if (mode != 0) return -LINUX_EOPNOTSUPP;
@@ -1368,6 +1375,7 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
 
     /* Extend file if needed (ftruncate only extends, doesn't shrink) */
     int64_t new_size = offset + len;
+    if (new_size < offset) return -LINUX_EFBIG;  /* Overflow check */
     if (new_size > st.st_size) {
         if (ftruncate(host_fd, new_size) < 0)
             return linux_errno();
@@ -1415,10 +1423,12 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
         if (nw < nr) break;  /* Short write */
     }
 
-    /* Write back updated offset (even on partial transfer) */
+    /* Write back updated offset (even on partial transfer).
+     * Preserve partial success: if bytes were transferred but offset
+     * writeback fails, return the count rather than -EFAULT. */
     if (offset_gva != 0) {
         if (guest_write(g, offset_gva, &offset, 8) < 0)
-            return -LINUX_EFAULT;
+            return total > 0 ? (int64_t)total : -LINUX_EFAULT;
     }
 
     return (int64_t)total;
@@ -1476,14 +1486,15 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
         if (nw < nr) break;
     }
 
-    /* Write back updated offsets (even on partial transfer) */
+    /* Write back updated offsets (even on partial transfer).
+     * Preserve partial success on writeback failure. */
     if (off_in_gva != 0) {
         if (guest_write(g, off_in_gva, &off_in, 8) < 0)
-            return -LINUX_EFAULT;
+            return total > 0 ? (int64_t)total : -LINUX_EFAULT;
     }
     if (off_out_gva != 0) {
         if (guest_write(g, off_out_gva, &off_out, 8) < 0)
-            return -LINUX_EFAULT;
+            return total > 0 ? (int64_t)total : -LINUX_EFAULT;
     }
 
     return (int64_t)total;
@@ -1517,11 +1528,14 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
     if (!buf) return -LINUX_ENOMEM;
 
     size_t total = 0;
+    int saved_errno = 0;  /* Preserve errno across free/guest_write */
+    int rw_error = 0;     /* Track whether read or write failed */
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
         ssize_t r = (off_in >= 0) ? pread(host_in, buf, n, off_in)
                                   : read(host_in, buf, n);
-        if (r <= 0) break;
+        if (r < 0) { rw_error = 1; saved_errno = errno; break; }
+        if (r == 0) break;  /* EOF */
         if (off_in >= 0) off_in += r;
 
         size_t written = 0;
@@ -1530,7 +1544,9 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
                 ? pwrite(host_out, buf + written, r - written, off_out)
                 : write(host_out, buf + written, r - written);
             if (w <= 0) {
-                if (w < 0 && errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+                if (w < 0) { rw_error = 1; saved_errno = errno; }
+                if (w < 0 && saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+                total += written;  /* Account for partial bytes written */
                 goto done;
             }
             written += w;
@@ -1543,12 +1559,18 @@ done:
     free(buf);
 
     /* Write back updated offsets */
-    if (off_in_gva && off_in >= 0)
-        guest_write(g, off_in_gva, &off_in, 8);
-    if (off_out_gva && off_out >= 0)
-        guest_write(g, off_out_gva, &off_out, 8);
+    if (off_in_gva && off_in >= 0 &&
+        guest_write(g, off_in_gva, &off_in, 8) < 0)
+        return -LINUX_EFAULT;
+    if (off_out_gva && off_out >= 0 &&
+        guest_write(g, off_out_gva, &off_out, 8) < 0)
+        return -LINUX_EFAULT;
 
-    return total > 0 ? (int64_t)total : linux_errno();
+    /* Return bytes transferred, or errno only if read/write failed.
+     * Restore saved_errno since free/guest_write may have clobbered it. */
+    if (total > 0) return (int64_t)total;
+    if (rw_error) { errno = saved_errno; return linux_errno(); }
+    return 0;
 }
 
 /* vmsplice: emulate as writev to the pipe fd */
@@ -1566,8 +1588,9 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
                        &liov, sizeof(liov)) < 0)
             return -LINUX_EFAULT;
 
+        if (liov.iov_len == 0) continue;
         void *src = guest_ptr(g, liov.iov_base);
-        if (!src) return -LINUX_EFAULT;
+        if (!src) return total > 0 ? (int64_t)total : -LINUX_EFAULT;
 
         ssize_t w = write(host_fd, src, liov.iov_len);
         if (w < 0) {

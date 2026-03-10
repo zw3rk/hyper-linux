@@ -14,6 +14,7 @@
 
 /* ---------- Time/timer syscall handlers ---------- */
 
+int64_t sys_clock_getres(guest_t *g, int clockid, uint64_t tp_gva);
 int64_t sys_clock_gettime(guest_t *g, int clockid, uint64_t tp_gva);
 int64_t sys_nanosleep(guest_t *g, uint64_t req_gva, uint64_t rem_gva);
 int64_t sys_clock_nanosleep(guest_t *g, int clockid, int flags,

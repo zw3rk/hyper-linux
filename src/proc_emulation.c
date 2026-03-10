@@ -112,7 +112,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             off += snprintf(buf + off, sizeof(buf) - off,
                 "processor\t: %d\n"
                 "BogoMIPS\t: 48.00\n"
-                "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics\n"
+                "Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics\n"
                 "CPU implementer\t: 0x61\n"
                 "CPU architecture: 8\n"
                 "CPU variant\t: 0x1\n"
@@ -139,10 +139,19 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         }
         vm_rss_kb /= 1024;
 
+        /* Extract basename from ELF path for the Name field (Linux uses
+         * the comm name, which is basename truncated to 15 chars) */
+        const char *exe = proc_get_elf_path();
+        const char *name = "hl";
+        if (exe) {
+            const char *slash = strrchr(exe, '/');
+            name = slash ? slash + 1 : exe;
+        }
+
         int threads = thread_active_count();
         char buf[2048];
         int len = snprintf(buf, sizeof(buf),
-            "Name:\thl\n"
+            "Name:\t%.15s\n"
             "State:\tR (running)\n"
             "Tgid:\t%lld\n"
             "Pid:\t%lld\n"
@@ -153,6 +162,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "VmSize:\t%llu kB\n"
             "VmRSS:\t%llu kB\n"
             "Threads:\t%d\n",
+            name,
             (long long)proc_get_pid(),
             (long long)proc_get_pid(),
             (long long)proc_get_ppid(),
@@ -160,6 +170,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             (unsigned long long)vm_size_kb,
             (unsigned long long)vm_rss_kb,
             threads);
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -273,10 +285,12 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             e->prot = r->prot;
             e->flags = r->flags;
             e->offset = r->offset;
-            if (r->name[0])
+            if (r->name[0]) {
                 strncpy(e->name, r->name, sizeof(e->name) - 1);
-            else
+                e->name[sizeof(e->name) - 1] = '\0';
+            } else {
                 e->name[0] = '\0';
+            }
         }
 
         /* Add preannounced entries (if any) */
@@ -298,10 +312,12 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             e->prot = r->prot;
             e->flags = r->flags;
             e->offset = r->offset;
-            if (r->name[0])
+            if (r->name[0]) {
                 strncpy(e->name, r->name, sizeof(e->name) - 1);
-            else
+                e->name[sizeof(e->name) - 1] = '\0';
+            } else {
                 e->name[0] = '\0';
+            }
         }
 
         /* Sort by start address (regions[] is sorted by GPA but we
@@ -369,6 +385,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
                       + (double)(now.tv_usec - boottime.tv_usec) / 1e6;
         char buf[128];
         int len = snprintf(buf, sizeof(buf), "%.2f 0.00\n", uptime);
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -381,6 +399,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         int len = snprintf(buf, sizeof(buf), "%.2f %.2f %.2f 1/1 %lld\n",
                            loadavg[0], loadavg[1], loadavg[2],
                            (long long)proc_get_pid());
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -394,8 +414,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         memset(&entry, 0, sizeof(entry));
         entry.ut_type = LINUX_USER_PROCESS;
         entry.ut_pid = (int32_t)proc_get_pid();
-        strncpy(entry.ut_line, "pts/0", LINUX_UT_LINESIZE);
-        strncpy(entry.ut_id, "0", 4);
+        strncpy(entry.ut_line, "pts/0", LINUX_UT_LINESIZE - 1);
+        strncpy(entry.ut_id, "0", sizeof(entry.ut_id) - 1);
         const char *user = getenv("USER");
         if (!user) user = "user";
         strncpy(entry.ut_user, user, LINUX_UT_NAMESIZE - 1);
@@ -430,8 +450,10 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
     if (strcmp(path, "/proc/version") == 0) {
         char buf[256];
         int len = snprintf(buf, sizeof(buf),
-            "Linux version 6.1.0-hl (hl@hyper-linux) "
+            "Linux version 6.8.0-101-generic (hl@hyper-linux) "
             "(aarch64-linux-musl-gcc) #1 SMP PREEMPT\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -447,10 +469,23 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         return proc_synthetic_fd(data, strlen(data));
     }
 
+    /* /proc/self/mountinfo -> Linux mountinfo format (different from /proc/mounts).
+     * Format: id parent_id major:minor root mount_point options - type source super_options */
+    if (strcmp(path, "/proc/self/mountinfo") == 0) {
+        char buf[1024];
+        int len = snprintf(buf, sizeof(buf),
+            "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+            "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
+            "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+        return proc_synthetic_fd(buf, len);
+    }
+
     /* /proc/mounts, /etc/mtab -> synthetic mount table */
     if (strcmp(path, "/proc/mounts") == 0 ||
         strcmp(path, "/proc/self/mounts") == 0 ||
-        strcmp(path, "/proc/self/mountinfo") == 0 ||
         strcmp(path, "/etc/mtab") == 0) {
         char buf[512];
         int len = snprintf(buf, sizeof(buf),
@@ -458,6 +493,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
             "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
             "devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -520,6 +557,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             (unsigned long long)(total_kb - free_kb - cached_kb - buffers_kb),
             (unsigned long long)(cached_kb / 2),
             (unsigned long long)(total_kb / 2));
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -558,6 +597,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         int len = snprintf(buf, sizeof(buf),
             "root:x:0:0:root:/root:/bin/sh\n"
             "user:x:1000:1000:user:/home/user:/bin/sh\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -568,6 +609,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "root:x:0:\n"
             "staff:x:20:\n"
             "user:x:1000:\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 

@@ -224,6 +224,6 @@ int main(void) {
     test_shared_memory();
     test_tls();
 
-    printf("\ntest-pthread: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-pthread");
     return fails > 0 ? 1 : 0;
 }

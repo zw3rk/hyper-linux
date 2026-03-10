@@ -181,6 +181,6 @@ int main(void) {
     test_zero_length_iovec();
     test_many_iovecs();
 
-    printf("\ntest-readv-writev: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-readv-writev");
     return fails > 0 ? 1 : 0;
 }

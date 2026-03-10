@@ -263,6 +263,6 @@ int main(void) {
     test_large_cow();
     test_brk_isolation();
 
-    printf("\ntest-cow-fork: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-cow-fork");
     return fails > 0 ? 1 : 0;
 }

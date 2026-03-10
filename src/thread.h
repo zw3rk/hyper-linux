@@ -39,6 +39,13 @@ typedef struct {
     uint64_t      saved_blocked;   /* Original mask saved by sigsuspend */
     int           saved_blocked_valid;
 
+    /* Per-thread alternate signal stack (Linux sigaltstack is per-thread).
+     * Fields mirror linux_stack_t layout for easy copy. */
+    uint64_t      altstack_sp;     /* Alternate signal stack pointer */
+    int32_t       altstack_flags;  /* SS_DISABLE / 0 */
+    uint64_t      altstack_size;   /* Alternate signal stack size */
+    int           on_altstack;     /* Non-zero if currently delivering on altstack */
+
     /* ---------- ptrace state ----------
      * Used by Rosetta's two-process JIT: the tracer attaches via
      * PTRACE_SEIZE, then uses BRK-triggered SIGTRAP + wait4 to
@@ -106,6 +113,10 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
 /* Count active VM-clone threads (is_vm_clone && !vm_exited).
  * Used to detect when the last rosetta tracee exits. */
 int thread_count_active_vm_clones(void);
+
+/* Destroy all active worker vCPUs. Called during guest_destroy to
+ * ensure no vCPUs remain active before hv_vm_destroy(). */
+void thread_destroy_all_vcpus(void);
 
 /* Interrupt all active vCPUs by calling hv_vcpus_exit().
  * Used for signal preemption: when a signal is queued while a vCPU

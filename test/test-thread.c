@@ -186,6 +186,6 @@ int main(void) {
     test_parent_settid();
     test_multi_thread();
 
-    printf("\ntest-thread: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-thread");
     return fails > 0 ? 1 : 0;
 }

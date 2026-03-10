@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
- * host buffer). A 64GB address space is reserved via mmap(MAP_ANON) (macOS
- * demand-pages physical memory on first touch, so unused pages cost nothing).
- * The slab is mapped RWX to Hypervisor.framework; fine-grained permissions
- * are enforced by the guest's own page tables built from mem_region
- * descriptors. Page tables can be extended at runtime (e.g. when mmap/brk
- * grows beyond initial mappings).
+ * host buffer). Buffer size is determined by the VM's configured IPA width:
+ *   - Native aarch64 on M2 (36-bit IPA): 64GB
+ *   - Native aarch64 on M3+ (40-bit IPA): 1TB
+ *   - Rosetta x86_64 on any hardware (48-bit IPA, capped at 40): 1TB
+ * Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on first
+ * touch, so unused pages cost nothing. The slab is mapped RWX to
+ * Hypervisor.framework; fine-grained permissions are enforced by the guest's
+ * own page tables built from mem_region descriptors. Page tables can be
+ * extended at runtime (e.g. when mmap/brk grows beyond initial mappings).
  */
 #ifndef GUEST_H
 #define GUEST_H
@@ -129,6 +132,26 @@ typedef struct {
 
 #define GUEST_MAX_ALIASES 16
 
+/* ---------- Overflow segments ---------- */
+
+/* Overflow segment: additional hv_vm_map'd host buffer for high-VA
+ * allocations when the primary buffer's RW region is exhausted.
+ * On M2 (max_ipa=36), the primary buffer is limited to 64GB by HVF,
+ * but rosetta's JIT allocates many 2MB blocks for high-VA regions
+ * (slab at 240TB, PIE at 85TB, thread stacks). Each high-VA 2MB block
+ * consumes a 2MB GPA from the primary buffer's mmap RW pool (48GB usable).
+ * Large x86_64 binaries exhaust this pool. Overflow segments provide
+ * additional GPA space mapped at IPAs beyond the primary buffer. */
+typedef struct {
+    void     *host_base;   /* Host mmap'd buffer */
+    uint64_t  ipa_start;   /* IPA where this segment is mapped */
+    uint64_t  size;        /* Total segment size */
+    uint64_t  next;        /* Bump allocator: next free offset */
+} guest_overflow_t;
+
+#define GUEST_MAX_OVERFLOW  4
+#define GUEST_OVERFLOW_SIZE (1ULL * 1024 * 1024 * 1024)  /* 1GB per segment */
+
 /* ---------- Semantic region tracking ---------- */
 
 /* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.).
@@ -210,6 +233,13 @@ typedef struct {
     guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
     int            npreannounced;
     int            verbose;       /* Non-zero: print debug diagnostics to stderr */
+    /* Overflow segments for high-VA GPA exhaustion (rosetta on M2).
+     * When find_free_gap() can't allocate from the primary buffer's
+     * mmap RW region, new 2MB blocks come from overflow segments
+     * mapped at IPAs beyond guest_size. */
+    guest_overflow_t overflow[GUEST_MAX_OVERFLOW];
+    int              noverflow;
+    uint64_t         overflow_ipa_next; /* Next IPA for new overflow segment */
 } guest_t;
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */
@@ -320,6 +350,17 @@ int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
 int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
                        uint64_t gpa_start, int perms);
+
+/* Allocate a 2MB-aligned GPA block from overflow segments.
+ * Creates a new overflow segment if needed (1GB, mapped via hv_vm_map
+ * at an IPA beyond the primary buffer). Returns the allocated IPA,
+ * or UINT64_MAX on failure. */
+uint64_t guest_overflow_alloc(guest_t *g);
+
+/* Translate a host pointer back to a GPA, checking both the primary
+ * buffer and overflow segments. Returns 0 on success, -1 if the
+ * pointer doesn't belong to any known region. */
+int guest_host_to_gpa(const guest_t *g, const void *ptr, uint64_t *out_gpa);
 
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and
  * resets page table pool, brk, and mmap allocation state. Preserves the

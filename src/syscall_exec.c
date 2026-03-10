@@ -18,6 +18,8 @@
 #include "rosetta.h"         /* rosetta_prepare, rosetta_finalize */
 #include "hv_util.h"         /* HV_CHECK, SCTLR_*, TCR_EL1_VALUE */
 #include "vdso.h"            /* VDSO_BASE, VDSO_SIZE */
+#include "syscall_fd.h"      /* eventfd_close, signalfd_close, timerfd_close */
+#include "syscall_inotify.h" /* inotify_close */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,19 +206,29 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
 
-    /* Step 4: Close CLOEXEC fds */
+    /* Step 4: Close CLOEXEC fds — must dispatch by type to avoid UB
+     * (e.g., calling closedir() on an epoll_instance_t pointer). */
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type != FD_CLOSED &&
             (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
+            /* Clean up type-specific resources */
             if (fd_table[i].dir) {
-                closedir((DIR *)fd_table[i].dir);
+                if (fd_table[i].type == FD_DIR)
+                    closedir((DIR *)fd_table[i].dir);
+                else
+                    free(fd_table[i].dir); /* FD_EPOLL */
                 fd_table[i].dir = NULL;
+            }
+            switch (fd_table[i].type) {
+            case FD_EVENTFD:  eventfd_close(i);  break;
+            case FD_SIGNALFD: signalfd_close(i); break;
+            case FD_TIMERFD:  timerfd_close(i);  break;
+            case FD_INOTIFY:  inotify_close(i);  break;
+            default: break;
             }
             if (fd_table[i].type != FD_STDIO)
                 close(fd_table[i].host_fd);
             fd_mark_closed(i);
-            fd_table[i].host_fd = -1;
-            fd_table[i].linux_flags = 0;
         }
     }
 
@@ -303,7 +315,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
 
-    /* Step 7c: Invalidate I-cache for loaded code regions. */
+    /* Step 7c: Invalidate I-cache for loaded code regions.
+     * Rosetta handles I-cache coherence internally, so skip in that path.
+     * The interpreter loop is inside the guard because interp_info is only
+     * populated for non-rosetta loads. */
     if (!need_rosetta) {
         for (int i = 0; i < elf_info.num_segments; i++) {
             if (elf_info.segments[i].flags & PF_X) {
@@ -312,12 +327,12 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                 sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
             }
         }
-    }
-    for (int i = 0; i < interp_info.num_segments; i++) {
-        if (interp_info.segments[i].flags & PF_X) {
-            void *host_addr = (uint8_t *)g->host_base +
-                              interp_info.segments[i].gpa + interp_base;
-            sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
+        for (int i = 0; i < interp_info.num_segments; i++) {
+            if (interp_info.segments[i].flags & PF_X) {
+                void *host_addr = (uint8_t *)g->host_base +
+                                  interp_info.segments[i].gpa + interp_base;
+                sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
+            }
         }
     }
     sys_icache_invalidate((uint8_t *)g->host_base + SHIM_BASE, shim_size);
@@ -506,6 +521,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         free(rosetta_argv);
         entry_point = rr.entry_point;
         g->is_rosetta = 1;
+
+        /* Update /proc/self/exe and /proc/self/cmdline */
+        proc_set_elf_path(path);
+        proc_set_cmdline(argc, argv_const);
     } else {
         sp = build_linux_stack(g, g->stack_top, argc, argv_const,
                                envp_const, &elf_info,
@@ -523,8 +542,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             g->is_rosetta = 0;
         }
 
-        /* Update ELF path for /proc/self/exe */
+        /* Update /proc/self/exe and /proc/self/cmdline */
         proc_set_elf_path(path);
+        proc_set_cmdline(argc, argv_const);
     }
 
     /* Step 10: Set vCPU state for new process */

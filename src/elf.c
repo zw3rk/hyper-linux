@@ -84,6 +84,12 @@ int elf_load(const char *path, elf_info_t *info) {
         fclose(f);
         return -1;
     }
+    if (ehdr.e_phentsize < sizeof(elf64_phdr_t)) {
+        fprintf(stderr, "%s: e_phentsize too small (%u < %zu)\n",
+                path, ehdr.e_phentsize, sizeof(elf64_phdr_t));
+        fclose(f);
+        return -1;
+    }
 
     size_t ph_total = (size_t)ehdr.e_phnum * ehdr.e_phentsize;
     uint8_t *ph_buf = malloc(ph_total);
@@ -109,7 +115,14 @@ int elf_load(const char *path, elf_info_t *info) {
         /* PT_INTERP: read the dynamic linker path from the file */
         if (ph->p_type == PT_INTERP) {
             size_t interp_len = ph->p_filesz;
-            if (interp_len > 0 && interp_len < sizeof(info->interp_path)) {
+            if (interp_len >= sizeof(info->interp_path)) {
+                fprintf(stderr, "%s: PT_INTERP path too long (%zu >= %zu)\n",
+                        path, interp_len, sizeof(info->interp_path));
+                free(ph_buf);
+                fclose(f);
+                return -1;
+            }
+            if (interp_len > 0) {
                 long saved_pos = ftell(f);
                 if (fseek(f, ph->p_offset, SEEK_SET) == 0) {
                     size_t n = fread(info->interp_path, 1, interp_len, f);
@@ -144,6 +157,7 @@ int elf_load(const char *path, elf_info_t *info) {
             if (ph->p_vaddr < info->load_min)
                 info->load_min = ph->p_vaddr;
             uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+            if (seg_end < ph->p_vaddr) seg_end = UINT64_MAX; /* overflow */
             if (seg_end > info->load_max)
                 info->load_max = seg_end;
         }
@@ -200,11 +214,19 @@ int elf_map_segments(const elf_info_t *info, const char *path,
     }
 
     /* Copy program headers into guest memory at phdr_gpa + load_base
-     * (needed for AT_PHDR auxv entry) */
+     * (needed for AT_PHDR auxv entry).  Fail hard if they don't fit —
+     * a missing copy would leave AT_PHDR pointing at uninitialised
+     * memory, crashing the dynamic linker. */
     uint64_t phdr_dest = info->phdr_gpa + load_base;
-    if (phdr_dest + ph_total <= guest_size) {
-        memcpy((uint8_t *)guest_base + phdr_dest, ph_buf, ph_total);
+    if (phdr_dest + ph_total > guest_size) {
+        fprintf(stderr, "%s: program headers at 0x%llx exceed guest memory "
+                "(size 0x%llx)\n", path, (unsigned long long)(phdr_dest + ph_total),
+                (unsigned long long)guest_size);
+        free(ph_buf);
+        fclose(f);
+        return -1;
     }
+    memcpy((uint8_t *)guest_base + phdr_dest, ph_buf, ph_total);
 
     /* Load each PT_LOAD segment (adjusted by load_base for ET_DYN) */
     int seg_idx = 0;
@@ -218,8 +240,19 @@ int elf_map_segments(const elf_info_t *info, const char *path,
         uint64_t filesz = ph->p_filesz;
         uint64_t memsz = ph->p_memsz;
 
-        /* Bounds check */
-        if (gpa + memsz > guest_size) {
+        /* Validate filesz <= memsz (ELF spec requirement) */
+        if (filesz > memsz) {
+            fprintf(stderr, "%s: segment at 0x%llx has filesz > memsz "
+                    "(0x%llx > 0x%llx)\n",
+                    path, (unsigned long long)gpa,
+                    (unsigned long long)filesz, (unsigned long long)memsz);
+            free(ph_buf);
+            fclose(f);
+            return -1;
+        }
+
+        /* Bounds check (overflow-safe) */
+        if (memsz > guest_size || gpa > guest_size - memsz) {
             fprintf(stderr, "%s: segment at 0x%llx+0x%llx exceeds guest memory\n",
                     path, (unsigned long long)gpa, (unsigned long long)memsz);
             free(ph_buf);

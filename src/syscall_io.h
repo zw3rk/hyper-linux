@@ -55,4 +55,9 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
                      unsigned long nr_segs, unsigned int flags);
 int64_t sys_tee(int fd_in, int fd_out, size_t len, unsigned int flags);
 
+/* rosettad AOT translation interface */
+void rosettad_set_binary_path(const char *path);
+void rosettad_start_handler(int handler_fd, int client_fd);
+int  rosettad_is_socket(int host_fd);
+
 #endif /* SYSCALL_IO_H */

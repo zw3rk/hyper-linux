@@ -59,7 +59,9 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
 
     sysctl_str("kern.osproductversion", os_version, sizeof(os_version));
     sysctl_str("kern.osrelease",        os_release, sizeof(os_release));
-    sysctl_str("machdep.cpu.brand_string", hw_model, sizeof(hw_model));
+    /* machdep.cpu.brand_string is x86-only; hw.model works on both */
+    if (sysctl_str("machdep.cpu.brand_string", hw_model, sizeof(hw_model)) != 0)
+        sysctl_str("hw.model", hw_model, sizeof(hw_model));
 
     fprintf(stderr, "## Environment\n");
     fprintf(stderr, "- hl version: %s\n", HL_VERSION);
@@ -110,7 +112,7 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
         fprintf(stderr, "PC   = 0x%016llx  CPSR = 0x%016llx\n",
                 (unsigned long long)pc, (unsigned long long)cpsr);
 
-        uint64_t esr, far_reg, elr, spsr, sctlr, sp_el0;
+        uint64_t esr = 0, far_reg = 0, elr = 0, spsr = 0, sctlr = 0, sp_el0 = 0;
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1,   &esr);
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1,   &far_reg);
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,   &elr);

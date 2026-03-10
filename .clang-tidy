@@ -1,0 +1,19 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  cert-*,
+  -cert-err33-c,
+  -cert-err34-c,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  misc-redundant-expression,
+  performance-*,
+  readability-inconsistent-declaration-parameter-name
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*\.h$'
+CheckOptions:
+  - key: bugprone-unsafe-functions.ReportMoreUnsafeFunctions
+    value: false

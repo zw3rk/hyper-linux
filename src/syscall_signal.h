@@ -131,7 +131,7 @@ typedef struct {
     uint64_t sp;             /* SP_EL0 */
     uint64_t pc;             /* ELR_EL1 at time of signal */
     uint64_t pstate;         /* SPSR_EL1 at time of signal */
-    /* 8 bytes reserved for extensions (FPSIMD etc.) */
+    /* Extension space for FPSIMD, ESR, SVE contexts (4096 bytes) */
     uint8_t  __reserved[4096] __attribute__((aligned(16)));
 } linux_sigcontext_t;
 

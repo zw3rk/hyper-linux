@@ -19,6 +19,9 @@
        test-x64-glibc-dynamic test-x64-glibc-coreutils \
        test-x64-haskell test-x64-haskell-bins \
        test-full \
+       test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
+       test-matrix-lima-aarch64 test-matrix-lima-x64 \
+       lint analyze format \
        site site-serve help
 
 # ── Configuration ──────────────────────────────────────────────────
@@ -60,6 +63,12 @@ YELLOW := \033[1;33m
 RED    := \033[0;31m
 RESET  := \033[0m
 
+# ── Compiler flags ────────────────────────────────────────────────
+CFLAGS := -O2 -Wall -Wextra -Wpedantic \
+          -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
+          -Wformat=2 -Wimplicit-fallthrough -Wundef \
+          -Wnull-dereference -Wno-unused-parameter
+
 # ── Source layout ─────────────────────────────────────────────────
 SRC_DIR := src
 
@@ -74,7 +83,7 @@ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
-           syscall_signal.h syscall_net.h stack.h \
+           syscall_signal.h syscall_net.h stack.h hv_util.h \
            thread.h futex.h vdso.h crash_report.h rosetta.h)
 
 # ── Default target ─────────────────────────────────────────────────
@@ -123,7 +132,7 @@ hl: $(BUILD_DIR)/hl
 
 $(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Compiling$(RESET) hl\n"
-	clang -O2 -Wall -Wextra -Wpedantic \
+	clang $(CFLAGS) \
 		-I$(BUILD_DIR) -I$(SRC_DIR) \
 		-o $@ $(HL_SRCS) \
 		-framework Hypervisor -arch arm64
@@ -360,7 +369,6 @@ test-haskell: $(BUILD_DIR)/hl
 # ── Haskell binary integration tests ────────────────────────────────
 
 HASKELL_BINS_DIR ?= $(GUEST_HASKELL_BINS)/bin
-HASKELL_SYSROOT_DIR ?= $(GUEST_HASKELL_SYSROOT)
 
 ## Run Haskell binary integration tests (pandoc, shellcheck)
 test-haskell-bins: $(BUILD_DIR)/hl
@@ -368,7 +376,7 @@ test-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR) $(HASKELL_SYSROOT_DIR)
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR)
 
 # ── x86_64-linux via Rosetta tests ─────────────────────────────────
 
@@ -573,7 +581,6 @@ test-x64-glibc-coreutils: $(BUILD_DIR)/hl
 # ── x86_64 Haskell binary integration tests ────────────────────────
 
 X64_HASKELL_BINS_DIR ?= $(GUEST_X64_HASKELL_BINS)/bin
-X64_HASKELL_SYSROOT_DIR ?= $(GUEST_X64_HASKELL_SYSROOT)
 
 ## Run x86_64 Haskell binary integration tests (pandoc, shellcheck via rosetta)
 test-x64-haskell-bins: $(BUILD_DIR)/hl
@@ -581,7 +588,29 @@ test-x64-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ x86_64 Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR) $(X64_HASKELL_SYSROOT_DIR) "+RTS -xr4G -RTS"
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR) "" "+RTS -xr4G -RTS"
+
+# ── Test matrix (4-way: hl + lima, aarch64 + x86_64) ────────────────
+
+## Run full test matrix (all modes: hl + lima, aarch64 + x86_64)
+test-matrix: $(BUILD_DIR)/hl
+	@bash test/test-matrix.sh all
+
+## Run test matrix: hl aarch64 mode
+test-matrix-hl-aarch64: $(BUILD_DIR)/hl
+	@bash test/test-matrix.sh hl-aarch64
+
+## Run test matrix: hl x86_64 (rosetta) mode
+test-matrix-hl-x64: $(BUILD_DIR)/hl
+	@bash test/test-matrix.sh hl-x64
+
+## Run test matrix: Lima aarch64 mode
+test-matrix-lima-aarch64: $(BUILD_DIR)/hl
+	@bash test/test-matrix.sh lima-aarch64
+
+## Run test matrix: Lima x86_64 (rosetta) mode
+test-matrix-lima-x64: $(BUILD_DIR)/hl
+	@bash test/test-matrix.sh lima-x64
 
 # ── Full test suite ──────────────────────────────────────────────────
 
@@ -637,7 +666,7 @@ test-full: $(BUILD_DIR)/hl
 ## Build the multi-vCPU HVF validation test (native macOS binary)
 $(BUILD_DIR)/test-multi-vcpu: test/test-multi-vcpu.c $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Compiling$(RESET) test-multi-vcpu (native)\n"
-	clang -O2 -Wall -Wextra -Wpedantic \
+	clang $(CFLAGS) \
 		-I$(BUILD_DIR) \
 		-o $@ $< \
 		-framework Hypervisor -arch arm64
@@ -653,7 +682,7 @@ test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
 ## Build the RWX W^X validation test (native macOS binary)
 $(BUILD_DIR)/test-rwx: test/test-rwx.c $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Compiling$(RESET) test-rwx (native)\n"
-	clang -O2 -Wall -Wextra -Wpedantic \
+	clang $(CFLAGS) \
 		-I$(BUILD_DIR) \
 		-o $@ $< \
 		-framework Hypervisor -arch arm64
@@ -663,6 +692,25 @@ $(BUILD_DIR)/test-rwx: test/test-rwx.c $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 ## Run RWX page table entry test (does HVF allow W+X?)
 test-rwx: $(BUILD_DIR)/test-rwx
 	$(BUILD_DIR)/test-rwx
+
+# ── Static analysis ────────────────────────────────────────────────
+
+.PHONY: lint analyze format
+
+## Run clang-tidy on all source files
+lint:
+	@printf "$(BLUE)▸ Running$(RESET) clang-tidy\n"
+	clang-tidy $(HL_SRCS) -- $(CFLAGS) -I$(SRC_DIR) -I$(BUILD_DIR)
+
+## Run clang static analyzer (scan-build)
+analyze:
+	@printf "$(BLUE)▸ Running$(RESET) scan-build\n"
+	scan-build --use-cc=clang $(MAKE) -B hl
+
+## Run clang-format on all source files (check only, no changes)
+format:
+	@printf "$(BLUE)▸ Checking$(RESET) code formatting\n"
+	clang-format --dry-run --Werror $(HL_SRCS) $(HL_HDRS)
 
 # ── Cleanup ────────────────────────────────────────────────────────
 

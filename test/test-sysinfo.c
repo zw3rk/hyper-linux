@@ -96,6 +96,6 @@ int main(void) {
         else FAIL("invalid pid");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-sysinfo");
     return fails > 0 ? 1 : 0;
 }

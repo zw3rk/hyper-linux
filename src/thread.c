@@ -11,6 +11,11 @@
 #include "guest.h"   /* SHIM_DATA_BASE, BLOCK_2MB, GUEST_IPA_BASE */
 #include "hv_util.h" /* vcpu_get_gpr, vcpu_get_sysreg */
 
+/* From syscall_signal.h — included here directly to avoid pulling in
+ * the full signal header (macOS defines sa_handler as a macro that
+ * conflicts with our linux_sigaction_t field name). */
+#define LINUX_SS_DISABLE 2
+
 #include <stdio.h>
 #include <string.h>
 
@@ -50,6 +55,8 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     t->clear_child_tid = 0;
     t->sp_el1          = sp_el1;
     t->active          = 1;
+    t->altstack_flags  = LINUX_SS_DISABLE;
+    t->on_altstack     = 0;
     thread_ptrace_init(t);
 
     /* Slot 0 is consumed by main thread */
@@ -71,6 +78,7 @@ thread_entry_t *thread_alloc(int64_t tid) {
             memset(t, 0, sizeof(*t));
             t->guest_tid = tid;
             t->active    = 1;
+            t->altstack_flags = 2; /* LINUX_SS_DISABLE */
             thread_ptrace_init(t);
             result = t;
             break;
@@ -86,18 +94,28 @@ void thread_deactivate(thread_entry_t *t) {
 
     pthread_mutex_lock(&thread_lock);
 
-    /* Destroy ptrace condition variables */
-    pthread_cond_destroy(&t->ptrace_cond);
-    pthread_cond_destroy(&t->resume_cond);
-
     /* If this is a VM-clone child, mark it as exited and wake the
-     * tracer/parent so wait4 can collect the exit status. */
+     * tracer/parent so wait4 can collect the exit status.  Must happen
+     * BEFORE destroying the condvars — broadcasting a destroyed condvar
+     * is undefined behavior. */
+    /* Guard against double-deactivation: if already inactive, skip. */
+    if (!t->active) {
+        pthread_mutex_unlock(&thread_lock);
+        return;
+    }
+
     if (t->is_vm_clone) {
         t->vm_exited = 1;
         pthread_cond_broadcast(&t->ptrace_cond);
     }
 
     t->active = 0;
+
+    /* Destroy ptrace condition variables after broadcasting and after
+     * marking inactive so no waiter can re-enter a wait on these. */
+    pthread_cond_destroy(&t->ptrace_cond);
+    pthread_cond_destroy(&t->resume_cond);
+
     pthread_mutex_unlock(&thread_lock);
 }
 
@@ -168,6 +186,20 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
     for (int i = 0; i < MAX_THREADS; i++) {
         if (thread_table[i].active) {
             fn(&thread_table[i], ctx);
+        }
+    }
+    pthread_mutex_unlock(&thread_lock);
+}
+
+void thread_destroy_all_vcpus(void) {
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_table[i].active && thread_table[i].vcpu) {
+            hv_vcpu_destroy(thread_table[i].vcpu);
+            thread_table[i].vcpu = 0;
+            thread_table[i].active = 0;
+            pthread_cond_destroy(&thread_table[i].ptrace_cond);
+            pthread_cond_destroy(&thread_table[i].resume_cond);
         }
     }
     pthread_mutex_unlock(&thread_lock);
@@ -303,8 +335,13 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
                 int64_t tid = t->guest_tid;
                 if (out_status)
                     *out_status = t->vm_exit_status;
-                /* Deactivate the slot (already under lock) */
+                /* Deactivate the slot and clean up condvars.
+                 * vm-clone children do NOT call thread_deactivate() on exit
+                 * (they skip it since the slot is collected here), so we
+                 * must destroy condvars to avoid resource leaks. */
                 t->active = 0;
+                pthread_cond_destroy(&t->ptrace_cond);
+                pthread_cond_destroy(&t->resume_cond);
                 pthread_mutex_unlock(&thread_lock);
                 return tid;
             }

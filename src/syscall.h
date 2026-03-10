@@ -81,6 +81,7 @@
 #define SYS_setitimer       103
 #define SYS_nanosleep       101
 #define SYS_clock_gettime   113
+#define SYS_clock_getres    114
 #define SYS_clock_nanosleep 115
 #define SYS_sched_getaffinity 123
 #define SYS_sched_yield     124
@@ -270,6 +271,18 @@ typedef struct {
 #define LINUX_EDESTADDRREQ 89
 #define LINUX_EPROTOTYPE   91
 #define LINUX_ETIMEDOUT    110
+#define LINUX_ENOBUFS      105
+#define LINUX_ENOTSUP      95   /* Same as EOPNOTSUPP on Linux */
+#define LINUX_EPROTONOSUPPORT 93
+#define LINUX_ESOCKTNOSUPPORT 94
+#define LINUX_ENETDOWN     100
+#define LINUX_ENETRESET    102
+#define LINUX_ESHUTDOWN    108
+#define LINUX_ETOOMANYREFS 109
+#define LINUX_EDQUOT       122
+#define LINUX_ESTALE       116
+#define LINUX_ENOTRECOVERABLE 131
+#define LINUX_EOWNERDEAD   130
 
 /* ---------- Linux FD flags ---------- */
 #define LINUX_FD_CLOEXEC   1
@@ -297,6 +310,7 @@ typedef struct {
 #define LINUX_O_RDWR     0x0002
 #define LINUX_O_CREAT    0x0040
 #define LINUX_O_EXCL     0x0080
+#define LINUX_O_NOCTTY   0x0100
 #define LINUX_O_TRUNC    0x0200
 #define LINUX_O_APPEND   0x0400
 #define LINUX_O_NONBLOCK 0x0800
@@ -311,7 +325,8 @@ typedef struct {
 /* ---------- Linux AT_* constants ---------- */
 #define LINUX_AT_FDCWD             (-100)
 #define LINUX_AT_SYMLINK_NOFOLLOW  0x100
-#define LINUX_AT_REMOVEDIR         0x200
+#define LINUX_AT_REMOVEDIR         0x200  /* for unlinkat */
+#define LINUX_AT_EACCESS           0x200  /* for faccessat (same value, context-dependent) */
 #define LINUX_AT_SYMLINK_FOLLOW    0x400
 #define LINUX_AT_EMPTY_PATH        0x1000
 

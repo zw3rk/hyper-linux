@@ -87,6 +87,43 @@ make clean       # remove _build/
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
 
+## Validation
+
+**Always run the full 4-mode test matrix after any code change:**
+
+```
+nix develop -c bash test/test-matrix.sh all
+```
+
+This tests all 4 modes: `hl-aarch64`, `hl-x64`, `lima-aarch64`, `lima-x64`.
+Individual modes can be run with e.g. `bash test/test-matrix.sh hl-aarch64`.
+
+The matrix covers: unit tests (~34), coreutils (musl static + musl dynamic
++ glibc dynamic), busybox, static bins, Haskell bins (pandoc, shellcheck),
+and a Haskell hello-hyper test — per mode.
+
+Quick unit-only tests (subset of the full matrix):
+```
+nix develop -c make test-all       # aarch64 unit tests (38 tests)
+nix develop -c make test-x64-all   # x86_64 unit tests (34+4 xfail)
+```
+
+### Expected Results (M2, as of commit 9b6505a)
+
+| Mode | Pass | Fail | Timeout | Notes |
+|------|------|------|---------|-------|
+| hl-aarch64 | 204 | 0 | 0 | Clean |
+| hl-x64 | 200 | 1 | 2 | Known rosetta limitations |
+| lima-aarch64 | 201 | 1 | 2 | lima-specific test-poll |
+| lima-x64 | 199 | 2 | 2 | rosetta + lima test-poll |
+
+### Known Failures (not regressions)
+
+- **test-signal-thread** (x64): SA_RESETHAND not reset — rosetta shadows
+  signal state internally. Also fails in Lima VM.
+- **test-thread, test-stress** (x64): TLS=0 hang — rosetta limitation.
+- **test-poll** (lima only): lima-specific, passes in hl modes.
+
 ## Dynamic Linking
 
 hl supports dynamically-linked aarch64-linux ELF binaries via `--sysroot`:
@@ -295,23 +332,25 @@ Rosetta's binary contains only 1 IC IVAU instruction (at VA 0x2686c)
 which is never called in the JIT path — it relies on external cache
 maintenance, which the shim now provides.
 
-### Rosetta JIT Translation Status
+### Rosetta AOT Activation Status
 
-Simple x86_64 binaries (hello-write, echo) run successfully through
-rosetta's AOT-assisted JIT path. Complex binaries with indirect jumps
-(printf jump tables, .init_array function pointers) still fail:
+Rosettad AOT translation is fully active with persistent caching. The
+handler thread intercepts rosetta's SOCK_SEQPACKET socket via
+socketpair(SOCK_STREAM) and handles the 't'/'d'/'q' protocol.
 
-1. First BRK stub: translated and patched successfully (IC IALLU works)
-2. Subsequent BRK: rosetta's signal handler detects a translation failure
-   (block_for_offset returns NULL for indirect jump targets)
-3. Handler calls rt_sigaction(SIGTRAP, SIG_DFL) to reset, then
-   rt_tgsigqueueinfo to re-raise SIGTRAP with SIG_DFL (intentional
-   "give up and die" pattern)
-4. Process terminates cleanly with SIGTRAP default disposition
+**Persistent AOT cache** at `~/.cache/hl-rosettad/`:
+- Files: `<sha256_hex>.aot` keyed by SHA256 of the original x86_64 binary
+- 't' handler: computes binary SHA256, checks cache, translates on miss,
+  stores in cache. Binaries >100MB are skipped (high-VA limitation on M2).
+- 'd' handler: looks up persistent cache by digest, responds HIT with
+  cached AOT fd. On first run, all 'd' queries miss → rosetta sends 't'.
+  On subsequent runs, rosetta's .flu cache (`~/.cache/rosetta/`) sends
+  'd' with cached digests → all HIT → no re-translation needed.
 
-This is a genuine rosetta limitation also observed in real VZ VMs
-(OrbStack #1396, Docker #7320). The block_for_offset assertion fires
-for addresses not pre-registered as block starts, even with AOT data.
+This matches real rosettad behavior: the digest is always the SHA256 of
+the original binary (not the AOT output). Large binaries (e.g., pandoc
+at 217MB) fall back to pure JIT because rosetta's AOT path allocates
+high-VA regions that exceed hl's current page table capacity on M2.
 
 **The `_potential_targets` assertion** at VA 0x800000048eac
 (`_mode == TranslationMode::Aot || _potential_targets.empty()`,
@@ -327,51 +366,43 @@ sets caps[0]=1), BSS[0xa04]=1, and the runtime AOT code at 0x90afc
 proceeds to connect to rosettad via socket.
 
 **BSS[0xa05]** is a secondary VZ capability flag from caps[108].
-Must be non-null to allow the rosettad translate path (checked at VA 0x90ba4).
 **BSS[0xa06..0xa71]** (108 bytes) stores the `sun_path` socket path bytes,
-copied from VZ_CAPS caps[1..108]. NOTE: caps[64] (sun_path[63]) MUST be
-non-null — it gates the entire rosettad AOT initialization (VA 0x307a4).
-caps[66..] (sun_path[65..]) holds the null-terminated x86_64 binary path
-that Rosetta passes to rosettad for AOT translation.
+copied from VZ_CAPS caps[1..108]. caps[66..] (sun_path[65..]) holds the
+null-terminated x86_64 binary path that Rosetta passes to rosettad for
+AOT translation.
 
 **VZ mode activation:** Rosetta checks for VZ (Virtualization.framework)
 support via 3 ioctls: VZ_CHECK (0x80456125) returns a 69-byte signature,
 VZ_CAPS (0x80806123) returns 128 bytes of capability data, VZ_ACTIVATE
 (0x6124). These are intercepted in `syscall_io.c`.
 
-**VZ_CAPS buffer layout** (128 bytes, reverse-engineered from Rosetta binary):
+**VZ_CAPS buffer layout** (128 bytes, verified via strace in Lima VZ VM):
 - `caps[0]`: VZ enable flag (1 = active). Written to BSS[0xa04].
-- `caps[1..64]`: `sun_path[0..63]` — first 64 bytes of socket path.
-  **`caps[64]` (= `sun_path[63]`) MUST be non-null.** At VA 0x800000307a4,
-  Rosetta reads this byte and branches (`cbz w8, 0x3080c`): if zero, the
-  entire rosettad AOT initialization is skipped silently. `[aot_registry+0x70]`
-  is never populated, and the AOT mmap function (0x80000002ec84) always
-  returns without contacting rosettad. We fill caps[1..64] with 63 `'A'`
-  bytes + `'/'` as a fake path prefix; the connect() interception is fd-based
-  so the actual bytes don't matter.
-- `caps[65]`: Null terminator of the socket path (zero).
-- `caps[66..107]`: Null-terminated path to the x86_64 binary being translated
-  (`caps+0x42` in Rosetta notation). At VA 0x800000090bb0, Rosetta calls
-  `openat(AT_FDCWD, caps+0x42, 0, 0)` to open the binary and sends the fd
-  to rosettad via SCM_RIGHTS for AOT translation.
-- `caps[108]`: Written to BSS[0xa05]. Checked at VA 0x800000090ba4
-  (`cbz w23, 0x90ca4`): must be non-null to allow the translate (`'t'`)
-  handler to proceed after the `'?'` handshake. We ensure it's non-null
-  (set to 1 if not already non-zero from the binary path bytes).
-- `caps[109..127]`: Additional capability flags (purpose unknown, left as zero)
+- `caps[1..64]`: `sun_path[0..63]` — socket path for rosettad. Must be
+  non-empty (caps[1] != 0). Real VZ returns "/run/rosettad/rosetta.sock".
+  The actual path doesn't matter because connect() is intercepted via
+  `rosettad_is_socket()` — the socketpair is pre-connected.
+- `caps[66..107]`: Null-terminated path to the x86_64 binary being
+  translated (`caps+0x42` in Rosetta notation). Rosetta opens this file
+  and sends the fd to rosettad via SCM_RIGHTS for AOT translation.
+- `caps[108]`: Written to BSS[0xa05]. Real VZ has this as 0. Both 't'
+  (translate) and 'd' (digest) protocol commands work with caps[108]=0.
+- `caps[109..127]`: Other flags (purpose unknown, leave as zero).
 
-Our connect() interception in `syscall_net.c` is fd-based (`rosettad_is_socket()`),
-so Rosetta never reaches the actual socket path bytes in caps[1..108]. The
-rosettad protocol is handled by `rosettad_handler_thread` on the other end
-of the socketpair.
+The connect() interception in `syscall_net.c` uses `rosettad_is_socket()`
+to detect rosetta's socketpair end. The handler thread on the other end
+implements the rosettad protocol: '?' handshake, 't' translate (with
+persistent cache), 'd' digest (cache lookup), 'q' quit.
 
 **rosettad protocol** (implemented in `syscall_io.c:rosettad_handler_thread`):
 - Rosetta opens `AF_UNIX SOCK_SEQPACKET` — intercepted in `syscall_net.c`
   with `socketpair(SOCK_STREAM)` (macOS doesn't support SEQPACKET for AF_UNIX)
 - `'?'` → handshake, respond `0x01`
-- `'t'` → translate: receive binary fd via SCM_RIGHTS, run `rosettad translate`
-  via subprocess, send back AOT fd + 32-byte digest
-- `'d'` → digest cache lookup (respond `0x00` = not cached)
+- `'t'` → translate: receive binary fd via SCM_RIGHTS, compute binary SHA256,
+  check persistent cache, translate on miss via `hl rosettad translate`
+  subprocess, store in cache, send back AOT fd + 32-byte binary SHA256
+- `'d'` → digest lookup: receive 32-byte SHA256, look up persistent AOT cache,
+  respond HIT (0x01 + AOT fd via SCM_RIGHTS) or MISS (0x00)
 - `'q'` → quit
 
 **cmsghdr format translation** (critical for SCM_RIGHTS to work):
@@ -553,16 +584,17 @@ MAP_FIXED to map AOT code/data sections from the translated file.
 0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
 0x020000000  - mmap_limit:    mmap RX growth area (up to g->mmap_limit)
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
-0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit)
+0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit or rosetta)
 interp_base  - varies:        Dynamic linker (g->interp_base, if --sysroot)
 --- Extra IPA mappings (x86_64 mode only, via guest_add_mapping) ---
 0x800000000000+:               Rosetta binary (3 segments at 128TB link addr)
 ```
 
-The address space size is determined at runtime by querying the max IPA
-(Intermediate Physical Address) size via `hv_vm_config_get_max_ipa_size()`:
-- **36-bit IPA (64GB)**: HVF default, mmap_limit=56GB, interp_base=60GB
-- **40-bit IPA (1TB)**: macOS 15+, mmap_limit=1016GB, interp_base=1020GB
+The primary buffer size is determined by the VM's configured IPA width
+(capped at 40-bit = 1TB):
+- **36-bit IPA (64GB)**: Native aarch64 on M2, mmap_limit=56GB, interp_base=60GB
+- **40-bit IPA (1TB)**: Native aarch64 on M3+, OR rosetta mode on any hardware
+  (vm_ipa=48 capped to 40), mmap_limit=1016GB, interp_base=1020GB
 
 Both `mmap_limit` and `interp_base` are computed dynamically from
 `guest_size` and stored in `guest_t` (replacing the old compile-time

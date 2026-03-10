@@ -306,7 +306,8 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             return 1;
         }
 
-        if (rhdr.offset + rhdr.size > g.guest_size) {
+        if (rhdr.offset > g.guest_size ||
+            rhdr.size > g.guest_size - rhdr.offset) {
             fprintf(stderr, "hl: fork-child: region out of bounds\n");
             guest_destroy(&g);
             return 1;
@@ -340,8 +341,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         return 1;
     }
 
-    /* Initialize our FD table */
+    /* Initialize our FD table and reset mmap gap-finder hints
+     * (parent's gap hints are stale for the child's allocator). */
     syscall_init();
+    mmap_reset_hints();
 
     if (num_fds > 0) {
         ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(ipc_fd_entry_t));
@@ -410,6 +413,9 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                             fprintf(stderr, "hl: fork-child: fdopendir "
                                     "failed for gfd %d\n", gfd);
                         }
+                    } else {
+                        fprintf(stderr, "hl: fork-child: dup failed for "
+                                "DIR gfd %d: %s\n", gfd, strerror(errno));
                     }
                 }
             }
@@ -441,6 +447,46 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     }
     if (sysroot_ipc[0] != '\0')
         proc_set_sysroot(sysroot_ipc);
+
+    /* Step 6a2: Read ELF path (/proc/self/exe) and hl path (rosettad) */
+    char elf_path_ipc[LINUX_PATH_MAX];
+    if (ipc_read_all(ipc_fd, elf_path_ipc, sizeof(elf_path_ipc)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read elf path\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (elf_path_ipc[0] != '\0')
+        proc_set_elf_path(elf_path_ipc);
+
+    char hl_path_ipc[LINUX_PATH_MAX];
+    if (ipc_read_all(ipc_fd, hl_path_ipc, sizeof(hl_path_ipc)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read hl path\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (hl_path_ipc[0] != '\0')
+        proc_set_hl_path(hl_path_ipc);
+
+    /* Step 6a3: Read cmdline (/proc/self/cmdline) */
+    uint32_t cmdline_len_u32;
+    if (ipc_read_all(ipc_fd, &cmdline_len_u32, sizeof(cmdline_len_u32)) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to read cmdline len\n");
+        guest_destroy(&g);
+        return 1;
+    }
+    if (cmdline_len_u32 > 0 && cmdline_len_u32 < LINUX_PATH_MAX * 4) {
+        char *cmdline_buf = malloc(cmdline_len_u32);
+        if (cmdline_buf) {
+            if (ipc_read_all(ipc_fd, cmdline_buf, cmdline_len_u32) < 0) {
+                free(cmdline_buf);
+                fprintf(stderr, "hl: fork-child: failed to read cmdline\n");
+                guest_destroy(&g);
+                return 1;
+            }
+            proc_set_cmdline_raw(cmdline_buf, cmdline_len_u32);
+            free(cmdline_buf);
+        }
+    }
 
     /* Step 6b: Read semantic region tracking */
     uint32_t num_guest_regions;
@@ -598,7 +644,15 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
 
     proc_init();
+    /* Restore identity after proc_init (which resets pid/ppid to 1/0) */
+    proc_set_identity(hdr.child_pid, hdr.parent_pid);
     /* proc_set_shim was called above from IPC data (step 6c) */
+
+    /* Register the fork child's main thread in the thread table.
+     * Without this, current_thread is NULL and any syscall handler that
+     * accesses per-thread state (signal masks, ptrace, CLONE_THREAD)
+     * will dereference NULL. */
+    thread_register_main(vcpu, vexit, hdr.child_pid, regs.sp_el1);
 
     if (verbose)
         fprintf(stderr, "hl: fork-child: entering vCPU loop\n");
@@ -620,7 +674,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
 #define LINUX_CLONE_PARENT_SETTID  0x00100000
 #define LINUX_CLONE_CHILD_CLEARTID 0x00200000
 #define LINUX_CLONE_CHILD_SETTID   0x01000000
-#define LINUX_SIGCHLD              17
+/* LINUX_SIGCHLD defined in syscall_signal.h (included above) */
 
 /* ---------- CLONE_THREAD: create a new guest thread in the same VM ---------- */
 
@@ -634,7 +688,7 @@ typedef struct {
     uint64_t        flags;
     uint64_t        tls;
     /* Parent system regs to copy into the new vCPU */
-    uint64_t        elr, spsr, vbar, ttbr0, sctlr, tcr, mair, cpacr;
+    uint64_t        elr, spsr, vbar, ttbr0, ttbr1, sctlr, tcr, mair, cpacr;
     uint64_t        tpidr;
     uint64_t        gprs[31];
     uint64_t        sp_el1;
@@ -672,13 +726,14 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
     /* Capture parent register state before spawning worker.
      * HVF binds vCPU to the creating thread, so the worker must call
      * hv_vcpu_create itself. We pass all parent state via the args. */
-    uint64_t parent_elr, parent_spsr, parent_vbar, parent_ttbr0;
+    uint64_t parent_elr, parent_spsr, parent_vbar, parent_ttbr0, parent_ttbr1;
     uint64_t parent_sctlr, parent_tcr, parent_mair, parent_cpacr;
     uint64_t parent_tpidr;
     parent_elr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
     parent_spsr   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
     parent_vbar   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
     parent_ttbr0  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
+    parent_ttbr1  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR1_EL1);
     parent_sctlr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
     parent_tcr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
     parent_mair   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
@@ -705,6 +760,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
     tca->spsr        = parent_spsr;
     tca->vbar        = parent_vbar;
     tca->ttbr0       = parent_ttbr0;
+    tca->ttbr1       = parent_ttbr1;
     tca->sctlr       = parent_sctlr;
     tca->tcr         = parent_tcr;
     tca->mair        = parent_mair;
@@ -716,7 +772,11 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
     /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
     if (flags & LINUX_CLONE_PARENT_SETTID) {
         int32_t tid32 = (int32_t)child_tid;
-        guest_write(g, ptid_gva, &tid32, sizeof(tid32));
+        if (guest_write(g, ptid_gva, &tid32, sizeof(tid32)) < 0) {
+            free(tca);
+            thread_deactivate(t);
+            return -LINUX_EFAULT;
+        }
     }
 
     /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
@@ -728,7 +788,11 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
      * This writes into shared guest memory (visible to child thread). */
     if (flags & LINUX_CLONE_CHILD_SETTID) {
         int32_t tid32 = (int32_t)child_tid;
-        guest_write(g, ctid_gva, &tid32, sizeof(tid32));
+        if (guest_write(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
+            free(tca);
+            thread_deactivate(t);
+            return -LINUX_EFAULT;
+        }
     }
 
     /* Create the host pthread (detached — cleanup happens via
@@ -787,6 +851,8 @@ static void *thread_create_and_run(void *arg) {
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1,  tca->tcr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
+    if (tca->ttbr1)
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, tca->ttbr1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
 
     /* MMU already on — set SCTLR with M=1 directly (page tables exist) */
@@ -918,6 +984,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
     uint64_t parent_spsr   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SPSR_EL1);
     uint64_t parent_vbar   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_VBAR_EL1);
     uint64_t parent_ttbr0  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR0_EL1);
+    uint64_t parent_ttbr1  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TTBR1_EL1);
     uint64_t parent_sctlr  = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SCTLR_EL1);
     uint64_t parent_tcr    = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_TCR_EL1);
     uint64_t parent_mair   = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_MAIR_EL1);
@@ -945,6 +1012,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
     tca->spsr        = parent_spsr;
     tca->vbar        = parent_vbar;
     tca->ttbr0       = parent_ttbr0;
+    tca->ttbr1       = parent_ttbr1;
     tca->sctlr       = parent_sctlr;
     tca->tcr         = parent_tcr;
     tca->mair        = parent_mair;
@@ -956,7 +1024,11 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
     /* CLONE_PARENT_SETTID: write child TID to parent's ptid address */
     if (flags & LINUX_CLONE_PARENT_SETTID) {
         int32_t tid32 = (int32_t)child_tid;
-        guest_write(g, ptid_gva, &tid32, sizeof(tid32));
+        if (guest_write(g, ptid_gva, &tid32, sizeof(tid32)) < 0) {
+            free(tca);
+            thread_deactivate(t);
+            return -LINUX_EFAULT;
+        }
     }
 
     /* CLONE_CHILD_CLEARTID: store the address for cleanup on exit */
@@ -966,7 +1038,11 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
     /* CLONE_CHILD_SETTID: write child TID to child's ctid address */
     if (flags & LINUX_CLONE_CHILD_SETTID) {
         int32_t tid32 = (int32_t)child_tid;
-        guest_write(g, ctid_gva, &tid32, sizeof(tid32));
+        if (guest_write(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
+            free(tca);
+            thread_deactivate(t);
+            return -LINUX_EFAULT;
+        }
     }
 
     /* Create the host pthread */
@@ -1024,6 +1100,8 @@ static void *vm_clone_thread_run(void *arg) {
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1,  tca->tcr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
+    if (tca->ttbr1)
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, tca->ttbr1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
@@ -1349,7 +1427,6 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
      * correspondence: each fd_entry has a matching host fd at the same
      * index. If dup() fails for a non-STDIO fd, the entry is skipped
      * entirely so the arrays never get out of sync. */
-    int open_fds[FD_TABLE_SIZE];
     ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
     int host_fds_to_send[FD_TABLE_SIZE];
     /* Track which host_fds were duped (need close) vs passed as-is (STDIO) */
@@ -1378,7 +1455,6 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         fd_entries[num_fds].pad = 0;
         host_fds_to_send[num_fds] = host_fd;
         host_fds_duped[num_fds] = was_duped;
-        open_fds[num_fds] = i;
         num_fds++;
     }
     int num_host_fds = (int)num_fds; /* 1:1 with fd_entries */
@@ -1397,6 +1473,10 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         /* Send host FDs via SCM_RIGHTS */
         if (send_fds(ipc_sock, host_fds_to_send, num_host_fds) < 0) {
             fprintf(stderr, "hl: clone: failed to send fds via SCM_RIGHTS\n");
+            for (uint32_t fi = 0; fi < num_fds; fi++) {
+                if (host_fds_duped[fi])
+                    close(host_fds_to_send[fi]);
+            }
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }
@@ -1429,6 +1509,34 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     if (ipc_write_all(ipc_sock, sysroot_ipc, sizeof(sysroot_ipc)) < 0) {
         close(ipc_sock);
         return -LINUX_ENOMEM;
+    }
+
+    /* ELF path (for /proc/self/exe) and hl path (for rosettad spawn) */
+    char elf_path_ipc[LINUX_PATH_MAX] = {0};
+    const char *ep = proc_get_elf_path();
+    if (ep) strncpy(elf_path_ipc, ep, sizeof(elf_path_ipc) - 1);
+    char hl_path_ipc[LINUX_PATH_MAX] = {0};
+    const char *hp = proc_get_hl_path();
+    if (hp) strncpy(hl_path_ipc, hp, sizeof(hl_path_ipc) - 1);
+    if (ipc_write_all(ipc_sock, elf_path_ipc, sizeof(elf_path_ipc)) < 0 ||
+        ipc_write_all(ipc_sock, hl_path_ipc, sizeof(hl_path_ipc)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Cmdline (for /proc/self/cmdline) */
+    size_t cmdline_len = 0;
+    const char *cmdline = proc_get_cmdline(&cmdline_len);
+    uint32_t cmdline_len_u32 = (uint32_t)cmdline_len;
+    if (ipc_write_all(ipc_sock, &cmdline_len_u32, sizeof(cmdline_len_u32)) < 0) {
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    if (cmdline_len_u32 > 0 && cmdline) {
+        if (ipc_write_all(ipc_sock, cmdline, cmdline_len_u32) < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
     }
 
     /* Semantic region tracking */

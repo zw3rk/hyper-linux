@@ -120,7 +120,7 @@ static int futex_make_deadline(guest_t *g, uint64_t timeout_gva,
         gettimeofday(&now, NULL);
         out->tv_sec  = now.tv_sec + (time_t)lts.tv_sec;
         out->tv_nsec = now.tv_usec * 1000 + (long)lts.tv_nsec;
-        if (out->tv_nsec >= 1000000000L) {
+        while (out->tv_nsec >= 1000000000L) {
             out->tv_sec  += 1;
             out->tv_nsec -= 1000000000L;
         }
@@ -231,8 +231,16 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
         }
     }
 
-    /* Dequeue waiter from the bucket list */
-    futex_waiter_t **pp = &b->head;
+    /* Dequeue waiter from the correct bucket. Requeue may have moved us
+     * to a different bucket (changed waiter.uaddr), so re-hash. */
+    unsigned dequeue_idx = futex_hash(waiter.uaddr);
+    futex_bucket_t *b_dequeue = &buckets[dequeue_idx];
+    if (b_dequeue != b) {
+        /* Requeued to a different bucket — release original, lock new */
+        pthread_mutex_unlock(&b->lock);
+        pthread_mutex_lock(&b_dequeue->lock);
+    }
+    futex_waiter_t **pp = &b_dequeue->head;
     while (*pp) {
         if (*pp == &waiter) {
             *pp = waiter.next;
@@ -240,8 +248,7 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
         }
         pp = &(*pp)->next;
     }
-
-    pthread_mutex_unlock(&b->lock);
+    pthread_mutex_unlock(&b_dequeue->lock);
     pthread_cond_destroy(&waiter.cond);
 
     /* If we were woken by FUTEX_WAKE, return 0 regardless of timeout race */
@@ -395,11 +402,20 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
         pthread_mutex_lock(&b1->lock);
     }
 
-    /* Decode operation and comparison from val3 */
+    /* Decode operation and comparison from val3.
+     * Bits 31-28: operation (bit 31 = OPARG_SHIFT flag, bits 30-28 = op)
+     * Bits 27-24: comparison operator
+     * Bits 23-12: op_arg (operand for modify)
+     * Bits 11-0:  cmp_arg (operand for compare) */
     unsigned wake_op   = (val3 >> 28) & 0xF;
     unsigned wake_cmp  = (val3 >> 24) & 0xF;
     unsigned op_arg    = (val3 >> 12) & 0xFFF;
     unsigned cmp_arg   = val3 & 0xFFF;
+
+    /* FUTEX_OP_OPARG_SHIFT (bit 3 of wake_op): interpret op_arg as 1<<op_arg */
+    int op_shift = wake_op & 8;
+    wake_op &= 7;  /* Actual operation is bits 0-2 */
+    if (op_shift) op_arg = 1U << (op_arg & 0x1F);
 
     /* Atomically modify *uaddr2 */
     uint32_t *word2 = (uint32_t *)guest_ptr(g, uaddr2);
@@ -437,13 +453,15 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
 
     /* Evaluate comparison predicate on old_val */
     int cond_met = 0;
+    /* Linux FUTEX_WAKE_OP uses signed comparison semantics */
+    int32_t sv = (int32_t)old_val, sa = (int32_t)cmp_arg;
     switch (wake_cmp) {
-    case 0: cond_met = (old_val == cmp_arg); break;  /* EQ */
-    case 1: cond_met = (old_val != cmp_arg); break;  /* NE */
-    case 2: cond_met = (old_val <  cmp_arg); break;  /* LT */
-    case 3: cond_met = (old_val <= cmp_arg); break;  /* LE */
-    case 4: cond_met = (old_val >  cmp_arg); break;  /* GT */
-    case 5: cond_met = (old_val >= cmp_arg); break;  /* GE */
+    case 0: cond_met = (sv == sa); break;  /* EQ */
+    case 1: cond_met = (sv != sa); break;  /* NE */
+    case 2: cond_met = (sv <  sa); break;  /* LT (signed) */
+    case 3: cond_met = (sv <= sa); break;  /* LE (signed) */
+    case 4: cond_met = (sv >  sa); break;  /* GT (signed) */
+    case 5: cond_met = (sv >= sa); break;  /* GE (signed) */
     default: break;
     }
 
@@ -479,7 +497,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
 /* ---------- PI (Priority-Inheritance) futex ----------
  *
  * PI futexes use the futex word itself as an atomic lock:
- *   bits 0-29 = owner TID, bit 30 = FUTEX_WAITERS, bit 31 = FUTEX_OWNER_DIED
+ *   bits 0-30 = owner TID (FUTEX_TID_MASK), bit 31 = FUTEX_WAITERS
  *
  * We don't implement real priority inheritance (boosting the holder's
  * priority to the highest waiter's), but we implement the locking
@@ -597,18 +615,21 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
                         if (*pp == &waiter) { *pp = waiter.next; break; }
                         pp = &(*pp)->next;
                     }
+                    /* Only clear WAITERS bit if no waiters remain in bucket */
+                    int has_waiters = (b->head != NULL);
                     pthread_mutex_unlock(&b->lock);
                     pthread_cond_destroy(&waiter.cond);
-                    /* Clear WAITERS bit if we were the only waiter */
-                    for (;;) {
-                        uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
-                        if (!(v & FUTEX_WAITERS)) break;
-                        uint32_t nv = v & ~FUTEX_WAITERS;
-                        if (__atomic_compare_exchange_n(word, &v, nv,
-                                                         /*weak=*/0,
-                                                         __ATOMIC_SEQ_CST,
-                                                         __ATOMIC_SEQ_CST))
-                            break;
+                    if (!has_waiters) {
+                        for (;;) {
+                            uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+                            if (!(v & FUTEX_WAITERS)) break;
+                            uint32_t nv = v & ~FUTEX_WAITERS;
+                            if (__atomic_compare_exchange_n(word, &v, nv,
+                                                             /*weak=*/0,
+                                                             __ATOMIC_SEQ_CST,
+                                                             __ATOMIC_SEQ_CST))
+                                break;
+                        }
                     }
                     return -LINUX_ETIMEDOUT;
                 }

@@ -96,6 +96,6 @@ int main(void) {
         else FAIL("setpgid failed");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-poll");
     return fails > 0 ? 1 : 0;
 }

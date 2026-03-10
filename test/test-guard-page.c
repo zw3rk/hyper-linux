@@ -179,6 +179,6 @@ int main(void) {
     test_mprotect_partial();
     test_mmap_churn();
 
-    printf("\ntest-guard-page: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-guard-page");
     return fails > 0 ? 1 : 0;
 }
