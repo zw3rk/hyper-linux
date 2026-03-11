@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ---------- Thread table ---------- */
 
@@ -111,10 +112,11 @@ void thread_deactivate(thread_entry_t *t) {
 
     t->active = 0;
 
-    /* Destroy ptrace condition variables after broadcasting and after
-     * marking inactive so no waiter can re-enter a wait on these. */
-    pthread_cond_destroy(&t->ptrace_cond);
-    pthread_cond_destroy(&t->resume_cond);
+    /* Do NOT destroy ptrace condvars here — a waiter woken by the
+     * broadcast above may still be inside pthread_cond_wait() trying
+     * to re-acquire thread_lock. Destroying the condvar while a waiter
+     * references it is undefined behavior. thread_ptrace_init() re-inits
+     * condvars when the slot is reused via thread_alloc(). */
 
     pthread_mutex_unlock(&thread_lock);
 }
@@ -132,6 +134,21 @@ thread_entry_t *thread_find(int64_t tid) {
     pthread_mutex_unlock(&thread_lock);
 
     return result;
+}
+
+int thread_tid_alive(int64_t tid) {
+    /* Lock-free scan: `active` transitions 1→0 exactly once (in
+     * thread_deactivate under thread_lock), and `guest_tid` is set
+     * at allocation and never changes until the slot is reused
+     * (after active=0). A stale read of active=1 for a thread
+     * being deactivated is benign — the caller retries on the
+     * next poll iteration (100ms later). */
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (__atomic_load_n(&thread_table[i].active, __ATOMIC_ACQUIRE) &&
+            thread_table[i].guest_tid == tid)
+            return 1;
+    }
+    return 0;
 }
 
 int thread_active_count(void) {
@@ -191,6 +208,42 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
     pthread_mutex_unlock(&thread_lock);
 }
 
+void thread_join_workers(void) {
+    /* Snapshot worker threads under the lock. We need the host_thread
+     * handle and a way to check the active flag without re-locking.
+     * Storing the table index lets us use __atomic_load on active. */
+    struct { pthread_t thr; int idx; } workers[MAX_THREADS];
+    int nworkers = 0;
+
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_table[i].active && &thread_table[i] != current_thread) {
+            workers[nworkers].thr = thread_table[i].host_thread;
+            workers[nworkers].idx = i;
+            nworkers++;
+        }
+    }
+    pthread_mutex_unlock(&thread_lock);
+
+    /* Poll/join each worker OUTSIDE the lock. Workers that responded
+     * to hv_vcpus_exit typically finish within microseconds. Threads
+     * stuck in uninterruptible host calls are abandoned after ~50ms. */
+    for (int w = 0; w < nworkers; w++) {
+        for (int i = 0; i < 10; i++) {
+            if (!__atomic_load_n(&thread_table[workers[w].idx].active,
+                                  __ATOMIC_ACQUIRE))
+                break;
+            usleep(5000);
+        }
+
+        if (!__atomic_load_n(&thread_table[workers[w].idx].active,
+                              __ATOMIC_ACQUIRE))
+            pthread_join(workers[w].thr, NULL);
+        else
+            pthread_detach(workers[w].thr);
+    }
+}
+
 void thread_destroy_all_vcpus(void) {
     pthread_mutex_lock(&thread_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -198,8 +251,9 @@ void thread_destroy_all_vcpus(void) {
             hv_vcpu_destroy(thread_table[i].vcpu);
             thread_table[i].vcpu = 0;
             thread_table[i].active = 0;
-            pthread_cond_destroy(&thread_table[i].ptrace_cond);
-            pthread_cond_destroy(&thread_table[i].resume_cond);
+            /* Do NOT destroy condvars — same race as thread_deactivate:
+             * a waiter woken by an earlier broadcast may still reference
+             * the condvar. Process is exiting, so the leak is harmless. */
         }
     }
     pthread_mutex_unlock(&thread_lock);

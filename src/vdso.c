@@ -110,7 +110,7 @@ typedef struct {
 #define VDSO_OFF_EHDR    0x000
 #define VDSO_OFF_PHDR    0x040   /* = sizeof(elf64_ehdr_t) */
 #define VDSO_OFF_PHDR1   0x078   /* = PHDR + sizeof(elf64_phdr_t) */
-#define VDSO_OFF_TEXT    0x0B0   /* = PHDR1 + sizeof(elf64_phdr_t) */
+/* VDSO_OFF_TEXT defined in vdso.h (shared with syscall_signal.c) */
 #define VDSO_OFF_DYNSTR  0x0E0   /* after .text (4 × 12 = 48 bytes) */
 /* DYNSTR_SIZE = 90 bytes → ends at 0x13A, round up to 4-byte align: 0x13C */
 #define VDSO_OFF_DYNSYM  0x13C   /* after .dynstr (92 bytes padded) */
@@ -170,18 +170,12 @@ static const uint32_t sym_name_offsets[VDSO_NUM_SYMS] = {
     68,  /* __kernel_gettimeofday */
 };
 
-/* ---------- ELF hash function (SysV / DT_HASH) ---------- */
-
-static uint32_t elf_hash(const char *name) {
-    uint32_t h = 0, g;
-    while (*name) {
-        h = (h << 4) + (uint8_t)*name++;
-        g = h & 0xf0000000;
-        if (g) h ^= g >> 24;
-        h &= ~g;
-    }
-    return h;
-}
+/* ELF SysV hash (DT_HASH) is defined as:
+ *   uint32_t h = 0; while (*name) { h = (h<<4) + *name++;
+ *   uint32_t g = h & 0xf0000000; if (g) h ^= g >> 24; h &= ~g; }
+ * With only 1 hash bucket (nbucket=1), all symbols map to bucket[0]
+ * regardless of their hash value (hash % 1 == 0). So the hash function
+ * is not called at runtime — the chain is walked linearly. */
 
 uint64_t vdso_build(guest_t *g) {
     /* Get host pointer to the vDSO page */
@@ -296,10 +290,8 @@ uint64_t vdso_build(guest_t *g) {
      * starts with the first real symbol). Walk symbols 1..4 and link them. */
     uint32_t first_sym = 0;  /* No symbols yet in bucket 0 */
     for (int i = VDSO_NUM_SYMS; i >= 1; i--) {
-        /* Each symbol hashes to bucket[elf_hash(name) % 1] = bucket[0].
+        /* All symbols map to bucket 0 (single bucket, hash % 1 == 0).
          * Prepend to chain: chain[i] = old head, bucket[0] = i. */
-        const char *name = dynstr_data + sym_name_offsets[i - 1];
-        (void)elf_hash(name);  /* Verify hash works; all go to bucket 0 */
         chain[i] = first_sym;
         first_sym = (uint32_t)i;
     }

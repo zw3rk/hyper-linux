@@ -97,6 +97,13 @@ void thread_deactivate(thread_entry_t *t);
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);
 
+/* Lock-free check: is there an active thread with this TID?
+ * Returns 1 if found, 0 if not. Safe to call without holding
+ * any lock (used from futex_lock_pi to avoid lock order inversion
+ * with bucket locks). May return a stale true if the thread is
+ * being deactivated concurrently — callers must tolerate this. */
+int thread_tid_alive(int64_t tid);
+
 /* Count currently active threads. */
 int thread_active_count(void);
 
@@ -113,6 +120,12 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
 /* Count active VM-clone threads (is_vm_clone && !vm_exited).
  * Used to detect when the last rosetta tracee exits. */
 int thread_count_active_vm_clones(void);
+
+/* Join worker threads (all active threads except the caller).
+ * Collects thread handles under the lock, then polls/joins OUTSIDE
+ * the lock so workers can call thread_deactivate() to set active=0.
+ * Threads still alive after ~50ms are detached (process is exiting). */
+void thread_join_workers(void);
 
 /* Destroy all active worker vCPUs. Called during guest_destroy to
  * ensure no vCPUs remain active before hv_vm_destroy(). */

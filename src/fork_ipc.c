@@ -39,7 +39,7 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
-#define IPC_VERSION       4            /* v4: COW fork via shm_open */
+#define IPC_VERSION       4            /* v4: COW fork + stack_base/stack_top */
 
 /* IPC header: sent first over socketpair */
 typedef struct {
@@ -189,7 +189,11 @@ static int recv_fds(int sock, int *fds, int max_count, int *out_count) {
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
         cmsg->cmsg_type == SCM_RIGHTS) {
-        int n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        if (cmsg->cmsg_len < CMSG_LEN(0)) {
+            free(cmsg_buf);
+            return -1;  /* malformed cmsg */
+        }
+        int n = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
         if (n > max_count) n = max_count;
         memcpy(fds, CMSG_DATA(cmsg), n * sizeof(int));
         *out_count = n;
@@ -317,7 +321,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         uint8_t *dst = (uint8_t *)g.host_base + rhdr.offset;
         size_t remaining = rhdr.size;
         while (remaining > 0) {
-            size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
+            size_t chunk = remaining > ((size_t)1024 * 1024) ? ((size_t)1024 * 1024) : remaining;
             if (ipc_read_all(ipc_fd, dst, chunk) < 0) {
                 fprintf(stderr, "hl: fork-child: failed to read region data\n");
                 guest_destroy(&g);
@@ -345,6 +349,15 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
      * (parent's gap hints are stale for the child's allocator). */
     syscall_init();
     mmap_reset_hints();
+
+    /* Validate num_fds to prevent integer overflow in multiplication
+     * and allocation of unreasonably large buffers from malformed IPC. */
+    if (num_fds > FD_TABLE_SIZE) {
+        fprintf(stderr, "hl: fork-child: num_fds %u exceeds FD_TABLE_SIZE\n",
+                num_fds);
+        guest_destroy(&g);
+        return 1;
+    }
 
     if (num_fds > 0) {
         ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(ipc_fd_entry_t));
@@ -380,6 +393,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             fprintf(stderr, "hl: fork-child: fd count mismatch: "
                     "received %d, expected %u\n",
                     received_count, num_fds);
+            for (int fi = 0; fi < received_count; fi++)
+                close(host_fds[fi]);
+            free(host_fds);
+            free(fd_entries);
+            guest_destroy(&g);
+            return 1;
         }
 
         /* Populate fd_table.  Parent sends fd_entries and host_fds in
@@ -391,11 +410,17 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
 
             if (fd_entries[i].type == FD_STDIO) {
-                /* stdio fds are already set up by syscall_init */
+                /* stdio fds are already set up by syscall_init.
+                 * Close the received fd — SCM_RIGHTS created a new fd
+                 * in the child, but we use the child's own stdio. */
+                if ((int)i < received_count)
+                    close(host_fds[i]);
                 fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             } else if ((int)i < received_count) {
-                fd_table[gfd].type = fd_entries[i].type;
-                fd_table[gfd].host_fd = host_fds[i];
+                /* Use fd_alloc_at to properly update the bitmap.
+                 * Without this, fd_alloc() would see these slots as
+                 * free and overwrite them on the first allocation. */
+                fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
                 fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
 
                 /* Reconstruct DIR* for directory FDs. The parent's DIR*
@@ -474,9 +499,23 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         guest_destroy(&g);
         return 1;
     }
-    if (cmdline_len_u32 > 0 && cmdline_len_u32 < LINUX_PATH_MAX * 4) {
+    if (cmdline_len_u32 > 0 && cmdline_len_u32 <= LINUX_PATH_MAX * 4) {
         char *cmdline_buf = malloc(cmdline_len_u32);
-        if (cmdline_buf) {
+        if (!cmdline_buf) {
+            /* Must still drain the cmdline bytes to keep the IPC stream
+             * synchronized — subsequent reads expect region data next. */
+            fprintf(stderr, "hl: fork-child: cmdline malloc failed\n");
+            char drain[256];
+            uint32_t remaining = cmdline_len_u32;
+            while (remaining > 0) {
+                uint32_t chunk = remaining < sizeof(drain) ? remaining : sizeof(drain);
+                if (ipc_read_all(ipc_fd, drain, chunk) < 0) {
+                    guest_destroy(&g);
+                    return 1;
+                }
+                remaining -= chunk;
+            }
+        } else {
             if (ipc_read_all(ipc_fd, cmdline_buf, cmdline_len_u32) < 0) {
                 free(cmdline_buf);
                 fprintf(stderr, "hl: fork-child: failed to read cmdline\n");
@@ -514,8 +553,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         guest_destroy(&g);
         return 1;
     }
-    if (num_aliases > GUEST_MAX_ALIASES)
-        num_aliases = GUEST_MAX_ALIASES;
+    if (num_aliases > GUEST_MAX_ALIASES) {
+        fprintf(stderr, "hl: fork-child: too many VA aliases: %u (max %d)\n",
+                num_aliases, GUEST_MAX_ALIASES);
+        guest_destroy(&g);
+        return 1;
+    }
     if (num_aliases > 0) {
         if (ipc_read_all(ipc_fd, g.va_aliases,
                          num_aliases * sizeof(guest_va_alias_t)) < 0) {
@@ -533,8 +576,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         guest_destroy(&g);
         return 1;
     }
-    if (num_preannounced > GUEST_MAX_PREANNOUNCED)
-        num_preannounced = GUEST_MAX_PREANNOUNCED;
+    if (num_preannounced > GUEST_MAX_PREANNOUNCED) {
+        fprintf(stderr, "hl: fork-child: too many preannounced regions: "
+                "%u (max %d)\n", num_preannounced, GUEST_MAX_PREANNOUNCED);
+        guest_destroy(&g);
+        return 1;
+    }
     if (num_preannounced > 0) {
         if (ipc_read_all(ipc_fd, g.preannounced,
                          num_preannounced * sizeof(guest_region_t)) < 0) {
@@ -552,6 +599,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         guest_destroy(&g);
         return 1;
     }
+    /* POSIX: "Signals pending to the parent shall not be pending to the
+     * child."  Clear pending bitmask and RT queue before applying state. */
+    sig.pending = 0;
+    memset(sig.rt_queue, 0, sizeof(sig.rt_queue));
     signal_set_state(&sig);
 
     /* Step 6d: Read shim blob (needed for exec in child) */
@@ -646,7 +697,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     proc_init();
     /* Restore identity after proc_init (which resets pid/ppid to 1/0) */
     proc_set_identity(hdr.child_pid, hdr.parent_pid);
-    /* proc_set_shim was called above from IPC data (step 6c) */
+    /* proc_set_shim was called above from IPC data (step 6d) */
 
     /* Register the fork child's main thread in the thread table.
      * Without this, current_thread is NULL and any syscall handler that
@@ -795,12 +846,12 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
         }
     }
 
-    /* Create the host pthread (detached — cleanup happens via
-     * CLONE_CHILD_CLEARTID + futex wake, not pthread_join) */
+    /* Create the host pthread (joinable — exit_group joins all workers
+     * via thread_join_workers_cb before process exit). Threads clean up
+     * their TID address via CLONE_CHILD_CLEARTID + futex wake. */
     pthread_t host_thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
     int err = pthread_create(&host_thread, &attr, thread_create_and_run, tca);
     pthread_attr_destroy(&attr);
@@ -1408,7 +1459,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
             uint8_t *src = (uint8_t *)g->host_base + used[i].offset;
             size_t remaining = used[i].size;
             while (remaining > 0) {
-                size_t chunk = remaining > (1024 * 1024) ? (1024 * 1024) : remaining;
+                size_t chunk = remaining > ((size_t)1024 * 1024) ? ((size_t)1024 * 1024) : remaining;
                 if (ipc_write_all(ipc_sock, src, chunk) < 0) {
                     close(ipc_sock);
                     return -LINUX_ENOMEM;
@@ -1421,7 +1472,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
     /* FD table -- count open fds and send entries + host fds via SCM_RIGHTS.
      * Note: CLOEXEC FDs are inherited across fork (POSIX semantics).
-     * CLOEXEC only takes effect at exec (handled in syscall_exec.c:109-123).
+     * CLOEXEC only takes effect at exec (handled in syscall_exec.c).
      *
      * Both arrays (fd_entries and host_fds_to_send) are kept in 1:1
      * correspondence: each fd_entry has a matching host fd at the same
@@ -1433,6 +1484,10 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     int host_fds_duped[FD_TABLE_SIZE];
     uint32_t num_fds = 0;
 
+    /* Hold fd_lock while scanning the FD table to prevent concurrent
+     * close/open from another thread corrupting the snapshot.
+     * Lock order: fd_lock(3) — no higher-order locks held here. */
+    pthread_mutex_lock(&fd_lock);
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) continue;
 
@@ -1457,15 +1512,20 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         host_fds_duped[num_fds] = was_duped;
         num_fds++;
     }
+    pthread_mutex_unlock(&fd_lock);
     int num_host_fds = (int)num_fds; /* 1:1 with fd_entries */
 
     if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {
+        for (uint32_t fi = 0; fi < num_fds; fi++)
+            if (host_fds_duped[fi]) close(host_fds_to_send[fi]);
         close(ipc_sock);
         return -LINUX_ENOMEM;
     }
 
     if (num_fds > 0) {
         if (ipc_write_all(ipc_sock, fd_entries, num_fds * sizeof(ipc_fd_entry_t)) < 0) {
+            for (uint32_t fi = 0; fi < num_fds; fi++)
+                if (host_fds_duped[fi]) close(host_fds_to_send[fi]);
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }

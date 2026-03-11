@@ -14,6 +14,7 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
 #include "syscall_io.h"      /* rosettad_is_socket */
+#include "guest.h"           /* guest_ptr_avail */
 
 #include <stdio.h>
 #include <string.h>
@@ -492,8 +493,10 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
-    void *buf = guest_ptr(g, buf_gva);
+    uint64_t avail = 0;
+    void *buf = len > 0 ? guest_ptr_avail(g, buf_gva, &avail) : NULL;
     if (!buf && len > 0) return -LINUX_EFAULT;
+    if (len > avail) len = avail;
 
     int mac_flags = translate_msg_flags(linux_flags);
     /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE.
@@ -534,8 +537,10 @@ int64_t sys_recvfrom(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
-    void *buf = guest_ptr(g, buf_gva);
+    uint64_t avail = 0;
+    void *buf = len > 0 ? guest_ptr_avail(g, buf_gva, &avail) : NULL;
     if (!buf && len > 0) return -LINUX_EFAULT;
+    if (len > avail) len = avail;
 
     int mac_flags = translate_msg_flags(flags);
 
@@ -743,10 +748,18 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
 
     struct iovec host_iov[64];
     for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base && guest_iov[i].iov_len > 0) return -LINUX_EFAULT;
+        if (guest_iov[i].iov_len == 0) {
+            host_iov[i].iov_base = NULL;
+            host_iov[i].iov_len = 0;
+            continue;
+        }
+        uint64_t avail = 0;
+        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
+        if (!base) return -LINUX_EFAULT;
+        uint64_t len = guest_iov[i].iov_len;
+        if (len > avail) len = avail;
         host_iov[i].iov_base = base;
-        host_iov[i].iov_len = guest_iov[i].iov_len;
+        host_iov[i].iov_len = len;
     }
 
     /* Translate control messages from Linux to macOS format.
@@ -789,6 +802,9 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
             memcpy(&lcmsg_type, linux_ctrl + lpos + 12, 4);
 
             if (lcmsg_len < 16) break;  /* invalid */
+            /* Validate ldata_len fits within remaining input buffer to
+             * prevent memcpy overflow from malformed guest cmsghdr. */
+            if (lcmsg_len > lctl_len - lpos) break;
             size_t ldata_len = (size_t)(lcmsg_len - 16);
 
             /* Translate SOL_SOCKET (Linux=1 → macOS=0xFFFF) */
@@ -879,10 +895,18 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
 
     struct iovec host_iov[64];
     for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base && guest_iov[i].iov_len > 0) return -LINUX_EFAULT;
+        if (guest_iov[i].iov_len == 0) {
+            host_iov[i].iov_base = NULL;
+            host_iov[i].iov_len = 0;
+            continue;
+        }
+        uint64_t avail = 0;
+        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
+        if (!base) return -LINUX_EFAULT;
+        uint64_t len = guest_iov[i].iov_len;
+        if (len > avail) len = avail;
         host_iov[i].iov_base = base;
-        host_iov[i].iov_len = guest_iov[i].iov_len;
+        host_iov[i].iov_len = len;
     }
 
     /* Source address buffer */
@@ -951,7 +975,11 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
              cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_len < CMSG_LEN(0)) continue; /* malformed */
+            /* Cap data_len to prevent integer overflow in lcmsg_space
+             * calculation. Kernel-returned cmsg_len should be sane but
+             * defend against edge cases. */
             size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            if (data_len > sizeof(linux_ctrl) - 16) break;
             /* Linux CMSG_LEN = 16 + data_len */
             uint64_t lcmsg_len = 16 + data_len;
             /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */

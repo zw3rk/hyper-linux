@@ -52,7 +52,7 @@
  * initial instruction fetches execute with whatever we wrote. */
 #define SCTLR_RES1 ((1ULL << 29) /* LSMAOE */  | \
                      (1ULL << 28) /* nTLSMD */  | \
-                     (1ULL << 23) /* SPAN   */  | \
+                     (1ULL << 23) /* SPAN — disable auto-PAN on exception entry */  | \
                      (1ULL << 22) /* EIS    */  | \
                      (1ULL << 20) /* TSCXT  */  | \
                      (1ULL << 11) /* EOS    */  | \
@@ -101,13 +101,15 @@ static inline void vcpu_set_sysreg(hv_vcpu_t vcpu, hv_sys_reg_t reg,
  * When acquiring multiple locks, always follow this total order to
  * prevent deadlock. Lower-numbered locks are acquired first.
  *
- *   1. mmap_lock     (syscall.c)       — mmap/brk/mprotect allocator
- *   2. pt_lock       (guest.c)         — page table pool allocation
- *   3. fd_lock       (syscall.c)       — FD table operations
- *   4. sig_lock      (syscall_signal.c)— signal state (pending/blocked/actions)
- *   5. thread_lock   (thread.c)        — thread table
- *   6. pid_lock      (syscall_proc.c)  — guest PID allocation
- *   7. futex buckets (futex.c)         — 64 per-address hash buckets
+ *   1. mmap_lock     (syscall.c)         — mmap/brk/mprotect allocator
+ *   2. pt_lock       (guest.c)           — page table pool allocation
+ *   3. fd_lock       (syscall.c)         — FD table operations
+ *   4. sig_lock      (syscall_signal.c)  — signal state (pending/blocked/actions)
+ *   5. thread_lock   (thread.c)          — thread table
+ *   5a. sfd_lock     (syscall_fd.c)      — special fd (never held with thread_lock)
+ *   6. pid_lock      (syscall_proc.c)    — guest PID allocation
+ *   7. futex buckets (futex.c)           — 64 per-address hash buckets
+ *   7. inotify_lock  (syscall_inotify.c) — inotify watch table
  *
  * Current nesting:
  *   mmap_lock → pt_lock  (sys_brk/sys_mmap/sys_mprotect → pt_alloc_page)

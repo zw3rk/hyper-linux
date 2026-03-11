@@ -16,6 +16,7 @@
 #include "syscall_internal.h"
 #include "syscall_proc.h"
 #include "syscall_signal.h"
+#include "rosetta.h"
 #include "guest.h"
 #include "thread.h"
 
@@ -59,6 +60,209 @@ typedef struct {
     uint32_t c_ospeed;  /* output speed */
 } linux_termios_t;
 
+/* ---------- termios flag translation helpers ---------- */
+
+/* Linux aarch64 c_iflag bits (from asm-generic/termbits-common.h).
+ * Low 9 bits (IGNBRK..ICRNL) match macOS exactly.
+ * Bits from 0x200 onward differ: Linux IUCLC=0x200 has no macOS equivalent;
+ * Linux IXON=0x400/IXOFF=0x1000 vs macOS IXON=0x200/IXOFF=0x400. */
+#define LINUX_IFLAG_LOW_MASK  0x1ff   /* bits 0-8: same on Linux and macOS */
+#define LINUX_IUCLC   0x0200         /* Linux only, no macOS equivalent */
+#define LINUX_IXON    0x0400
+#define LINUX_IXOFF   0x1000
+#define LINUX_IMAXBEL 0x2000         /* same value on both */
+#define LINUX_IUTF8   0x4000         /* same value on both */
+
+/* Translate Linux c_iflag to macOS c_iflag. */
+static tcflag_t linux_iflag_to_mac(uint32_t lf) {
+    tcflag_t mf = lf & LINUX_IFLAG_LOW_MASK;   /* IGNBRK..ICRNL identical */
+    /* IXANY=0x800 is the same on both; pass through */
+    if (lf & 0x800)    mf |= IXANY;
+    if (lf & LINUX_IXON)  mf |= IXON;          /* Linux 0x400 → macOS 0x200 */
+    if (lf & LINUX_IXOFF) mf |= IXOFF;         /* Linux 0x1000 → macOS 0x400 */
+    if (lf & LINUX_IMAXBEL) mf |= IMAXBEL;
+    if (lf & LINUX_IUTF8)  mf |= IUTF8;
+    /* IUCLC (Linux 0x200) has no macOS equivalent — drop it */
+    return mf;
+}
+
+/* Translate macOS c_iflag to Linux c_iflag. */
+static uint32_t mac_iflag_to_linux(tcflag_t mf) {
+    uint32_t lf = mf & LINUX_IFLAG_LOW_MASK;   /* IGNBRK..ICRNL identical */
+    if (mf & IXANY)   lf |= 0x800;
+    if (mf & IXON)    lf |= LINUX_IXON;
+    if (mf & IXOFF)   lf |= LINUX_IXOFF;
+    if (mf & IMAXBEL) lf |= LINUX_IMAXBEL;
+    if (mf & IUTF8)   lf |= LINUX_IUTF8;
+    return lf;
+}
+
+/* Linux aarch64 c_oflag bits (asm-generic/termbits-common.h + termbits.h).
+ * Only OPOST (0x01) has the same value on both platforms.
+ * macOS 0x02 = ONLCR; Linux 0x02 = OLCUC (output lowercase→uppercase, rare).
+ * macOS 0x04 = OXTABS; Linux 0x04 = ONLCR. All other bits shift by one. */
+#define LINUX_OPOST   0x001
+#define LINUX_OLCUC   0x002  /* Linux only (map lowercase→uppercase on output); macOS 0x02=ONLCR */
+#define LINUX_ONLCR   0x004  /* macOS ONLCR=0x002 */
+#define LINUX_OCRNL   0x008  /* macOS OCRNL=0x010 */
+#define LINUX_ONOCR   0x010  /* macOS ONOCR=0x020 */
+#define LINUX_ONLRET  0x020  /* macOS ONLRET=0x040 */
+#define LINUX_OFILL   0x040  /* macOS OFILL=0x080 */
+#define LINUX_OFDEL   0x080  /* macOS OFDEL=0x020000 */
+/* Linux NLDLY/CRDLY/TABDLY/BSDLY/VTDLY/FFDLY have no macOS equivalents */
+
+/* Translate Linux c_oflag to macOS c_oflag. */
+static tcflag_t linux_oflag_to_mac(uint32_t lf) {
+    tcflag_t mf = 0;
+    if (lf & LINUX_OPOST)  mf |= OPOST;
+    /* LINUX_OLCUC (0x002) has no macOS equivalent — drop it */
+    if (lf & LINUX_ONLCR)  mf |= ONLCR;
+    if (lf & LINUX_OCRNL)  mf |= OCRNL;
+    if (lf & LINUX_ONOCR)  mf |= ONOCR;
+    if (lf & LINUX_ONLRET) mf |= ONLRET;
+    if (lf & LINUX_OFILL)  mf |= OFILL;
+    if (lf & LINUX_OFDEL)  mf |= OFDEL;
+    /* NLDLY, CRDLY, TABDLY, BSDLY, VTDLY, FFDLY: no macOS equivalents */
+    return mf;
+}
+
+/* Translate macOS c_oflag to Linux c_oflag. */
+static uint32_t mac_oflag_to_linux(tcflag_t mf) {
+    uint32_t lf = 0;
+    if (mf & OPOST)  lf |= LINUX_OPOST;
+    if (mf & ONLCR)  lf |= LINUX_ONLCR;
+    if (mf & OCRNL)  lf |= LINUX_OCRNL;
+    if (mf & ONOCR)  lf |= LINUX_ONOCR;
+    if (mf & ONLRET) lf |= LINUX_ONLRET;
+    if (mf & OFILL)  lf |= LINUX_OFILL;
+    if (mf & OFDEL)  lf |= LINUX_OFDEL;
+    return lf;
+}
+
+/* Linux aarch64 c_cflag bits (asm-generic/termbits.h).
+ * All standard flags differ from macOS — macOS shifts everything left by 4
+ * bits (e.g., Linux CS8=0x30, macOS CS8=0x300; Linux CSTOPB=0x40, macOS=0x400).
+ * The CBAUD field (Linux 0x0000100f) encodes baud rate symbolically; macOS
+ * uses raw numeric speeds via cfgetispeed/cfsetispeed, so we drop CBAUD from
+ * c_cflag and always use the speed accessors. */
+#define LINUX_CSIZE   0x0030
+#define LINUX_CS5     0x0000
+#define LINUX_CS6     0x0010
+#define LINUX_CS7     0x0020
+#define LINUX_CS8     0x0030
+#define LINUX_CSTOPB  0x0040
+#define LINUX_CREAD   0x0080
+#define LINUX_PARENB  0x0100
+#define LINUX_PARODD  0x0200
+#define LINUX_HUPCL   0x0400
+#define LINUX_CLOCAL  0x0800
+/* LINUX_CBAUD 0x0000100f and LINUX_CBAUDEX 0x00001000 encode baud in c_cflag;
+ * macOS uses dedicated speed fields, so we ignore CBAUD on translation. */
+
+/* Translate Linux c_cflag to macOS c_cflag. */
+static tcflag_t linux_cflag_to_mac(uint32_t lf) {
+    tcflag_t mf = 0;
+    /* CSIZE: Linux CS5=0x00, CS6=0x10, CS7=0x20, CS8=0x30
+     *        macOS CS5=0x00, CS6=0x100, CS7=0x200, CS8=0x300 */
+    switch (lf & LINUX_CSIZE) {
+    case LINUX_CS5: mf |= CS5; break;
+    case LINUX_CS6: mf |= CS6; break;
+    case LINUX_CS7: mf |= CS7; break;
+    case LINUX_CS8: mf |= CS8; break;
+    default: break;
+    }
+    if (lf & LINUX_CSTOPB) mf |= CSTOPB;
+    if (lf & LINUX_CREAD)  mf |= CREAD;
+    if (lf & LINUX_PARENB) mf |= PARENB;
+    if (lf & LINUX_PARODD) mf |= PARODD;
+    if (lf & LINUX_HUPCL)  mf |= HUPCL;
+    if (lf & LINUX_CLOCAL) mf |= CLOCAL;
+    /* CBAUD/CBAUDEX: drop — baud rate comes from c_ispeed/c_ospeed fields */
+    return mf;
+}
+
+/* Translate macOS c_cflag to Linux c_cflag. */
+static uint32_t mac_cflag_to_linux(tcflag_t mf) {
+    uint32_t lf = 0;
+    switch (mf & CSIZE) {
+    case CS5: lf |= LINUX_CS5; break;
+    case CS6: lf |= LINUX_CS6; break;
+    case CS7: lf |= LINUX_CS7; break;
+    case CS8: lf |= LINUX_CS8; break;
+    default: break;
+    }
+    if (mf & CSTOPB) lf |= LINUX_CSTOPB;
+    if (mf & CREAD)  lf |= LINUX_CREAD;
+    if (mf & PARENB) lf |= LINUX_PARENB;
+    if (mf & PARODD) lf |= LINUX_PARODD;
+    if (mf & HUPCL)  lf |= LINUX_HUPCL;
+    if (mf & CLOCAL) lf |= LINUX_CLOCAL;
+    return lf;
+}
+
+/* Linux aarch64 c_lflag bits (asm-generic/termbits.h).
+ * Virtually every flag has a different value from macOS.
+ * Only ECHO (0x0008) is the same on both platforms. */
+#define LINUX_ISIG    0x00001
+#define LINUX_ICANON  0x00002
+#define LINUX_XCASE   0x00004  /* Linux-only (rarely used) */
+#define LINUX_ECHO    0x00008  /* same on macOS */
+#define LINUX_ECHOE   0x00010
+#define LINUX_ECHOK   0x00020
+#define LINUX_ECHONL  0x00040
+#define LINUX_NOFLSH  0x00080
+#define LINUX_TOSTOP  0x00100
+#define LINUX_ECHOCTL 0x00200
+#define LINUX_ECHOPRT 0x00400
+#define LINUX_ECHOKE  0x00800
+#define LINUX_FLUSHO  0x01000
+#define LINUX_PENDIN  0x04000
+#define LINUX_IEXTEN  0x08000
+#define LINUX_EXTPROC 0x10000
+
+/* Translate Linux c_lflag to macOS c_lflag. */
+static tcflag_t linux_lflag_to_mac(uint32_t lf) {
+    tcflag_t mf = 0;
+    if (lf & LINUX_ISIG)    mf |= ISIG;
+    if (lf & LINUX_ICANON)  mf |= ICANON;
+    /* LINUX_XCASE (0x004) has no macOS equivalent — drop it */
+    if (lf & LINUX_ECHO)    mf |= ECHO;
+    if (lf & LINUX_ECHOE)   mf |= ECHOE;
+    if (lf & LINUX_ECHOK)   mf |= ECHOK;
+    if (lf & LINUX_ECHONL)  mf |= ECHONL;
+    if (lf & LINUX_NOFLSH)  mf |= NOFLSH;
+    if (lf & LINUX_TOSTOP)  mf |= TOSTOP;
+    if (lf & LINUX_ECHOCTL) mf |= ECHOCTL;
+    if (lf & LINUX_ECHOPRT) mf |= ECHOPRT;
+    if (lf & LINUX_ECHOKE)  mf |= ECHOKE;
+    if (lf & LINUX_FLUSHO)  mf |= FLUSHO;
+    if (lf & LINUX_PENDIN)  mf |= PENDIN;
+    if (lf & LINUX_IEXTEN)  mf |= IEXTEN;
+    if (lf & LINUX_EXTPROC) mf |= EXTPROC;
+    return mf;
+}
+
+/* Translate macOS c_lflag to Linux c_lflag. */
+static uint32_t mac_lflag_to_linux(tcflag_t mf) {
+    uint32_t lf = 0;
+    if (mf & ISIG)    lf |= LINUX_ISIG;
+    if (mf & ICANON)  lf |= LINUX_ICANON;
+    if (mf & ECHO)    lf |= LINUX_ECHO;
+    if (mf & ECHOE)   lf |= LINUX_ECHOE;
+    if (mf & ECHOK)   lf |= LINUX_ECHOK;
+    if (mf & ECHONL)  lf |= LINUX_ECHONL;
+    if (mf & NOFLSH)  lf |= LINUX_NOFLSH;
+    if (mf & TOSTOP)  lf |= LINUX_TOSTOP;
+    if (mf & ECHOCTL) lf |= LINUX_ECHOCTL;
+    if (mf & ECHOPRT) lf |= LINUX_ECHOPRT;
+    if (mf & ECHOKE)  lf |= LINUX_ECHOKE;
+    if (mf & FLUSHO)  lf |= LINUX_FLUSHO;
+    if (mf & PENDIN)  lf |= LINUX_PENDIN;
+    if (mf & IEXTEN)  lf |= LINUX_IEXTEN;
+    if (mf & EXTPROC) lf |= LINUX_EXTPROC;
+    return lf;
+}
+
 /* ---------- basic read/write ---------- */
 
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
@@ -71,359 +275,20 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
     if (count == 0) return 0;
 
-    void *buf = guest_ptr(g, buf_gva);
+    /* Resolve buffer and cap count to available contiguous guest bytes.
+     * guest_ptr_avail returns the host pointer and remaining bytes in
+     * the current region — prevents host write() from reading past
+     * the guest buffer boundary. */
+    uint64_t avail = 0;
+    void *buf = guest_ptr_avail(g, buf_gva, &avail);
     if (!buf) return -LINUX_EFAULT;
-
-    /* Detect rosetta assertion message and dump thread context when verbose.
-     * Rosetta writes "BasicBlock requested for unrecognized address" to
-     * stderr (fd 2) right before crashing. Dump X18 (thread context ptr)
-     * and the saved registers to help identify the failing x86 target. */
-    if (hl_verbose && host_fd == STDERR_FILENO && count > 10 && count < 256) {
-        if (memmem(buf, count, "BasicBlock", 10) != NULL) {
-            fprintf(stderr, "hl: DEBUG assertion intercepted: %.*s\n",
-                    (int)count, (char *)buf);
-            /* Read X18 (thread context pointer) from the vCPU */
-            hv_vcpu_t vcpu = current_thread->vcpu;
-            uint64_t x18_val;
-            hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18_val);
-            uint64_t x18_base = x18_val & 0x7FFFFFFFFFFFFFFFULL; /* clear bit 63 */
-            fprintf(stderr, "hl: DEBUG X18=0x%llx (base=0x%llx)\n",
-                    (unsigned long long)x18_val, (unsigned long long)x18_base);
-
-            /* Dump saved registers from thread context [x18+0x10..0x90] */
-            for (int i = 0; i < 16; i++) {
-                uint64_t val = 0;
-                void *p = guest_ptr(g, x18_base + 0x10 + i * 8);
-                if (p) memcpy(&val, p, 8);
-                fprintf(stderr, "hl: DEBUG ctx[X%d] = 0x%llx\n", i, (unsigned long long)val);
-            }
-            /* Dump key thread context fields beyond saved regs */
-            struct { int offset; const char *name; } ctx_fields[] = {
-                {0x138, "feat_afp"},
-                {0x190, "thread_id"},
-                {0x198, "hash_table_desc"},
-                {0x1a0, "jit_region_lo"},
-                {0x1a8, "target_x86_pc"},
-                {0x1b0, "syscall_ret"},
-                {0x1b8, "pending_flags"},
-                {0x1c0, "misc_1c0"},
-                {0x1c8, "signal_futex"},
-                {0x1d0, "resume_pc"},
-                {0x1d8, "misc_1d8"},
-                {0x1e0, "translation_mode"},
-            };
-            for (int i = 0; i < (int)(sizeof(ctx_fields)/sizeof(ctx_fields[0])); i++) {
-                uint64_t val = 0;
-                void *p = guest_ptr(g, x18_base + ctx_fields[i].offset);
-                if (p) memcpy(&val, p, 8);
-                fprintf(stderr, "hl: DEBUG ctx[+0x%03x] %s = 0x%llx\n",
-                        ctx_fields[i].offset, ctx_fields[i].name,
-                        (unsigned long long)val);
-            }
-            /* Walk FP chain for return addresses */
-            uint64_t fp, sp;
-            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
-            hv_vcpu_get_reg(vcpu, HV_REG_FP, &fp);
-            fprintf(stderr, "hl: DEBUG FP chain (SP=0x%llx, FP=0x%llx):\n",
-                    (unsigned long long)sp, (unsigned long long)fp);
-            for (int i = 0; i < 20 && fp != 0; i++) {
-                uint64_t saved_fp = 0, saved_lr = 0;
-                void *p = guest_ptr(g, fp);
-                if (!p) break;
-                memcpy(&saved_fp, p, 8);
-                memcpy(&saved_lr, (uint8_t*)p + 8, 8);
-                fprintf(stderr, "hl: DEBUG  [%d] FP=0x%llx LR=0x%llx\n",
-                        i, (unsigned long long)saved_fp,
-                        (unsigned long long)saved_lr);
-                /* Also dump the callee-saved regs at FP-N */
-                /* X19-X28 are saved below FP by ARM64 convention */
-                for (int j = 0; j < 5; j++) {
-                    uint64_t reg = 0;
-                    void *rp = guest_ptr(g, fp - (j + 1) * 16);
-                    if (!rp) break;
-                    memcpy(&reg, rp, 8);
-                    uint64_t reg2 = 0;
-                    memcpy(&reg2, (uint8_t*)rp + 8, 8);
-                    fprintf(stderr, "hl: DEBUG    [FP-0x%02x] 0x%llx, 0x%llx\n",
-                            (j + 1) * 16, (unsigned long long)reg,
-                            (unsigned long long)reg2);
-                }
-                fp = saved_fp;
-            }
-
-            /* Dump AOT metadata from guest memory at 0x418000 to verify
-             * correct loading. The block table starts at 0x418140. */
-            fprintf(stderr, "hl: DEBUG AOT metadata verification:\n");
-            for (uint64_t gva = 0x418000; gva < 0x418200; gva += 16) {
-                void *mp = guest_ptr(g, gva);
-                if (!mp) { fprintf(stderr, "  [0x%llx] <unmapped>\n",
-                           (unsigned long long)gva); break; }
-                uint64_t v1 = 0, v2 = 0;
-                memcpy(&v1, mp, 8);
-                memcpy(&v2, (uint8_t*)mp + 8, 8);
-                fprintf(stderr, "  [0x%llx] %016llx %016llx\n",
-                        (unsigned long long)gva,
-                        (unsigned long long)v1, (unsigned long long)v2);
-            }
-            /* Also dump the x86 .text content at 0x401000 (first 64 bytes)
-             * and AOT code at 0x40a000 (first 64 bytes) */
-            fprintf(stderr, "hl: DEBUG x86 .text at 0x401000:\n  ");
-            void *tp = guest_ptr(g, 0x401000);
-            if (tp) {
-                for (int j = 0; j < 32; j++)
-                    fprintf(stderr, "%02x ", ((uint8_t*)tp)[j]);
-                fprintf(stderr, "\n");
-            }
-            fprintf(stderr, "hl: DEBUG AOT code at 0x40a000:\n  ");
-            void *ap = guest_ptr(g, 0x40a000);
-            if (ap) {
-                for (int j = 0; j < 32; j++)
-                    fprintf(stderr, "%02x ", ((uint8_t*)ap)[j]);
-                fprintf(stderr, "\n");
-            }
-            /* Dump block table header at 0x418140 */
-            fprintf(stderr, "hl: DEBUG block table at 0x418140:\n");
-            for (uint64_t gva = 0x418140; gva < 0x418280; gva += 16) {
-                void *bp = guest_ptr(g, gva);
-                if (!bp) break;
-                uint64_t v1 = 0, v2 = 0;
-                memcpy(&v1, bp, 8);
-                memcpy(&v2, (uint8_t*)bp + 8, 8);
-                fprintf(stderr, "  [0x%llx] %016llx %016llx\n",
-                        (unsigned long long)gva,
-                        (unsigned long long)v1, (unsigned long long)v2);
-            }
-
-            /* Walk FP chain to find block_for_offset's frame.
-             *
-             * Call stack at assertion write time:
-             *   write() syscall        ← current frame
-             *   log_fatal (0x800000088c28)
-             *   assert_fail_with_msg (0x8000000899e4)
-             *   block_for_offset (0x8000000387d4)  ← WE WANT THIS
-             *   translate_block (0x800000046cb0)
-             *
-             * block_for_offset's saved_lr = 0x800000047c08 (or 0x47abc/0x47c70)
-             * (return address in the caller after bl 0x8000000387d4)
-             *
-             * block_for_offset's stack frame (0x50 bytes):
-             *   FP+0x00: saved x29 (caller's FP)
-             *   FP+0x08: saved x30 (return to caller)
-             *   FP+0x10: saved x26, x25
-             *   FP+0x20: saved x24, x23
-             *   FP+0x30: saved x22, x21
-             *   FP+0x40: saved x20  ← binary search result (0 = NULL)
-             *   FP+0x48: saved x19  ← self (BuilderBase*)
-             *
-             * translate_block's frame (0x60 + 0x370 locals):
-             *   FP+0x50: saved x20, x19
-             *   FP+0x40: saved x22, x21  ← x22 = target x86 offset!
-             *   FP+0x30: saved x24, x23
-             *   FP+0x20: saved x26, x25
-             *   FP+0x10: saved x28, x27
-             */
-            uint64_t walk_fp = 0;
-            hv_vcpu_get_reg(vcpu, HV_REG_FP, &walk_fp);
-            for (int frame_i = 0; frame_i < 20 && walk_fp != 0; frame_i++) {
-                uint64_t sf = 0, sl = 0;
-                void *wp = guest_ptr(g, walk_fp);
-                if (!wp) break;
-                memcpy(&sf, wp, 8);
-                memcpy(&sl, (uint8_t*)wp + 8, 8);
-                fprintf(stderr, "hl: DEBUG FPwalk[%d] fp=0x%llx "
-                        "saved_fp=0x%llx saved_lr=0x%llx\n",
-                        frame_i, (unsigned long long)walk_fp,
-                        (unsigned long long)sf, (unsigned long long)sl);
-
-                /* Strategy: find assert_fail_with_msg frame (LR in
-                 * 0x800000038838..0x800000038864 = block_for_offset's
-                 * assertion path), then read block_for_offset's active
-                 * regs from assert_fail_with_msg's saved callee-regs.
-                 *
-                 * assert_fail_with_msg frame layout (0x40 bytes):
-                 *   FP+0x00: x29,x30  FP+0x10: x28
-                 *   FP+0x20: x22,x21  FP+0x30: x20,x19
-                 * These are block_for_offset's ACTIVE values:
-                 *   x19 = self (BuilderBase*)
-                 *   x20 = 0 (binary search returned NULL)
-                 *   x22 = whatever block_for_offset had in x22
-                 *
-                 * block_for_offset frame layout (0x50 bytes):
-                 *   FP+0x00: x29,x30  FP+0x10: x26,x25
-                 *   FP+0x20: x24,x23  FP+0x30: x22,x21
-                 *   FP+0x40: x20,x19
-                 * These are translate_block's values at call time:
-                 *   x22 at FP+0x30 = w22 = TARGET x86 offset!
-                 */
-                if (sl >= 0x800000038838 && sl <= 0x800000038868) {
-                    /* assert_fail_with_msg frame → read block_for_offset's
-                     * active x19 (self) from FP+0x38. */
-                    fprintf(stderr, "hl: DEBUG found assert_fail frame "
-                            "(frame %d, FP=0x%llx, LR=0x%llx)\n",
-                            frame_i, (unsigned long long)walk_fp,
-                            (unsigned long long)sl);
-
-                    uint64_t bfo_x19 = 0, bfo_x20 = 0;
-                    void *p;
-                    p = guest_ptr(g, walk_fp + 0x38);
-                    if (p) memcpy(&bfo_x19, p, 8);
-                    p = guest_ptr(g, walk_fp + 0x30);
-                    if (p) memcpy(&bfo_x20, p, 8);
-
-                    fprintf(stderr, "hl: DEBUG block_for_offset active regs "
-                            "(from assert_fail frame):\n"
-                            "  x19 (self)   = 0x%llx\n"
-                            "  x20 (result) = 0x%llx\n",
-                            (unsigned long long)bfo_x19,
-                            (unsigned long long)bfo_x20);
-
-                    /* Now get the x86 offset target. It was passed as w1
-                     * to block_for_offset. In block_for_offset, w2=w1
-                     * (copy for binary search). But both w1 and w2 are
-                     * caller-saved and clobbered by the assertion setup.
-                     *
-                     * However, translate_block had w22 = the target offset.
-                     * block_for_offset saves translate_block's x22 at
-                     * block_for_offset's FP+0x30 (saved x22).
-                     * block_for_offset's FP = saved_fp from this frame. */
-                    uint64_t bfo_fp = sf; /* block_for_offset's FP */
-                    if (bfo_fp) {
-                        uint64_t saved_x22 = 0, saved_x23 = 0;
-                        uint64_t saved_x19_entry = 0, saved_x20_entry = 0;
-                        p = guest_ptr(g, bfo_fp + 0x30);
-                        if (p) memcpy(&saved_x22, p, 8);
-                        p = guest_ptr(g, bfo_fp + 0x38);
-                        if (p) memcpy(&saved_x23, p, 8);
-                        p = guest_ptr(g, bfo_fp + 0x48);
-                        if (p) memcpy(&saved_x19_entry, p, 8);
-                        p = guest_ptr(g, bfo_fp + 0x40);
-                        if (p) memcpy(&saved_x20_entry, p, 8);
-
-                        /* Also read w1 from block_for_offset:
-                         * At entry, w2=w1 then x9=self->current_offset.
-                         * current_offset is at self+0x10. */
-                        uint64_t cur_off = 0;
-                        if (bfo_x19) {
-                            p = guest_ptr(g, bfo_x19 + 0x10);
-                            if (p) memcpy(&cur_off, p, 8);
-                        }
-
-                        fprintf(stderr, "hl: DEBUG block_for_offset frame "
-                                "(FP=0x%llx):\n"
-                                "  saved x22 (translate_block's x22) = 0x%llx  "
-                                "← TARGET x86 offset\n"
-                                "  saved x21 (translate_block's x21) = 0x%llx\n"
-                                "  saved x19 (translate_block's x19) = 0x%llx\n"
-                                "  saved x20 (translate_block's x20) = 0x%llx\n"
-                                "  self->current_offset (+0x10)      = 0x%llx\n",
-                                (unsigned long long)bfo_fp,
-                                (unsigned long long)saved_x22,
-                                (unsigned long long)saved_x23,
-                                (unsigned long long)saved_x19_entry,
-                                (unsigned long long)saved_x20_entry,
-                                (unsigned long long)cur_off);
-                    }
-
-                    /* Dump TranslationBuilder state from self (x19) */
-                    if (bfo_x19) {
-                        void *bp;
-                        uint64_t cur_off = 0, blk_begin = 0, blk_end = 0;
-                        uint64_t code_buf = 0;
-                        bp = guest_ptr(g, bfo_x19 + 0x10);
-                        if (bp) memcpy(&cur_off, bp, 8);
-                        bp = guest_ptr(g, bfo_x19 + 0x178);
-                        if (bp) memcpy(&blk_begin, bp, 8);
-                        bp = guest_ptr(g, bfo_x19 + 0x180);
-                        if (bp) memcpy(&blk_end, bp, 8);
-                        bp = guest_ptr(g, bfo_x19 + 0x1c0);
-                        if (bp) memcpy(&code_buf, bp, 8);
-
-                        uint64_t nblocks = (blk_end > blk_begin) ?
-                                           (blk_end - blk_begin) / 8 : 0;
-                        fprintf(stderr, "hl: DEBUG TranslationBuilder "
-                                "(self=0x%llx):\n"
-                                "  current_offset  = 0x%llx\n"
-                                "  blocks          = [0x%llx..0x%llx] "
-                                "(%llu blocks)\n"
-                                "  code_buffer     = 0x%llx\n",
-                                (unsigned long long)bfo_x19,
-                                (unsigned long long)cur_off,
-                                (unsigned long long)blk_begin,
-                                (unsigned long long)blk_end,
-                                (unsigned long long)nblocks,
-                                (unsigned long long)code_buf);
-
-                        /* Dump all BasicBlock x86_offsets */
-                        for (uint64_t i = 0; i < nblocks && i < 64; i++) {
-                            uint64_t bb_ptr = 0;
-                            bp = guest_ptr(g, blk_begin + i * 8);
-                            if (!bp) break;
-                            memcpy(&bb_ptr, bp, 8);
-                            uint32_t x86_off = 0;
-                            bp = guest_ptr(g, bb_ptr + 0x40);
-                            if (bp) memcpy(&x86_off, bp, 4);
-                            fprintf(stderr, "  block[%llu] ptr=0x%llx "
-                                    "x86_off=0x%x\n",
-                                    (unsigned long long)i,
-                                    (unsigned long long)bb_ptr,
-                                    (unsigned)x86_off);
-                        }
-
-                        /* Dump more TranslationBuilder fields to
-                         * find the x86 source base address */
-                        fprintf(stderr, "hl: DEBUG TranslationBuilder "
-                                "fields:\n");
-                        for (int off = 0; off < 0x200; off += 8) {
-                            uint64_t val = 0;
-                            bp = guest_ptr(g, bfo_x19 + off);
-                            if (bp) memcpy(&val, bp, 8);
-                            if (val != 0)
-                                fprintf(stderr, "  +0x%03x: 0x%llx\n",
-                                        off, (unsigned long long)val);
-                        }
-
-                        /* Hex dump x86 code around the desync.
-                         * code_buffer may or may not be the x86 src.
-                         * Dump 64 bytes starting 16 before the
-                         * target offset from BOTH code_buffer and
-                         * what might be the x86 base. */
-                        uint64_t tgt_off = 0;
-                        if (bfo_fp) {
-                            p = guest_ptr(g, bfo_fp + 0x30);
-                            if (p) memcpy(&tgt_off, p, 8);
-                            tgt_off &= 0xFFFFFFFF;
-                        }
-                        uint64_t dump_start = (tgt_off > 0x20) ?
-                                              tgt_off - 0x20 : 0;
-                        fprintf(stderr, "hl: DEBUG x86 code at "
-                                "code_buffer+0x%llx..+0x%llx "
-                                "(GVA 0x%llx):\n",
-                                (unsigned long long)dump_start,
-                                (unsigned long long)(dump_start + 0x60),
-                                (unsigned long long)(code_buf + dump_start));
-                        for (uint64_t off = dump_start;
-                             off < dump_start + 0x60; off += 16) {
-                            uint8_t hex[16] = {0};
-                            p = guest_ptr(g, code_buf + off);
-                            if (!p) break;
-                            memcpy(hex, p, 16);
-                            fprintf(stderr, "  +%03llx: ",
-                                    (unsigned long long)off);
-                            for (int j = 0; j < 16; j++)
-                                fprintf(stderr, "%02x ", hex[j]);
-                            fprintf(stderr, "\n");
-                        }
-                    }
-                    break;
-                }
-                walk_fp = sf;
-            }
-        }
-    }
+    if (count > avail) count = avail;
 
     ssize_t ret = write(host_fd, buf, count);
     if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        int saved_errno = errno;
+        if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        errno = saved_errno;
         return linux_errno();
     }
     return ret;
@@ -447,8 +312,12 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     /* Linux: read(fd, NULL, 0) returns 0, not EFAULT */
     if (count == 0) return 0;
 
-    void *buf = guest_ptr(g, buf_gva);
+    /* Resolve buffer and cap count to available contiguous guest bytes.
+     * Prevents host read() from writing past the guest buffer boundary. */
+    uint64_t avail = 0;
+    void *buf = guest_ptr_avail(g, buf_gva, &avail);
     if (!buf) return -LINUX_EFAULT;
+    if (count > avail) count = avail;
 
     ssize_t ret = read(host_fd, buf, count);
     return ret < 0 ? linux_errno() : ret;
@@ -462,8 +331,10 @@ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
     /* Linux: pread(fd, NULL, 0, off) returns 0, not EFAULT */
     if (count == 0) return 0;
 
-    void *buf = guest_ptr(g, buf_gva);
+    uint64_t avail = 0;
+    void *buf = guest_ptr_avail(g, buf_gva, &avail);
     if (!buf) return -LINUX_EFAULT;
+    if (count > avail) count = avail;
 
     ssize_t ret = pread(host_fd, buf, count, offset);
     return ret < 0 ? linux_errno() : ret;
@@ -477,32 +348,46 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
     /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
     if (count == 0) return 0;
 
-    void *buf = guest_ptr(g, buf_gva);
+    uint64_t avail = 0;
+    void *buf = guest_ptr_avail(g, buf_gva, &avail);
     if (!buf) return -LINUX_EFAULT;
+    if (count > avail) count = avail;
 
     ssize_t ret = pwrite(host_fd, buf, count, offset);
     if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        int saved_errno = errno;
+        if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        errno = saved_errno;
         return linux_errno();
     }
     return ret;
 }
 
 /* Helper: build host iovec array from guest iovec array.
+ * Uses guest_read for the iovec array (may cross 2MB block boundary)
+ * and guest_ptr_avail for each buffer (caps to contiguous bytes).
  * Returns 0 on success, -LINUX_EFAULT on bad guest pointer. */
 static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
                                struct iovec *host_iov) {
-    linux_iovec_t *guest_iov = guest_ptr(g, iov_gva);
-    if (!guest_iov) return -LINUX_EFAULT;
+    linux_iovec_t guest_iov[1024]; /* UIO_MAXIOV */
+    if (iovcnt > 1024) iovcnt = 1024;
+    if (guest_read(g, iov_gva, guest_iov,
+                   iovcnt * sizeof(linux_iovec_t)) < 0)
+        return -LINUX_EFAULT;
     for (int i = 0; i < iovcnt; i++) {
-        void *base = guest_ptr(g, guest_iov[i].iov_base);
-        if (!base && guest_iov[i].iov_len > 0) return -LINUX_EFAULT;
-        uint64_t iov_end = guest_iov[i].iov_base + guest_iov[i].iov_len;
-        if (iov_end < guest_iov[i].iov_base) return -LINUX_EFAULT;
-        if (guest_iov[i].iov_len > 0 && !guest_ptr(g, iov_end - 1))
-            return -LINUX_EFAULT;
+        if (guest_iov[i].iov_len == 0) {
+            host_iov[i].iov_base = NULL;
+            host_iov[i].iov_len = 0;
+            continue;
+        }
+        uint64_t avail = 0;
+        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
+        if (!base) return -LINUX_EFAULT;
+        /* Cap to contiguous bytes within the 2MB block */
+        uint64_t len = guest_iov[i].iov_len;
+        if (len > avail) len = avail;
         host_iov[i].iov_base = base;
-        host_iov[i].iov_len = guest_iov[i].iov_len;
+        host_iov[i].iov_len = len;
     }
     return 0;
 }
@@ -518,9 +403,12 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
         if (type == FD_EVENTFD || type == FD_SIGNALFD ||
             type == FD_TIMERFD || type == FD_INOTIFY) {
             if (iovcnt <= 0) return -LINUX_EINVAL;
-            linux_iovec_t *giov = guest_ptr(g, iov_gva);
-            if (!giov) return -LINUX_EFAULT;
-            return sys_read(g, fd, giov[0].iov_base, giov[0].iov_len);
+            /* Use guest_read for the iov array — guest_ptr alone is unsafe
+             * if the array spans a 2MB block boundary. */
+            linux_iovec_t giov;
+            if (guest_read(g, iov_gva, &giov, sizeof(giov)) < 0)
+                return -LINUX_EFAULT;
+            return sys_read(g, fd, giov.iov_base, giov.iov_len);
         }
     }
 
@@ -538,14 +426,15 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
 
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
     /* Special FD types: glibc may use writev() for eventfd wakeup writes.
-     * Delegate using the first iov entry.  Use giov[0].iov_len (not the
-     * sum of all iovs) — the data is at giov[0].iov_base which is only
-     * giov[0].iov_len bytes.  eventfd expects exactly 8 bytes. */
+     * Delegate using the first iov entry.  Use giov.iov_len (not the
+     * sum of all iovs) — the data is at giov.iov_base which is only
+     * giov.iov_len bytes.  eventfd expects exactly 8 bytes. */
     if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD) {
         if (iovcnt <= 0) return -LINUX_EINVAL;
-        linux_iovec_t *giov = guest_ptr(g, iov_gva);
-        if (!giov) return -LINUX_EFAULT;
-        return eventfd_write(fd, g, giov[0].iov_base, giov[0].iov_len);
+        linux_iovec_t giov;
+        if (guest_read(g, iov_gva, &giov, sizeof(giov)) < 0)
+            return -LINUX_EFAULT;
+        return eventfd_write(fd, g, giov.iov_base, giov.iov_len);
     }
 
     int host_fd = fd_to_host(fd);
@@ -558,7 +447,9 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
 
     ssize_t ret = writev(host_fd, host_iov, iovcnt);
     if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        int saved_errno = errno;
+        if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        errno = saved_errno;
         return linux_errno();
     }
     return ret;
@@ -590,7 +481,9 @@ int64_t sys_pwritev(guest_t *g, int fd, uint64_t iov_gva,
 
     ssize_t ret = pwritev(host_fd, host_iov, iovcnt, offset);
     if (ret < 0) {
-        if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        int saved_errno = errno;
+        if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+        errno = saved_errno;
         return linux_errno();
     }
     return ret;
@@ -711,21 +604,21 @@ static void aot_cache_init(void) {
     if (!home) home = "/tmp";
 
     snprintf(aot_cache_dir, sizeof(aot_cache_dir),
-             "%s/.cache/hl-rosettad", home);
+             "%s/" ROSETTAD_CACHE_SUBDIR, home);
     mkdir(aot_cache_dir, 0700);  /* ignore EEXIST */
 }
 
-/* Format a SHA256 digest as hex into buf (must be >= 65 bytes). */
-static void digest_to_hex(const uint8_t digest[32], char *buf) {
-    for (int i = 0; i < 32; i++)
-        snprintf(buf + i * 2, 3, "%02x", digest[i]);
+/* Format a SHA256 digest as hex into buf (must be >= ROSETTAD_DIGEST_HEX_LEN). */
+static void digest_to_hex(const uint8_t digest[ROSETTAD_DIGEST_SIZE], char *buf) {
+    for (int i = 0; i < ROSETTAD_DIGEST_SIZE; i++)
+        snprintf(buf + (size_t)i * 2, 3, "%02x", digest[i]);
 }
 
 /* Look up a cached AOT file by binary SHA256 digest.
  * Returns an open fd on hit, -1 on miss. */
-static int aot_cache_lookup(const uint8_t digest[32]) {
+static int aot_cache_lookup(const uint8_t digest[ROSETTAD_DIGEST_SIZE]) {
     aot_cache_init();
-    char hex[65];
+    char hex[ROSETTAD_DIGEST_HEX_LEN];
     digest_to_hex(digest, hex);
 
     char path[PATH_MAX];
@@ -735,9 +628,10 @@ static int aot_cache_lookup(const uint8_t digest[32]) {
 
 /* Store an AOT file in the persistent cache, keyed by binary SHA256.
  * Moves (hard-links + unlinks) the temp file into the cache dir. */
-static void aot_cache_store(const uint8_t digest[32], const char *aot_path) {
+static void aot_cache_store(const uint8_t digest[ROSETTAD_DIGEST_SIZE],
+                            const char *aot_path) {
     aot_cache_init();
-    char hex[65];
+    char hex[ROSETTAD_DIGEST_HEX_LEN];
     digest_to_hex(digest, hex);
 
     char dest[PATH_MAX];
@@ -794,11 +688,11 @@ static int run_rosettad_translate(const char *bin_path, const char *aot_path) {
  * support SOCK_SEQPACKET for AF_UNIX, we intercept via socketpair
  * (SOCK_STREAM) and frame messages by individual write() calls.
  *
- * Protocol:
- *   '?' → respond 0x01 (ready)
- *   't' → receive binary fd via SCM_RIGHTS, translate, send back AOT fd
- *   'd' → receive 32-byte digest, check cache, respond
- *   'q' → quit
+ * Protocol (command constants in rosetta.h):
+ *   ROSETTAD_CMD_HANDSHAKE → respond ROSETTAD_RESP_HIT (ready)
+ *   ROSETTAD_CMD_TRANSLATE → receive binary fd via SCM_RIGHTS, translate, send AOT fd
+ *   ROSETTAD_CMD_DIGEST    → receive ROSETTAD_DIGEST_SIZE-byte SHA256, check cache
+ *   ROSETTAD_CMD_QUIT      → exit handler thread
  */
 static void *rosettad_handler_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
@@ -816,13 +710,11 @@ static void *rosettad_handler_thread(void *arg) {
         }
 
         switch (cmd) {
-        case '?': {
-            /* Handshake: respond 0x01 to enable AOT translation.
-             * 0x01 = ready (enables rosettad AOT path)
-             * 0x00 = not ready (JIT-only, no AOT) */
+        case ROSETTAD_CMD_HANDSHAKE: {
+            /* Handshake: respond ROSETTAD_RESP_HIT to enable AOT translation */
             if (hl_verbose)
                 fprintf(stderr, "hl: rosettad: handshake '?'\n");
-            uint8_t resp = 0x01;
+            uint8_t resp = ROSETTAD_RESP_HIT;
             if (write(fd, &resp, 1) != 1) {
                 fprintf(stderr, "hl: rosettad: handshake write failed\n");
                 goto done;
@@ -830,7 +722,7 @@ static void *rosettad_handler_thread(void *arg) {
             break;
         }
 
-        case 't': {
+        case ROSETTAD_CMD_TRANSLATE: {
             /* Translate request: rosetta sends the binary fd via sendmsg
              * (SCM_RIGHTS) with a data payload. We compute the binary's
              * SHA256, check the persistent cache, and translate only on
@@ -846,7 +738,7 @@ static void *rosettad_handler_thread(void *arg) {
                 fprintf(stderr, "hl: rosettad: recv_fd failed: n=%zd fd=%d (%s)\n",
                         rn, bin_fd, rn < 0 ? strerror(errno) : "no fd");
                 if (bin_fd >= 0) close(bin_fd);
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
@@ -859,13 +751,14 @@ static void *rosettad_handler_thread(void *arg) {
              * high-VA regions that exceed hl's current page table capacity
              * for very large binaries (e.g., pandoc at 217MB). */
             struct stat bin_st;
-            if (fstat(bin_fd, &bin_st) == 0 && bin_st.st_size > 100 * 1024 * 1024) {
+            if (fstat(bin_fd, &bin_st) == 0 &&
+                bin_st.st_size > ROSETTAD_BINARY_SIZE_LIMIT) {
                 if (hl_verbose)
                     fprintf(stderr, "hl: rosettad: skipping translate for "
                             "large binary (%lld bytes)\n",
                             (long long)bin_st.st_size);
                 close(bin_fd);
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
@@ -873,11 +766,11 @@ static void *rosettad_handler_thread(void *arg) {
             /* Compute SHA256 of the original binary (not the AOT output).
              * This is the digest rosetta stores in .flu files and sends
              * via 'd' for subsequent cache lookups. */
-            uint8_t bin_digest[32];
+            uint8_t bin_digest[ROSETTAD_DIGEST_SIZE];
             if (compute_fd_sha256(bin_fd, bin_digest) < 0) {
                 fprintf(stderr, "hl: rosettad: SHA256 of binary failed\n");
                 close(bin_fd);
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
@@ -886,16 +779,18 @@ static void *rosettad_handler_thread(void *arg) {
             int cached_fd = aot_cache_lookup(bin_digest);
             if (cached_fd >= 0) {
                 if (hl_verbose) {
-                    char hex[65];
+                    char hex[ROSETTAD_DIGEST_HEX_LEN];
                     digest_to_hex(bin_digest, hex);
                     fprintf(stderr, "hl: rosettad: cache HIT for %s\n", hex);
                 }
                 close(bin_fd);
 
                 /* Send cached AOT: success + digest + fd */
-                uint8_t resp = 0x01;
+                uint8_t resp = ROSETTAD_RESP_HIT;
                 if (write(fd, &resp, 1) != 1) { close(cached_fd); goto done; }
-                if (write(fd, bin_digest, 32) != 32) { close(cached_fd); goto done; }
+                if (write(fd, bin_digest, ROSETTAD_DIGEST_SIZE) != ROSETTAD_DIGEST_SIZE) {
+                    close(cached_fd); goto done;
+                }
                 uint8_t dummy = 0;
                 ssize_t sent = send_fd(fd, &dummy, 1, cached_fd);
                 if (sent < 0) {
@@ -916,7 +811,7 @@ static void *rosettad_handler_thread(void *arg) {
             if (fcntl(bin_fd, F_GETPATH, bin_path) < 0) {
                 fprintf(stderr, "hl: rosettad: F_GETPATH failed: %s\n",
                         strerror(errno));
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) { close(bin_fd); goto done; }
                 close(bin_fd);
                 break;
@@ -931,7 +826,7 @@ static void *rosettad_handler_thread(void *arg) {
             if (aot_fd < 0) {
                 fprintf(stderr, "hl: rosettad: mkstemp failed: %s\n",
                         strerror(errno));
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
@@ -941,7 +836,7 @@ static void *rosettad_handler_thread(void *arg) {
             if (ret != 0) {
                 fprintf(stderr, "hl: rosettad: translate failed (exit=%d) "
                         "for %s\n", ret, bin_path);
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) { unlink(aot_path); goto done; }
                 unlink(aot_path);
                 break;
@@ -958,7 +853,7 @@ static void *rosettad_handler_thread(void *arg) {
             }
             if (aot_fd < 0) {
                 fprintf(stderr, "hl: rosettad: open AOT failed after translate\n");
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
                 break;
             }
@@ -972,15 +867,17 @@ static void *rosettad_handler_thread(void *arg) {
             /* Rosetta expects THREE separate messages for the translate
              * response (matching SOCK_SEQPACKET semantics where each
              * send/write creates a distinct message):
-             *   1. Success byte (0x01)
-             *   2. SHA256 digest of original binary (32 bytes)
+             *   1. Success byte (ROSETTAD_RESP_HIT)
+             *   2. SHA256 digest of original binary (ROSETTAD_DIGEST_SIZE bytes)
              *   3. AOT fd via SCM_RIGHTS + 1-byte dummy
              *
              * IMPORTANT: Do NOT combine into one sendmsg — rosetta reads
              * these as three separate recvmsg/read calls. */
-            uint8_t resp = 0x01;
+            uint8_t resp = ROSETTAD_RESP_HIT;
             if (write(fd, &resp, 1) != 1) { close(aot_fd); goto done; }
-            if (write(fd, bin_digest, 32) != 32) { close(aot_fd); goto done; }
+            if (write(fd, bin_digest, ROSETTAD_DIGEST_SIZE) != ROSETTAD_DIGEST_SIZE) {
+                close(aot_fd); goto done;
+            }
 
             /* Send AOT fd via SCM_RIGHTS with 1-byte dummy payload. */
             uint8_t dummy = 0;
@@ -998,7 +895,7 @@ static void *rosettad_handler_thread(void *arg) {
             break;
         }
 
-        case 'd': {
+        case ROSETTAD_CMD_DIGEST: {
             /* Digest lookup: receive 32-byte SHA256 of the original binary,
              * look up the persistent AOT cache.
              *
@@ -1008,8 +905,16 @@ static void *rosettad_handler_thread(void *arg) {
              * directly — this avoids re-translation and uses the 'd' HIT
              * code path in rosetta (which handles large binaries better
              * than the 't' response path). */
-            uint8_t digest[32];
-            if (read(fd, digest, 32) != 32) {
+            uint8_t digest[ROSETTAD_DIGEST_SIZE];
+            size_t dgst_off = 0;
+            while (dgst_off < ROSETTAD_DIGEST_SIZE) {
+                ssize_t nr = read(fd, digest + dgst_off,
+                                  ROSETTAD_DIGEST_SIZE - dgst_off);
+                if (nr < 0 && errno == EINTR) continue;
+                if (nr <= 0) break;
+                dgst_off += nr;
+            }
+            if (dgst_off != ROSETTAD_DIGEST_SIZE) {
                 fprintf(stderr, "hl: rosettad: digest read short\n");
                 goto done;
             }
@@ -1017,14 +922,14 @@ static void *rosettad_handler_thread(void *arg) {
             int cached_fd = aot_cache_lookup(digest);
             if (cached_fd >= 0) {
                 if (hl_verbose) {
-                    char hex[65];
+                    char hex[ROSETTAD_DIGEST_HEX_LEN];
                     digest_to_hex(digest, hex);
                     fprintf(stderr, "hl: rosettad: digest lookup → HIT (%s)\n",
                             hex);
                 }
 
                 /* HIT response: success byte + AOT fd via SCM_RIGHTS */
-                uint8_t resp = 0x01;
+                uint8_t resp = ROSETTAD_RESP_HIT;
                 if (write(fd, &resp, 1) != 1) { close(cached_fd); goto done; }
                 uint8_t dummy = 0;
                 ssize_t sent = send_fd(fd, &dummy, 1, cached_fd);
@@ -1040,18 +945,18 @@ static void *rosettad_handler_thread(void *arg) {
                 close(cached_fd);
             } else {
                 if (hl_verbose) {
-                    char hex[65];
+                    char hex[ROSETTAD_DIGEST_HEX_LEN];
                     digest_to_hex(digest, hex);
                     fprintf(stderr, "hl: rosettad: digest lookup → MISS (%s)\n",
                             hex);
                 }
-                uint8_t resp = 0x00;
+                uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) goto done;
             }
             break;
         }
 
-        case 'q':
+        case ROSETTAD_CMD_QUIT:
             if (hl_verbose)
                 fprintf(stderr, "hl: rosettad: quit 'q'\n");
             goto done;
@@ -1066,6 +971,7 @@ done:
     if (hl_verbose)
         fprintf(stderr, "hl: rosettad: handler thread exiting\n");
     close(fd);
+    rosettad_client_fd = -1;  /* Reset so rosettad_is_socket() stops matching */
     return NULL;
 }
 
@@ -1101,9 +1007,7 @@ int rosettad_is_socket(int host_fd) {
  * 0x80456125: _IOR('a', 0x25, 69)  — environment signature check
  * 0x80806123: _IOR('a', 0x23, 128) — capabilities/config query
  * 0x6124:     _IO('a', 0x24)       — JIT activation / hypervisor handshake */
-#define ROSETTA_VZ_CHECK      0x80456125
-#define ROSETTA_VZ_CAPS       0x80806123
-#define ROSETTA_VZ_ACTIVATE   0x6124
+/* VZ ioctl constants: centralized in rosetta.h */
 
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     int host_fd = fd_to_host(fd);
@@ -1119,7 +1023,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
          * Virtualization.framework with Rosetta mode enabled" and aborts. */
         if (g->verbose)
             fprintf(stderr, "hl: rosetta: VZ_CHECK ioctl\n");
-        static const char rosetta_sig[69] =
+        static const char rosetta_sig[ROSETTA_VZ_SIG_LEN] =
             "Our hard work\nby these words guarded\n"
             "please don't steal\n\xc2\xa9 Apple Inc";
         if (guest_write(g, arg, rosetta_sig, sizeof(rosetta_sig)) < 0)
@@ -1128,60 +1032,42 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
     }
 
     case ROSETTA_VZ_CAPS: {
-        /* VZ_CAPS buffer layout (128 bytes).
-         *
-         * Verified via strace + ioctl dump in a real Lima VZ VM:
-         *   Real Apple VZ returns: caps[0]=1,
-         *   caps[1..27]="/run/rosettad/rosetta.sock\0",
-         *   caps[28..127]=all zeros (including caps[64] and caps[108]).
-         *
-         *   caps[0]:       VZ enable flag (1 = VZ mode active).
-         *                  Written to BSS[0xa04]; enables the rosettad AOT path.
-         *
-         *   caps[1..64]:   sun_path[0..63] — socket path for rosettad.
-         *                  Must be non-empty (caps[1] != 0) for rosettad init
-         *                  to proceed. The actual path doesn't matter because
-         *                  connect() is intercepted in sys_connect() via
-         *                  rosettad_is_socket() — the socketpair is pre-connected.
-         *
-         *   caps[66..107]: Null-terminated path to the x86_64 binary.
-         *                  Rosetta opens this (caps+0x42) and sends the fd to
-         *                  rosettad via SCM_RIGHTS for AOT translation.
-         *
-         *   caps[108]:     Written to BSS[0xa05]. Real VZ has this as 0.
-         *                  Both 't' (translate) and 'd' (digest) protocol
-         *                  commands work with caps[108]=0 (verified by strace).
-         *
-         *   caps[109..127]: Other flags (purpose unknown, leave as zero). */
-        uint8_t caps[128] = {0};
+        /* VZ_CAPS buffer layout (ROSETTA_CAPS_SIZE bytes).
+         * Offsets defined in rosetta.h.  Verified via strace in a real Lima VZ VM. */
+        uint8_t caps[ROSETTA_CAPS_SIZE] = {0};
 
         /* caps[0]: VZ enable flag — activates the rosettad AOT pipeline. */
-        caps[0] = 1;
+        caps[ROSETTA_CAPS_VZ_ENABLE] = 1;
 
         /* caps[1..]: Socket path — must be non-empty for rosettad init.
          * We use a short placeholder; connect() is intercepted fd-based. */
         static const char fake_sock_path[] = "/run/rosettad/rosetta.sock";
-        memcpy(&caps[1], fake_sock_path, sizeof(fake_sock_path));
+        memcpy(&caps[ROSETTA_CAPS_SOCKET_PATH], fake_sock_path,
+               sizeof(fake_sock_path));
 
         /* caps[66..]: Null-terminated path to x86_64 binary for rosettad.
          * Rosetta opens this file and sends the fd to rosettad via SCM_RIGHTS. */
         size_t binpath_len = strlen(rosettad_binary_path);
-        if (binpath_len > 0 && binpath_len <= 128 - 66 - 1) {
-            memcpy(&caps[66], rosettad_binary_path, binpath_len + 1);
+        if (binpath_len > 0 &&
+            binpath_len <= ROSETTA_CAPS_BINARY_PATH_LEN) {
+            memcpy(&caps[ROSETTA_CAPS_BINARY_PATH], rosettad_binary_path,
+                   binpath_len + 1);
         } else if (binpath_len > 0) {
-            /* Path too long to fit: truncate, ensure null termination at [127] */
-            memcpy(&caps[66], rosettad_binary_path, 128 - 66 - 1);
-            caps[127] = 0;
+            /* Path too long to fit: truncate, NUL-terminate within field */
+            memcpy(&caps[ROSETTA_CAPS_BINARY_PATH], rosettad_binary_path,
+                   ROSETTA_CAPS_BINARY_PATH_LEN);
+            caps[ROSETTA_CAPS_BINARY_PATH + ROSETTA_CAPS_BINARY_PATH_LEN - 1] = 0;
         }
 
         /* caps[108]: Match real VZ behavior (0). Both 't' and 'd' protocol
          * commands work with this value, verified by strace in Lima VM. */
-        caps[108] = 0;
+        caps[ROSETTA_CAPS_VZ_SECONDARY] = 0;
 
         if (g->verbose)
             fprintf(stderr, "hl: rosetta: VZ_CAPS ioctl → caps[0]=%d caps[64]=0x%02x "
                     "caps[108]=0x%02x binary=%s\n",
-                    caps[0], caps[64], caps[108], rosettad_binary_path);
+                    caps[ROSETTA_CAPS_VZ_ENABLE], caps[64],
+                    caps[ROSETTA_CAPS_VZ_SECONDARY], rosettad_binary_path);
         if (guest_write(g, arg, caps, sizeof(caps)) < 0)
             return -LINUX_EFAULT;
         return 1;  /* Real VZ driver returns 1 on success */
@@ -1244,10 +1130,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
             -1, -1, /* unused slots 17-18 */
         };
         linux_termios_t lt = {0};
-        lt.c_iflag = (uint32_t)t.c_iflag;
-        lt.c_oflag = (uint32_t)t.c_oflag;
-        lt.c_cflag = (uint32_t)t.c_cflag;
-        lt.c_lflag = (uint32_t)t.c_lflag;
+        lt.c_iflag = mac_iflag_to_linux(t.c_iflag);
+        lt.c_oflag = mac_oflag_to_linux(t.c_oflag);
+        lt.c_cflag = mac_cflag_to_linux(t.c_cflag);
+        lt.c_lflag = mac_lflag_to_linux(t.c_lflag);
         for (int i = 0; i < 19; i++) {
             int mac_idx = mac_to_linux_cc[i];
             lt.c_cc[i] = (mac_idx >= 0 && mac_idx < NCCS) ? t.c_cc[mac_idx] : 0;
@@ -1289,10 +1175,10 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
         struct termios t;
         if (tcgetattr(host_fd, &t) < 0)
             return -LINUX_ENOTTY;  /* Not a terminal */
-        t.c_iflag = lt.c_iflag;
-        t.c_oflag = lt.c_oflag;
-        t.c_cflag = lt.c_cflag;
-        t.c_lflag = lt.c_lflag;
+        t.c_iflag = linux_iflag_to_mac(lt.c_iflag);
+        t.c_oflag = linux_oflag_to_mac(lt.c_oflag);
+        t.c_cflag = linux_cflag_to_mac(lt.c_cflag);
+        t.c_lflag = linux_lflag_to_mac(lt.c_lflag);
         for (int i = 0; i < 19; i++) {
             int mac_idx = linux_to_mac_cc[i];
             if (mac_idx >= 0 && mac_idx < NCCS)
@@ -1395,6 +1281,7 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
     if (offset_gva != 0) {
         if (guest_read(g, offset_gva, &offset, 8) < 0)
             return -LINUX_EFAULT;
+        if (offset < 0) return -LINUX_EINVAL;
     }
 
     char buf[65536];
@@ -1408,7 +1295,11 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
         } else {
             nr = read(host_in, buf, chunk);
         }
-        if (nr <= 0) break;
+        if (nr < 0) {
+            if (total > 0) break;  /* Partial success: report bytes sent */
+            return linux_errno();
+        }
+        if (nr == 0) break;  /* EOF */
 
         ssize_t nw = write(host_out, buf, nr);
         if (nw < 0) {
@@ -1465,7 +1356,11 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
         } else {
             nr = read(host_in, buf, chunk);
         }
-        if (nr <= 0) break;
+        if (nr < 0) {
+            if (total > 0) break;  /* Partial success: report bytes sent */
+            return linux_errno();
+        }
+        if (nr == 0) break;  /* EOF */
 
         ssize_t nw;
         if (off_out >= 0) {
@@ -1522,13 +1417,13 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
             return -LINUX_EFAULT;
     }
 
-    /* Emulate with read/write loop using a host-side buffer */
-    size_t chunk = len > 65536 ? 65536 : len;
-    uint8_t *buf = malloc(chunk);
-    if (!buf) return -LINUX_ENOMEM;
+    /* Emulate with read/write loop using a stack buffer (matching
+     * sendfile/copy_file_range which also use stack buffers). */
+    uint8_t buf[65536];
+    size_t chunk = len > sizeof(buf) ? sizeof(buf) : len;
 
     size_t total = 0;
-    int saved_errno = 0;  /* Preserve errno across free/guest_write */
+    int saved_errno = 0;  /* Preserve errno across guest_write */
     int rw_error = 0;     /* Track whether read or write failed */
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
@@ -1556,15 +1451,15 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
     }
 
 done:
-    free(buf);
-
-    /* Write back updated offsets */
+    /* Write back updated offsets. Preserve partial transfer success:
+     * if bytes were already moved, return that count even if the
+     * offset writeback fails (consistent with sendfile/copy_file_range). */
     if (off_in_gva && off_in >= 0 &&
         guest_write(g, off_in_gva, &off_in, 8) < 0)
-        return -LINUX_EFAULT;
+        return total > 0 ? (int64_t)total : -LINUX_EFAULT;
     if (off_out_gva && off_out >= 0 &&
         guest_write(g, off_out_gva, &off_out, 8) < 0)
-        return -LINUX_EFAULT;
+        return total > 0 ? (int64_t)total : -LINUX_EFAULT;
 
     /* Return bytes transferred, or errno only if read/write failed.
      * Restore saved_errno since free/guest_write may have clobbered it. */
@@ -1579,7 +1474,8 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
     (void)flags;
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
-    if (nr_segs > 64) nr_segs = 64;
+    if (nr_segs > 1024) return -LINUX_EINVAL;  /* UIO_MAXIOV */
+    if (nr_segs > 64) nr_segs = 64;  /* local processing limit */
 
     size_t total = 0;
     for (unsigned long i = 0; i < nr_segs; i++) {
@@ -1589,16 +1485,19 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
             return -LINUX_EFAULT;
 
         if (liov.iov_len == 0) continue;
-        void *src = guest_ptr(g, liov.iov_base);
+        uint64_t avail = 0;
+        void *src = guest_ptr_avail(g, liov.iov_base, &avail);
         if (!src) return total > 0 ? (int64_t)total : -LINUX_EFAULT;
+        uint64_t len = liov.iov_len;
+        if (len > avail) len = avail;
 
-        ssize_t w = write(host_fd, src, liov.iov_len);
+        ssize_t w = write(host_fd, src, len);
         if (w < 0) {
             if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
             return total > 0 ? (int64_t)total : linux_errno();
         }
         total += w;
-        if ((size_t)w < liov.iov_len) break;
+        if ((uint64_t)w < len) break;
     }
 
     return (int64_t)total;

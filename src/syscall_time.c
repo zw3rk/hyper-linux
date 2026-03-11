@@ -93,6 +93,10 @@ int64_t sys_nanosleep(guest_t *g, uint64_t req_gva, uint64_t rem_gva) {
     if (guest_read(g, req_gva, &lreq, sizeof(lreq)) < 0)
         return -LINUX_EFAULT;
 
+    /* Linux rejects negative tv_sec or tv_nsec outside [0, 999999999] */
+    if (lreq.tv_sec < 0 || lreq.tv_nsec < 0 || lreq.tv_nsec >= 1000000000LL)
+        return -LINUX_EINVAL;
+
     struct timespec req = { .tv_sec = lreq.tv_sec, .tv_nsec = lreq.tv_nsec };
     struct timespec rem = {0};
 
@@ -115,6 +119,10 @@ int64_t sys_clock_nanosleep(guest_t *g, int clockid, int flags,
     if (guest_read(g, req_gva, &lreq, sizeof(lreq)) < 0)
         return -LINUX_EFAULT;
 
+    /* Linux rejects tv_nsec outside [0, 999999999] */
+    if (lreq.tv_nsec < 0 || lreq.tv_nsec >= 1000000000LL)
+        return -LINUX_EINVAL;
+
     int mac_clockid = translate_clockid(clockid);
     if (mac_clockid < 0) return -LINUX_EINVAL;
 
@@ -126,6 +134,9 @@ int64_t sys_clock_nanosleep(guest_t *g, int clockid, int flags,
         if (clock_gettime(mac_clockid, &now) < 0)
             return linux_errno();
 
+        /* Guard against signed overflow: INT64_MAX / 1e9 ≈ 9.2e9 seconds.
+         * Values beyond that are absurdly far in the future; clamp. */
+        if (lreq.tv_sec > INT64_MAX / 1000000000LL) return 0; /* past year 2262 */
         int64_t target_ns = lreq.tv_sec * 1000000000LL + lreq.tv_nsec;
         int64_t now_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
         int64_t delta_ns = target_ns - now_ns;
@@ -179,6 +190,13 @@ int64_t sys_setitimer(guest_t *g, int which,
         has_new = 1;
     }
 
+    /* Linux rejects tv_usec outside [0, 999999] for both value and interval */
+    if (has_new) {
+        if (lnew.it_value.tv_usec < 0 || lnew.it_value.tv_usec >= 1000000 ||
+            lnew.it_interval.tv_usec < 0 || lnew.it_interval.tv_usec >= 1000000)
+            return -LINUX_EINVAL;
+    }
+
     /* ITIMER_REAL (which=0) is emulated internally because macOS shares
      * alarm() and setitimer(ITIMER_REAL) as the same underlying timer,
      * and hl needs alarm() for its per-iteration vCPU timeout. */
@@ -207,32 +225,14 @@ int64_t sys_setitimer(guest_t *g, int which,
         return 0;
     }
 
-    /* ITIMER_VIRTUAL and ITIMER_PROF: forward to host */
-    struct itimerval nval = {0};
-    if (has_new) {
-        nval = (struct itimerval){
-            .it_interval = { .tv_sec = (long)lnew.it_interval.tv_sec,
-                             .tv_usec = (int)lnew.it_interval.tv_usec },
-            .it_value    = { .tv_sec = (long)lnew.it_value.tv_sec,
-                             .tv_usec = (int)lnew.it_value.tv_usec },
-        };
-    }
-
-    struct itimerval oval;
-    if (setitimer(which, has_new ? &nval : NULL, old_gva ? &oval : NULL) < 0)
-        return linux_errno();
-
+    /* ITIMER_VIRTUAL and ITIMER_PROF: stub as no-op. Forwarding to host
+     * setitimer would cause SIGVTALRM/SIGPROF delivery to the hl process
+     * itself, potentially killing it. Return old value as zero (disarmed). */
     if (old_gva) {
-        linux_itimerval_t lold = {
-            .it_interval = { .tv_sec = oval.it_interval.tv_sec,
-                             .tv_usec = oval.it_interval.tv_usec },
-            .it_value    = { .tv_sec = oval.it_value.tv_sec,
-                             .tv_usec = oval.it_value.tv_usec },
-        };
+        linux_itimerval_t lold = {0};
         if (guest_write(g, old_gva, &lold, sizeof(lold)) < 0)
             return -LINUX_EFAULT;
     }
-
     return 0;
 }
 

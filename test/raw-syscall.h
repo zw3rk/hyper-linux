@@ -42,6 +42,30 @@ static inline long raw_syscall1(long nr, long a0) {
 #endif
 }
 
+/* ── 2-argument syscall ─────────────────────────────────────────── */
+
+static inline long raw_syscall2(long nr, long a0, long a1) {
+#if defined(__aarch64__)
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x8 __asm__("x8") = nr;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x8)
+                     : "memory", "cc");
+    return x0;
+#elif defined(__x86_64__)
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a0), "S"(a1)
+                     : "rcx", "r11", "memory", "cc");
+    return ret;
+#else
+#error "Unsupported architecture"
+#endif
+}
+
 /* ── 3-argument syscall ─────────────────────────────────────────── */
 
 static inline long raw_syscall3(long nr, long a0, long a1, long a2) {

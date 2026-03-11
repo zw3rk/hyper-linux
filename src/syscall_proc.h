@@ -93,8 +93,9 @@ typedef struct {
     int     exit_status;/* wait status (as returned by waitpid) */
 } proc_entry_t;
 
-/* Register a child process in the process table. */
-void proc_register_child(pid_t host_pid, int64_t guest_pid);
+/* Register a child process in the process table.
+ * Returns 0 on success, -1 if the table is full. */
+int proc_register_child(pid_t host_pid, int64_t guest_pid);
 
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);

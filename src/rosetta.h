@@ -34,6 +34,52 @@
 #define TCR_EL1_VALUE       0x25B5903510ULL  /* EPD1=1: TTBR1 walks disabled */
 #define TCR_EL1_VALUE_KBUF  0x65B5103510ULL  /* EPD1=0, TBI1=1: TTBR1 + TBI */
 
+/* ---------- VZ ioctl protocol ---------- */
+
+/* Rosetta VZ (Virtualization.framework) mode activation ioctls.
+ * Three ioctls on the rosetta fd: check for VZ support, query
+ * capabilities, and activate VZ mode.  Intercepted in sys_ioctl. */
+#define ROSETTA_VZ_CHECK     0x80456125   /* Returns 69-byte signature */
+#define ROSETTA_VZ_CAPS      0x80806123   /* Returns 128-byte capability data */
+#define ROSETTA_VZ_ACTIVATE  0x6124       /* Activate VZ mode */
+
+/* VZ_CAPS buffer layout (128 bytes).  Filled by hl to emulate a VZ
+ * environment so rosetta enables its AOT translation path. */
+#define ROSETTA_CAPS_SIZE             128  /* Total buffer size */
+#define ROSETTA_CAPS_VZ_ENABLE        0   /* caps[0]: 1 = VZ active */
+#define ROSETTA_CAPS_SOCKET_PATH      1   /* caps[1..64]: rosettad socket path */
+#define ROSETTA_CAPS_SOCKET_PATH_LEN  64  /* Max socket path length */
+#define ROSETTA_CAPS_BINARY_PATH      66  /* caps[66..107]: x86_64 binary path */
+#define ROSETTA_CAPS_BINARY_PATH_LEN  42  /* Max binary path length */
+#define ROSETTA_CAPS_VZ_SECONDARY     108 /* caps[108]: secondary VZ flag */
+
+/* VZ_CHECK signature (reverse-engineered from rosetta binary) */
+#define ROSETTA_VZ_SIG_LEN  69
+
+/* ---------- rosettad protocol ---------- */
+
+/* Protocol commands sent over the rosettad socketpair.  Rosetta opens
+ * AF_UNIX SOCK_SEQPACKET; hl intercepts with socketpair(SOCK_STREAM)
+ * and runs a handler thread implementing this protocol. */
+#define ROSETTAD_CMD_HANDSHAKE  '?'   /* Ready check → respond 0x01 */
+#define ROSETTAD_CMD_TRANSLATE  't'   /* AOT translate: binary fd via SCM_RIGHTS */
+#define ROSETTAD_CMD_DIGEST     'd'   /* Digest lookup: 32-byte SHA256 */
+#define ROSETTAD_CMD_QUIT       'q'   /* Quit handler thread */
+
+/* Protocol responses */
+#define ROSETTAD_RESP_HIT   0x01      /* Cache hit / success */
+#define ROSETTAD_RESP_MISS  0x00      /* Cache miss / failure */
+
+/* SHA256 digest constants (used for AOT persistent cache) */
+#define ROSETTAD_DIGEST_SIZE     32                 /* SHA256 digest bytes */
+#define ROSETTAD_DIGEST_HEX_LEN (ROSETTAD_DIGEST_SIZE * 2 + 1)  /* Hex + NUL */
+
+/* AOT translation limits */
+#define ROSETTAD_BINARY_SIZE_LIMIT  (100LL * 1024 * 1024)  /* Skip >100MB binaries */
+
+/* Persistent AOT cache directory (under $HOME) */
+#define ROSETTAD_CACHE_SUBDIR  ".cache/hl-rosettad"
+
 /* ---------- Result structure ---------- */
 
 /* Output from rosetta_prepare(), consumed by rosetta_finalize() and

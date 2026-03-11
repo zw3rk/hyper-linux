@@ -30,9 +30,12 @@
  * Literal 4096 in guest.c/stack.c means actual page size, not this. */
 #define LINUX_PATH_MAX 4096
 
+/* ---------- Locks (owned by syscall.c) ---------- */
+extern pthread_mutex_t mmap_lock;   /* Lock order: 1 — mmap/brk + page tables */
+extern pthread_mutex_t fd_lock;     /* Lock order: 3 — FD table */
+
 /* ---------- FD table (owned by syscall.c) ---------- */
 extern fd_entry_t fd_table[FD_TABLE_SIZE];
-extern pthread_mutex_t fd_lock;
 
 /* ---------- FD helpers ---------- */
 
@@ -52,6 +55,10 @@ int fd_to_host(int guest_fd);
  * Does NOT close the host FD or free type-specific resources (DIR*,
  * epoll instance) — caller must do that first. */
 void fd_mark_closed(int fd);
+
+/* Same as fd_mark_closed but requires fd_lock to be already held.
+ * Used by sys_execve CLOEXEC loop which holds fd_lock for the entire scan. */
+void fd_mark_closed_unlocked(int fd);
 
 /* Atomically snapshot an fd entry and mark it closed.  Returns 1 if the
  * slot was open (snapshot written to *out), 0 if already closed.  Prevents

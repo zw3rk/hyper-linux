@@ -59,6 +59,7 @@ endif
 # Colors
 GREEN  := \033[0;32m
 BLUE   := \033[0;34m
+CYAN   := \033[0;36m
 YELLOW := \033[1;33m
 RED    := \033[0;31m
 RESET  := \033[0m
@@ -175,7 +176,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test() { \
 		name=$$(basename "$$2"); \
 		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
-		if output=$$($$@ 2>&1); then \
+		if output=$$(timeout 60 $$@ 2>&1); then \
 			printf "$(GREEN)✓ PASS$(RESET)\n"; \
 			pass=$$((pass + 1)); \
 		else \
@@ -183,6 +184,9 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 			if [ "$$expected_rc" != "" ] && [ "$$rc" = "$$expected_rc" ]; then \
 				printf "$(GREEN)✓ PASS$(RESET) (exit $$rc)\n"; \
 				pass=$$((pass + 1)); \
+			elif [ "$$rc" = "124" ]; then \
+				printf "$(RED)✗ FAIL$(RESET) (timeout after 60s)\n"; \
+				fail=$$((fail + 1)); \
 			else \
 				printf "$(RED)✗ FAIL$(RESET) (exit $$rc)\n"; \
 				printf "  %s\n" "$$output" | head -5; \
@@ -247,6 +251,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-readv-writev; \
 	printf "\n$(BLUE)── inotify emulation tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-inotify; \
+	printf "\n$(BLUE)── PI futex + EINTR regression tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-futex-pi; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
@@ -484,6 +490,8 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-inotify; \
 	printf "\n$(BLUE)── COW fork isolation tests (x86_64) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cow-fork; \
+	printf "\n$(BLUE)── PI futex + EINTR regression tests (x86_64) ──$(RESET)\n"; \
+	run_xfail test-futex-pi "rosetta: raw clone(CLONE_THREAD) in dead-owner test hangs"; \
 	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
@@ -588,7 +596,7 @@ test-x64-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ x86_64 Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR) "" "+RTS -xr4G -RTS"
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR)
 
 # ── Test matrix (4-way: hl + lima, aarch64 + x86_64) ────────────────
 
@@ -698,7 +706,7 @@ test-rwx: $(BUILD_DIR)/test-rwx
 .PHONY: lint analyze format
 
 ## Run clang-tidy on all source files
-lint:
+lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 	@printf "$(BLUE)▸ Running$(RESET) clang-tidy\n"
 	clang-tidy $(HL_SRCS) -- $(CFLAGS) -I$(SRC_DIR) -I$(BUILD_DIR)
 

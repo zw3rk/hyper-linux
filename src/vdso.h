@@ -14,8 +14,9 @@
 #include "guest.h"
 
 /* Guest address where the vDSO is placed (one 4KB page, below PT pool) */
-#define VDSO_BASE 0x0000F000ULL
-#define VDSO_SIZE 0x00001000ULL  /* 4KB */
+#define VDSO_BASE     0x0000F000ULL
+#define VDSO_SIZE     0x00001000ULL  /* 4KB */
+#define VDSO_OFF_TEXT 0x0B0          /* Offset of .text (trampoline code) */
 
 /* Build a minimal vDSO ELF image at VDSO_BASE in guest memory.
  * The image contains a valid ELF header, one LOAD program header,

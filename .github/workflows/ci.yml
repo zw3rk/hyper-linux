@@ -23,6 +23,12 @@ on:
     tags: ['v*']
   pull_request:
 
+# Cancel redundant runs: only the latest commit on each branch/PR runs.
+# Self-hosted runners are a shared resource — don't queue stale builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NIX_CONFIG: |
     extra-experimental-features = nix-command flakes
@@ -429,28 +435,24 @@ jobs:
             dist/out/*.pkg
 
   # ── GitHub Release (tags only) ──────────────────────────────────
+  # Downloads the dist artifact built above instead of rebuilding.
   release:
     needs: [dist, test]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-        continue-on-error: true
-
-      - name: Build distribution
-        run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
+          name: hl-dist
+          path: dist-out
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/out/*.zip
-            dist/out/*.pkg
+            dist-out/**/*.zip
+            dist-out/**/*.pkg
           generate_release_notes: true

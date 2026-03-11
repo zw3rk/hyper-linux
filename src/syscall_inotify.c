@@ -53,6 +53,7 @@
                                       * flags, never in add_watch() event masks.
                                       * Equals O_NONBLOCK on aarch64-linux. */
 #define IN_CLOEXEC       0x00080000  /* Same as O_CLOEXEC on aarch64 */
+#define IN_MASK_ADD      0x20000000  /* OR new events into existing mask */
 
 /* Linux struct inotify_event layout:
  *   int32_t  wd;      watch descriptor
@@ -73,6 +74,8 @@ typedef struct {
     int      host_fd;   /* Open fd to the watched path (O_EVTONLY) */
     uint32_t mask;      /* Subscribed IN_* events */
     int      is_dir;    /* 1 if watching a directory */
+    dev_t    dev;       /* Device ID (for re-add lookup by inode) */
+    ino_t    ino;       /* Inode number (for re-add lookup by inode) */
 } inotify_watch_t;
 
 typedef struct {
@@ -124,6 +127,15 @@ static int watch_find(inotify_instance_t *inst, int wd) {
 static int watch_find_by_hostfd(inotify_instance_t *inst, int host_fd) {
     for (int i = 0; i < INOTIFY_WATCHES; i++)
         if (inst->watches[i].wd != 0 && inst->watches[i].host_fd == host_fd)
+            return i;
+    return -1;
+}
+
+/* Find a watch by device/inode (for re-add lookup). Returns index or -1. */
+static int watch_find_by_devino(inotify_instance_t *inst, dev_t dev, ino_t ino) {
+    for (int i = 0; i < INOTIFY_WATCHES; i++)
+        if (inst->watches[i].wd != 0 &&
+            inst->watches[i].dev == dev && inst->watches[i].ino == ino)
             return i;
     return -1;
 }
@@ -355,11 +367,16 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     int host_fd = open(path, O_EVTONLY);
     if (host_fd < 0) return linux_errno();
 
-    /* Check if it's a directory */
+    /* Identify the file by dev/ino for re-add detection */
     struct stat st;
-    int is_dir = 0;
-    if (fstat(host_fd, &st) == 0 && S_ISDIR(st.st_mode))
-        is_dir = 1;
+    if (fstat(host_fd, &st) < 0) {
+        close(host_fd);
+        return linux_errno();
+    }
+    int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+
+    /* Strip IN_MASK_ADD control flag before storing */
+    uint32_t event_mask = mask & ~(uint32_t)IN_MASK_ADD;
 
     pthread_mutex_lock(&inotify_lock);
 
@@ -372,7 +389,38 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
 
     inotify_instance_t *inst = &inotify_state[slot];
 
-    /* Find or allocate a watch slot */
+    /* Linux inotify re-add semantics: if the same file (by dev/ino) is
+     * already watched, update the existing watch's mask instead of
+     * creating a new one.  IN_MASK_ADD ORs new bits; without it, the
+     * mask is replaced entirely.  Returns the existing wd. */
+    int existing = watch_find_by_devino(inst, st.st_dev, st.st_ino);
+    if (existing >= 0) {
+        inotify_watch_t *w = &inst->watches[existing];
+        if (mask & IN_MASK_ADD)
+            w->mask |= event_mask;
+        else
+            w->mask = event_mask;
+        int wd = w->wd;
+        int existing_host_fd = w->host_fd;
+        int kq_fd = inst->kq_fd;
+        uint32_t snapshot_mask = w->mask;  /* Snapshot before unlock */
+        pthread_mutex_unlock(&inotify_lock);
+
+        /* Close the duplicate fd — we keep the original */
+        close(host_fd);
+
+        /* Update kevent filter with the new mask (use snapshot —
+         * w->mask may be modified by another thread after unlock) */
+        uint32_t notes = in_mask_to_notes(snapshot_mask);
+        struct kevent kev;
+        EV_SET(&kev, (uintptr_t)existing_host_fd, EVFILT_VNODE,
+               EV_ADD | EV_CLEAR, notes, 0, NULL);
+        kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+
+        return wd;
+    }
+
+    /* New watch — allocate a slot */
     int widx = watch_slot_alloc(inst);
     if (widx < 0) {
         pthread_mutex_unlock(&inotify_lock);
@@ -388,8 +436,10 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     inotify_watch_t *w = &inst->watches[widx];
     w->wd = wd;
     w->host_fd = host_fd;
-    w->mask = mask;
+    w->mask = event_mask;
     w->is_dir = is_dir;
+    w->dev = st.st_dev;
+    w->ino = st.st_ino;
 
     /* Capture kq_fd while under lock */
     int kq_fd = inst->kq_fd;
@@ -399,7 +449,7 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
      * automatically after each kevent() retrieval, matching inotify's
      * continuous monitoring behavior.
      * kevent() is thread-safe; run outside the lock to avoid blocking. */
-    uint32_t notes = in_mask_to_notes(mask);
+    uint32_t notes = in_mask_to_notes(event_mask);
     struct kevent kev;
     EV_SET(&kev, (uintptr_t)host_fd, EVFILT_VNODE,
            EV_ADD | EV_CLEAR, notes, 0, NULL);

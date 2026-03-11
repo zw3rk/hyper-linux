@@ -114,7 +114,7 @@ run_lima() {
 
 # Run binary via hl with --sysroot.  Uses global _SYSROOT for the sysroot
 # path, _HL_TIMEOUT for the timeout (default 30s), and _GUEST_EXTRA for
-# extra guest arguments (e.g. "+RTS -xr4G -RTS" to shrink GHC VA reservation).
+# extra guest arguments passed after the binary path.
 _SYSROOT=""
 _HL_TIMEOUT=30
 _GUEST_EXTRA=""
@@ -229,7 +229,10 @@ run_unit_tests() {
     local runner="$1"
     local bindir="$2"
 
-    printf "${BLUE}── Unit tests ──${RESET}\n"
+    printf "${BLUE}── Assembly tests ──${RESET}\n"
+    test_check "$runner" "test-hello"         "hello"           "$bindir/test-hello"
+
+    printf "\n${BLUE}── Unit tests ──${RESET}\n"
     test_check "$runner" "hello-musl"        "Hello"           "$bindir/hello-musl"
     test_check "$runner" "hello-write"        "Hello"           "$bindir/hello-write"
     test_check "$runner" "echo-test"          "hello world"     "$bindir/echo-test" hello world
@@ -281,6 +284,21 @@ run_unit_tests() {
 
     printf "\n${BLUE}── Negative tests ──${RESET}\n"
     test_check "$runner" "test-negative"      "0 failed"        "$bindir/test-negative"
+
+    printf "\n${BLUE}── COW fork isolation ──${RESET}\n"
+    test_check "$runner" "test-cow-fork"      "PASS"            "$bindir/test-cow-fork"
+
+    printf "\n${BLUE}── Guard page / mmap edge cases ──${RESET}\n"
+    test_check "$runner" "test-guard-page"    "PASS"            "$bindir/test-guard-page"
+
+    printf "\n${BLUE}── Scatter-gather I/O ──${RESET}\n"
+    test_check "$runner" "test-readv-writev"  "PASS"            "$bindir/test-readv-writev"
+
+    printf "\n${BLUE}── inotify emulation ──${RESET}\n"
+    test_check "$runner" "test-inotify"       "PASS"            "$bindir/test-inotify"
+
+    printf "\n${BLUE}── PI futex + EINTR regression ──${RESET}\n"
+    test_check "$runner" "test-futex-pi"      "0 failed"        "$bindir/test-futex-pi"
 }
 
 # ── Test suite: coreutils ─────────────────────────────────────────
@@ -465,7 +483,7 @@ run_suite() {
     local mode="$1"
     local runner test_bin coreutils_bin busybox_bin static_bin
     local dyn_runner musl_sysroot musl_dyn_coreutils glibc_sysroot glibc_dyn_coreutils
-    local haskell_hello haskell_hello_sysroot haskell_bins haskell_extra
+    local haskell_hello haskell_hello_sysroot haskell_bins
 
     # Create test fixtures in a location accessible to the runner.
     cleanup_fixtures
@@ -492,7 +510,6 @@ run_suite() {
             haskell_hello="$AARCH64_HASKELL_HELLO"
             haskell_hello_sysroot="$AARCH64_MUSL_SYSROOT"
             haskell_bins="$AARCH64_HASKELL_BINS"
-            haskell_extra=""
             ;;
         hl-x64)
             runner="run_hl"
@@ -508,7 +525,6 @@ run_suite() {
             haskell_hello="$X64_HASKELL_HELLO"
             haskell_hello_sysroot="$X64_MUSL_SYSROOT"
             haskell_bins="$X64_HASKELL_BINS"
-            haskell_extra="+RTS -xr4G -RTS"
             ;;
         lima-aarch64)
             runner="run_lima"
@@ -524,7 +540,6 @@ run_suite() {
             haskell_hello="$AARCH64_HASKELL_HELLO"
             haskell_hello_sysroot=""
             haskell_bins="$AARCH64_HASKELL_BINS"
-            haskell_extra=""
             ;;
         lima-x64)
             runner="run_lima"
@@ -540,7 +555,6 @@ run_suite() {
             haskell_hello="$X64_HASKELL_HELLO"
             haskell_hello_sysroot=""
             haskell_bins="$X64_HASKELL_BINS"
-            haskell_extra=""
             ;;
         *)
             echo "Unknown mode: $mode"
@@ -600,7 +614,7 @@ run_suite() {
     # Haskell bins (pandoc, shellcheck — nix interpreter, no sysroot needed)
     if [ -d "$haskell_bins" ]; then
         printf "\n${BLUE}═══ Haskell bins ═══${RESET}\n"
-        _SYSROOT=""; _HL_TIMEOUT=120; _GUEST_EXTRA="$haskell_extra"
+        _SYSROOT=""; _HL_TIMEOUT=120; _GUEST_EXTRA=""
         run_haskell_bins_tests "$dyn_runner" "$haskell_bins"
     fi
 

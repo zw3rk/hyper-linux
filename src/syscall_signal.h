@@ -108,7 +108,7 @@ typedef struct {
 /* si_code values */
 #define LINUX_SI_USER    0
 #define LINUX_SI_KERNEL  128
-#define LINUX_SI_TIMER   -2
+#define LINUX_SI_TIMER   (-2)
 
 /* si_code values for SIGTRAP (from include/uapi/asm-generic/siginfo.h) */
 #define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
@@ -138,7 +138,7 @@ typedef struct {
 /* ---------- Linux stack_t and sigaltstack constants ---------- */
 #define LINUX_SS_ONSTACK   1    /* Currently executing on altstack */
 #define LINUX_SS_DISABLE   2    /* Altstack is disabled */
-#define LINUX_MINSIGSTKSZ  2048 /* Minimum altstack size (aarch64) */
+#define LINUX_MINSIGSTKSZ  5120 /* Minimum altstack size (aarch64, post-SVE) */
 
 typedef struct {
     uint64_t ss_sp;

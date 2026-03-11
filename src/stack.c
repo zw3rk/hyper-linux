@@ -166,7 +166,8 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     str_ptr -= 16;
     uint64_t random_ptr = str_ptr;
     uint8_t random_bytes[16];
-    getentropy(random_bytes, 16);
+    if (getentropy(random_bytes, 16) != 0)
+        memset(random_bytes, 0x42, 16);  /* Fallback: deterministic fill */
     guest_write(g, random_ptr, random_bytes, 16);
 
     /* AT_PLATFORM: "aarch64\0" */
@@ -208,18 +209,22 @@ uint64_t build_linux_stack(guest_t *g, uint64_t stack_top,
     str_ptr &= ~15ULL;
     uint64_t sp = str_ptr;
 
-    /* Count auxv entries: base 15 + optional AT_BASE + AT_EXECFN +
-     * optional AT_SYSINFO_EHDR = up to 18.
+    /* Count auxv entries: base 15 (always) + AT_EXECFN (always) +
+     * AT_BASE (always, matching Linux kernel — see commit ba0b177) +
+     * optional AT_SYSINFO_EHDR + optional AT_EXECFD.
      * Each auxv entry = 2 words. Plus AT_NULL = 2 words.
      * Total words from auxv = (num_auxv_entries + 1) * 2.
-     * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) + argv_ptrs(argc) + argc(1).
+     * Plus envp_null(1) + envp_ptrs(envc) + argv_null(1) +
+     * argv_ptrs(argc) + argc(1).
      *
-     * Base auxv: 15 entries = 30 words, AT_NULL = 2 words.
-     * Optional: AT_EXECFN = +2,
-     *           AT_SYSINFO_EHDR (if vdso_base != 0) = +2.
-     * Total = 35 + optional + 1 + envc + 1 + argc + 1
+     * Base auxv: 15 entries = 30 words, AT_NULL = 2 words = 32.
+     * Always: AT_EXECFN = +2, AT_BASE = +2.
+     * Optional: AT_SYSINFO_EHDR (if vdso_base != 0) = +2,
+     *           AT_EXECFD (if execfd >= 0) = +2.
+     * Plus envp_null(1) + envp(envc) + argv_null(1) + argv(argc) + argc(1) = 3.
+     * Total = 32 + extra + 3 + envc + argc = 35 + extra + envc + argc.
      * For 16-byte alignment: total must be even. */
-    int extra = 2 + 2;  /* AT_EXECFN + AT_BASE always present */
+    int extra = 2 + 2;  /* AT_EXECFN + AT_BASE (both always present) */
     if (vdso_base != 0) extra += 2;    /* AT_SYSINFO_EHDR */
     if (execfd >= 0) extra += 2;       /* AT_EXECFD (binfmt_misc binary fd) */
     int total_entries = 35 + extra + argc + envc;

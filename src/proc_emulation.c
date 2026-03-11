@@ -7,6 +7,14 @@
  * paths. Returns host fds for synthetic content, or -2 if the path is
  * not intercepted (caller falls through to real syscall).
  */
+
+/* Maximum /proc/self/maps entries. Array is sized to this; loop bounds
+ * use MAPS_ENTRY_MAX - 1 to leave room for safe increment. */
+#define MAPS_ENTRY_MAX      256
+
+/* Column at which the region name starts in /proc/self/maps output.
+ * Matches observed Linux kernel formatting (verified via strace). */
+#define MAPS_NAME_COLUMN    73
 #include "proc_emulation.h"
 #include "syscall_proc.h"    /* proc_get_pid, proc_get_ppid, proc_get_cmdline, proc_get_elf_path */
 #include "syscall_internal.h" /* fd_to_host, FD_TABLE_SIZE */
@@ -84,9 +92,11 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /dev/fd/N -> dup(N) */
     if (strncmp(path, "/dev/fd/", 8) == 0) {
-        int n = atoi(path + 8);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 8, &endptr, 10);
+        if (endptr == path + 8 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
         return dup(host_fd);
     }
@@ -214,11 +224,11 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             uint64_t offset;
             char name[64];
         } maps_entry_t;
-        maps_entry_t entries[256];
+        maps_entry_t entries[MAPS_ENTRY_MAX];
         int nentries = 0;
 
         /* First pass: convert regions[] to VA-space entries */
-        for (int i = 0; i < g->nregions && nentries < 255; i++) {
+        for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX - 1; i++) {
             const guest_region_t *r = &g->regions[i];
             uint64_t start = r->start;
             uint64_t end = r->end;
@@ -294,7 +304,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         }
 
         /* Add preannounced entries (if any) */
-        for (int pi = 0; pi < g->npreannounced && nentries < 255; pi++) {
+        for (int pi = 0; pi < g->npreannounced && nentries < MAPS_ENTRY_MAX - 1; pi++) {
             const guest_region_t *r = &g->preannounced[pi];
             /* Skip if shadowed by actual regions */
             int shadowed = 0;
@@ -352,17 +362,28 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
                 (unsigned long long)e->end,
                 perms,
                 (unsigned long long)e->offset);
+            /* Cap lineoff to buffer size (snprintf may return more
+             * than available on truncation) */
+            if (lineoff >= (int)sizeof(line))
+                lineoff = (int)sizeof(line) - 1;
             if (e->name[0]) {
-                while (lineoff < 73 && lineoff < (int)sizeof(line) - 1)
+                while (lineoff < MAPS_NAME_COLUMN && lineoff < (int)sizeof(line) - 1)
                     line[lineoff++] = ' ';
-                lineoff += snprintf(line + lineoff, sizeof(line) - lineoff,
+                int n = snprintf(line + lineoff, sizeof(line) - lineoff,
                     "%s", e->name);
+                if (n > 0) lineoff += n;
+                if (lineoff >= (int)sizeof(line))
+                    lineoff = (int)sizeof(line) - 1;
             } else {
                 if (lineoff < (int)sizeof(line) - 1)
                     line[lineoff++] = ' ';
             }
-            off += snprintf(buf + off, sizeof(buf) - off, "%.*s\n",
-                            lineoff, line);
+            int wrote = snprintf(buf + off, sizeof(buf) - off, "%.*s\n",
+                                 lineoff, line);
+            if (wrote > 0 && off + wrote < (int)sizeof(buf))
+                off += wrote;
+            else
+                break;  /* Buffer full */
         }
 
         if (g->verbose)
@@ -500,9 +521,11 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /proc/self/fd/N -> open the target of the fd (readlink-style) */
     if (strncmp(path, "/proc/self/fd/", 14) == 0) {
-        int n = atoi(path + 14);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 14, &endptr, 10);
+        if (endptr == path + 14 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
         return dup(host_fd);
     }
@@ -640,9 +663,11 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
 
     /* /proc/self/fd/N -> path of host fd (via fcntl F_GETPATH on macOS) */
     if (strncmp(path, "/proc/self/fd/", 14) == 0) {
-        int n = atoi(path + 14);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 14, &endptr, 10);
+        if (endptr == path + 14 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
 
         char fdpath[MAXPATHLEN];

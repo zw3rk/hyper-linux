@@ -83,6 +83,7 @@
 #define SYS_clock_gettime   113
 #define SYS_clock_getres    114
 #define SYS_clock_nanosleep 115
+#define SYS_sched_setaffinity 122
 #define SYS_sched_getaffinity 123
 #define SYS_sched_yield     124
 #define SYS_kill            129
@@ -167,8 +168,6 @@
 #define SYS_fremovexattr    18
 /* chroot */
 #define SYS_chroot          51
-/* scheduling */
-#define SYS_sched_setaffinity 122
 /* network batch I/O */
 #define SYS_recvmmsg        243
 #define SYS_sendmmsg        269
@@ -283,6 +282,13 @@ typedef struct {
 #define LINUX_ESTALE       116
 #define LINUX_ENOTRECOVERABLE 131
 #define LINUX_EOWNERDEAD   130
+/* Additional errno values needed for complete macOS→Linux mapping */
+#define LINUX_ENOMSG       42   /* No message of desired type */
+#define LINUX_ENOLINK      67   /* Link has been severed */
+#define LINUX_EPROTO       71   /* Protocol error */
+#define LINUX_EMULTIHOP    72   /* Multihop attempted */
+#define LINUX_EILSEQ       84   /* Illegal byte sequence */
+#define LINUX_EHOSTDOWN   112   /* Host is down */
 
 /* ---------- Linux FD flags ---------- */
 #define LINUX_FD_CLOEXEC   1

@@ -49,7 +49,7 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
 
     fprintf(stderr,
         "\n╔══════════════════════════════════════════════════════════╗\n"
-          "║                   hl crash report                       ║\n"
+          "║                   hl crash report                        ║\n"
           "╚══════════════════════════════════════════════════════════╝\n\n");
 
     /* ── 1. Environment ─────────────────────────────────────────── */
@@ -106,7 +106,7 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
         fprintf(stderr, "## Registers\n");
         fprintf(stderr, "```\n");
 
-        uint64_t pc, cpsr;
+        uint64_t pc = 0, cpsr = 0;
         hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
         hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
         fprintf(stderr, "PC   = 0x%016llx  CPSR = 0x%016llx\n",
@@ -130,7 +130,7 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
 
         /* GPRs X0-X30 (4 per line) */
         for (int i = 0; i <= 30; i++) {
-            uint64_t val;
+            uint64_t val = 0;
             hv_vcpu_get_reg(vcpu, (hv_reg_t)(HV_REG_X0 + i), &val);
             fprintf(stderr, "X%-2d  = 0x%016llx", i, (unsigned long long)val);
             if ((i % 4) == 3 || i == 30)

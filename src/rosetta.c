@@ -94,7 +94,7 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
                     "%lluMB\n",
                     (unsigned long long)guest_base,
                     (unsigned long long)va_base,
-                    (unsigned long long)(size / (1024 * 1024)));
+                    (unsigned long long)(size / (1024ULL * 1024)));
 
         /* Initialize kbuf (kernel VA backing store) for rosetta. */
         uint64_t kbuf_gpa = (guest_base + size + BLOCK_2MB - 1)
@@ -105,7 +105,10 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
         }
         /* Register user VA alias for kbuf so syscall handlers can
          * resolve the user VA addresses we return from kernel VA mmaps. */
-        guest_add_va_alias(g, KBUF_USER_VA, kbuf_gpa, KBUF_SIZE);
+        if (guest_add_va_alias(g, KBUF_USER_VA, kbuf_gpa, KBUF_SIZE) < 0) {
+            fprintf(stderr, "hl: failed to register kbuf VA alias\n");
+            return -1;
+        }
 
         /* Persist placement in guest_t for execve re-setup */
         g->rosetta_guest_base = guest_base;
@@ -145,7 +148,7 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
                     "%lluMB\n",
                     (unsigned long long)guest_base,
                     (unsigned long long)va_base,
-                    (unsigned long long)(size / (1024 * 1024)));
+                    (unsigned long long)(size / (1024ULL * 1024)));
     }
 
     /* ---- I-cache invalidation for rosetta code segments ---- */
@@ -254,25 +257,29 @@ int rosetta_finalize(guest_t *g, hv_vcpu_t vcpu,
     }
 
     /* ---- Pre-open binary at fd 3 for rosetta ---- */
+    /* ---- Build binfmt_misc argv ---- */
+    /* rosetta_argv = [rosetta_path, binary_path, guest_argv[1:], NULL]
+     * Minimum 2 entries even when guest_argc == 0 (no argv[0]). */
+    int rosetta_argc = (guest_argc > 0) ? guest_argc + 1 : 2;
+    const char **rosetta_argv = (const char **)malloc(sizeof(char *) * (rosetta_argc + 1));
+    if (!rosetta_argv) {
+        fprintf(stderr, "hl: malloc failed for rosetta argv\n");
+        return -1;
+    }
+
+    /* Pre-open binary at fd 3 (rosetta reads it via /proc/self/fd/3).
+     * Done after malloc so the error path doesn't leak FD table entries. */
     int bin_host_fd = open(binary_path, O_RDONLY);
     if (bin_host_fd < 0) {
         fprintf(stderr, "hl: failed to pre-open binary: %s\n", binary_path);
+        free((void *)rosetta_argv);
         return -1;
     }
     int bin_guest_fd = fd_alloc_at(3, FD_REGULAR, bin_host_fd);
     if (bin_guest_fd < 0) {
         fprintf(stderr, "hl: failed to allocate fd 3 for binary\n");
         close(bin_host_fd);
-        return -1;
-    }
-
-    /* ---- Build binfmt_misc argv ---- */
-    /* rosetta_argv = [rosetta_path, binary_path, guest_argv[1:], NULL]
-     * Minimum 2 entries even when guest_argc == 0 (no argv[0]). */
-    int rosetta_argc = (guest_argc > 0) ? guest_argc + 1 : 2;
-    const char **rosetta_argv = malloc(sizeof(char *) * (rosetta_argc + 1));
-    if (!rosetta_argv) {
-        fprintf(stderr, "hl: malloc failed for rosetta argv\n");
+        free((void *)rosetta_argv);
         return -1;
     }
     rosetta_argv[0] = ROSETTA_PATH;

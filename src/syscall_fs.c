@@ -281,8 +281,12 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
+    /* Apply sysroot redirect for absolute paths */
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *fs_path = resolve_sysroot_path(path, sysroot_buf,
+                                                sizeof(sysroot_buf));
     struct statfs mac_st;
-    if (statfs(path, &mac_st) < 0)
+    if (statfs(fs_path, &mac_st) < 0)
         return linux_errno();
 
     linux_statfs_t lin_st;
@@ -486,9 +490,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
          * Linux aarch64 layout: {short l_type, short l_whence,
          *   long l_start, long l_len, int l_pid, pad[4]}
          * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
-         *   short l_type, short l_whence} */
-        uint8_t *lflock = guest_ptr(g, arg);
-        if (!lflock) return -LINUX_EFAULT;
+         *   short l_type, short l_whence}
+         * Use guest_read/guest_write (not guest_ptr) to safely handle
+         * structs that span 2MB page table block boundaries. */
+        uint8_t lflock[32];  /* Linux struct flock is 32 bytes on aarch64 */
+        if (guest_read(g, arg, lflock, sizeof(lflock)) < 0)
+            return -LINUX_EFAULT;
 
         /* Read Linux flock fields */
         int16_t l_type, l_whence;
@@ -515,11 +522,14 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
             int16_t rt = mac_fl.l_type, rw = mac_fl.l_whence;
             int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
             int32_t rp = mac_fl.l_pid;
+            memset(lflock, 0, sizeof(lflock));
             memcpy(lflock + 0, &rt, 2);
             memcpy(lflock + 2, &rw, 2);
             memcpy(lflock + 8, &rs, 8);
             memcpy(lflock + 16, &rl, 8);
             memcpy(lflock + 24, &rp, 4);
+            if (guest_write(g, arg, lflock, sizeof(lflock)) < 0)
+                return -LINUX_EFAULT;
         }
         return 0;
     }
@@ -595,11 +605,16 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     DIR *dir = (DIR *)fd_table[fd].dir;
     if (!dir) return -LINUX_ENOTDIR;
 
-    uint8_t *guest_buf = guest_ptr(g, buf_gva);
-    if (!guest_buf) return -LINUX_EFAULT;
+    if (!guest_ptr(g, buf_gva)) return -LINUX_EFAULT;
 
     size_t guest_pos = 0;
     struct dirent *de;
+
+    /* Temp buffer for dirent serialization — max dirent64 is 280 bytes
+     * (19-byte header + NAME_MAX=255 + null + padding to 8). Using a
+     * stack buffer avoids guest_ptr boundary issues: guest_write() handles
+     * 2MB block crossings that raw memcpy into guest_ptr() cannot. */
+    uint8_t entry_buf[280];
 
     while (1) {
         /* Save position BEFORE readdir so we can rewind if the entry
@@ -625,11 +640,16 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
         lde.d_reclen = (uint16_t)reclen;
         lde.d_type = de->d_type;
 
-        memcpy(guest_buf + guest_pos, &lde, sizeof(lde));
-        memcpy(guest_buf + guest_pos + 19, de->d_name, name_len + 1);
+        /* Serialize entry into temp buffer, then copy to guest via
+         * guest_write() which handles 2MB block boundary crossings. */
+        memcpy(entry_buf, &lde, sizeof(lde));
+        memcpy(entry_buf + 19, de->d_name, name_len + 1);
         size_t pad_start = 19 + name_len + 1;
         if (pad_start < reclen)
-            memset(guest_buf + guest_pos + pad_start, 0, reclen - pad_start);
+            memset(entry_buf + pad_start, 0, reclen - pad_start);
+
+        if (guest_write(g, buf_gva + guest_pos, entry_buf, reclen) < 0)
+            return guest_pos > 0 ? (int64_t)guest_pos : -LINUX_EFAULT;
 
         guest_pos += reclen;
     }
@@ -667,8 +687,14 @@ int64_t sys_chroot(guest_t *g, uint64_t path_gva) {
      * doesn't make sense in hl's single-process VM.  This enables
      * coreutils stdbuf (which does fork → chroot("/") → exec) and the
      * chroot coreutil itself. */
-    if (strcmp(path, "/") != 0)
+    if (strcmp(path, "/") != 0) {
+        struct stat st;
+        if (stat(path, &st) < 0)
+            return linux_errno();
+        if (!S_ISDIR(st.st_mode))
+            return -LINUX_ENOTDIR;
         proc_set_sysroot(path);
+    }
     return 0;
 }
 
@@ -752,7 +778,11 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
-    ssize_t len = readlinkat(host_dirfd, path, link, sizeof(link) - 1);
+    /* Apply sysroot redirect for absolute paths */
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *read_path = resolve_sysroot_path(path, sysroot_buf,
+                                                  sizeof(sysroot_buf));
+    ssize_t len = readlinkat(host_dirfd, read_path, link, sizeof(link) - 1);
     if (len < 0) return linux_errno();
 
     size_t copy_len = (size_t)len < bufsiz ? (size_t)len : bufsiz;
@@ -827,7 +857,8 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                 return linux_errno();
             return 0;
         }
-        /* For non-CWD dirfds, emulate with link+unlink to ensure atomicity */
+        /* For non-CWD dirfds, emulate with link+unlink (not atomic, but
+         * link fails if dest exists, approximating RENAME_NOREPLACE) */
         if (linkat(host_olddir, oldpath, host_newdir, newpath, 0) < 0)
             return linux_errno();
         unlinkat(host_olddir, oldpath, 0);
@@ -1094,11 +1125,23 @@ int64_t sys_getxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Use a host-side buffer to avoid guest_ptr spanning 2MB block
+     * boundaries.  Cap at 64KB (Linux XATTR_SIZE_MAX). */
+    if (size > 65536) return -LINUX_E2BIG;
+    void *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = getxattr(path, name, buf, size, 0, opts);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret < 0) {
+        free(buf);
+        return linux_errno();
+    }
+    if (guest_write(g, value_gva, buf, (size_t)ret) < 0) {
+        free(buf);
+        return -LINUX_EFAULT;
+    }
+    free(buf);
+    return ret;
 }
 
 int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
@@ -1110,8 +1153,17 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf && size > 0) return -LINUX_EFAULT;
+    /* Use host-side buffer to safely read from guest memory. */
+    if (size > 65536) return -LINUX_E2BIG;
+    void *buf = NULL;
+    if (size > 0) {
+        buf = malloc(size);
+        if (!buf) return -LINUX_ENOMEM;
+        if (guest_read(g, value_gva, buf, size) < 0) {
+            free(buf);
+            return -LINUX_EFAULT;
+        }
+    }
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
     /* Linux flags: XATTR_CREATE=1, XATTR_REPLACE=2 — same on macOS */
@@ -1119,6 +1171,7 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (flags & 2) opts |= XATTR_REPLACE;
 
     int ret = setxattr(path, name, buf, size, 0, opts);
+    free(buf);
     return ret < 0 ? linux_errno() : 0;
 }
 
@@ -1135,11 +1188,17 @@ int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, list_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = listxattr(path, buf, size, opts);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, list_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_removexattr(guest_t *g, uint64_t path_gva,
@@ -1169,11 +1228,17 @@ int64_t sys_fgetxattr(guest_t *g, int fd, uint64_t name_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = fgetxattr(host_fd, name, buf, size, 0, 0);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, value_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
@@ -1185,15 +1250,22 @@ int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf && size > 0) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = NULL;
+    if (size > 0) {
+        buf = malloc(size);
+        if (!buf) return -LINUX_ENOMEM;
+        if (guest_read(g, value_gva, buf, size) < 0) { free(buf); return -LINUX_EFAULT; }
+    }
 
     int opts = 0;
     if (flags & 1) opts |= XATTR_CREATE;
     if (flags & 2) opts |= XATTR_REPLACE;
 
     int ret = fsetxattr(host_fd, name, buf, size, 0, opts);
-    return ret < 0 ? linux_errno() : 0;
+    int64_t result = ret < 0 ? linux_errno() : 0;
+    free(buf);
+    return result;
 }
 
 int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
@@ -1205,11 +1277,17 @@ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, list_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = flistxattr(host_fd, buf, size, 0);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, list_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva) {

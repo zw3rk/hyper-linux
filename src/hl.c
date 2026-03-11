@@ -329,6 +329,7 @@ int main(int argc, const char **argv) {
      * IMPORTANT: Apple HVF enforces W^X even with SCTLR.WXN=0.
      * This region must NOT overlap with any RW region in the same
      * 2MB block, or the merged RWX permissions will cause faults. */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = SHIM_BASE,
         .gpa_end   = SHIM_BASE + shim_bin_len,
@@ -336,6 +337,7 @@ int main(int argc, const char **argv) {
     };
 
     /* Shim data/stack (RW) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = SHIM_DATA_BASE,
         .gpa_end   = SHIM_DATA_BASE + BLOCK_2MB,
@@ -379,6 +381,7 @@ int main(int argc, const char **argv) {
 
     /* brk region (RW). Pre-mapped up to MMAP_RX_BASE; brk can grow
      * beyond via dynamic page table extension in sys_brk. */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g.brk_base,
         .gpa_end   = MMAP_RX_BASE,
@@ -386,6 +389,7 @@ int main(int argc, const char **argv) {
     };
 
     /* Stack (RW) — position is dynamic (above brk) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g.stack_base,
         .gpa_end   = g.stack_top,
@@ -396,6 +400,7 @@ int main(int argc, const char **argv) {
      * Apple HVF enforces W^X on page table entries: a 2MB block can't be
      * both writable and executable. Shared library text (PROT_EXEC) goes
      * here, separate from RW data in the main mmap region. */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_RX_BASE,
         .gpa_end   = MMAP_RX_INITIAL_END,
@@ -410,12 +415,21 @@ int main(int argc, const char **argv) {
      * or address-space partitioning). Additional pages beyond
      * MMAP_INITIAL_END are mapped dynamically by
      * guest_extend_page_tables(). */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_BASE,
         .gpa_end   = MMAP_INITIAL_END,
         .perms     = MEM_PERM_RW
     };
     g.mmap_end = MMAP_INITIAL_END;
+
+    if (0) {
+too_many_regions:
+        fprintf(stderr, "hl: too many memory regions (%d >= %d)\n",
+                nregions, MAX_REGIONS);
+        guest_destroy(&g);
+        return 1;
+    }
 
     uint64_t ttbr0 = guest_build_page_tables(&g, regions, nregions);
     if (!ttbr0) {
@@ -568,17 +582,36 @@ int main(int argc, const char **argv) {
                                0 /* no dynamic linker for rosetta */,
                                vdso_addr,
                                3 /* AT_EXECFD: binary pre-opened at fd 3 */);
-        free(rosetta_argv);
+        free((void *)rosetta_argv);
+        if (sp == 0) {
+            fprintf(stderr, "hl: failed to build initial stack\n");
+            hv_vcpu_destroy(vcpu);
+            guest_destroy(&g);
+            return 1;
+        }
         entry_point = rr.entry_point;
     } else {
         /* Normal aarch64 mode */
         proc_set_cmdline(guest_argc, guest_argv);
+
+        /* Build vDSO for the signal restorer fallback (sa_restorer == 0).
+         * musl/glibc always set sa_restorer, but raw rt_sigaction users
+         * or other libc implementations may rely on the kernel-provided
+         * vDSO trampoline. Building it unconditionally is safe (1 page). */
+        uint64_t native_vdso = vdso_build(&g);
+
         sp = build_linux_stack(&g, g.stack_top,
                                guest_argc, guest_argv,
                                environ, &elf_info,
                                elf_load_base, interp_base,
-                               0 /* no vDSO for aarch64 */,
+                               native_vdso,
                                -1 /* no AT_EXECFD */);
+        if (sp == 0) {
+            fprintf(stderr, "hl: failed to build initial stack\n");
+            hv_vcpu_destroy(vcpu);
+            guest_destroy(&g);
+            return 1;
+        }
 
         /* Entry point: interpreter entry if dynamic, ELF entry if static. */
         entry_point = (interp_base != 0)
@@ -602,7 +635,7 @@ int main(int argc, const char **argv) {
     /* Register main thread in the thread table (before entering run loop) */
     thread_register_main(vcpu, vexit, proc_get_pid(), el1_sp);
 
-    /* -- System registers (all set from host, no HVC #4 in shim) -- */
+    /* -- System registers (set from host; MMU enable deferred to HVC #4) -- */
 
     /* VBAR_EL1: vector table at shim_base + 0x800 (.align 11 offset) */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1,

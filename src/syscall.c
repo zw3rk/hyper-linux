@@ -52,7 +52,7 @@
 /* Protects mmap/brk bump allocators and page table extension. Multiple
  * threads may call mmap/brk concurrently; without this lock they could
  * get overlapping allocations or corrupt page table structures. */
-static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close).
  * File descriptor operations from concurrent threads must be serialized. */
@@ -204,23 +204,32 @@ int fd_alloc_at(int fd, int type, int host_fd) {
         case FD_INOTIFY:  inotify_close(fd);  break;
         default: break;
         }
-        close(old_host_fd);
+        /* Don't close host stdin/stdout/stderr — hl uses them for
+         * diagnostics. The guest may dup2() over fd 0/1/2 but the
+         * host process still needs the original stdio fds. */
+        if (old_type != FD_STDIO)
+            close(old_host_fd);
     }
 
     return fd;
 }
 
-void fd_mark_closed(int fd) {
-    pthread_mutex_lock(&fd_lock);
+/* Internal: mark fd closed with fd_lock already held.
+ * Clear host_fd and dir BEFORE marking the slot free in the bitmap.
+ * Otherwise another thread could fd_alloc() this slot, populate it
+ * with a new host_fd/dir, and then our stale writes would corrupt
+ * the new entry. */
+void fd_mark_closed_unlocked(int fd) {
     fd_table[fd].type = FD_CLOSED;
-    /* Clear host_fd and dir BEFORE marking the slot free in the bitmap.
-     * Otherwise another thread could fd_alloc() this slot, populate it
-     * with a new host_fd/dir, and then our stale writes would corrupt
-     * the new entry. */
     fd_table[fd].host_fd = -1;
     fd_table[fd].dir = NULL;
     fd_table[fd].linux_flags = 0;
     fd_bitmap_set_free(fd);
+}
+
+void fd_mark_closed(int fd) {
+    pthread_mutex_lock(&fd_lock);
+    fd_mark_closed_unlocked(fd);
     pthread_mutex_unlock(&fd_lock);
 }
 
@@ -290,7 +299,10 @@ int64_t linux_errno(void) {
     case ENOTEMPTY:    return -LINUX_ENOTEMPTY;    /* mac 66 → linux 39 */
     case ELOOP:        return -LINUX_ELOOP;        /* mac 62 → linux 40 */
     case ENOPROTOOPT:  return -LINUX_ENOPROTOOPT;  /* mac 42 → linux 92 */
-    case EOPNOTSUPP:   return -LINUX_EOPNOTSUPP;   /* mac 45 → linux 95 */
+    case EOPNOTSUPP:   return -LINUX_EOPNOTSUPP;   /* mac 102 → linux 95 */
+#if ENOTSUP != EOPNOTSUPP
+    case ENOTSUP:      return -LINUX_EOPNOTSUPP;   /* mac 45 → linux 95 */
+#endif
     case EOVERFLOW:    return -LINUX_EOVERFLOW;    /* mac 84 → linux 75 */
     /* Networking errno values */
     case ECONNREFUSED: return -LINUX_ECONNREFUSED; /* mac 61 → linux 111 */
@@ -311,7 +323,8 @@ int64_t linux_errno(void) {
     case EPROTOTYPE:   return -LINUX_EPROTOTYPE;   /* mac 41 → linux 91 */
     case ETIMEDOUT:    return -LINUX_ETIMEDOUT;    /* mac 60 → linux 110 */
     case ENOBUFS:      return -LINUX_ENOBUFS;      /* mac 55 → linux 105 */
-    /* ENOTSUP == EOPNOTSUPP on macOS (both 45), handled above */
+    /* ENOTSUP (mac 45) and EOPNOTSUPP (mac 102) are distinct on modern
+     * macOS (__DARWIN_UNIX03). Both map to Linux EOPNOTSUPP (95). */
     case EPROTONOSUPPORT: return -LINUX_EPROTONOSUPPORT; /* mac 43 → linux 93 */
     case ESOCKTNOSUPPORT: return -LINUX_ESOCKTNOSUPPORT; /* mac 44 → linux 94 */
     case ENETDOWN:     return -LINUX_ENETDOWN;     /* mac 50 → linux 100 */
@@ -320,6 +333,13 @@ int64_t linux_errno(void) {
     case ETOOMANYREFS: return -LINUX_ETOOMANYREFS; /* mac 59 → linux 109 */
     case EDQUOT:       return -LINUX_EDQUOT;       /* mac 69 → linux 122 */
     case ESTALE:       return -LINUX_ESTALE;       /* mac 70 → linux 116 */
+    /* Additional macOS-specific errno values that diverge from Linux */
+    case ENOMSG:       return -LINUX_ENOMSG;       /* mac 91 → linux 42 */
+    case EILSEQ:       return -LINUX_EILSEQ;       /* mac 92 → linux 84 */
+    case EHOSTDOWN:    return -LINUX_EHOSTDOWN;    /* mac 64 → linux 112 */
+    case EMULTIHOP:    return -LINUX_EMULTIHOP;    /* mac 95 → linux 72 */
+    case ENOLINK:      return -LINUX_ENOLINK;      /* mac 97 → linux 67 */
+    case EPROTO:       return -LINUX_EPROTO;       /* mac 100 → linux 71 */
 #ifdef ENOTRECOVERABLE
     case ENOTRECOVERABLE: return -LINUX_ENOTRECOVERABLE; /* mac 104 → linux 131 */
 #endif
@@ -535,10 +555,12 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
     if (new_off > g->brk_base) {
         /* Remove old heap region and add updated one */
         guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
-        guest_region_add(g, g->brk_base, new_off,
-                         LINUX_PROT_READ | LINUX_PROT_WRITE,
-                         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                         0, "[heap]");
+        if (guest_region_add(g, g->brk_base, new_off,
+                             LINUX_PROT_READ | LINUX_PROT_WRITE,
+                             LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                             0, "[heap]") < 0) {
+            /* Non-fatal: heap is mapped, just untracked in /proc/self/maps */
+        }
     } else {
         /* brk shrank back to base — remove heap region */
         guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
@@ -576,10 +598,10 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
     uint64_t va_block_end   = (va + length + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
 
     int alloc_count = 0, skip_count = 0;
-    int total_blocks = (int)((va_block_end - va_block_start) / BLOCK_2MB);
+    uint64_t total_blocks = (va_block_end - va_block_start) / BLOCK_2MB;
     if (total_blocks > 2 && hl_verbose)
-        fprintf(stderr, "hl: mmap_high_va: mapping %d 2MB blocks "
-                "[0x%llx,0x%llx)\n", total_blocks,
+        fprintf(stderr, "hl: mmap_high_va: mapping %llu 2MB blocks "
+                "[0x%llx,0x%llx)\n", (unsigned long long)total_blocks,
                 (unsigned long long)va_block_start,
                 (unsigned long long)va_block_end);
     for (uint64_t bva = va_block_start; bva < va_block_end; bva += BLOCK_2MB) {
@@ -609,7 +631,9 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
                             (unsigned long long)update_start,
                             (unsigned long long)update_end,
                             page_perms);
-                guest_split_block(g, bva);
+                if (guest_split_block(g, bva) < 0 && hl_verbose)
+                    fprintf(stderr, "hl: mmap_high_va: split_block failed "
+                            "for 0x%llx\n", (unsigned long long)bva);
                 guest_update_perms(g, update_start, update_end, page_perms);
                 g->need_tlbi = 1;
             }
@@ -702,7 +726,8 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
     }
     if (total_blocks > 2 && hl_verbose)
         fprintf(stderr, "hl: mmap_high_va: allocated=%d skipped=%d "
-                "total=%d\n", alloc_count, skip_count, total_blocks);
+                "total=%llu\n", alloc_count, skip_count,
+                (unsigned long long)total_blocks);
 
     /* PROT_NONE is purely an address reservation — no data to write.
      * Page table entries are already created (for guest_ptr resolution),
@@ -761,8 +786,9 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
     int is_prot_none = (prot == LINUX_PROT_NONE);
 
     /* We handle all mmap variants. For file-backed MAP_SHARED, we fall
-     * back to MAP_PRIVATE semantics (copy-on-write). Since the guest
-     * is single-process, shared vs private is equivalent. */
+     * back to MAP_PRIVATE semantics (copy-on-write). All threads share
+     * the same guest_t address space (CLONE_VM semantics), so MAP_SHARED
+     * and MAP_PRIVATE are equivalent within the guest. */
 
     /* Linux rejects zero-length mmap */
     if (length == 0) return -LINUX_EINVAL;
@@ -849,6 +875,9 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             /* High VA (above primary buffer): allocate backing GPA and
              * create non-identity page table mapping. Used by rosetta's
              * internal allocators (slab, translation cache, etc.). */
+            /* sys_mmap_high_va modifies page tables, regions, and
+             * overflow segments — thread-safe because the caller
+             * (syscall_dispatch) holds mmap_lock around sys_mmap. */
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset);
         }
         result_off = off;
@@ -1011,10 +1040,10 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                                & ~(BLOCK_2MB - 1);
             if (ext_end > g->mmap_limit) ext_end = g->mmap_limit;
             /* Preserve execute permission for RWX requests (e.g., rosetta's
-             * JIT buffer). make_block_desc/make_page_desc handle combined
-             * W+X by setting AP=RW_EL0 with UXN/PXN=0. HVF stage-2 is
-             * already mapped RWX; stage-1 RWX entries let rosetta JIT
-             * write and execute code without W^X page toggling. */
+             * JIT buffer). Stage-2 (hv_vm_map) is RWX for the whole
+             * buffer; stage-1 PTEs set AP=RW_EL0 with UXN/PXN=0 for
+             * combined W+X. HVF allows this in stage-1 even though
+             * normal W^X enforcement disallows it per HV_MEMORY flags. */
             int ext_perms = MEM_PERM_RW;
             if (prot & LINUX_PROT_EXEC) ext_perms |= MEM_PERM_X;
             if (guest_extend_page_tables(g, ext_start, ext_end,
@@ -1071,21 +1100,8 @@ static void thread_force_exit_cb(thread_entry_t *t, void *ctx) {
     hv_vcpus_exit(&t->vcpu, 1);
 }
 
-/* Callback for thread_for_each: join each worker thread with a timeout.
- * This allows CLONE_CHILD_CLEARTID futex wake to complete before the
- * main thread exits. Skips the calling thread. */
-static void thread_join_workers_cb(thread_entry_t *t, void *ctx) {
-    (void)ctx;
-    if (t == current_thread) return;
-    if (!t->active) return;
-
-    /* macOS does not have pthread_timedjoin_np, so we use a detach
-     * approach: wait briefly via pthread_join. If the worker thread was
-     * signaled by hv_vcpus_exit and had time to finish, this returns
-     * quickly. If it's stuck in a host blocking call, we accept the
-     * brief block — the wakeup pipe mechanism should have unblocked it. */
-    pthread_join(t->host_thread, NULL);
-}
+/* Defined in thread.c — joins workers outside thread_lock so
+ * they can call thread_deactivate() to set active=0. */
 
 /* ---------- Main dispatch ---------- */
 
@@ -1143,7 +1159,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         /* Join worker threads to allow CLONE_CHILD_CLEARTID futex wake
          * to complete before the process exits. Without this, the main
          * thread may exit before workers finish their cleanup. */
-        thread_for_each(thread_join_workers_cb, NULL);
+        thread_join_workers();
 
         *exit_code = (int)x0;
         should_exit = 1;
@@ -1239,11 +1255,13 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         if (unmap_addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
             /* Kernel VA (TTBR1 kbuf): zero the backing memory and
              * remove region tracking. PTEs remain valid — kbuf L2
-             * block descriptors are pre-built. */
+             * block descriptors are pre-built. Only process addresses
+             * within the kbuf range. */
             uint64_t koff = unmap_addr - KBUF_VA_BASE;
-            if (koff + unmap_len <= KBUF_SIZE)
+            if (koff + unmap_len <= KBUF_SIZE) {
                 memset((uint8_t *)g->kbuf_base + koff, 0, unmap_len);
-            guest_region_remove(g, unmap_addr, unmap_addr + unmap_len);
+                guest_region_remove(g, unmap_addr, unmap_addr + unmap_len);
+            }
         } else if (unmap_addr > 0x0000FFFFFFFFFFFFULL) {
             /* Kernel VA without kbuf: no-op */
         } else {
@@ -1350,8 +1368,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                     if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
                     if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
 
-                    guest_extend_page_tables(g, mprot_off,
-                                              mprot_off + mprot_len, page_perms);
+                    if (guest_extend_page_tables(g, mprot_off,
+                                              mprot_off + mprot_len, page_perms) < 0) {
+                        pthread_mutex_unlock(&mmap_lock);
+                        result = -LINUX_ENOMEM;
+                        break;
+                    }
                     guest_update_perms(g, mprot_off, mprot_off + mprot_len,
                                        page_perms);
                 } else {
@@ -1715,11 +1737,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         int sig = (int)x1;
         int pid = (int)x0;
         int64_t our_pid = proc_get_pid();
-        if (sig == 0) {
+        if (sig < 0 || sig > LINUX_NSIG) {
+            result = -LINUX_EINVAL;
+        } else if (sig == 0) {
             /* Signal 0: just check if process exists */
-            result = (pid == (int)our_pid || pid == 0 || pid == -1) ? 0 : -LINUX_ESRCH;
-        } else if (pid == (int)our_pid || pid == 0 || pid == -1) {
-            /* Sending to self (or all processes in our model) */
+            result = (pid == (int)our_pid || pid == 0 || pid == -1
+                      || pid == -(int)our_pid) ? 0 : -LINUX_ESRCH;
+        } else if (pid == (int)our_pid || pid == 0 || pid == -1
+                   || pid == -(int)our_pid) {
+            /* Sending to self or our process group */
             signal_queue(sig);
             result = 0;
         } else {
@@ -1730,6 +1756,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_tgkill: {
         int sig = (int)x2;
         int tid = (int)x1;
+        if (sig < 0 || sig > LINUX_NSIG) {
+            result = -LINUX_EINVAL;
+            break;
+        }
         /* Accept tgkill targeting any active thread in our process */
         thread_entry_t *target = thread_find((int64_t)tid);
         if (!target) {

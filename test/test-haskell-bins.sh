@@ -12,8 +12,7 @@
 #        where <haskell-bins-dir> contains: pandoc, shellcheck
 #        <sysroot> is optional; when set, dynamically-linked binaries
 #        (pandoc) are run with --sysroot <sysroot>.
-#        <guest-extra-args> is optional; passed to every guest binary
-#        (e.g. "+RTS -xr4G -RTS" to shrink GHC's VA reservation on M1).
+#        <guest-extra-args> is optional; passed to every guest binary.
 
 set -euo pipefail
 

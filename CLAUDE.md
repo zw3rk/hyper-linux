@@ -31,7 +31,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **Apple HVF enforces W^X** even with SCTLR.WXN=0. Regions can't be both writable
   and executable simultaneously. Use RW for data, RX for code.
 - **SCTLR RES1 bits must be set explicitly** — HVF returns default SCTLR=0x0.
-  Use SCTLR_RES1 mask (0x30D01804) + desired bits.
+  Use SCTLR_RES1 mask (0x30D00980) + desired bits.
 - **MMU must be enabled during vCPU execution** — via HVC #4 from the shim,
   not before hv_vcpu_run(). Setting SCTLR.M=1 via hv_vcpu_set_sys_reg before
   start causes permission faults on first instruction fetch.
@@ -70,8 +70,13 @@ memory that DC ZVA was supposed to zero), causing assertion failures.
 |-------|---------|-----------|
 | #0 | Normal exit | x0 = exit code |
 | #2 | Bad exception | x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector |
-| #4 | Set sysreg | x0 = reg ID, x1 = value |
+| #4 | Set sysreg | x0 = reg ID (0-8), x1 = value |
 | #5 | Syscall forward | X0-X5=args, X8=syscall nr; on return X8=TLBI flag |
+| #7 | MRS trap (read sysreg) | host reads reg from ESR ISS; returns value in x0 |
+| #9 | W^X toggle | x0=FAR, x1=type (0=exec→RX, 1=write→RW) |
+| #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
+| #11 | EL0 fault | SIGSEGV delivery; GPRs in frame |
+| #12 | System instruction trap | cache maintenance logging (DC CVAU, IC IVAU, etc.) |
 
 ## Build
 
@@ -134,7 +139,8 @@ hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
 
 How it works:
 1. `elf_load()` parses PT_INTERP to find the interpreter path (e.g., `/lib/ld-musl-aarch64.so.1`)
-2. The interpreter is loaded as ET_DYN at `INTERP_LOAD_BASE` (0x40000000)
+2. The interpreter is loaded as ET_DYN at `g->interp_base` (computed dynamically:
+   60GB for 36-bit IPA, 1020GB for 40-bit IPA)
 3. `build_linux_stack()` passes `AT_BASE` (interpreter load address) and
    `AT_EXECFN` (argv[0]) in the auxiliary vector
 4. Entry point is set to `interp_entry + load_base` (dynamic linker takes over)

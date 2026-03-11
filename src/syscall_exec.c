@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <dirent.h>
 #include <libkern/OSCacheControl.h>
 
@@ -42,7 +43,7 @@ static int read_string_array(guest_t *g, uint64_t array_gva,
 
     for (int i = 0; i < max_count; i++) {
         uint64_t ptr;
-        if (guest_read(g, array_gva + i * 8, &ptr, 8) < 0)
+        if (guest_read(g, array_gva + (uint64_t)i * 8, &ptr, 8) < 0)
             return -1;
         if (ptr == 0) break; /* NULL terminator */
 
@@ -75,7 +76,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     /* Step 2: Read argv[] and envp[] from guest memory */
     #define MAX_ARGS 256
     #define MAX_ENVS 4096
-    #define STR_BUF_SIZE (256 * 1024)
+    #define STR_BUF_SIZE ((size_t)256 * 1024)
 
     char *argv[MAX_ARGS + 1];
     char *envp[MAX_ENVS + 1];
@@ -206,52 +207,15 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         }
     }
 
-    /* Step 4: Close CLOEXEC fds — must dispatch by type to avoid UB
-     * (e.g., calling closedir() on an epoll_instance_t pointer). */
-    for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type != FD_CLOSED &&
-            (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
-            /* Clean up type-specific resources */
-            if (fd_table[i].dir) {
-                if (fd_table[i].type == FD_DIR)
-                    closedir((DIR *)fd_table[i].dir);
-                else
-                    free(fd_table[i].dir); /* FD_EPOLL */
-                fd_table[i].dir = NULL;
-            }
-            switch (fd_table[i].type) {
-            case FD_EVENTFD:  eventfd_close(i);  break;
-            case FD_SIGNALFD: signalfd_close(i); break;
-            case FD_TIMERFD:  timerfd_close(i);  break;
-            case FD_INOTIFY:  inotify_close(i);  break;
-            default: break;
-            }
-            if (fd_table[i].type != FD_STDIO)
-                close(fd_table[i].host_fd);
-            fd_mark_closed(i);
-        }
-    }
+    /* === PRE-PNR VALIDATION ===
+     * All checks that can fail gracefully MUST happen before guest_reset().
+     * After guest_reset(), the old process image is gone — failures are
+     * unrecoverable, matching the Linux kernel's behavior (SIGKILL). */
 
-    /* Detect x86_64 → rosetta transition */
+    /* Detect x86_64 → rosetta (needed for pre-validation and later) */
     int need_rosetta = (elf_info.e_machine == EM_X86_64);
 
-    /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
-    guest_reset(g);
-    mmap_reset_hints();
-
-    /* Step 5b: Reset signal state for exec (POSIX requirement).
-     * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN),
-     * pending signals preserved, signal mask preserved. */
-    signal_reset_for_exec();
-
-    /* Step 6: Reload shim into guest */
-    const unsigned char *shim_ptr = proc_get_shim_blob();
-    unsigned int shim_size = proc_get_shim_size();
-    if (shim_ptr && shim_size > 0) {
-        memcpy((uint8_t *)g->host_base + SHIM_BASE, shim_ptr, shim_size);
-    }
-
-    /* Step 7: Load new ELF segments into guest memory.
+    /* Compute load base once (used for size check and later mapping).
      * PIE (ET_DYN) binaries start near address 0 and would overlap with
      * the shim; load them at PIE_LOAD_BASE instead. */
     uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
@@ -267,27 +231,20 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         return -LINUX_ENOEXEC;
     }
 
-    if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size,
-                         elf_load_base) < 0) {
-        fprintf(stderr, "hl: execve: failed to map ELF segments for %s\n", path);
-        free(argv_buf); free(envp_buf);
-        return -LINUX_ENOEXEC;
-    }
-
-    /* Step 7b: Load interpreter if aarch64 dynamically linked.
-     * For x86_64 + rosetta, rosetta handles dynamic linking internally. */
+    /* Pre-load interpreter (headers only) for non-rosetta dynamic binaries.
+     * This validates the interpreter exists and is a valid ELF before we
+     * cross the point of no return. elf_map_segments() happens post-PNR. */
     elf_info_t interp_info;
-    uint64_t interp_base = 0;
     memset(&interp_info, 0, sizeof(interp_info));
+    char interp_resolved[LINUX_PATH_MAX];
+    interp_resolved[0] = '\0';
 
     if (!need_rosetta && elf_info.interp_path[0] != '\0') {
-        const char *sr = proc_get_sysroot();
-        char interp_resolved[LINUX_PATH_MAX];
-        elf_resolve_interp(sr, elf_info.interp_path,
+        elf_resolve_interp(proc_get_sysroot(), elf_info.interp_path,
                            interp_resolved, sizeof(interp_resolved));
 
         if (verbose)
-            fprintf(stderr, "hl: execve: loading interpreter: %s\n",
+            fprintf(stderr, "hl: execve: pre-validating interpreter: %s\n",
                     interp_resolved);
 
         if (elf_load(interp_resolved, &interp_info) < 0) {
@@ -296,13 +253,107 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             free(argv_buf); free(envp_buf);
             return -LINUX_ENOEXEC;
         }
+    }
 
+    /* Pre-validate rosetta binary exists */
+    if (need_rosetta) {
+        if (access(ROSETTA_PATH, X_OK) != 0) {
+            fprintf(stderr, "hl: execve: rosetta not found at %s\n",
+                    ROSETTA_PATH);
+            free(argv_buf); free(envp_buf);
+            return -LINUX_ENOEXEC;
+        }
+    }
+
+    /* === POINT OF NO RETURN ===
+     * guest_reset() zeroes all guest memory — the old process image is gone.
+     * All validation that can fail gracefully MUST happen above this line.
+     * Failures below are unrecoverable — we exit fatally, matching the
+     * Linux kernel's behavior (SIGKILL after exec PNR). */
+
+    /* Step 4: Close CLOEXEC fds — snapshot under fd_lock, then do
+     * type-specific cleanup outside the lock.  Cleanup functions
+     * (eventfd_close, signalfd_close, etc.) acquire sfd_lock or
+     * inotify_lock, which must NOT be held under fd_lock (lock
+     * ordering: fd_lock(3) < sfd_lock(5a) < inotify_lock(7)). */
+    typedef struct { int fd; int type; int host_fd; void *dir; } cloexec_t;
+    cloexec_t cloexec_list[FD_TABLE_SIZE];
+    int cloexec_count = 0;
+
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type != FD_CLOSED &&
+            (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
+            cloexec_list[cloexec_count++] = (cloexec_t){
+                i, fd_table[i].type, fd_table[i].host_fd, fd_table[i].dir
+            };
+            fd_table[i].dir = NULL;
+            fd_mark_closed_unlocked(i);
+        }
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    /* Now do type-specific cleanup without holding fd_lock */
+    for (int j = 0; j < cloexec_count; j++) {
+        if (cloexec_list[j].dir) {
+            if (cloexec_list[j].type == FD_DIR)
+                closedir((DIR *)cloexec_list[j].dir);
+            else
+                free(cloexec_list[j].dir); /* FD_EPOLL */
+        }
+        switch (cloexec_list[j].type) {
+        case FD_EVENTFD:  eventfd_close(cloexec_list[j].fd);  break;
+        case FD_SIGNALFD: signalfd_close(cloexec_list[j].fd); break;
+        case FD_TIMERFD:  timerfd_close(cloexec_list[j].fd);  break;
+        case FD_INOTIFY:  inotify_close(cloexec_list[j].fd);  break;
+        default: break;
+        }
+        if (cloexec_list[j].type != FD_STDIO)
+            close(cloexec_list[j].host_fd);
+    }
+
+    /* Step 5: Reset guest memory (zero ELF, brk, stack, mmap regions) */
+    guest_reset(g);
+    mmap_reset_hints();
+
+    /* Step 5a: Reset global process flags.  After exec, the new image
+     * starts fresh — stale exit_group / futex_interrupt flags from a
+     * previous multi-threaded state must not leak into the new program. */
+    extern _Atomic int futex_interrupt_requested;
+    atomic_store(&exit_group_requested, 0);
+    atomic_store(&futex_interrupt_requested, 0);
+
+    /* Step 5b: Reset signal state for exec (POSIX requirement).
+     * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN),
+     * pending signals preserved, signal mask preserved. */
+    signal_reset_for_exec();
+
+    /* Step 6: Reload shim into guest */
+    const unsigned char *shim_ptr = proc_get_shim_blob();
+    unsigned int shim_size = proc_get_shim_size();
+    if (shim_ptr && shim_size > 0) {
+        memcpy((uint8_t *)g->host_base + SHIM_BASE, shim_ptr, shim_size);
+    }
+
+    /* Step 7: Map ELF segments into guest memory (validated pre-PNR) */
+    if (elf_map_segments(&elf_info, path, g->host_base, g->guest_size,
+                         elf_load_base) < 0) {
+        fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+                "failed to map ELF segments for %s\n", path);
+        exit(128);
+    }
+
+    /* Step 7b: Map interpreter segments (pre-validated before PNR).
+     * For x86_64 + rosetta, rosetta handles dynamic linking internally. */
+    uint64_t interp_base = 0;
+
+    if (!need_rosetta && elf_info.interp_path[0] != '\0') {
         interp_base = g->interp_base;
         if (elf_map_segments(&interp_info, interp_resolved,
                              g->host_base, g->guest_size, interp_base) < 0) {
-            fprintf(stderr, "hl: execve: failed to map interpreter segments\n");
-            free(argv_buf); free(envp_buf);
-            return -LINUX_ENOEXEC;
+            fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+                    "failed to map interpreter segments\n");
+            exit(128);
         }
 
         if (verbose) {
@@ -311,7 +362,6 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                     (unsigned long long)interp_base,
                     (unsigned long long)(interp_info.entry + interp_base),
                     interp_info.num_segments);
-
         }
     }
 
@@ -363,12 +413,18 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     if (need_rosetta) {
         if (rosetta_prepare(g, path, regions, &nregions,
                             MAX_REGIONS, verbose, &rr) < 0) {
-            free(argv_buf); free(envp_buf);
-            return -LINUX_ENOEXEC;
+            fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+                    "rosetta_prepare failed\n");
+            exit(128);
         }
     }
 
+    /* Fixed regions (shim, brk, stack, mmap areas) — 6 entries.
+     * Bounds-check before each to prevent array overflow. After the
+     * point of no return, overflow is fatal (exit). */
+
     /* Shim code (RX) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = SHIM_BASE,
         .gpa_end   = SHIM_BASE + shim_size,
@@ -376,6 +432,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     };
 
     /* Shim data/stack (RW) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = SHIM_DATA_BASE,
         .gpa_end   = SHIM_DATA_BASE + BLOCK_2MB,
@@ -411,6 +468,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     }
 
     /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g->brk_base,
         .gpa_end   = MMAP_RX_BASE,
@@ -418,6 +476,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     };
 
     /* Stack (RW) — position is dynamic (stored in guest_t) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g->stack_base,
         .gpa_end   = g->stack_top,
@@ -425,6 +484,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     };
 
     /* mmap RX region (for PROT_EXEC allocations) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_RX_BASE,
         .gpa_end   = MMAP_RX_INITIAL_END,
@@ -433,6 +493,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
 
     /* mmap RW region (starts at 8GB to match real Linux layout) */
+    if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = MMAP_BASE,
         .gpa_end   = MMAP_INITIAL_END,
@@ -442,9 +503,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
 
     uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
     if (!ttbr0) {
-        fprintf(stderr, "hl: execve: failed to build page tables\n");
-        free(argv_buf); free(envp_buf);
-        return -LINUX_ENOMEM;
+        fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+                "failed to build page tables\n");
+        exit(128);
     }
 
     /* Step 8b: Record semantic regions (cleared by guest_reset) */
@@ -467,11 +528,8 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                              elf_info.segments[i].offset, path);
         }
     }
-    /* Interpreter semantic regions */
+    /* Interpreter semantic regions (interp_resolved populated pre-PNR) */
     if (interp_info.num_segments > 0) {
-        char interp_resolved[LINUX_PATH_MAX];
-        elf_resolve_interp(proc_get_sysroot(), elf_info.interp_path,
-                           interp_resolved, sizeof(interp_resolved));
         for (int i = 0; i < interp_info.num_segments; i++) {
             int seg_prot = LINUX_PROT_READ;
             if (interp_info.segments[i].flags & PF_W) seg_prot |= LINUX_PROT_WRITE;
@@ -507,8 +565,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         if (rosetta_finalize(g, vcpu, path,
                              argc, argv_const, &rr, verbose,
                              &rosetta_argc, &rosetta_argv, &vdso_addr) < 0) {
-            free(argv_buf); free(envp_buf);
-            return -LINUX_ENOEXEC;
+            fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+                    "rosetta_finalize failed\n");
+            exit(128);
         }
 
         sp = build_linux_stack(g, g->stack_top,
@@ -518,18 +577,22 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                                0 /* no dynamic linker for rosetta */,
                                vdso_addr,
                                3 /* AT_EXECFD: binary pre-opened at fd 3 */);
-        free(rosetta_argv);
+        free((void *)rosetta_argv);
         entry_point = rr.entry_point;
         g->is_rosetta = 1;
 
-        /* Update /proc/self/exe and /proc/self/cmdline */
+        /* Update /proc/self/exe. Cmdline already set by rosetta_finalize()
+         * to binfmt_misc format [rosetta_path, binary_path, args...] that
+         * rosetta needs for /proc/self/cmdline parsing during init. */
         proc_set_elf_path(path);
-        proc_set_cmdline(argc, argv_const);
     } else {
+        /* Build vDSO for signal restorer fallback (sa_restorer == 0) */
+        uint64_t exec_vdso = vdso_build(g);
+
         sp = build_linux_stack(g, g->stack_top, argc, argv_const,
                                envp_const, &elf_info,
                                elf_load_base, interp_base,
-                               0 /* no vDSO for aarch64 */,
+                               exec_vdso,
                                -1 /* no AT_EXECFD */);
 
         entry_point = (interp_base != 0)
@@ -602,4 +665,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     free(envp_buf);
 
     return SYSCALL_EXEC_HAPPENED;
+
+too_many_regions:
+    fprintf(stderr, "hl: FATAL: execve failed after point of no return: "
+            "too many memory regions (max %d)\n", MAX_REGIONS);
+    exit(128);
 }

@@ -12,12 +12,13 @@
  * HVC protocol:
  *   #0  Normal exit       (x0 = exit code)
  *   #2  Bad exception     (x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector)
- *   #4  Set sysreg        (x0 = reg ID, x1 = value; host writes via HVF)
- *   #5  Syscall forward   (registers preserved from EL0 SVC #0)
- *   #7  MRS trap          (host reads sysreg from ESR ISS; returns value in x0)
- *   #9  W^X toggle        (x0 = FAR, x1 = type: 0=exec→RX, 1=write→RW)
- *   #10 BRK from EL0      (host delivers SIGTRAP; GPRs restored before HVC)
- *   #11 EL0 fault         (host delivers SIGSEGV; GPRs restored before HVC)
+ *   #4  Set sysreg        (x0 = reg ID (0-8), x1 = value)
+ *   #5  Syscall forward   (X0-X5=args, X8=syscall nr; on return X8=TLBI flag)
+ *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
+ *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec→RX, 1=write→RW)
+ *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
+ *   #11 EL0 fault         (SIGSEGV delivery; GPRs in frame)
+ *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
  *
  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
  * NOT as a statement separator. Each instruction must be on its own line.
@@ -308,7 +309,7 @@ handle_sysreg_trap:
      *   Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
      * DC ZVA: Op0=01 Op2=001 Op1=011 CRn=0111 CRm=0100 Dir=0
      *   = (01 << 20) | (001 << 17) | (011 << 14) | (0111 << 10) | (0100 << 1) | 0
-     *   = 0x169C08 + (Rt << 5) */
+     *   = 0x12DC08 + (Rt << 5) */
 
     /* Check for DC ZVA: extract fields around Rt and compare.
      * DC ZVA ISS: Op0[21:20]=01 Op2[19:17]=001 Op1[16:14]=011

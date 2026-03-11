@@ -121,7 +121,7 @@ int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva) {
     for (int i = 0; i < ngroups; i++)
         linux_groups[i] = (uint32_t)groups[i];
 
-    if (guest_write(g, list_gva, linux_groups, ngroups * 4) < 0)
+    if (guest_write(g, list_gva, linux_groups, (size_t)ngroups * 4) < 0)
         return -LINUX_EFAULT;
 
     return ngroups;
@@ -142,7 +142,7 @@ int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva) {
     lin_usage.ru_utime.tv_usec = mac_usage.ru_utime.tv_usec;
     lin_usage.ru_stime.tv_sec  = mac_usage.ru_stime.tv_sec;
     lin_usage.ru_stime.tv_usec = mac_usage.ru_stime.tv_usec;
-    lin_usage.ru_maxrss  = mac_usage.ru_maxrss;
+    lin_usage.ru_maxrss  = mac_usage.ru_maxrss / 1024; /* macOS: bytes → Linux: KB */
     lin_usage.ru_minflt  = mac_usage.ru_minflt;
     lin_usage.ru_majflt  = mac_usage.ru_majflt;
     lin_usage.ru_inblock = mac_usage.ru_inblock;
@@ -189,8 +189,7 @@ int64_t sys_sysinfo(guest_t *g, uint64_t info_gva) {
     /* Free RAM from vm_statistics64 (scaled proportionally to capped total) */
     vm_statistics64_data_t vmstat;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    static mach_port_t host_port = 0;
-    if (!host_port) host_port = mach_host_self();
+    mach_port_t host_port = mach_host_self();
     if (host_statistics64(host_port, HOST_VM_INFO64,
                           (host_info64_t)&vmstat, &count) == KERN_SUCCESS) {
         uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
@@ -247,20 +246,9 @@ int64_t sys_prlimit64(guest_t *g, int pid, int resource,
     int mac_res = translate_rlimit_resource(resource);
     if (mac_res < 0) return -LINUX_EINVAL;
 
-    /* Set new limits if requested */
-    if (new_gva != 0) {
-        linux_rlimit64_t new_lim;
-        if (guest_read(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
-            return -LINUX_EFAULT;
-
-        struct rlimit rl;
-        rl.rlim_cur = new_lim.rlim_cur;
-        rl.rlim_max = new_lim.rlim_max;
-        if (setrlimit(mac_res, &rl) < 0)
-            return linux_errno();
-    }
-
-    /* Get current limits if requested */
+    /* Get old limits BEFORE setting new ones (Linux prlimit64 atomically
+     * returns old values and sets new ones; approximate by get-then-set). */
+    linux_rlimit64_t old_lim = {0};
     if (old_gva != 0) {
         struct rlimit rl;
         if (getrlimit(mac_res, &rl) < 0)
@@ -270,7 +258,6 @@ int64_t sys_prlimit64(guest_t *g, int pid, int resource,
          * macOS: 0x7FFFFFFFFFFFFFFF, Linux: 0xFFFFFFFFFFFFFFFF.
          * Rosetta and musl both check for RLIM_INFINITY to determine
          * uncapped resources (e.g., stack size for thread stacks). */
-        linux_rlimit64_t old_lim;
         old_lim.rlim_cur = (rl.rlim_cur == RLIM_INFINITY)
                            ? UINT64_MAX : rl.rlim_cur;
         old_lim.rlim_max = (rl.rlim_max == RLIM_INFINITY)
@@ -283,7 +270,27 @@ int64_t sys_prlimit64(guest_t *g, int pid, int resource,
         if (resource == 3 /* RLIMIT_STACK */ &&
             old_lim.rlim_cur > 0 && old_lim.rlim_cur < 8388608)
             old_lim.rlim_cur = 8388608;
+    }
 
+    /* Set new limits if requested */
+    if (new_gva != 0) {
+        linux_rlimit64_t new_lim;
+        if (guest_read(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
+            return -LINUX_EFAULT;
+
+        /* Translate Linux RLIM_INFINITY (UINT64_MAX) back to macOS
+         * RLIM_INFINITY (0x7FFFFFFFFFFFFFFF) for setrlimit. */
+        struct rlimit rl;
+        rl.rlim_cur = (new_lim.rlim_cur == UINT64_MAX)
+                       ? RLIM_INFINITY : new_lim.rlim_cur;
+        rl.rlim_max = (new_lim.rlim_max == UINT64_MAX)
+                       ? RLIM_INFINITY : new_lim.rlim_max;
+        if (setrlimit(mac_res, &rl) < 0)
+            return linux_errno();
+    }
+
+    /* Write old limits to guest after set (so guest sees pre-set values) */
+    if (old_gva != 0) {
         if (guest_write(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
             return -LINUX_EFAULT;
     }

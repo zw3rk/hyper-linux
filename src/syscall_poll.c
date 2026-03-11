@@ -98,7 +98,12 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         /* Linux returns EINVAL for negative timeout values */
         if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000LL)
             return -LINUX_EINVAL;
-        int64_t ms64 = lts.tv_sec * (int64_t)1000 + lts.tv_nsec / 1000000;
+        /* Guard against overflow: tv_sec * 1000 can exceed INT64_MAX */
+        int64_t ms64;
+        if (lts.tv_sec > INT64_MAX / 1000)
+            ms64 = INT64_MAX;
+        else
+            ms64 = lts.tv_sec * (int64_t)1000 + lts.tv_nsec / 1000000;
         timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int)ms64;
     }
 
@@ -193,7 +198,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         uint64_t rbits[FD_TABLE_SIZE / 64] = {0};
         uint64_t wbits[FD_TABLE_SIZE / 64] = {0};
         uint64_t ebits[FD_TABLE_SIZE / 64] = {0};
-        size_t bitmask_bytes = ((nfds + 63) / 64) * 8;
+        size_t bitmask_bytes = (size_t)((nfds + 63) / 64) * 8;
         if (readfds_gva && guest_read(g, readfds_gva, rbits, bitmask_bytes) < 0)
             return -LINUX_EFAULT;
         if (writefds_gva && guest_read(g, writefds_gva, wbits, bitmask_bytes) < 0)
@@ -281,7 +286,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         }
 
         ret = pselect(max_host_fd + 1,
-                      readfds_gva ? &read_set : NULL,
+                      (readfds_gva || added_wakeup) ? &read_set : NULL,
                       writefds_gva ? &write_set : NULL,
                       exceptfds_gva ? &except_set : NULL,
                       has_timeout ? &ts : &poll_ts, NULL);
@@ -378,9 +383,13 @@ typedef struct {
 
 /* Per-fd registration entry within an epoll instance. */
 typedef struct {
-    uint32_t events;   /* Registered EPOLL* events mask */
-    uint64_t data;     /* User data to return in epoll_wait */
-    int      active;   /* 1 if registered in this instance */
+    uint32_t events;        /* Registered EPOLL* events mask */
+    uint64_t data;          /* User data to return in epoll_wait */
+    int      active;        /* 1 if registered in this instance */
+    int      oneshot_armed; /* 1 if EPOLLONESHOT and event already fired,
+                             * waiting for EPOLL_CTL_MOD re-arm.
+                             * kqueue removed the event, so we prevent
+                             * reporting but allow MOD. */
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance
@@ -451,24 +460,28 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
             /* Ignore errors from EV_DELETE (fd might already be closed) */
             kevent(kq_fd, changes, nchanges, NULL, 0, NULL);
             reg->active = 0;
+            reg->oneshot_armed = 0; /* Clear stale state for potential re-add */
         }
         return 0;
     }
 
     /* Linux semantics: ADD fails with EEXIST if already registered;
-     * MOD fails with ENOENT if not registered. */
+     * MOD fails with ENOENT if not registered. Note: oneshot_armed registrations
+     * (EPOLLONESHOT fired, waiting for re-arm) are still valid for MOD. */
     if (op == LINUX_EPOLL_CTL_ADD && reg->active) return -LINUX_EEXIST;
-    if (op == LINUX_EPOLL_CTL_MOD && !reg->active) return -LINUX_ENOENT;
+    if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed)
+        return -LINUX_ENOENT;
 
     /* ADD or MOD: read the epoll_event from guest */
     linux_epoll_event_t ev;
     if (guest_read(g, event_gva, &ev, sizeof(ev)) < 0)
         return -LINUX_EFAULT;
 
-    /* For MOD, remove old registrations first.
+    /* For MOD, remove old registrations first if they exist in kqueue.
      * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check
-     * both EPOLLIN and EPOLLRDHUP — same logic as CTL_DEL. */
-    if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
+     * both EPOLLIN and EPOLLRDHUP — same logic as CTL_DEL.
+     * Skip deletion if oneshot_armed (kqueue already removed it). */
+    if (op == LINUX_EPOLL_CTL_MOD && reg->active && !reg->oneshot_armed) {
         struct kevent del[2];
         int ndel = 0;
         if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
@@ -508,10 +521,12 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
             return linux_errno();
     }
 
-    /* Store registration data in per-instance table */
+    /* Store registration data in per-instance table.
+     * Clear oneshot_armed when MOD successfully re-arms. */
     reg->events = ev.events;
     reg->data = ev.data;
     reg->active = 1;
+    reg->oneshot_armed = 0;
 
     return 0;
 }
@@ -667,14 +682,15 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         }
     }
 
-    /* Clear registrations for EPOLLONESHOT FDs that fired.
-     * kqueue already removed the event (EV_ONESHOT), but our table
-     * must reflect that the registration is now disabled until re-armed. */
+    /* Mark EPOLLONESHOT FDs as armed (fired but waiting for MOD re-arm).
+     * kqueue already removed the event (EV_ONESHOT), so we mark the
+     * registration as oneshot_armed to allow MOD but prevent further
+     * event reporting until re-armed. */
     for (int i = 0; i < nout; i++) {
         int gfd = out_gfds[i];
         if (gfd >= 0 && gfd < FD_TABLE_SIZE && inst->regs[gfd].active) {
             if (inst->regs[gfd].events & LINUX_EPOLLONESHOT)
-                inst->regs[gfd].active = 0;
+                inst->regs[gfd].oneshot_armed = 1;
         }
     }
 

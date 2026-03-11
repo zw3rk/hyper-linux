@@ -227,15 +227,20 @@ int signal_pending(void) {
 }
 
 const signal_state_t *signal_get_state(void) {
-    /* Populate IPC-serializable altstack fields from per-thread state.
-     * This ensures fork children inherit the parent thread's altstack. */
+    /* Populate IPC-serializable fields from per-thread state under the
+     * lock to avoid data races with concurrent sigaction calls.
+     * This ensures fork children inherit the parent thread's blocked
+     * mask and altstack (POSIX: fork preserves signal mask). */
+    pthread_mutex_lock(&sig_lock);
     if (current_thread) {
+        sig_state.blocked           = current_thread->blocked;
         sig_state.altstack.ss_sp    = current_thread->altstack_sp;
         sig_state.altstack.ss_flags = current_thread->altstack_flags;
         sig_state.altstack._pad     = 0;
         sig_state.altstack.ss_size  = current_thread->altstack_size;
         sig_state.on_altstack       = current_thread->on_altstack;
     }
+    pthread_mutex_unlock(&sig_lock);
     return &sig_state;
 }
 
@@ -243,8 +248,10 @@ void signal_set_state(const signal_state_t *state) {
     if (!state) return;
     pthread_mutex_lock(&sig_lock);
     sig_state = *state;
-    /* Restore per-thread altstack from deserialized state (fork child) */
+    /* Restore per-thread state from deserialized signal state (fork child).
+     * POSIX: fork preserves blocked mask, altstack, and on_altstack. */
     if (current_thread) {
+        current_thread->blocked        = state->blocked;
         current_thread->altstack_sp    = state->altstack.ss_sp;
         current_thread->altstack_flags = state->altstack.ss_flags;
         current_thread->altstack_size  = state->altstack.ss_size;
@@ -281,7 +288,7 @@ void signal_restore_blocked(uint64_t saved) {
 static struct timeval monotonic_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (struct timeval){ .tv_sec = ts.tv_sec, .tv_usec = ts.tv_nsec / 1000 };
+    return (struct timeval){ .tv_sec = ts.tv_sec, .tv_usec = (int)(ts.tv_nsec / 1000) };
 }
 
 /* Helper: compare timevals. Returns <0, 0, >0. */
@@ -401,7 +408,11 @@ void signal_check_timer(void) {
     if (timeval_cmp(&now, &guest_itimer.expiry) >= 0) {
         if (guest_itimer.interval.tv_sec != 0 ||
             guest_itimer.interval.tv_usec != 0) {
-            guest_itimer.expiry = timeval_add(&now, &guest_itimer.interval);
+            /* Re-arm from previous expiry (not now) to prevent drift.
+             * If check_timer is called late, the next expiry still
+             * advances by exactly one interval from the old expiry. */
+            guest_itimer.expiry = timeval_add(&guest_itimer.expiry,
+                                              &guest_itimer.interval);
         } else {
             guest_itimer.active = 0;
         }
@@ -571,8 +582,10 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva,
     if (!set_gva) return -LINUX_EFAULT;
 
     pthread_mutex_lock(&sig_lock);
-    /* Return signals that are pending AND blocked by this thread */
-    uint64_t result = sig_state.pending & *thread_blocked_ptr();
+    /* Return all pending signals (matching Linux kernel do_sigpending).
+     * In practice unblocked signals are delivered before sigpending can
+     * observe them, but returning the full set is strictly correct. */
+    uint64_t result = sig_state.pending;
     pthread_mutex_unlock(&sig_lock);
 
     if (guest_write(g, set_gva, &result, 8) < 0)
@@ -668,7 +681,7 @@ static void build_sigcontext_reserved(uint8_t *reserved, uint64_t esr,
     for (int i = 0; i < 32; i++) {
         hv_simd_fp_uchar16_t vreg;
         hv_vcpu_get_simd_fp_reg(vcpu, HV_SIMD_FP_REG_Q0 + i, &vreg);
-        memcpy(reserved + off + 16 + i * 16, &vreg, 16);
+        memcpy(reserved + off + 16 + (size_t)i * 16, &vreg, 16);
     }
     off += FPSIMD_CONTEXT_SIZE;
 
@@ -821,7 +834,10 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         frame.uc.uc_stack.ss_flags |= LINUX_SS_ONSTACK;
 
     /* 3. Determine stack for signal frame: use altstack if SA_ONSTACK
-     * is set, an altstack is configured, and we're not already on it. */
+     * is set, an altstack is configured, and we're not already on it.
+     * Note: across fork, only the forking thread's altstack is preserved
+     * (via signal_get_state). Worker thread altstacks start as SS_DISABLE
+     * in the child — matches Linux kernel per-thread altstack semantics. */
     uint64_t signal_sp = saved_sp;
     int use_altstack = 0;
     if (thr && (act->sa_flags & LINUX_SA_ONSTACK) &&
@@ -861,12 +877,12 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
      * field is architecturally unused on aarch64 — the kernel ignores it.
      * However, musl explicitly sets sa_restorer to its own __restore_rt
      * trampoline. We honor sa_restorer if set (for musl compatibility),
-     * otherwise use the vDSO trampoline (for rosetta and any signal handler
-     * that relies on kernel behavior). */
+     * otherwise use the vDSO trampoline. The vDSO is built unconditionally
+     * in both native aarch64 and rosetta modes (hl.c + syscall_exec.c). */
     uint64_t restorer = act->sa_restorer;
     if (restorer == 0) {
-        /* vDSO __kernel_rt_sigreturn: VDSO_BASE + .text offset 0 */
-        restorer = VDSO_BASE + 0xB0;
+        /* vDSO __kernel_rt_sigreturn: first trampoline in text section */
+        restorer = VDSO_BASE + VDSO_OFF_TEXT;
     }
     hv_vcpu_set_reg(vcpu, HV_REG_X30, restorer);
 
@@ -919,7 +935,13 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
     /* Restore SP, PC, PSTATE */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, frame.uc.uc_mcontext.sp);
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, frame.uc.uc_mcontext.pc);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, frame.uc.uc_mcontext.pstate);
+    /* Sanitize PSTATE: clear EL0-prohibited bits to prevent a corrupted
+     * sigframe from causing unexpected behavior. Matches Linux kernel's
+     * valid_user_regs(): M[4:0]=mode+AArch32 flag, DAIF[9:6]=exception
+     * masks, IL[20]=illegal state, SS[21]=software step. Bit 4 (M[4])
+     * must be 0 for AArch64; bit 5 is RES0. */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1,
+                         frame.uc.uc_mcontext.pstate & ~0x003F03FFULL);
 
     /* Restore FPSIMD state from the sigcontext __reserved area.
      * The FPSIMD context starts at offset 0 of __reserved (after magic/size). */
@@ -934,18 +956,28 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
         hv_vcpu_set_reg(vcpu, HV_REG_FPCR, fpcr32);
         for (int i = 0; i < 32; i++) {
             hv_simd_fp_uchar16_t vreg;
-            memcpy(&vreg, reserved + 16 + i * 16, 16);
+            memcpy(&vreg, reserved + 16 + (size_t)i * 16, 16);
             hv_vcpu_set_simd_fp_reg(vcpu, HV_SIMD_FP_REG_Q0 + i, vreg);
         }
     }
 
-    /* Restore signal mask and clear per-thread altstack-in-use flag */
+    /* Restore signal mask and update altstack-in-use flag.
+     * If the restored SP is still within the altstack range (nested signal
+     * case), keep on_altstack=1.  Matches Linux kernel's restore_altstack. */
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
     *blocked = frame.uc.uc_sigmask;
     *blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
-    if (current_thread)
-        current_thread->on_altstack = 0;
+    if (current_thread) {
+        uint64_t restored_sp = frame.uc.uc_mcontext.sp;
+        if (current_thread->altstack_sp &&
+            restored_sp >= current_thread->altstack_sp &&
+            restored_sp < current_thread->altstack_sp +
+                          current_thread->altstack_size)
+            current_thread->on_altstack = 1;
+        else
+            current_thread->on_altstack = 0;
+    }
     pthread_mutex_unlock(&sig_lock);
 
     /* Return SYSCALL_EXEC_HAPPENED to skip the normal X0 writeback,

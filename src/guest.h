@@ -280,6 +280,12 @@ void guest_destroy(guest_t *g);
  * Returns NULL if gva is out of bounds. */
 void *guest_ptr(const guest_t *g, uint64_t gva);
 
+/* Get a host pointer for a guest virtual address, with available byte count.
+ * *avail receives the number of contiguous bytes from gva to the end of
+ * the current memory region. Use this when passing guest buffers directly
+ * to host syscalls (read/write) to prevent accessing past the region. */
+void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail);
+
 /* Bounds-checked copy from guest memory to host buffer.
  * Returns 0 on success, -1 if out of bounds. */
 int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len);

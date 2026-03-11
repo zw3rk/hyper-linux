@@ -188,6 +188,53 @@ int main(void) {
         close(epfd);
     }
 
+    /* Test EPOLLONESHOT + EPOLL_CTL_MOD re-arm
+     * This is the critical test: after EPOLLONESHOT fires and is reported,
+     * EPOLL_CTL_MOD should succeed to re-arm the registration. */
+    TEST("EPOLLONESHOT re-arm with MOD");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        pipe(pipefd);
+
+        /* Register with EPOLLONESHOT */
+        struct epoll_event ev = {
+            .events = EPOLLIN | EPOLLONESHOT,
+            .data.fd = pipefd[0]
+        };
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) == 0) {
+            write(pipefd[1], "x", 1);
+
+            /* First event should fire */
+            struct epoll_event out;
+            int n = epoll_wait(epfd, &out, 1, 100);
+            if (n == 1 && (out.events & EPOLLIN)) {
+                /* KEY: MOD should succeed to re-arm after ONESHOT fired */
+                ev.events = EPOLLIN | EPOLLONESHOT;
+                ev.data.fd = pipefd[0];
+                if (epoll_ctl(epfd, EPOLL_CTL_MOD, pipefd[0], &ev) == 0) {
+                    /* Write again to verify re-arm */
+                    write(pipefd[1], "y", 1);
+                    n = epoll_wait(epfd, &out, 1, 100);
+                    if (n == 1 && (out.events & EPOLLIN))
+                        PASS();
+                    else
+                        FAIL("re-armed EPOLLONESHOT did not fire");
+                } else {
+                    FAIL("EPOLL_CTL_MOD failed after ONESHOT (this was the bug)");
+                }
+            } else {
+                FAIL("initial EPOLLONESHOT did not fire");
+            }
+        } else {
+            FAIL("epoll_ctl ADD with EPOLLONESHOT failed");
+        }
+
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(epfd);
+    }
+
     SUMMARY("test-epoll");
     return fails > 0 ? 1 : 0;
 }
