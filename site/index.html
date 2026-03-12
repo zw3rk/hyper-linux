@@ -9,20 +9,20 @@
   <link rel="stylesheet" href="style.css">
   <!-- Open Graph (Facebook, Slack, Discord, LinkedIn, etc.) -->
   <meta property="og:title" content="hyper-linux — Run Linux binaries on macOS">
-  <meta property="og:description" content="Execute aarch64/x86_64 Linux ELF binaries on Apple Silicon. No VM, no Docker, no kernel. 1–3ms startup, native speed, ~160 syscalls.">
+  <meta property="og:description" content="Execute aarch64/x86_64 Linux ELF binaries on Apple Silicon. No VM, no Docker, no kernel. 1–3ms startup, native speed, ~170 syscalls.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hyper-linux.app">
   <meta property="og:image" content="https://hyper-linux.app/og-image.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~160 syscalls, 300KB binary, native ARM64 speed.">
+  <meta property="og:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~170 syscalls, 250KB binary, native ARM64 speed.">
   <meta property="og:site_name" content="hyper-linux">
   <!-- Twitter / X -->
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="hyper-linux — Run Linux binaries on macOS">
-  <meta name="twitter:description" content="No VM, no Docker, no kernel. A single 300KB binary that translates Linux syscalls to macOS. 1–3ms startup, native ARM64 speed.">
+  <meta name="twitter:description" content="No VM, no Docker, no kernel. A single 250KB binary that translates Linux syscalls to macOS. 1–3ms startup, native ARM64 speed.">
   <meta name="twitter:image" content="https://hyper-linux.app/og-image.png">
-  <meta name="twitter:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~160 syscalls, 300KB binary, native ARM64 speed.">
+  <meta name="twitter:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~170 syscalls, 250KB binary, native ARM64 speed.">
 </head>
 <body>
 
@@ -52,7 +52,7 @@
     <p class="tagline">
       No Docker, no full VM &mdash; just a lightweight per-process virtual machine
       that translates Linux syscalls to macOS equivalents. Millisecond startup,
-      native speed, ~160 syscalls.
+      native speed, ~170 syscalls.
     </p>
 
     <div class="install-widget">
@@ -91,15 +91,15 @@
         <span class="stat-label">VM startup time</span>
       </div>
       <div class="stat">
-        <span class="stat-value">~160</span>
+        <span class="stat-value">~170</span>
         <span class="stat-label">Linux syscalls</span>
       </div>
       <div class="stat">
-        <span class="stat-value">300 KB</span>
+        <span class="stat-value">250 KB</span>
         <span class="stat-label">Single binary</span>
       </div>
       <div class="stat">
-        <span class="stat-value">17,600</span>
+        <span class="stat-value">23,000</span>
         <span class="stat-label">Lines of C + asm</span>
       </div>
     </div>
@@ -112,7 +112,7 @@
     <div class="section-label">Why hyper-linux</div>
     <h2>Everything you need, nothing you don't</h2>
     <p class="section-desc">
-      A single 300KB native macOS binary. No daemon, no disk image, no multi-GB download.
+      A single 250KB native macOS binary. No daemon, no disk image, no multi-GB download.
     </p>
 
     <div class="props-grid">
@@ -148,7 +148,7 @@
       </div>
       <div class="prop-card">
         <span class="prop-icon" aria-hidden="true">&#x1F50D;</span>
-        <h3>~160 Linux syscalls</h3>
+        <h3>~170 Linux syscalls</h3>
         <p>I/O, filesystem, networking, signals, threading, process management, time, epoll, inotify, /proc, /dev &mdash; all translated.</p>
       </div>
       <div class="prop-card">
@@ -270,7 +270,7 @@
           </tr>
           <tr>
             <td>Disk overhead</td>
-            <td class="highlight">~300 KB binary</td>
+            <td class="highlight">~250 KB binary</td>
             <td>Multi-GB image</td>
             <td>Multi-GB image</td>
             <td>Multi-GB image</td>
@@ -285,8 +285,8 @@
           <tr>
             <td>x86_64 support</td>
             <td class="highlight">Via Rosetta (fast)</td>
-            <td>Via QEMU (slow)</td>
-            <td>Via QEMU (slow)</td>
+            <td>Rosetta or QEMU</td>
+            <td>Rosetta (VZ) or QEMU</td>
             <td>Via QEMU (slow)</td>
           </tr>
           <tr>
@@ -512,7 +512,7 @@ bash-5.2$
       </div>
       <div class="prop-card">
         <h3>Rosetta integration</h3>
-        <p>x86_64 binaries run by co-loading Apple's Rosetta at 128TB using 48-bit IPA. AOT translation via rosettad supported for complex binaries with indirect calls.</p>
+        <p>x86_64 binaries run by co-loading Apple's Rosetta at 128TB using 48-bit IPA. JIT works for all binaries; optional AOT pre-translation via rosettad with persistent caching.</p>
       </div>
       <div class="prop-card">
         <h3>/proc &amp; /dev emulation</h3>
@@ -592,8 +592,8 @@ ENVIRONMENT:
       <div class="limit-item">
         <div class="limit-icon">&#x25B3;</div>
         <div>
-          <h4>No ptrace / debuggers</h4>
-          <p>GDB/LLDB cannot attach to the guest process.</p>
+          <h4>No external debuggers</h4>
+          <p>ptrace is implemented internally (used by Rosetta's JIT), but GDB/LLDB cannot attach to the guest from the host.</p>
         </div>
       </div>
       <div class="limit-item">
@@ -613,8 +613,8 @@ ENVIRONMENT:
       <div class="limit-item">
         <div class="limit-icon">&#x25B3;</div>
         <div>
-          <h4>Some x86_64 binaries need AOT</h4>
-          <p>Complex x86_64 binaries with indirect calls may need rosettad AOT translation.</p>
+          <h4>Rosetta AOT optional</h4>
+          <p>x86_64 JIT works for all binaries. AOT pre-translation via rosettad is supported for additional performance.</p>
         </div>
       </div>
     </div>
