@@ -375,6 +375,7 @@ test-haskell: $(BUILD_DIR)/hl
 # ── Haskell binary integration tests ────────────────────────────────
 
 HASKELL_BINS_DIR ?= $(GUEST_HASKELL_BINS)/bin
+HASKELL_SYSROOT ?=
 
 ## Run Haskell binary integration tests (pandoc, shellcheck)
 test-haskell-bins: $(BUILD_DIR)/hl
@@ -382,7 +383,7 @@ test-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR)
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(HASKELL_BINS_DIR) $(HASKELL_SYSROOT)
 
 # ── x86_64-linux via Rosetta tests ─────────────────────────────────
 
@@ -589,6 +590,7 @@ test-x64-glibc-coreutils: $(BUILD_DIR)/hl
 # ── x86_64 Haskell binary integration tests ────────────────────────
 
 X64_HASKELL_BINS_DIR ?= $(GUEST_X64_HASKELL_BINS)/bin
+X64_HASKELL_SYSROOT ?=
 
 ## Run x86_64 Haskell binary integration tests (pandoc, shellcheck via rosetta)
 test-x64-haskell-bins: $(BUILD_DIR)/hl
@@ -596,7 +598,7 @@ test-x64-haskell-bins: $(BUILD_DIR)/hl
 		printf "$(RED)✗ x86_64 Haskell bins not found.$(RESET) Run inside nix develop.\n"; \
 		exit 1; \
 	fi
-	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR)
+	@bash test/test-haskell-bins.sh $(BUILD_DIR)/hl $(X64_HASKELL_BINS_DIR) $(X64_HASKELL_SYSROOT)
 
 # ── Test matrix (4-way: hl + lima, aarch64 + x86_64) ────────────────
 

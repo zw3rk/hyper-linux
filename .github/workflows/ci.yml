@@ -119,6 +119,14 @@ jobs:
   haskell-x64-bins:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+
       - uses: actions/checkout@v4
 
       - uses: DeterminateSystems/nix-installer-action@main
@@ -267,6 +275,7 @@ jobs:
         if: always()
         env:
           HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-bins/haskell-bins/bin
+          HASKELL_SYSROOT: ${{ github.workspace }}/haskell-bins/haskell-sysroot
         run: nix develop .#ci -c make test-haskell-bins
 
       # ── x86_64-linux tests (via Rosetta) ────────────────────────
@@ -346,6 +355,7 @@ jobs:
         continue-on-error: true
         env:
           X64_HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-x64-bins/haskell-bins/bin
+          X64_HASKELL_SYSROOT: ${{ github.workspace }}/haskell-x64-bins/haskell-sysroot
         run: nix develop .#ci -c make test-x64-haskell-bins
 
       # ── Test summary ──────────────────────────────────────────────

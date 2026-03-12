@@ -216,16 +216,99 @@ in {
     '';
 
   # Build CI haskell bundle: haskellBins + haskellHello with patched
-  # interpreter for sysroot usage.  Uploaded as CI artifact for the
-  # macOS test job to download.
+  # interpreters and a glibc sysroot containing all shared lib deps.
+  # Uploaded as CI artifact for the macOS test job to download.
+  #
+  # pandoc/shellcheck are dynamically linked against glibc.  Their nix
+  # store interpreter paths don't exist on the macOS CI runner, so we:
+  # 1. Walk RPATH of each binary to discover all shared lib deps
+  # 2. Copy explicit baseline deps (glibc, GCC, GMP, libffi) as safety net
+  # 3. Patch interpreters to standard /lib/ paths
+  # 4. Strip RPATHs so the dynamic linker resolves from the sysroot
   mkHaskellBundle = { name, pkgs, haskellBins, haskellHello, interpreter }:
-    pkgs.runCommand name {
+    let
+      glibcLinkerName =
+        if pkgs.stdenv.hostPlatform.isAarch64
+        then "ld-linux-aarch64.so.1"
+        else "ld-linux-x86-64.so.2";
+      gccLibs = pkgs.stdenv.cc.cc.lib;
+    in pkgs.runCommand name {
       nativeBuildInputs = [ pkgs.patchelf ];
     } ''
       mkdir -p $out/{haskell-bins/bin,haskell-bins/share/pandoc-data}
+      mkdir -p $out/{haskell-sysroot/lib,haskell-sysroot/lib64}
       cp -rL ${haskellBins}/bin/.       $out/haskell-bins/bin/
       cp -rL ${haskellBins}/share/pandoc-data/. $out/haskell-bins/share/pandoc-data/
 
+      # Auto-discover shared lib deps by walking RPATH of binaries AND
+      # their transitive library deps.  Iterates until no new libs are
+      # found (fixpoint = full transitive closure).  Uses patchelf
+      # --print-rpath which works cross-arch (unlike ldd).
+      chmod -R u+w $out/haskell-bins/bin/
+      prev_count=-1
+      while true; do
+        curr_count=$(find $out/haskell-sysroot/lib -name '*.so*' 2>/dev/null | wc -l)
+        [ "$curr_count" -eq "$prev_count" ] && break
+        prev_count=$curr_count
+        for f in $out/haskell-bins/bin/* $out/haskell-sysroot/lib/*.so*; do
+          [ -f "$f" ] || continue
+          rpath=$(patchelf --print-rpath "$f" 2>/dev/null) || continue
+          [ -z "$rpath" ] && continue
+          IFS=: read -ra dirs <<< "$rpath"
+          for dir in "''${dirs[@]}"; do
+            [ -d "$dir" ] || continue
+            for lib in "$dir"/*.so*; do
+              [ -f "$lib" ] || [ -L "$lib" ] || continue
+              cp -anL "$lib" $out/haskell-sysroot/lib/ 2>/dev/null || true
+            done
+          done
+        done
+        chmod -R u+w $out/haskell-sysroot/lib 2>/dev/null || true
+      done
+
+      # Explicit baseline: glibc dynamic linker + core shared libs.
+      # These may not appear in RPATH (resolved by the linker itself).
+      cp -aL ${pkgs.glibc}/lib/${glibcLinkerName}            $out/haskell-sysroot/lib/
+      cp -aL ${pkgs.glibc}/lib/libc.so.6                    $out/haskell-sysroot/lib/
+      cp -aL ${pkgs.glibc}/lib/libc.so                      $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libm.so.6                    $out/haskell-sysroot/lib/
+      cp -aL ${pkgs.glibc}/lib/libm.so                      $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libpthread.so.0              $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libdl.so.2                   $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libresolv.so.2               $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/librt.so.1                   $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libmvec.so*                  $out/haskell-sysroot/lib/ || true
+      # NSS modules (needed for getpwnam, getgrnam, etc.)
+      cp -aL ${pkgs.glibc}/lib/libnss_files.so*             $out/haskell-sysroot/lib/ || true
+      cp -aL ${pkgs.glibc}/lib/libnss_dns.so*               $out/haskell-sysroot/lib/ || true
+      # GCC runtime
+      cp -aL ${gccLibs}/lib/libgcc_s.so*                    $out/haskell-sysroot/lib/
+      cp -aL ${gccLibs}/lib/libatomic.so*                   $out/haskell-sysroot/lib/ || true
+      # GHC RTS deps
+      cp -aL ${pkgs.gmp}/lib/libgmp.so*                     $out/haskell-sysroot/lib/
+      cp -aL ${pkgs.libffi}/lib/libffi.so*                  $out/haskell-sysroot/lib/
+      cp -aL ${pkgs.numactl}/lib/libnuma.so*                $out/haskell-sysroot/lib/ || true
+
+      # /lib64 symlink for binaries with /lib64 PT_INTERP
+      ln -sf ../lib/${glibcLinkerName} $out/haskell-sysroot/lib64/${glibcLinkerName}
+
+      # Strip RPATHs from sysroot libs so they resolve from sysroot
+      chmod -R u+w $out/haskell-sysroot/lib
+      for f in $out/haskell-sysroot/lib/*.so*; do
+        [ -L "$f" ] && continue
+        patchelf --remove-rpath "$f" 2>/dev/null || true
+      done
+
+      # Patch haskell binary interpreters to standard path and strip RPATHs
+      for f in $out/haskell-bins/bin/*; do
+        [ -f "$f" ] || continue
+        if patchelf --print-interpreter "$f" 2>/dev/null | grep -q nix; then
+          patchelf --set-interpreter /lib/${glibcLinkerName} "$f"
+        fi
+        patchelf --remove-rpath "$f" 2>/dev/null || true
+      done
+
+      # haskell-hello (static musl — only patch interpreter)
       mkdir -p $out/haskell-hello/bin
       cp -rL ${haskellHello}/bin/.         $out/haskell-hello/bin/
       chmod -R u+w $out/haskell-hello/
