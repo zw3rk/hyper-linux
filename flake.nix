@@ -88,6 +88,9 @@
         # GNU objcopy for Mach-O → raw binary (clang wrapper shadows with llvm-objcopy)
         GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
 
+        # Prevent nix from stripping the binary (removes codesign)
+        dontStrip = true;
+
         buildPhase = ''
           make hl VERSION="$version+${self.shortRev or "unknown"}"
         '';
@@ -96,6 +99,11 @@
           mkdir -p $out/bin $out/share/man/man1
           cp _build/hl $out/bin/hl
           cp hl.1 $out/share/man/man1/hl.1
+        '';
+
+        # Re-sign after install to ensure Hypervisor entitlement survives
+        postFixup = ''
+          codesign --entitlements entitlements.plist -f -s "-" $out/bin/hl
         '';
 
         meta = with darwinPkgs.lib; {
