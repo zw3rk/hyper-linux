@@ -23,9 +23,27 @@
 
 /* ---------- Clock ID translation ---------- */
 
+/* Linux dynamic CPU clock ID encoding (kernel/time/posix-cpu-timers.c):
+ *
+ *   clockid = ~pid << 3 | type [| CPUCLOCK_PERTHREAD_MASK]
+ *
+ * Where type is:  CPUCLOCK_PROF=0, CPUCLOCK_VIRT=1, CPUCLOCK_SCHED=2
+ * CPUCLOCK_PERTHREAD_MASK = 4 (bit 2) — set for per-thread, clear for per-process
+ * pid = 0 means "self" (current process/thread).
+ *
+ * Examples: -2 = per-thread SCHED (self), -6 = per-process SCHED (self)
+ * GHC RTS uses these for getCurrentThreadCPUTime via pthread_getcpuclockid(). */
+#define LINUX_CPUCLOCK_PERTHREAD_MASK 4
+#define LINUX_CPUCLOCK_TYPE_MASK      3
+#define LINUX_CPUCLOCK_PID(clk)       (~((clk) >> 3))
+
 /* Translate Linux clock IDs to macOS.
  * Linux: REALTIME=0, MONOTONIC=1, PROCESS_CPUTIME=2, THREAD_CPUTIME=3, MONOTONIC_RAW=4
- * macOS: REALTIME=0, MONOTONIC_RAW=4, MONOTONIC=6, PROCESS_CPUTIME=12, THREAD_CPUTIME=16 */
+ * macOS: REALTIME=0, MONOTONIC_RAW=4, MONOTONIC=6, PROCESS_CPUTIME=12, THREAD_CPUTIME=16
+ *
+ * Negative clock IDs encode Linux dynamic per-process/per-thread CPU clocks.
+ * We translate pid=0 (self) clocks to the macOS equivalents; for other pids
+ * we return -1 (no macOS equivalent). */
 static int translate_clockid(int linux_clockid) {
     switch (linux_clockid) {
     case 0: return CLOCK_REALTIME;
@@ -36,7 +54,18 @@ static int translate_clockid(int linux_clockid) {
     case 5: return CLOCK_REALTIME;          /* CLOCK_REALTIME_COARSE */
     case 6: return CLOCK_MONOTONIC;         /* CLOCK_MONOTONIC_COARSE */
     case 7: return CLOCK_MONOTONIC;         /* CLOCK_BOOTTIME (no suspend-aware clock on macOS) */
-    default: return -1;
+    default:
+        /* Handle Linux dynamic CPU clock IDs (negative values).
+         * Decode: pid = ~(clockid >> 3), perthread = clockid & 4
+         * Only support pid=0 (self); other pids have no macOS equivalent. */
+        if (linux_clockid < 0) {
+            int pid = LINUX_CPUCLOCK_PID(linux_clockid);
+            if (pid != 0) return -1;  /* Can't query other process CPU times */
+            int is_perthread = linux_clockid & LINUX_CPUCLOCK_PERTHREAD_MASK;
+            return is_perthread ? CLOCK_THREAD_CPUTIME_ID
+                                : CLOCK_PROCESS_CPUTIME_ID;
+        }
+        return -1;
     }
 }
 
