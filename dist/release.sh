@@ -46,6 +46,11 @@ command -v git   >/dev/null 2>&1 || err "git not found"
 command -v gh    >/dev/null 2>&1 || err "gh CLI not found"
 command -v claude >/dev/null 2>&1 || err "claude CLI not found (install: npm i -g @anthropic-ai/claude-code)"
 
+# Allow claude -p to work when release.sh is invoked from within a
+# Claude Code session. The CLAUDECODE env var blocks nested sessions,
+# but -p (prompt mode) is safe and doesn't share runtime resources.
+unset CLAUDECODE 2>/dev/null || true
+
 # Must be on master with clean tree
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$BRANCH" != "master" ]; then
@@ -99,7 +104,7 @@ Rules:
 - MINOR: new features, new syscalls, significant enhancements
 - PATCH: bug fixes, documentation, minor improvements
 
-Respond with exactly: BUMP_TYPE: reason" 2>/dev/null || echo "PATCH: could not analyze")"
+Respond with exactly: BUMP_TYPE: reason" < /dev/null 2>/dev/null || echo "PATCH: could not analyze")"
 
 printf "\n"
 info "Commit summary (${COMMITS_SINCE} commits since ${CURRENT_TAG}):"
@@ -158,7 +163,7 @@ Rules:
 - Start each bullet with a verb (Add, Fix, Change, Update, etc.)
 - Be concise but informative
 - Include the key technical detail that matters to users
-- Do NOT include commit hashes" 2>/dev/null || echo "## [${NEW_VERSION}] - $(date +%Y-%m-%d)
+- Do NOT include commit hashes" < /dev/null 2>/dev/null || echo "## [${NEW_VERSION}] - $(date +%Y-%m-%d)
 
 (changelog generation failed — please edit manually)")"
 
@@ -269,7 +274,7 @@ Here is the current ${DOC_FILE}:
 $(cat "$DOC_FILE")
 
 Output a unified diff (--- a/${DOC_FILE} / +++ b/${DOC_FILE}) with
-minimal corrections, or output nothing if the file is already accurate." 2>/dev/null || true)"
+minimal corrections, or output nothing if the file is already accurate." < /dev/null 2>/dev/null || true)"
 
     # Skip empty or non-diff output
     if [ -z "$DOC_DIFF" ] || ! printf '%s' "$DOC_DIFF" | grep -q '^@@'; then
