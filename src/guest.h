@@ -155,9 +155,12 @@ typedef struct {
 /* ---------- Semantic region tracking ---------- */
 
 /* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.).
- * GHC RTS creates many regions via mmap/mprotect on its PROT_NONE
- * reservation; 1024 provides ample headroom. */
-#define GUEST_MAX_REGIONS 1024
+ * Adjacent anonymous regions with matching permissions are automatically
+ * coalesced (see regions_mergeable in guest.c). GHC RTS and cardano-node
+ * create many thread stacks with guard pages; with coalescing, typical
+ * workloads use ~50 regions. 4096 provides ample headroom for edge cases
+ * (many interleaved guard pages, file-backed mappings, etc.). */
+#define GUEST_MAX_REGIONS 4096
 
 /* Preannounced regions appear in /proc/self/maps but NOT in the main
  * regions[] array. Used in rosetta mode to advertise x86_64 binary LOAD

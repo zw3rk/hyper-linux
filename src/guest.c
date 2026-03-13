@@ -890,16 +890,25 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
 /* Check whether two adjacent regions can be merged. They must be
  * contiguous in address space, have identical protection/flags/name,
  * and have contiguous file offsets (so the merged region still
- * represents a valid mapping). */
+ * represents a valid mapping). For anonymous regions the offset is
+ * meaningless (always 0, but may become non-zero after split/trim),
+ * so the contiguity check is skipped. Without this, adjacent anonymous
+ * mmaps (common in GHC RTS megablock allocator) each create separate
+ * entries that exhaust the region table. */
 static int regions_mergeable(const guest_region_t *a,
                               const guest_region_t *b) {
-    return a->end == b->start
-        && a->prot == b->prot
-        && a->flags == b->flags
-        && a->display_va == 0 && b->display_va == 0
-        && a->display_end == 0 && b->display_end == 0
-        && a->offset + (a->end - a->start) == b->offset
-        && strcmp(a->name, b->name) == 0;
+    if (a->end != b->start) return 0;
+    if (a->prot != b->prot) return 0;
+    if (a->flags != b->flags) return 0;
+    if (a->display_va != 0 || b->display_va != 0) return 0;
+    if (a->display_end != 0 || b->display_end != 0) return 0;
+    if (strcmp(a->name, b->name) != 0) return 0;
+    /* Anonymous regions have no file offset to preserve. The flags field
+     * reliably distinguishes anonymous from file-backed because every
+     * guest_region_add call site sets LINUX_MAP_ANONYMOUS explicitly. */
+    if ((a->flags & LINUX_MAP_ANONYMOUS) && (b->flags & LINUX_MAP_ANONYMOUS))
+        return 1;
+    return a->offset + (a->end - a->start) == b->offset;
 }
 
 /* Try to merge region at index i with its right neighbor (i+1).
