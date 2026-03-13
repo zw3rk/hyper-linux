@@ -605,6 +605,13 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
     } else if (level == LINUX_IPPROTO_IP) {
         mac_level = IPPROTO_IP;
         if (optname == LINUX_IP_TOS) mac_optname = IP_TOS;
+        else if (optname == LINUX_IP_MTU_DISCOVER) {
+            /* Linux IP_MTU_DISCOVER controls path MTU discovery strategy.
+             * macOS has no equivalent — IP_DONTFRAG is the closest but only
+             * works on UDP. Silently succeed as a no-op; the kernel's default
+             * PMTU behavior is acceptable for cardano-node P2P networking. */
+            return 0;
+        }
     } else if (level == LINUX_IPPROTO_IPV6) {
         mac_level = IPPROTO_IPV6;
         if (optname == LINUX_IPV6_V6ONLY) mac_optname = IPV6_V6ONLY;
@@ -616,8 +623,12 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
         return -LINUX_EFAULT;
 
     if (setsockopt(host_fd, mac_level, mac_optname, optval,
-                   (socklen_t)optlen) < 0)
+                   (socklen_t)optlen) < 0) {
+        if (hl_verbose)
+            fprintf(stderr, "hl: setsockopt(fd=%d, level=%d/%d, opt=%d/%d, len=%u): %s\n",
+                    fd, level, mac_level, optname, mac_optname, optlen, strerror(errno));
         return linux_errno();
+    }
     return 0;
 }
 
@@ -645,6 +656,21 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
     } else if (level == LINUX_IPPROTO_IP) {
         mac_level = IPPROTO_IP;
         if (optname == LINUX_IP_TOS) mac_optname = IP_TOS;
+        else if (optname == LINUX_IP_MTU_DISCOVER) {
+            /* Return IP_PMTUDISC_WANT (3) as a reasonable default */
+            uint32_t guest_optlen_val;
+            if (guest_read(g, optlen_gva, &guest_optlen_val, 4) < 0)
+                return -LINUX_EFAULT;
+            if (guest_optlen_val >= sizeof(int)) {
+                int val = 3; /* IP_PMTUDISC_WANT */
+                if (guest_write(g, optval_gva, &val, sizeof(val)) < 0)
+                    return -LINUX_EFAULT;
+                uint32_t out_len = sizeof(int);
+                if (guest_write(g, optlen_gva, &out_len, 4) < 0)
+                    return -LINUX_EFAULT;
+            }
+            return 0;
+        }
     } else if (level == LINUX_IPPROTO_IPV6) {
         mac_level = IPPROTO_IPV6;
         if (optname == LINUX_IPV6_V6ONLY) mac_optname = IPV6_V6ONLY;

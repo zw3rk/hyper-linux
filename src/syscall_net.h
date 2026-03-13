@@ -59,8 +59,9 @@
 /* ---------- Linux IP/IPv6 level options ---------- */
 #define LINUX_IPPROTO_IP     0
 #define LINUX_IPPROTO_IPV6  41
-#define LINUX_IP_TOS         1
-#define LINUX_IPV6_V6ONLY   26
+#define LINUX_IP_TOS              1
+#define LINUX_IP_MTU_DISCOVER    10
+#define LINUX_IPV6_V6ONLY        26
 
 /* ---------- Linux shutdown() how values ---------- */
 #define LINUX_SHUT_RD   0
