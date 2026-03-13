@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3] - 2026-03-13
+
+### Added
+- Set process title to the guest binary name, making `hl` processes identifiable in `ps` and Activity Monitor
+
 ## [0.2.2] - 2026-03-13
 
 ### Added
