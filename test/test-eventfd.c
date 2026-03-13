@@ -125,6 +125,6 @@ int main(void) {
         } else FAIL("eventfd create failed");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-eventfd");
     return fails > 0 ? 1 : 0;
 }

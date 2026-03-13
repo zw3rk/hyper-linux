@@ -124,6 +124,6 @@ int main(void) {
     unlink(symlink_path);
     unlink(testfile);
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-file-ops");
     return fails > 0 ? 1 : 0;
 }

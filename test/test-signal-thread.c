@@ -11,49 +11,13 @@
  *                     rt_sigprocmask(135), getpid(172), gettid(178)
  */
 #include "test-harness.h"
+#include "raw-syscall.h"
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
 
 int passes = 0, fails = 0;
-
-/* ---------- Inline syscall helpers ---------- */
-
-static long raw_syscall3(long nr, long a, long b, long c) {
-    register long x0 __asm__("x0") = a;
-    register long x1 __asm__("x1") = b;
-    register long x2 __asm__("x2") = c;
-    register long x8 __asm__("x8") = nr;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x8)
-                     : "memory", "cc");
-    return x0;
-}
-
-static long raw_syscall1(long nr, long a) {
-    register long x0 __asm__("x0") = a;
-    register long x8 __asm__("x8") = nr;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x8)
-                     : "memory", "cc");
-    return x0;
-}
-
-static long raw_gettid(void) {
-    return raw_syscall1(__NR_gettid, 0);
-}
-
-static long raw_getpid(void) {
-    return raw_syscall1(__NR_getpid, 0);
-}
-
-static long raw_tgkill(int tgid, int tid, int sig) {
-    return raw_syscall3(__NR_tgkill, (long)tgid, (long)tid, (long)sig);
-}
 
 /* ---------- Signal state ---------- */
 
@@ -220,6 +184,6 @@ int main(void) {
     test_tgkill_bad_tid();
     test_sa_resethand();
 
-    printf("\ntest-signal-thread: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-signal-thread");
     return fails > 0 ? 1 : 0;
 }

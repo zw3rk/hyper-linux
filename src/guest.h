@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
- * host buffer). A 64GB address space is reserved via mmap(MAP_ANON) (macOS
- * demand-pages physical memory on first touch, so unused pages cost nothing).
- * The slab is mapped RWX to Hypervisor.framework; fine-grained permissions
- * are enforced by the guest's own page tables built from mem_region
- * descriptors. Page tables can be extended at runtime (e.g. when mmap/brk
- * grows beyond initial mappings).
+ * host buffer). Buffer size is determined by the VM's configured IPA width:
+ *   - Native aarch64 on M2 (36-bit IPA): 64GB
+ *   - Native aarch64 on M3+ (40-bit IPA): 1TB
+ *   - Rosetta x86_64 on any hardware (48-bit IPA, capped at 40): 1TB
+ * Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on first
+ * touch, so unused pages cost nothing. The slab is mapped RWX to
+ * Hypervisor.framework; fine-grained permissions are enforced by the guest's
+ * own page tables built from mem_region descriptors. Page tables can be
+ * extended at runtime (e.g. when mmap/brk grows beyond initial mappings).
  */
 #ifndef GUEST_H
 #define GUEST_H
@@ -36,10 +39,12 @@
 #define ELF_DEFAULT_BASE     0x00400000ULL   /* Typical ELF load base */
 #define PIE_LOAD_BASE        0x00400000ULL   /* PIE (ET_DYN) executable base (4MB) */
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
-#define STACK_TOP            0x08000000ULL   /* Stack grows down from here */
-#define STACK_BASE           0x07800000ULL   /* Bottom of 8MB stack region (4×2MB blocks).
+#define STACK_SIZE           0x00800000ULL   /* 8MB stack (4×2MB blocks).
                                               * macOS demand-pages HVF backing memory, so
                                               * unused stack pages consume no host RAM. */
+#define STACK_TOP_DEFAULT    0x08000000ULL   /* Default stack top (128MB) — used when
+                                              * brk_start is below this.  Otherwise stack
+                                              * is placed dynamically above brk. */
 #define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
                                               * Below 8GB — only code goes here, not
@@ -127,6 +132,26 @@ typedef struct {
 
 #define GUEST_MAX_ALIASES 16
 
+/* ---------- Overflow segments ---------- */
+
+/* Overflow segment: additional hv_vm_map'd host buffer for high-VA
+ * allocations when the primary buffer's RW region is exhausted.
+ * On M2 (max_ipa=36), the primary buffer is limited to 64GB by HVF,
+ * but rosetta's JIT allocates many 2MB blocks for high-VA regions
+ * (slab at 240TB, PIE at 85TB, thread stacks). Each high-VA 2MB block
+ * consumes a 2MB GPA from the primary buffer's mmap RW pool (48GB usable).
+ * Large x86_64 binaries exhaust this pool. Overflow segments provide
+ * additional GPA space mapped at IPAs beyond the primary buffer. */
+typedef struct {
+    void     *host_base;   /* Host mmap'd buffer */
+    uint64_t  ipa_start;   /* IPA where this segment is mapped */
+    uint64_t  size;        /* Total segment size */
+    uint64_t  next;        /* Bump allocator: next free offset */
+} guest_overflow_t;
+
+#define GUEST_MAX_OVERFLOW  4
+#define GUEST_OVERFLOW_SIZE (1ULL * 1024 * 1024 * 1024)  /* 1GB per segment */
+
 /* ---------- Semantic region tracking ---------- */
 
 /* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.).
@@ -147,17 +172,25 @@ typedef struct {
  * Distinct from mem_region_t which is used purely for page table construction.
  * Regions are kept sorted by start address in guest_t.regions[]. */
 typedef struct {
-    uint64_t start;       /* GVA start (page-aligned) */
-    uint64_t end;         /* GVA end (exclusive, page-aligned) */
+    uint64_t start;       /* GPA start for gap-finder (page-aligned) */
+    uint64_t end;         /* GPA end (exclusive, page-aligned) */
     int      prot;        /* LINUX_PROT_* flags */
     int      flags;       /* LINUX_MAP_* flags (for /proc/self/maps display) */
     uint64_t offset;      /* File offset (for /proc/self/maps display) */
+    uint64_t display_va;  /* Non-zero: /proc/self/maps shows this VA instead
+                           * of start. Used for high-VA mmaps (e.g., rosetta's
+                           * slab at 240TB) backed by GPA in primary buffer. */
+    uint64_t display_end; /* Non-zero: overrides the computed display end
+                           * (display_va + (end - start)). Used when the
+                           * backing GPA is larger than the actual mmap (e.g.,
+                           * 2MB-aligned GPA for a non-2MB-aligned mmap). */
     char     name[64];    /* Label: "[heap]", "[stack]", ELF path, etc. */
 } guest_region_t;
 
 /* ---------- Guest state ---------- */
 typedef struct {
     void       *host_base;    /* Host pointer to allocated guest memory */
+    int         shm_fd;       /* File fd backing host_base for COW fork (-1 if MAP_ANON) */
     uint64_t    guest_size;   /* Total size (determined by IPA capacity) */
     uint64_t    ipa_base;     /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     uint64_t    mmap_limit;   /* Max mmap address (computed from guest_size) */
@@ -165,6 +198,8 @@ typedef struct {
     uint64_t    pt_pool_next; /* Next free page table page in pool */
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
+    uint64_t    stack_base;   /* Bottom of stack region (dynamic, above brk) */
+    uint64_t    stack_top;    /* Top of stack (stack grows down from here) */
     uint64_t    mmap_next;    /* RW mmap high-water mark (for fork IPC state transfer) */
     uint64_t    mmap_end;     /* Current page-table-covered RW mmap limit */
     uint64_t    mmap_rx_next; /* RX mmap high-water mark (for fork IPC state transfer) */
@@ -182,6 +217,14 @@ typedef struct {
     guest_va_alias_t va_aliases[GUEST_MAX_ALIASES];
     int              naliases;
     uint32_t            ipa_bits;  /* IPA bits requested from HVF */
+    int                 is_rosetta; /* Non-zero when running x86_64 via rosetta */
+    /* Rosetta placement — survives guest_reset() for execve re-setup.
+     * Set by rosetta_prepare() on first load; reused on subsequent loads
+     * (e.g. execve of another x86_64 binary) so segments land at the
+     * same GPA and the existing VA aliases remain valid. */
+    uint64_t  rosetta_guest_base;  /* GPA in primary buffer where rosetta is loaded */
+    uint64_t  rosetta_va_base;     /* High VA start (e.g. 0x800000000000) */
+    uint64_t  rosetta_size;        /* 2MB-aligned total rosetta span */
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int            nregions;  /* Number of active regions */
@@ -189,6 +232,14 @@ typedef struct {
      * See GUEST_MAX_PREANNOUNCED comment above. */
     guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
     int            npreannounced;
+    int            verbose;       /* Non-zero: print debug diagnostics to stderr */
+    /* Overflow segments for high-VA GPA exhaustion (rosetta on M2).
+     * When find_free_gap() can't allocate from the primary buffer's
+     * mmap RW region, new 2MB blocks come from overflow segments
+     * mapped at IPAs beyond guest_size. */
+    guest_overflow_t overflow[GUEST_MAX_OVERFLOW];
+    int              noverflow;
+    uint64_t         overflow_ipa_next; /* Next IPA for new overflow segment */
 } guest_t;
 
 /* Convert a guest offset (0-based) to an IPA/VA (ipa_base + offset) */
@@ -203,6 +254,14 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset) {
  * ipa_bits: IPA width for HVF VM (0 = auto-detect).
  * Returns 0 on success, -1 on failure. */
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits);
+
+/* Initialize guest from a POSIX shared memory fd (COW fork path).
+ * Maps shm_fd MAP_PRIVATE (copy-on-write), creates HVF VM, maps to
+ * hypervisor. The child gets an instant COW snapshot of parent's guest
+ * memory without copying. shm_fd is closed after mapping.
+ * Returns 0 on success, -1 on failure. */
+int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
+                         uint32_t ipa_bits);
 
 /* Register a VA alias for a non-identity-mapped region. Allows syscall
  * handlers (guest_ptr/read/write) to resolve high virtual addresses
@@ -220,6 +279,12 @@ void guest_destroy(guest_t *g);
 /* Get a host pointer for a guest virtual address.
  * Returns NULL if gva is out of bounds. */
 void *guest_ptr(const guest_t *g, uint64_t gva);
+
+/* Get a host pointer for a guest virtual address, with available byte count.
+ * *avail receives the number of contiguous bytes from gva to the end of
+ * the current memory region. Use this when passing guest buffers directly
+ * to host syscalls (read/write) to prevent accessing past the region. */
+void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail);
 
 /* Bounds-checked copy from guest memory to host buffer.
  * Returns 0 on success, -1 if out of bounds. */
@@ -292,6 +357,17 @@ int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
 int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
                        uint64_t gpa_start, int perms);
 
+/* Allocate a 2MB-aligned GPA block from overflow segments.
+ * Creates a new overflow segment if needed (1GB, mapped via hv_vm_map
+ * at an IPA beyond the primary buffer). Returns the allocated IPA,
+ * or UINT64_MAX on failure. */
+uint64_t guest_overflow_alloc(guest_t *g);
+
+/* Translate a host pointer back to a GPA, checking both the primary
+ * buffer and overflow segments. Returns 0 on success, -1 if the
+ * pointer doesn't belong to any known region. */
+int guest_host_to_gpa(const guest_t *g, const void *ptr, uint64_t *out_gpa);
+
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and
  * resets page table pool, brk, and mmap allocation state. Preserves the
  * host_base mapping and VM/vCPU handles. */
@@ -319,6 +395,14 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
                      int prot, int flags, uint64_t offset,
                      const char *name);
 
+/* Add a preannounced region (appears in /proc/self/maps but is NOT checked
+ * by MAP_FIXED_NOREPLACE). Used for x86_64/rosetta mode where the binary
+ * is pre-mapped by hl but Rosetta still needs to do its own MAP_FIXED.
+ * Sorted by start address; shadowed by actual regions[] in maps output. */
+int guest_preannounce(guest_t *g, uint64_t start, uint64_t end,
+                      int prot, int flags, uint64_t offset,
+                      const char *name);
+
 /* Remove all region coverage in [start, end). Regions fully contained are
  * deleted; partially overlapping regions are trimmed or split. */
 void guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
@@ -333,11 +417,5 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
 
 /* Clear all tracked regions. Used by execve before re-adding new regions. */
 void guest_region_clear(guest_t *g);
-
-/* Debug: dump ARM64 page table entries for a given GPA offset range.
- * Walks L0→L1→L2→L3 and prints descriptor values, permissions, and
- * the actual IPA pointed to by each entry. Useful for verifying that
- * the vCPU sees the correct pages with the correct permissions. */
-void guest_dump_ptes(const guest_t *g, uint64_t start, uint64_t end);
 
 #endif /* GUEST_H */

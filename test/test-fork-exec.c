@@ -297,6 +297,6 @@ int main(int argc, char **argv) {
     test_fork_exit_codes();
     test_nested_fork();
 
-    printf("\ntest-fork-exec: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-fork-exec");
     return fails > 0 ? 1 : 0;
 }

@@ -22,6 +22,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
 - **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
 - **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
+- **src/crash_report.c/h** — Structured crash report for GitHub issue filing (~250 lines).
 - **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
 
@@ -30,7 +31,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **Apple HVF enforces W^X** even with SCTLR.WXN=0. Regions can't be both writable
   and executable simultaneously. Use RW for data, RX for code.
 - **SCTLR RES1 bits must be set explicitly** — HVF returns default SCTLR=0x0.
-  Use SCTLR_RES1 mask (0x30D01804) + desired bits.
+  Use SCTLR_RES1 mask (0x30D00980) + desired bits.
 - **MMU must be enabled during vCPU execution** — via HVC #4 from the shim,
   not before hv_vcpu_run(). Setting SCTLR.M=1 via hv_vcpu_set_sys_reg before
   start causes permission faults on first instruction fetch.
@@ -55,14 +56,27 @@ value is wrong and the EL0 caller's register state is corrupted after ERET.
 
 Only `bad_exception` vectors may clobber X5 (they halt, so no preservation needed).
 
+## DC ZVA Emulation (Critical for Rosetta)
+
+HVF traps DC ZVA (Data Cache Zero by VA) via HCR_EL2.TDZ=1 even with
+SCTLR_EL1.DZE=1. The shim MUST emulate DC ZVA by zeroing 64 bytes at
+the cache-line-aligned address from the Rt register. Without this,
+rosetta's JIT compiler produces corrupted block tables (stale data in
+memory that DC ZVA was supposed to zero), causing assertion failures.
+
 ## HVC Protocol
 
 | HVC # | Purpose | Registers |
 |-------|---------|-----------|
 | #0 | Normal exit | x0 = exit code |
 | #2 | Bad exception | x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector |
-| #4 | Set sysreg | x0 = reg ID, x1 = value |
+| #4 | Set sysreg | x0 = reg ID (0-8), x1 = value |
 | #5 | Syscall forward | X0-X5=args, X8=syscall nr; on return X8=TLBI flag |
+| #7 | MRS trap (read sysreg) | host reads reg from ESR ISS; returns value in x0 |
+| #9 | W^X toggle | x0=FAR, x1=type (0=exec→RX, 1=write→RW) |
+| #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
+| #11 | EL0 fault | SIGSEGV delivery; GPRs in frame |
+| #12 | System instruction trap | cache maintenance logging (DC CVAU, IC IVAU, etc.) |
 
 ## Build
 
@@ -78,6 +92,43 @@ make clean       # remove _build/
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
 
+## Validation
+
+**Always run the full 4-mode test matrix after any code change:**
+
+```
+nix develop -c bash test/test-matrix.sh all
+```
+
+This tests all 4 modes: `hl-aarch64`, `hl-x64`, `lima-aarch64`, `lima-x64`.
+Individual modes can be run with e.g. `bash test/test-matrix.sh hl-aarch64`.
+
+The matrix covers: unit tests (~34), coreutils (musl static + musl dynamic
++ glibc dynamic), busybox, static bins, Haskell bins (pandoc, shellcheck),
+and a Haskell hello-hyper test — per mode.
+
+Quick unit-only tests (subset of the full matrix):
+```
+nix develop -c make test-all       # aarch64 unit tests (38 tests)
+nix develop -c make test-x64-all   # x86_64 unit tests (34+4 xfail)
+```
+
+### Expected Results (M2, as of commit 9b6505a)
+
+| Mode | Pass | Fail | Timeout | Notes |
+|------|------|------|---------|-------|
+| hl-aarch64 | 204 | 0 | 0 | Clean |
+| hl-x64 | 200 | 1 | 2 | Known rosetta limitations |
+| lima-aarch64 | 201 | 1 | 2 | lima-specific test-poll |
+| lima-x64 | 199 | 2 | 2 | rosetta + lima test-poll |
+
+### Known Failures (not regressions)
+
+- **test-signal-thread** (x64): SA_RESETHAND not reset — rosetta shadows
+  signal state internally. Also fails in Lima VM.
+- **test-thread, test-stress** (x64): TLS=0 hang — rosetta limitation.
+- **test-poll** (lima only): lima-specific, passes in hl modes.
+
 ## Dynamic Linking
 
 hl supports dynamically-linked aarch64-linux ELF binaries via `--sysroot`:
@@ -88,7 +139,8 @@ hl --sysroot /path/to/musl-sysroot ./my-dynamic-program
 
 How it works:
 1. `elf_load()` parses PT_INTERP to find the interpreter path (e.g., `/lib/ld-musl-aarch64.so.1`)
-2. The interpreter is loaded as ET_DYN at `INTERP_LOAD_BASE` (0x40000000)
+2. The interpreter is loaded as ET_DYN at `g->interp_base` (computed dynamically:
+   60GB for 36-bit IPA, 1020GB for 40-bit IPA)
 3. `build_linux_stack()` passes `AT_BASE` (interpreter load address) and
    `AT_EXECFN` (argv[0]) in the auxiliary vector
 4. Entry point is set to `interp_entry + load_base` (dynamic linker takes over)
@@ -156,25 +208,208 @@ Rosetta is treated as a binfmt_misc interpreter (NOT a PT_INTERP dynamic linker)
   dynamic linking internally (loading ld-linux-x86-64.so.2 etc.)
 - AT_PLATFORM remains "aarch64" (correct: rosetta produces ARM64 code)
 
+### x86_64 musl AT_BASE Fix
+
+Rosetta reads AT_BASE from its own (host) auxv as a template when constructing
+the x86_64 auxv for dynamically-linked binaries. The Linux kernel always emits
+AT_BASE (value=0 for static binaries). hl's `build_linux_stack()` previously
+omitted AT_BASE when `interp_base == 0` (static binaries like Rosetta), causing
+Rosetta to skip AT_BASE in the x86_64 auxv. musl's `_dlstart_c` then fell back
+to scanning AT_PHDR for PT_DYNAMIC, found the wrong base → SIGFPE.
+
+Fix in `src/stack.c`: always emit `AT_BASE` (matching Linux kernel behavior).
+This lets Rosetta copy the entry and fill in the correct interpreter address.
+glibc is unaffected (uses `__ehdr_start` for base computation, independent of
+AT_BASE).
+
 ### Rosetta AOT Translation (rosettad)
 
 Rosetta supports ahead-of-time (AOT) translation via the `rosettad` daemon,
-which is also a static aarch64-linux binary. The AOT flow is essential for
-complex binaries (indirect calls, function pointers) that fail with JIT-only
-("BasicBlock requested for unrecognized address").
+which is also a static aarch64-linux binary. AOT translation produces
+ARM64 code for the x86_64 binary's functions.
+
+**Rosetta TranslationMode Architecture** (reverse-engineered from the binary):
+
+Rosetta has three independent mode concepts:
+1. **BSS[0x474] "translation quality"**: Hardware-dependent, set at init.
+   1=basic (M2, no FEAT_AFP), 2=enhanced (M3+, has FEAT_AFP). Set by
+   checking ID_AA64MMFR1_EL1 bits 44-47 (AFP field) at VA 0x800000030c64.
+2. **TranslationMode enum** (per-translation-unit): 0=Aot, 1=JIT, 2=AOT-assisted JIT, 3=unknown.
+   Stored at object offset 0x18 and stack local [sp,#0x110]/[sp,#0xb4].
+3. **is_aot_mode flag** (per-fragment): Object offset 0x214. Extracted from
+   bit 8 of packed AOT metadata at fragment header offset 0x88. The packed
+   field is computed by function at 0x54bf4 from two source uint64 values
+   at [source+0x80] and [source+0x88]: bit 8 of packed = bit 4 of
+   [source+0x88]. When set, the translate caller forces mode=2
+   (AOT-assisted JIT). **Currently always 0** because the AOT files from
+   `rosettad translate` have zeros at offsets 0x80 and 0x88.
+
+**Mode computation** (at VA 0x800000034f78-0x800000034f94):
+```
+and w8, w8, #0xff    ; mask is_aot_mode
+cmp w8, #1           ; compare with 1
+mov w8, #1           ; default = JIT
+cinc w8, w8, eq      ; if is_aot_mode == 1: mode=2 (AOT-assisted)
+```
+The JIT translate path NEVER uses TranslationMode::Aot (0). It only
+produces mode 1 (pure JIT) or mode 2 (AOT-assisted JIT).
+
+**TranslationMode::Aot (0) is a completely separate code path** used by
+TranslationCacheAot.cpp for fully pre-translated AOT cache entries. It
+uses the dispatch at VA 0x800000039e00 (Translator.cpp) and supports
+dyld stub translation (translate_indirect_jmp_dyld_stub at 0x39ed0,
+which asserts _mode==Aot). Mode 0 is set by a lookup function at
+0x29ae4 that searches a table at 0x80000001c380.
+
+**How AOT-assisted JIT (mode 2) prevents block_for_offset failures:**
+- At init (0x46ee8): mode 2 calls `seed_block()` at 0x2a7b0, which
+  pre-registers all blocks from AOT data into the block table
+- In the main translate loop (0x47cdc): mode 2 takes a short path
+  (`b.eq 0x47f8c`) that skips the block list iteration at 0x47ce8-0x47d3c
+- `block_for_offset()` at 0x387d4 uses binary search on the block table;
+  with AOT-seeded blocks, lookups succeed instead of returning NULL
+
+**The "BasicBlock requested for unrecognized address" assertion** at
+VA 0x800000038838 fires in `block_for_offset` (BuilderBase.h:550) when
+the binary search returns NULL. This happens for indirect jumps to
+addresses not pre-registered as block starts. In mode 2, AOT data
+pre-populates all known blocks; in mode 1, only discovered blocks exist.
+
+**Root cause of x86_64 indirect jump failures (RESOLVED):** DC ZVA (Data
+Cache Zero by VA) was trapped by HVF (HCR_EL2.TDZ=1) but not emulated.
+The shim only counted the trap and ran IC IALLU without zeroing memory.
+Rosetta uses DC ZVA as fast memset(0) for JIT code buffers and internal
+metadata. Without actual zeroing, stale data corrupted rosetta's block
+tables, causing `block_for_offset()` to fail on indirect jump targets.
+
+**Fix:** The shim now emulates DC ZVA by decoding the ISS to identify the
+instruction (Op0=1,Op1=3,CRn=7,CRm=4,Op2=1), extracting the Rt register
+from ISS[9:5], loading the VA from the saved register frame, and zeroing
+64 bytes at the cache-line-aligned address using four STP xzr pairs.
+SCTLR_EL1.DZE (bit 14) is also set to allow DC ZVA at EL0.
+
+**Previous incorrect theories (now disproven):**
+- AOT `is_aot_mode` flag / `seed_block()` pre-population: not the cause
+- Rosetta binary patching (TranslationMode, is_aot_mode): wrong approach
+- BSS signal handler pre-population: incorrect (BSS stores OLD handler)
+- rosettad AOT metadata at offsets 0x80/0x88: unrelated to the crash
+
+**AOT file format** (from `rosettad translate` output):
+```
+Offset  Size  Field
+0x00    8     total_size (mapped code+data region size)
+0x08    8     version (always 1)
+0x10    8     orig_size (original x86_64 binary mapped size)
+0x18    8     code_offset (file offset of translated ARM64 code, always 0x1000)
+0x20    8     unknown
+0x28    8     unknown
+0x30    8     unknown
+0x38    8     metadata_offset
+0x40    8     metadata_end
+0x48    8     block_table_end
+0x50    4     code_align (0x1000)
+0x54    4     entry_count (number of translated entry points)
+0x58-0xFFF    zero padding
+0x1000+       translated ARM64 code
+```
+Offsets 0x80 and 0x88 (the `is_aot_mode` source fields) are always zero
+in standalone `rosettad translate` output. hl patches bit 4 of the uint64
+at offset 0x88 after rosettad translate (in `patch_aot_is_aot_mode()`,
+src/syscall_io.c) to enable AOT-assisted JIT mode and `seed_block()`
+pre-population. Additionally, 3 UBFX extraction sites in the rosetta
+binary are patched to `mov wN, #1` (in src/hl.c) to force is_aot_mode=1
+regardless of AOT file contents.
+
+### I-cache / D-cache Coherence (IC IALLU)
+
+ARM64 I-cache and D-cache are not automatically coherent. When rosetta's
+JIT signal handler writes translated code (patching BRK stubs with branch
+instructions), the D-cache is updated but the I-cache retains the old BRK
+instruction. Without explicit I-cache invalidation, the CPU fetches the
+stale BRK from the I-cache, causing infinite re-traps.
+
+The shim executes `IC IALLU; DSB ISH; ISB` after every syscall return
+(post-HVC #5 in handle_svc_0). This ensures that rt_sigreturn from
+rosetta's signal handler flushes the I-cache before the translated code
+executes. IC IALLU is a single-cycle operation on Apple Silicon; the
+ISB pipeline flush (~10 cycles) is negligible vs HVC overhead (~1000+).
+
+Rosetta's binary contains only 1 IC IVAU instruction (at VA 0x2686c)
+which is never called in the JIT path — it relies on external cache
+maintenance, which the shim now provides.
+
+### Rosetta AOT Activation Status
+
+Rosettad AOT translation is fully active with persistent caching. The
+handler thread intercepts rosetta's SOCK_SEQPACKET socket via
+socketpair(SOCK_STREAM) and handles the 't'/'d'/'q' protocol.
+
+**Persistent AOT cache** at `~/.cache/hl-rosettad/`:
+- Files: `<sha256_hex>.aot` keyed by SHA256 of the original x86_64 binary
+- 't' handler: computes binary SHA256, checks cache, translates on miss,
+  stores in cache.
+- 'd' handler: looks up persistent cache by digest, responds HIT with
+  cached AOT fd. On first run, all 'd' queries miss → rosetta sends 't'.
+  On subsequent runs, rosetta's .flu cache (`~/.cache/rosetta/`) sends
+  'd' with cached digests → all HIT → no re-translation needed.
+
+This matches real rosettad behavior: the digest is always the SHA256 of
+the original binary (not the AOT output). Overflow segments (4×1GB via
+separate hv_vm_map calls) and the 1TB primary buffer (48-bit IPA) provide
+ample backing for rosetta's high-VA JIT/AOT allocations, so no binary
+size cap is needed.
+
+**The `_potential_targets` assertion** at VA 0x800000048eac
+(`_mode == TranslationMode::Aot || _potential_targets.empty()`,
+BranchTargetFinderBase.hpp:57) is a defensive check. Within the big
+translate function, `_potential_targets` ([sp,#0x150-0x160]) is only
+ever initialized to zero (0x46e54) and reset to zero (0x4758c). The
+assertion guards against future bugs where potential targets might leak
+into non-Aot modes.
+
+**BSS[0xa04] is the VZ enable flag** — written at VA 0x800000030304
+from caps[0] of the VZ_CAPS ioctl result. When VZ is active (our hl
+sets caps[0]=1), BSS[0xa04]=1, and the runtime AOT code at 0x90afc
+proceeds to connect to rosettad via socket.
+
+**BSS[0xa05]** is a secondary VZ capability flag from caps[108].
+**BSS[0xa06..0xa71]** (108 bytes) stores the `sun_path` socket path bytes,
+copied from VZ_CAPS caps[1..108]. caps[66..] (sun_path[65..]) holds the
+null-terminated x86_64 binary path that Rosetta passes to rosettad for
+AOT translation.
 
 **VZ mode activation:** Rosetta checks for VZ (Virtualization.framework)
 support via 3 ioctls: VZ_CHECK (0x80456125) returns a 69-byte signature,
 VZ_CAPS (0x80806123) returns 128 bytes of capability data, VZ_ACTIVATE
 (0x6124). These are intercepted in `syscall_io.c`.
 
+**VZ_CAPS buffer layout** (128 bytes, verified via strace in Lima VZ VM):
+- `caps[0]`: VZ enable flag (1 = active). Written to BSS[0xa04].
+- `caps[1..64]`: `sun_path[0..63]` — socket path for rosettad. Must be
+  non-empty (caps[1] != 0). Real VZ returns "/run/rosettad/rosetta.sock".
+  The actual path doesn't matter because connect() is intercepted via
+  `rosettad_is_socket()` — the socketpair is pre-connected.
+- `caps[66..107]`: Null-terminated path to the x86_64 binary being
+  translated (`caps+0x42` in Rosetta notation). Rosetta opens this file
+  and sends the fd to rosettad via SCM_RIGHTS for AOT translation.
+- `caps[108]`: Written to BSS[0xa05]. Real VZ has this as 0. Both 't'
+  (translate) and 'd' (digest) protocol commands work with caps[108]=0.
+- `caps[109..127]`: Other flags (purpose unknown, leave as zero).
+
+The connect() interception in `syscall_net.c` uses `rosettad_is_socket()`
+to detect rosetta's socketpair end. The handler thread on the other end
+implements the rosettad protocol: '?' handshake, 't' translate (with
+persistent cache), 'd' digest (cache lookup), 'q' quit.
+
 **rosettad protocol** (implemented in `syscall_io.c:rosettad_handler_thread`):
 - Rosetta opens `AF_UNIX SOCK_SEQPACKET` — intercepted in `syscall_net.c`
   with `socketpair(SOCK_STREAM)` (macOS doesn't support SEQPACKET for AF_UNIX)
 - `'?'` → handshake, respond `0x01`
-- `'t'` → translate: receive binary fd via SCM_RIGHTS, run `rosettad translate`
-  via subprocess, send back AOT fd + 32-byte digest
-- `'d'` → digest cache lookup (respond `0x00` = not cached)
+- `'t'` → translate: receive binary fd via SCM_RIGHTS, compute binary SHA256,
+  check persistent cache, translate on miss via `hl rosettad translate`
+  subprocess, store in cache, send back AOT fd + 32-byte binary SHA256
+- `'d'` → digest lookup: receive 32-byte SHA256, look up persistent AOT cache,
+  respond HIT (0x01 + AOT fd via SCM_RIGHTS) or MISS (0x00)
 - `'q'` → quit
 
 **cmsghdr format translation** (critical for SCM_RIGHTS to work):
@@ -193,9 +428,11 @@ so programs like busybox can use `basename(argv[0])` for applet lookup.
 
 ### Fork/IPC Propagation
 
-`fork_ipc.c` propagates `g->ipa_bits` in the IPC header so child processes
-create their VMs with the same IPA width. Extra mappings are NOT currently
-transferred — fork children in rosetta mode may need additional work.
+`fork_ipc.c` propagates `g->ipa_bits`, rosetta placement fields, and kbuf
+state in the IPC header so child processes create their VMs with the same
+IPA width and rosetta configuration. Rosetta fork children use the legacy
+IPC region-copy path (not COW) because rosetta's JIT state is process-local.
+Extra mappings (rosetta segments) are re-created from the IPC header fields.
 
 ## L3 Page Table Splitting
 
@@ -255,13 +492,36 @@ Key points:
 macOS HVF allows only one VM per process. Fork is implemented via:
 1. Parent creates socketpair(AF_UNIX, SOCK_STREAM)
 2. Parent posix_spawn()s new `hl --fork-child <fd>` process
-3. Parent serializes VM state over IPC: header + registers + memory
-   regions (only used regions, not full 4GB) + FD table (via SCM_RIGHTS)
-   + cwd + umask + signal state + shim blob + sentinel
+3. Parent serializes VM state over IPC (two paths, see below)
 4. Child receives state, creates own VM, restores registers directly
    into EL0 (bypasses shim _start to preserve callee-saved GPRs),
    enters vCPU loop with X0=0 (child return from clone)
 5. Parent records child in process table, returns child PID
+
+### COW Fork Path (aarch64, IPC v4)
+
+When `g->shm_fd >= 0` and `!g->is_rosetta`, guest memory is file-backed
+(mkstemp+unlink, MAP_SHARED). Fork sends the backing fd via SCM_RIGHTS:
+- Parent stays on MAP_SHARED (does NOT remap — HVF caches VA→PA)
+- Child maps the fd MAP_PRIVATE → instant COW clone, zero data copy
+- IPC header has `has_shm=1`, `num_regions=0` (skip memory serialization)
+- Child calls `guest_init_from_shm()` instead of `guest_init()`
+- ~50x faster than IPC copy path for large guest memory
+
+**Critical constraints discovered:**
+- macOS rejects MAP_PRIVATE on shm_open fds (EINVAL) — use mkstemp+unlink
+- HVF caches host VA→PA from hv_vm_map; MAP_FIXED remap does NOT update
+  Stage-2, causing vCPU to read stale pages. Parent must NOT remap host_base
+- Child must restore `g->ttbr0` from IPC header (guest_init_from_shm zeroes
+  the struct; without ttbr0, page table walks fail for all high VAs)
+
+### Legacy IPC Copy Path (rosetta, fallback)
+
+When `g->shm_fd < 0` or `g->is_rosetta`:
+- Parent serializes used memory regions in 1MB chunks over the socketpair
+- Child calls `guest_init()` and receives region data into fresh guest memory
+- Rosetta JIT state (TLS, code caches, slab allocators) is process-local
+  and corrupts when COW-copied — rosetta always uses this path
 
 CLOEXEC semantics follow POSIX: all FDs (including CLOEXEC) are inherited
 across fork. CLOEXEC only takes effect at exec (src/syscall_exec.c step 4).
@@ -312,6 +572,12 @@ is single-process, shared vs private semantics are equivalent. This
 enables tools like `sort` on large files that use file-backed shared
 mappings.
 
+**MAP_FIXED file-backed mmap** must pread() file contents into guest
+memory. Both the MAP_FIXED and non-fixed paths need this. The MAP_FIXED
+path zeros the region first (for pages beyond EOF), then overlays with
+file data. This is critical for Rosetta's AOT loading — rosetta uses
+MAP_FIXED to map AOT code/data sections from the translated file.
+
 ## Memory Layout
 
 ```
@@ -325,16 +591,17 @@ mappings.
 0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
 0x020000000  - mmap_limit:    mmap RX growth area (up to g->mmap_limit)
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
-0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit)
+0x210000000  - mmap_limit:   mmap RW growth area (56GB@36-bit / 1016GB@40-bit or rosetta)
 interp_base  - varies:        Dynamic linker (g->interp_base, if --sysroot)
 --- Extra IPA mappings (x86_64 mode only, via guest_add_mapping) ---
 0x800000000000+:               Rosetta binary (3 segments at 128TB link addr)
 ```
 
-The address space size is determined at runtime by querying the max IPA
-(Intermediate Physical Address) size via `hv_vm_config_get_max_ipa_size()`:
-- **36-bit IPA (64GB)**: HVF default, mmap_limit=56GB, interp_base=60GB
-- **40-bit IPA (1TB)**: macOS 15+, mmap_limit=1016GB, interp_base=1020GB
+The primary buffer size is determined by the VM's configured IPA width
+(capped at 40-bit = 1TB):
+- **36-bit IPA (64GB)**: Native aarch64 on M2, mmap_limit=56GB, interp_base=60GB
+- **40-bit IPA (1TB)**: Native aarch64 on M3+, OR rosetta mode on any hardware
+  (vm_ipa=48 capped to 40), mmap_limit=1016GB, interp_base=1020GB
 
 Both `mmap_limit` and `interp_base` are computed dynamically from
 `guest_size` and stored in `guest_t` (replacing the old compile-time
@@ -459,3 +726,53 @@ guest physical memory via `hv_vm_map()`. Validated by `test/test-multi-vcpu.c`
 - PI futexes (priority inheritance) — real-time only
 - CPU affinity (sched_setaffinity) — returns all-CPUs mask
 - clone3 — returns -ENOSYS; musl falls back to clone()
+
+## Ptrace and clone(CLONE_VM) for Rosetta JIT
+
+Rosetta's two-process JIT architecture uses `clone(CLONE_VM)` to create
+an inferior process that shares guest memory, then attaches via
+`PTRACE_SEIZE`. BRK instructions in translated code trigger ptrace-stops,
+allowing the tracer to read/write registers and discover untranslated
+code on-demand.
+
+### clone(CLONE_VM) — In-Process VM-Clone
+
+`sys_clone_vm()` in `src/fork_ipc.c` handles `CLONE_VM` without
+`CLONE_THREAD`. Unlike `sys_clone_thread()` (CLONE_THREAD), VM-clone
+children are waitable via wait4 and have exit semantics (exit_signal,
+vm_exit_status). Unlike the posix_spawn fork path, they share the
+same `guest_t*` (same guest memory, page tables).
+
+### sys_ptrace Operations
+
+Implemented in `src/syscall_proc.c`:
+- **PTRACE_SEIZE**: Attach to thread without stopping; sets `ptraced=1`
+- **PTRACE_CONT**: Resume stopped tracee, optionally inject signal
+- **PTRACE_INTERRUPT**: Force tracee into ptrace-stop via `hv_vcpus_exit()`
+- **PTRACE_GETREGSET** (NT_PRSTATUS): Read tracee's register snapshot
+- **PTRACE_SETREGSET** (NT_PRSTATUS): Write tracee's registers (applied on resume)
+
+### Register Snapshot Protocol
+
+Cross-thread HVF register access may not be supported, so we use a
+snapshot protocol: the tracee snapshots its own vCPU registers into
+`ptrace_regs` before entering ptrace-stop, and applies any dirty
+changes back to the vCPU on resume. This ensures all HVF register
+access happens on the owning thread.
+
+### BRK + Ptrace-Stop Flow
+
+1. Guest executes BRK → shim forwards via HVC #10
+2. If `current_thread->ptraced`: tracee calls `thread_ptrace_stop(SIGTRAP)`
+3. Tracee snapshots regs, sets `ptrace_stopped=1`, broadcasts `ptrace_cond`
+4. Tracer's wait4 returns with `WIFSTOPPED(status)` and `WSTOPSIG==SIGTRAP`
+5. Tracer reads/writes regs via GETREGSET/SETREGSET
+6. Tracer calls PTRACE_CONT → sets `ptrace_stopped=0`, signals `resume_cond`
+7. Tracee applies dirty regs, resumes execution
+
+### wait4 Integration
+
+`sys_wait4()` first checks for ptraced/vm-clone children via
+`thread_ptrace_wait()` before falling through to the process table
+for regular fork children. This handles both ptrace-stopped and
+vm-exited states.

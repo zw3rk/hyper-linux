@@ -3,8 +3,8 @@
  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Parses static aarch64-linux ELF64 executables, extracts PT_LOAD segments,
- * and copies them into guest memory.
+ * Parses aarch64-linux and x86_64-linux ELF64 executables (static and
+ * dynamic), extracts PT_LOAD segments, and copies them into guest memory.
  */
 #ifndef ELF_H
 #define ELF_H
@@ -43,6 +43,7 @@
 /* Program header types */
 #define PT_NULL    0
 #define PT_LOAD    1
+#define PT_DYNAMIC 2
 #define PT_INTERP  3
 #define PT_NOTE    4
 #define PT_PHDR    6

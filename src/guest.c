@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
- * The guest address space size is determined at runtime by querying the
- * max IPA size via hv_vm_config_get_max_ipa_size(): 40-bit (1TB) on
- * macOS 15+, falling back to 36-bit (64GB). The space is reserved via
+ * The guest address space size is determined by the VM's configured IPA
+ * width (capped at 40-bit = 1TB): 64GB for native aarch64 on M2 (36-bit),
+ * 1TB for M3+ (40-bit) or rosetta mode on any hardware. Reserved via
  * mmap(MAP_ANON); macOS demand-pages physical memory on first touch, so
  * only used pages consume RAM. The slab is mapped RWX to
  * Hypervisor.framework. The guest's own page tables
@@ -14,19 +14,26 @@
  * which are mandatory for transparent misaligned access. Page tables can be
  * extended at runtime via guest_extend_page_tables().
  *
- * PROT_NONE mappings (used by GHC RTS for heap reservation) do NOT get
- * page table entries — the translation fault is the correct behavior.
+ * PROT_NONE mappings in the primary address space (used by GHC RTS for
+ * heap reservation) do NOT get page table entries — the translation
+ * fault is the correct behavior. High-VA PROT_NONE reservations (used
+ * by Rosetta for PIE binary loading) DO get minimal PTEs (MEM_PERM_R)
+ * to avoid guest_ptr() returning NULL during MAP_FIXED overlay.
  * When mprotect changes an accessible region to PROT_NONE,
  * guest_invalidate_ptes() removes existing page table entries.
  * Page tables are created on demand when mprotect changes PROT_NONE
  * to an accessible permission.
  *
- * Page table format: AArch64 4KB granule, 3-level (L0 -> L1 -> L2).
- *   L0 entry covers 512GB — one entry pointing to L1
+ * Page table format: AArch64 4KB granule, up to 4-level:
+ *   L0 entry covers 512GB — multiple entries for >512GB (rosetta at 128TB)
  *   L1 entry covers 1GB  — either block or table pointing to L2
  *   L2 entry covers 2MB  — block descriptors with final permissions
+ *   L3 entry covers 4KB  — optional, created by guest_split_block() for
+ *                           mixed permissions within a 2MB block (W^X)
  */
 #include "guest.h"
+#include "syscall_internal.h"  /* hl_verbose */
+#include "thread.h"            /* thread_destroy_all_vcpus */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +44,7 @@
 
 /* ---------- Page table descriptor bits ---------- */
 #define PT_VALID       (1ULL << 0)
-#define PT_TABLE       (1ULL << 1)  /* Table descriptor (L0/L1) */
+#define PT_TABLE       (1ULL << 1)  /* Table descriptor (L0/L1/L2) */
 #define PT_BLOCK       (1ULL << 0)  /* Block descriptor (L1/L2): valid bit only */
 #define PT_AF          (1ULL << 10) /* Access Flag */
 #define PT_SH_ISH      (3ULL << 8)  /* Inner Shareable */
@@ -49,7 +56,7 @@
 #define PT_AP_RO       (3ULL << 6)  /* AP[2:1]=11: RO at EL1, RO at EL0 */
 
 #define PAGE_SIZE      4096ULL
-#define BLOCK_2MB      (2ULL * 1024 * 1024)
+/* BLOCK_2MB defined in guest.h — reuse it */
 #define BLOCK_1GB      (1ULL * 1024 * 1024 * 1024)
 
 /* Round up/down to 2MB boundary */
@@ -67,7 +74,7 @@ static int pt_pool_warned = 0;
 
 /* Allocate a zeroed 4KB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
- * Caller must hold pt_lock or the higher-level mmap_lock. */
+ * Acquires pt_lock internally. Caller typically holds mmap_lock. */
 static uint64_t pt_alloc_page(guest_t *g) {
     pthread_mutex_lock(&pt_lock);
     if (g->pt_pool_next + PAGE_SIZE > PT_POOL_END) {
@@ -85,11 +92,12 @@ static uint64_t pt_alloc_page(guest_t *g) {
     uint64_t used = gpa + PAGE_SIZE - PT_POOL_BASE;
     uint64_t total = PT_POOL_END - PT_POOL_BASE;
     if (!pt_pool_warned && used > (total * 4 / 5)) {
-        fprintf(stderr, "guest: warning: page table pool at %llu%% "
-                "(%llu / %llu bytes)\n",
-                (unsigned long long)(used * 100 / total),
-                (unsigned long long)used,
-                (unsigned long long)total);
+        if (hl_verbose)
+            fprintf(stderr, "guest: warning: page table pool at %llu%% "
+                    "(%llu / %llu bytes)\n",
+                    (unsigned long long)(used * 100 / total),
+                    (unsigned long long)used,
+                    (unsigned long long)total);
         pt_pool_warned = 1;
     }
 
@@ -109,6 +117,7 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa) {
 
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     memset(g, 0, sizeof(*g));
+    g->shm_fd = -1;
     g->ipa_base = GUEST_IPA_BASE;
     g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -137,12 +146,15 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     else
         vm_ipa = 36;
 
-    /* Primary buffer size: capped at the hardware-reported max IPA or
-     * 40-bit, whichever is smaller. When vm_ipa > max_ipa (e.g., 48-bit
-     * for rosetta while hardware reports 36), we trust HVF to handle the
-     * wider IPA for stage-2 tables, but the primary hv_vm_map buffer
-     * must not exceed what the hardware can physically map. */
-    uint32_t buf_bits = (max_ipa > 40) ? 40 : max_ipa;
+    /* Primary buffer size: use the VM's configured IPA width (capped at
+     * 40-bit = 1TB). When rosetta is active (vm_ipa=48), this gives 1TB
+     * instead of 64GB on M2, providing ~1008GB of mmap backing space for
+     * rosetta's high-VA JIT allocations (slab at 240TB, PIE at 85TB, etc.).
+     * The hv_vm_map call supports any size up to the VM's IPA width —
+     * confirmed by rosetta's own segments mapped at 128TB via hv_vm_map.
+     * macOS demand-pages the host reservation, so only touched pages cost
+     * physical memory. */
+    uint32_t buf_bits = (vm_ipa > 40) ? 40 : vm_ipa;
     uint64_t buf_capacity = 1ULL << buf_bits;
     if (size == 0 || size > buf_capacity)
         size = buf_capacity;
@@ -169,6 +181,45 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
         return -1;
     }
 
+    /* Upgrade to file-backed shared memory for COW fork support.
+     * mkstemp + unlink + ftruncate + MAP_SHARED|MAP_FIXED replaces the
+     * anonymous mapping with file-backed memory at the same host address.
+     * At fork time, the parent stays on MAP_SHARED (HVF caches VA→PA, so
+     * remapping would cause stale reads) and sends the file fd to the child.
+     * The child maps it MAP_PRIVATE, giving it an instant copy-on-write
+     * clone of all guest memory.
+     *
+     * macOS rejects MAP_PRIVATE on shm_open objects (EINVAL), but regular
+     * file fds support MAP_SHARED, MAP_PRIVATE, and MAP_PRIVATE|MAP_FIXED
+     * correctly. The file is unlinked immediately — the fd keeps it alive.
+     * macOS demand-pages file mappings, so untouched pages cost nothing.
+     * If any step fails, we silently keep the MAP_ANON mapping and fall
+     * back to the IPC region-copy path on fork.
+     *
+     * Skip for rosetta mode (vm_ipa > max_ipa): rosetta always uses the
+     * legacy IPC copy path (fork_ipc.c checks g->is_rosetta), so the
+     * file-backed upgrade is pointless and avoids a 1TB ftruncate. */
+    if (vm_ipa <= max_ipa) {
+        char tmppath[] = "/tmp/hl-XXXXXX";
+        int sfd = mkstemp(tmppath);
+        if (sfd >= 0) {
+            unlink(tmppath);  /* Unlink immediately; fd keeps file alive */
+            if (ftruncate(sfd, (off_t)size) == 0) {
+                void *p = mmap(g->host_base, size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_FIXED, sfd, 0);
+                if (p != MAP_FAILED) {
+                    g->shm_fd = sfd;
+                } else {
+                    /* MAP_FIXED failed; keep the original MAP_ANON mapping */
+                    close(sfd);
+                }
+            } else {
+                close(sfd);
+            }
+        }
+        /* If shm_fd is still -1, we're on MAP_ANON — fork uses IPC copy */
+    }
+
     /* Create Hypervisor VM with the determined IPA width and map the
      * primary slab at GUEST_IPA_BASE.
      *
@@ -192,21 +243,126 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
                 (int)ret, vm_ipa);
         munmap(g->host_base, size);
         g->host_base = NULL;
+        if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
+        return -1;
+    }
+
+    ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
+                    HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    if (ret != HV_SUCCESS && buf_bits > max_ipa) {
+        /* 1TB primary map failed — fall back to hardware-default buffer.
+         * This handles undocumented HVF limits on primary buffer size.
+         * Close shm_fd since the fallback uses anonymous memory (the file
+         * is no longer mapped to host_base, so COW fork won't work). */
+        fprintf(stderr, "guest: hv_vm_map %lluGB failed (%d), "
+                "retrying with %u-bit (%lluGB)\n",
+                (unsigned long long)(size >> 30), (int)ret,
+                max_ipa, 1ULL << (max_ipa - 30));
+        munmap(g->host_base, size);
+        if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
+        buf_bits = (max_ipa > 40) ? 40 : max_ipa;
+        size = 1ULL << buf_bits;
+        g->guest_size = size;
+        g->interp_base = size - 0x100000000ULL;
+        g->mmap_limit  = size - 0x200000000ULL;
+        g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                            MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (g->host_base == MAP_FAILED) {
+            perror("guest: mmap (fallback)");
+            g->host_base = NULL;
+            hv_vm_destroy();
+            return -1;
+        }
+        ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
+                        HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    }
+    if (ret != HV_SUCCESS) {
+        fprintf(stderr, "guest: hv_vm_map failed: %d\n", (int)ret);
+        hv_vm_destroy();
+        munmap(g->host_base, size);
+        g->host_base = NULL;
+        if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
+        return -1;
+    }
+
+    /* Printed by hl.c after setting g->verbose (guest_init runs before
+     * verbose is set, so we can't check g->verbose here). The IPA info
+     * is printed via the verbose block in hl.c main() instead. */
+
+    /* Overflow segments start at the IPA just beyond the primary buffer */
+    g->overflow_ipa_next = g->guest_size;
+
+    return 0;
+}
+
+int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
+                         uint32_t ipa_bits) {
+    memset(g, 0, sizeof(*g));
+    g->shm_fd = -1;  /* Child doesn't own the shm */
+    g->ipa_base = GUEST_IPA_BASE;
+    g->pt_pool_next = PT_POOL_BASE;
+    g->brk_base = BRK_BASE_DEFAULT;
+    g->brk_current = BRK_BASE_DEFAULT;
+    g->mmap_next = MMAP_BASE;
+    g->mmap_rx_next = MMAP_RX_BASE;
+    g->guest_size = size;
+    g->ipa_bits = ipa_bits;
+
+    /* Compute layout limits (same formula as guest_init) */
+    g->interp_base = size - 0x100000000ULL;
+    g->mmap_limit  = size - 0x200000000ULL;
+
+    /* Map the shm fd MAP_PRIVATE: copy-on-write semantics. Reads see
+     * the parent's frozen snapshot; writes are private to this process.
+     * macOS COW is page-granular — only modified pages are duplicated. */
+    g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE, shm_fd, 0);
+    if (g->host_base == MAP_FAILED) {
+        perror("guest: mmap shm");
+        g->host_base = NULL;
+        close(shm_fd);
+        return -1;
+    }
+
+    /* Close the shm fd — the mapping keeps the pages alive */
+    close(shm_fd);
+
+    /* Create HVF VM with the same IPA width as the parent */
+    hv_return_t ret = HV_ERROR;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        hv_vm_config_t config = hv_vm_config_create();
+        hv_vm_config_set_ipa_size(config, ipa_bits);
+        ret = hv_vm_create(config);
+        os_release(config);
+        if (ret == HV_SUCCESS)
+            break;
+        usleep(500000);
+    }
+    if (ret != HV_SUCCESS) {
+        fprintf(stderr, "guest: hv_vm_create (shm) failed: %d\n", (int)ret);
+        munmap(g->host_base, size);
+        g->host_base = NULL;
         return -1;
     }
 
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
     if (ret != HV_SUCCESS) {
-        fprintf(stderr, "guest: hv_vm_map failed: %d\n", (int)ret);
+        fprintf(stderr, "guest: hv_vm_map (shm) failed: %d\n", (int)ret);
         hv_vm_destroy();
         munmap(g->host_base, size);
         g->host_base = NULL;
         return -1;
     }
 
-    fprintf(stderr, "guest: IPA size: %u bits (%lluGB primary)\n",
-            vm_ipa, (unsigned long long)(size / (1024ULL * 1024 * 1024)));
+    if (hl_verbose)
+        fprintf(stderr, "guest: COW fork: mapped %lluGB from shm "
+                "(ipa=%u bits)\n",
+                (unsigned long long)(size / (1024ULL * 1024 * 1024)),
+                ipa_bits);
+
+    /* Overflow segments start at the IPA just beyond the primary buffer */
+    g->overflow_ipa_next = g->guest_size;
 
     return 0;
 }
@@ -269,12 +425,13 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa) {
     /* Store TTBR1 value (IPA of L0 page, with ASID=0) */
     g->ttbr1 = g->ipa_base + l0_gpa;
 
-    fprintf(stderr, "guest: kbuf initialized: VA 0x%llx-0x%llx → "
-            "GPA 0x%llx (TTBR1=0x%llx)\n",
-            (unsigned long long)KBUF_VA_BASE,
-            (unsigned long long)(KBUF_VA_BASE + KBUF_SIZE - 1),
-            (unsigned long long)kbuf_gpa,
-            (unsigned long long)g->ttbr1);
+    if (g->verbose)
+        fprintf(stderr, "hl: kbuf initialized: VA 0x%llx-0x%llx → "
+                "GPA 0x%llx (TTBR1=0x%llx)\n",
+                (unsigned long long)KBUF_VA_BASE,
+                (unsigned long long)(KBUF_VA_BASE + KBUF_SIZE - 1),
+                (unsigned long long)kbuf_gpa,
+                (unsigned long long)g->ttbr1);
     return 0;
 }
 
@@ -293,15 +450,124 @@ int guest_add_va_alias(guest_t *g, uint64_t va_start,
     return 0;
 }
 
+/* ---------- Overflow segment management ---------- */
+
+/* Resolve a GPA to a host pointer within overflow segments.
+ * Returns NULL if the GPA is not in any overflow segment. */
+static void *guest_overflow_resolve(const guest_t *g, uint64_t gpa) {
+    for (int i = 0; i < g->noverflow; i++) {
+        uint64_t off = gpa - g->overflow[i].ipa_start;
+        if (off < g->overflow[i].size)
+            return (uint8_t *)g->overflow[i].host_base + off;
+    }
+    return NULL;
+}
+
+uint64_t guest_overflow_alloc(guest_t *g) {
+    /* Try existing overflow segments first */
+    for (int i = 0; i < g->noverflow; i++) {
+        if (g->overflow[i].next + BLOCK_2MB <= g->overflow[i].size) {
+            uint64_t ipa = g->overflow[i].ipa_start + g->overflow[i].next;
+            g->overflow[i].next += BLOCK_2MB;
+            if (g->verbose)
+                fprintf(stderr, "hl: overflow alloc: 0x%llx from segment %d\n",
+                        (unsigned long long)ipa, i);
+            return ipa;
+        }
+    }
+
+    /* Create a new overflow segment */
+    if (g->noverflow >= GUEST_MAX_OVERFLOW) {
+        fprintf(stderr, "hl: overflow: all %d segments exhausted\n",
+                GUEST_MAX_OVERFLOW);
+        return UINT64_MAX;
+    }
+
+    uint64_t seg_size = GUEST_OVERFLOW_SIZE;
+    uint64_t seg_ipa  = g->overflow_ipa_next;
+
+    /* Allocate host buffer (demand-paged, costs nothing until touched) */
+    void *host = mmap(NULL, seg_size, PROT_READ | PROT_WRITE,
+                      MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (host == MAP_FAILED) {
+        perror("hl: overflow mmap");
+        return UINT64_MAX;
+    }
+
+    /* Map into the HVF VM at the overflow IPA */
+    hv_return_t ret = hv_vm_map(host, seg_ipa, seg_size,
+                                HV_MEMORY_READ | HV_MEMORY_WRITE |
+                                HV_MEMORY_EXEC);
+    if (ret != HV_SUCCESS) {
+        fprintf(stderr, "hl: overflow hv_vm_map failed at IPA 0x%llx: %d\n",
+                (unsigned long long)seg_ipa, (int)ret);
+        munmap(host, seg_size);
+        return UINT64_MAX;
+    }
+
+    int idx = g->noverflow++;
+    g->overflow[idx].host_base = host;
+    g->overflow[idx].ipa_start = seg_ipa;
+    g->overflow[idx].size      = seg_size;
+    g->overflow[idx].next      = BLOCK_2MB;  /* First block allocated */
+
+    g->overflow_ipa_next = seg_ipa + seg_size;
+
+    fprintf(stderr, "hl: overflow segment %d: IPA 0x%llx–0x%llx (%lluMB)\n",
+            idx, (unsigned long long)seg_ipa,
+            (unsigned long long)(seg_ipa + seg_size),
+            (unsigned long long)(seg_size >> 20));
+
+    return seg_ipa;  /* Return the first 2MB block's IPA */
+}
+
+int guest_host_to_gpa(const guest_t *g, const void *ptr, uint64_t *out_gpa) {
+    /* Primary buffer */
+    if ((const uint8_t *)ptr >= (const uint8_t *)g->host_base &&
+        (const uint8_t *)ptr < (const uint8_t *)g->host_base + g->guest_size) {
+        *out_gpa = (uint64_t)((const uint8_t *)ptr -
+                              (const uint8_t *)g->host_base);
+        return 0;
+    }
+    /* Overflow segments */
+    for (int i = 0; i < g->noverflow; i++) {
+        if ((const uint8_t *)ptr >= (const uint8_t *)g->overflow[i].host_base &&
+            (const uint8_t *)ptr < (const uint8_t *)g->overflow[i].host_base +
+                                    g->overflow[i].size) {
+            *out_gpa = g->overflow[i].ipa_start +
+                       (uint64_t)((const uint8_t *)ptr -
+                                  (const uint8_t *)g->overflow[i].host_base);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 void guest_destroy(guest_t *g) {
+    /* Destroy all worker vCPUs (thread table) before tearing down the VM.
+     * This prevents hv_vm_destroy from racing with active vCPUs that may
+     * still be running if thread join timed out during exit_group. */
+    thread_destroy_all_vcpus();
     if (g->vcpu) {
         hv_vcpu_destroy(g->vcpu);
         g->vcpu = 0;
     }
+    /* Unmap overflow segments before VM teardown (hv_vm_unmap requires
+     * the VM to still exist). Host munmap is safe regardless. */
+    for (int i = 0; i < g->noverflow; i++) {
+        hv_vm_unmap(g->overflow[i].ipa_start, g->overflow[i].size);
+        munmap(g->overflow[i].host_base, g->overflow[i].size);
+    }
+    g->noverflow = 0;
     hv_vm_destroy();
     if (g->host_base) {
         munmap(g->host_base, g->guest_size);
         g->host_base = NULL;
+    }
+    /* Close the shm fd if we own one (parent with shm backing) */
+    if (g->shm_fd >= 0) {
+        close(g->shm_fd);
+        g->shm_fd = -1;
     }
     /* kbuf lives within host_base — no separate free needed */
     g->kbuf_base = NULL;
@@ -386,13 +652,21 @@ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
      * calls share 2MB page table blocks — each VA resolves to whatever
      * GPA the page table actually maps it to. */
     uint64_t gpa = guest_walk_pt(g, gva);
-    if (gpa != UINT64_MAX && gpa < g->guest_size) {
+    if (gpa != UINT64_MAX) {
         /* Within a 2MB block, GPAs are always contiguous (guest_split_block
          * and guest_update_perms preserve contiguity). Report remaining
          * bytes to end of the 2MB block. */
         uint64_t block_remain = BLOCK_2MB - (gva & (BLOCK_2MB - 1));
-        if (avail) *avail = block_remain;
-        return (uint8_t *)g->host_base + gpa;
+        if (gpa < g->guest_size) {
+            if (avail) *avail = block_remain;
+            return (uint8_t *)g->host_base + gpa;
+        }
+        /* Check overflow segments (GPA beyond primary buffer) */
+        void *optr = guest_overflow_resolve(g, gpa);
+        if (optr) {
+            if (avail) *avail = block_remain;
+            return optr;
+        }
     }
     return NULL;
 }
@@ -401,46 +675,72 @@ void *guest_ptr(const guest_t *g, uint64_t gva) {
     return gva_resolve(g, gva, NULL);
 }
 
+void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail) {
+    return gva_resolve(g, gva, avail);
+}
+
 int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
-    uint64_t avail;
-    void *ptr = gva_resolve(g, gva, &avail);
-    if (!ptr || len > avail)
-        return -1;
-    memcpy(dst, ptr, len);
+    /* Loop across 2MB block boundaries. Each gva_resolve() call returns
+     * the host pointer and available bytes to the end of the current
+     * 2MB block. Multi-block reads (e.g., large structs spanning a
+     * block boundary) are handled by iterating. */
+    size_t copied = 0;
+    while (copied < len) {
+        uint64_t avail;
+        void *ptr = gva_resolve(g, gva + copied, &avail);
+        if (!ptr) return -1;
+        size_t chunk = len - copied;
+        if (chunk > avail) chunk = avail;
+        memcpy((uint8_t *)dst + copied, ptr, chunk);
+        copied += chunk;
+    }
     return 0;
 }
 
 int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len) {
-    uint64_t avail;
-    void *ptr = gva_resolve(g, gva, &avail);
-    if (!ptr || len > avail)
-        return -1;
-    memcpy(ptr, src, len);
+    /* Loop across 2MB block boundaries (see guest_read comment). */
+    size_t copied = 0;
+    while (copied < len) {
+        uint64_t avail;
+        void *ptr = gva_resolve(g, gva + copied, &avail);
+        if (!ptr) return -1;
+        size_t chunk = len - copied;
+        if (chunk > avail) chunk = avail;
+        memcpy(ptr, (const uint8_t *)src + copied, chunk);
+        copied += chunk;
+    }
     return 0;
 }
 
 int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
-    uint64_t avail;
-    void *ptr = gva_resolve(g, gva, &avail);
-    if (!ptr)
-        return -1;
-    const char *src = (const char *)ptr;
-    size_t limit = avail;
-    if (limit > max - 1)
-        limit = max - 1;
+    if (max == 0) return -1; /* Prevent underflow in max - 1 */
+    size_t copied = 0;
+    size_t limit = max - 1;
 
-    /* Scan for NUL terminator in the host-mapped buffer directly.
-     * Works for both primary and extra mappings since we have the
-     * host pointer and available size from gva_resolve(). */
-    const void *nul = memchr(src, '\0', limit);
-    if (nul) {
-        size_t len = (const char *)nul - src;
-        memcpy(dst, src, len + 1); /* Include the NUL terminator */
-        return (int)len;
+    /* Loop across 2MB block boundaries, same pattern as guest_read().
+     * Each iteration resolves the current GVA to a contiguous host
+     * region and scans for NUL within the available bytes. */
+    while (copied < limit) {
+        uint64_t avail;
+        void *ptr = gva_resolve(g, gva + copied, &avail);
+        if (!ptr) break;
+
+        size_t remain = limit - copied;
+        size_t chunk = avail < remain ? avail : remain;
+        const char *src = (const char *)ptr;
+
+        const void *nul = memchr(src, '\0', chunk);
+        if (nul) {
+            size_t len = (const char *)nul - src;
+            memcpy(dst + copied, src, len + 1); /* Include NUL */
+            return (int)(copied + len);
+        }
+        memcpy(dst + copied, src, chunk);
+        copied += chunk;
     }
-    /* Unterminated within bounds */
-    memcpy(dst, src, limit);
-    dst[limit] = '\0';
+
+    /* Unterminated within bounds (or resolve failed) */
+    dst[copied] = '\0';
     return -1;
 }
 
@@ -454,10 +754,15 @@ void guest_reset(guest_t *g) {
      * MAP_ANON zero-fill-on-demand state. */
 
     /* Zero tracked regions (ELF segments, heap, stack, mmap allocations).
-     * Skip PROT_NONE regions — they were never touched. */
+     * Skip PROT_NONE regions — they were never touched.
+     * Skip regions with GPAs beyond the primary buffer — these are
+     * high-VA regions (e.g., rosetta at 128TB, kbuf user VA) whose
+     * backing data either lives at a different GPA resolved through
+     * VA aliases, or in extra mappings outside host_base. */
     for (int i = 0; i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
-        if (r->prot != 0 /* PROT_NONE */ && r->end > r->start) {
+        if (r->prot != 0 /* PROT_NONE */ && r->end > r->start &&
+            r->end <= g->guest_size) {
             memset((uint8_t *)g->host_base + r->start, 0,
                    r->end - r->start);
         }
@@ -474,6 +779,7 @@ void guest_reset(guest_t *g) {
            SHIM_DATA_BASE + BLOCK_2MB - SHIM_BASE);
 
     /* Reset allocation state */
+    pt_pool_warned = 0;  /* Reset 80% warning for new binary */
     g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
@@ -483,6 +789,20 @@ void guest_reset(guest_t *g) {
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
     g->ttbr0 = 0;
     g->need_tlbi = 0;
+    /* Note: TTBR1 page tables are destroyed by the PT pool zeroing above.
+     * Caller must call guest_init_kbuf() to rebuild them if kbuf is needed
+     * (see TTBR1 Page Table Fix in CLAUDE.md). */
+
+    /* Release overflow segments (rosetta high-VA allocations).
+     * The page tables that reference them are being rebuilt, so the
+     * GPA space is no longer needed. New overflow segments will be
+     * allocated as needed by the next binary. */
+    for (int i = 0; i < g->noverflow; i++) {
+        hv_vm_unmap(g->overflow[i].ipa_start, g->overflow[i].size);
+        munmap(g->overflow[i].host_base, g->overflow[i].size);
+    }
+    g->noverflow = 0;
+    g->overflow_ipa_next = g->guest_size;
 
     /* Clear semantic region tracking (will be re-populated after exec) */
     guest_region_clear(g);
@@ -524,20 +844,41 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
         n++;
     }
 
-    /* Stack (2MB block) */
+    /* Stack (dynamic position, stored in guest_t) */
     if (n < max) {
-        out[n].offset = STACK_BASE;
-        out[n].size = STACK_TOP - STACK_BASE;
+        out[n].offset = g->stack_base;
+        out[n].size = g->stack_top - g->stack_base;
         n++;
     }
 
-    /* mmap region (up to high-water mark). With the gap-finding allocator,
+    /* mmap RW region (up to high-water mark). With the gap-finding allocator,
      * mmap_next is a high-water mark — freed regions within this range may
      * contain PROT_NONE pages (zero-fill, no cost to copy). This is
      * conservative but correct for fork state transfer. */
     if (n < max && g->mmap_next > MMAP_BASE) {
         out[n].offset = MMAP_BASE;
         out[n].size = g->mmap_next - MMAP_BASE;
+        n++;
+    }
+
+    /* mmap RX region (code mappings from dynamic linker, rosetta JIT, etc.) */
+    if (n < max && g->mmap_rx_next > MMAP_RX_BASE) {
+        out[n].offset = MMAP_RX_BASE;
+        out[n].size = g->mmap_rx_next - MMAP_RX_BASE;
+        n++;
+    }
+
+    /* Rosetta segments in primary buffer (loaded near interp_base) */
+    if (n < max && g->rosetta_guest_base != 0 && g->rosetta_size != 0) {
+        out[n].offset = g->rosetta_guest_base;
+        out[n].size = g->rosetta_size;
+        n++;
+    }
+
+    /* Kernel VA buffer (256MB, used by rosetta for JIT code cache etc.) */
+    if (n < max && g->kbuf_gpa != 0) {
+        out[n].offset = g->kbuf_gpa;
+        out[n].size = KBUF_SIZE;
         n++;
     }
 
@@ -555,6 +896,8 @@ static int regions_mergeable(const guest_region_t *a,
     return a->end == b->start
         && a->prot == b->prot
         && a->flags == b->flags
+        && a->display_va == 0 && b->display_va == 0
+        && a->display_end == 0 && b->display_end == 0
         && a->offset + (a->end - a->start) == b->offset
         && strcmp(a->name, b->name) == 0;
 }
@@ -588,7 +931,14 @@ static int try_merge_left(guest_t *g, int i) {
 int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
                      int prot, int flags, uint64_t offset,
                      const char *name) {
-    if (g->nregions >= GUEST_MAX_REGIONS) return -1;
+    if (g->nregions >= GUEST_MAX_REGIONS) {
+        fprintf(stderr, "guest: region table full (%d/%d), "
+                "cannot track [0x%llx-0x%llx) %s\n",
+                g->nregions, GUEST_MAX_REGIONS,
+                (unsigned long long)start, (unsigned long long)end,
+                name ? name : "");
+        return -1;
+    }
 
     /* Find insertion point (keep sorted by start address) */
     int i = g->nregions;
@@ -598,11 +948,13 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
     }
 
     guest_region_t *r = &g->regions[i];
-    r->start  = start;
-    r->end    = end;
-    r->prot   = prot;
-    r->flags  = flags;
-    r->offset = offset;
+    r->start       = start;
+    r->end         = end;
+    r->prot        = prot;
+    r->flags       = flags;
+    r->offset      = offset;
+    r->display_va  = 0;
+    r->display_end = 0;
     if (name) {
         strncpy(r->name, name, sizeof(r->name) - 1);
         r->name[sizeof(r->name) - 1] = '\0';
@@ -617,6 +969,36 @@ int guest_region_add(guest_t *g, uint64_t start, uint64_t end,
     try_merge_right(g, i);
     try_merge_left(g, i);
 
+    return 0;
+}
+
+int guest_preannounce(guest_t *g, uint64_t start, uint64_t end,
+                      int prot, int flags, uint64_t offset,
+                      const char *name) {
+    if (g->npreannounced >= GUEST_MAX_PREANNOUNCED) return -1;
+
+    /* Insert sorted by start address */
+    int i = g->npreannounced;
+    while (i > 0 && g->preannounced[i - 1].start > start) {
+        g->preannounced[i] = g->preannounced[i - 1];
+        i--;
+    }
+
+    guest_region_t *r = &g->preannounced[i];
+    r->start       = start;
+    r->end         = end;
+    r->prot        = prot;
+    r->flags       = flags;
+    r->offset      = offset;
+    r->display_va  = 0;
+    r->display_end = 0;
+    if (name) {
+        strncpy(r->name, name, sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    } else {
+        r->name[0] = '\0';
+    }
+    g->npreannounced++;
     return 0;
 }
 
@@ -659,7 +1041,12 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end) {
         if (r->start < start && r->end > end) {
             /* Need to split into two regions: [r->start, start) and [end, r->end) */
             if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Can't split — just trim to [r->start, start) and lose the tail */
+                /* Can't split — just trim to [r->start, start) and lose the tail.
+                 * The tail [end, r->end) becomes untracked in /proc/self/maps
+                 * but remains mapped in page tables. */
+                fprintf(stderr, "guest: region table full, "
+                        "munmap split drops tail [0x%llx-0x%llx)\n",
+                        (unsigned long long)end, (unsigned long long)r->end);
                 r->end = start;
                 i++;
                 continue;
@@ -714,7 +1101,12 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
 
         /* If region extends before start, split at start */
         if (r->start < start) {
-            if (g->nregions >= GUEST_MAX_REGIONS) continue;
+            if (g->nregions >= GUEST_MAX_REGIONS) {
+                fprintf(stderr, "guest: region table full, "
+                        "mprotect split skipped at 0x%llx\n",
+                        (unsigned long long)start);
+                continue;
+            }
             memmove(&g->regions[i + 1], &g->regions[i],
                     (g->nregions - i) * sizeof(guest_region_t));
             g->nregions++;
@@ -730,6 +1122,14 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
         /* If region extends past end, split at end */
         if (r->end > end) {
             if (g->nregions >= GUEST_MAX_REGIONS) {
+                /* Can't split — apply prot to the whole region.
+                 * The tail [end, r->end) gets new prot too. */
+                fprintf(stderr, "guest: region table full, "
+                        "mprotect split skipped at 0x%llx "
+                        "(region [0x%llx-0x%llx) gets prot %d entirely)\n",
+                        (unsigned long long)end,
+                        (unsigned long long)r->start,
+                        (unsigned long long)r->end, prot);
                 r->prot = prot;
                 if (first_modified < 0) first_modified = i;
                 last_modified = i;
@@ -770,6 +1170,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot) {
 
 void guest_region_clear(guest_t *g) {
     g->nregions = 0;
+    g->npreannounced = 0;
 }
 
 /* ---------- Page table builder ---------- */
@@ -882,18 +1283,22 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
             /* L2 index: which 2MB block within the 1GB region (from VA) */
             unsigned l2_idx = (unsigned)((lookup_addr % BLOCK_1GB) / BLOCK_2MB);
 
-            /* If block already mapped, merge permissions (most permissive) */
+            /* If block already mapped, merge permissions (most permissive).
+             * Use a local variable for the merged perms — do NOT modify
+             * the outer `perms` variable, which would leak accumulated
+             * permissions to subsequent 2MB blocks in the same region. */
+            int block_perms = perms;
             if (l2[l2_idx] & PT_BLOCK) {
                 int old_perms = 0;
                 if (!(l2[l2_idx] & PT_UXN)) old_perms |= MEM_PERM_X;
                 if ((l2[l2_idx] & (3ULL << 6)) == PT_AP_RW_EL0)
                     old_perms |= MEM_PERM_W;
                 old_perms |= MEM_PERM_R;
-                perms |= old_perms;
+                block_perms |= old_perms;
             }
 
             /* Block descriptor: output IPA (where data physically lives) */
-            l2[l2_idx] = make_block_desc(output_ipa, perms);
+            l2[l2_idx] = make_block_desc(output_ipa, block_perms);
         }
     }
 
@@ -924,6 +1329,11 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
 
         /* L0 index: which 512GB slot (>512GB addresses need L0[1]+) */
         unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
+        if (l0_idx >= 512) {
+            fprintf(stderr, "guest: IPA 0x%llx out of L0 range in extend\n",
+                    (unsigned long long)ipa);
+            return -1;
+        }
 
         /* Allocate L1 table on first access to each L0 slot */
         if (!(l0[l0_idx] & PT_VALID)) {
@@ -1073,7 +1483,7 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t gpa_offset) {
 
     /* L0 index from actual IPA (not base), correct for >512GB */
     unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
-    if (!(l0[l0_idx] & PT_VALID)) return NULL;
+    if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID)) return NULL;
 
     uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
     uint64_t *l1 = pt_at(g, l1_ipa - base);
@@ -1088,11 +1498,12 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t gpa_offset) {
     return &l2[l2_idx];
 }
 
-int guest_split_block(guest_t *g, uint64_t block_gpa) {
-    uint64_t base = g->ipa_base;
-    uint64_t block_start = ALIGN_2MB_DOWN(block_gpa);
-
-    uint64_t *l2_entry = find_l2_entry(g, block_start);
+/* Split a 2MB L2 block descriptor into 512 × 4KB L3 page descriptors.
+ * Shared between TTBR0 (guest_split_block) and TTBR1 (guest_kbuf_split_block).
+ * The caller provides the L2 entry via their respective find_l2_entry path.
+ * Extracts the output IPA from the existing descriptor — correct for both
+ * identity-mapped (VA=GPA) and non-identity (high VA→low GPA) regions. */
+static int split_l2_block(guest_t *g, uint64_t *l2_entry) {
     if (!l2_entry) return -1;
 
     /* Already a table descriptor (previously split) — nothing to do */
@@ -1101,33 +1512,28 @@ int guest_split_block(guest_t *g, uint64_t block_gpa) {
     /* Must be a valid block descriptor: bit[0]=1, bit[1]=0 */
     if (!(*l2_entry & PT_BLOCK)) return -1;
 
-    /* Extract current block permissions */
     int old_perms = desc_to_perms(*l2_entry);
 
-    /* Allocate a 4KB page for the L3 table (512 entries × 8 bytes) */
     uint64_t l3_gpa = pt_alloc_page(g);
     if (!l3_gpa) return -1;
-
     uint64_t *l3 = pt_at(g, l3_gpa);
 
-    /* Fill all 512 L3 entries with 4KB page descriptors inheriting
-     * the block's original permissions. Each page covers 4KB of the
-     * 2MB block's address range. Extract the output IPA from the
-     * existing block descriptor (bits [47:21]) — this is correct for
-     * both identity-mapped (VA=GPA) and non-identity (high VA→low GPA)
-     * regions. Using base+block_start would be wrong for non-identity
-     * mappings where block_start is a VA, not a GPA. */
+    /* Fill 512 L3 entries with 4KB page descriptors inheriting the
+     * block's permissions.  Extract the output IPA from bits [47:21]
+     * of the existing descriptor (not from the caller's address). */
     uint64_t block_ipa = *l2_entry & 0xFFFFFFE00000ULL;
-    for (int i = 0; i < 512; i++) {
+    for (int i = 0; i < 512; i++)
         l3[i] = make_page_desc(block_ipa + (uint64_t)i * PAGE_SIZE, old_perms);
-    }
 
-    /* Replace the L2 block descriptor with a table descriptor pointing
-     * to the new L3 table. Format: bits[1:0]=11, bits[47:12]=L3 IPA */
-    *l2_entry = (base + l3_gpa) | PT_VALID | PT_TABLE;
-
+    *l2_entry = (g->ipa_base + l3_gpa) | PT_VALID | PT_TABLE;
     g->need_tlbi = 1;
     return 0;
+}
+
+int guest_split_block(guest_t *g, uint64_t block_gpa) {
+    uint64_t block_start = ALIGN_2MB_DOWN(block_gpa);
+    uint64_t *l2_entry = find_l2_entry(g, block_start);
+    return split_l2_block(g, l2_entry);
 }
 
 int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end) {
@@ -1218,26 +1624,7 @@ static uint64_t *kbuf_find_l2_entry(guest_t *g, uint64_t va) {
 
 int guest_kbuf_split_block(guest_t *g, uint64_t block_va) {
     uint64_t *l2_entry = kbuf_find_l2_entry(g, block_va);
-    if (!l2_entry || !(*l2_entry & 1)) return -1;
-    /* Already split to L3 */
-    if (*l2_entry & PT_TABLE) return 0;
-
-    /* Allocate L3 page table */
-    uint64_t l3_gpa = pt_alloc_page(g);
-    if (!l3_gpa) return -1;
-    uint64_t *l3 = pt_at(g, l3_gpa);
-
-    /* Copy block permissions to all 512 L3 pages */
-    int old_perms = desc_to_perms(*l2_entry);
-    uint64_t block_ipa = *l2_entry & 0xFFFFFFE00000ULL;
-    for (int i = 0; i < 512; i++) {
-        l3[i] = make_page_desc(block_ipa + (uint64_t)i * PAGE_SIZE, old_perms);
-    }
-
-    /* Replace L2 block with table descriptor → L3 */
-    *l2_entry = (g->ipa_base + l3_gpa) | PT_VALID | PT_TABLE;
-    g->need_tlbi = 1;
-    return 0;
+    return split_l2_block(g, l2_entry);
 }
 
 int guest_kbuf_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
@@ -1280,6 +1667,7 @@ int guest_kbuf_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
         uint64_t page_end = (end < block_end) ? end : block_end;
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx = (unsigned)((pa % BLOCK_2MB) / PAGE_SIZE);
+            if (!(l3[l3_idx] & PT_VALID)) continue; /* skip invalidated */
             uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
             l3[l3_idx] = make_page_desc(page_ipa, perms);
         }
@@ -1393,11 +1781,22 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx = (unsigned)(((base + pa) % BLOCK_2MB) / PAGE_SIZE);
-            /* Extract the existing output IPA from the L3 entry rather than
-             * computing base+pa — correct for non-identity mapped regions
-             * where pa is a VA, not a GPA. guest_split_block already set
-             * the correct IPA when creating the L3 entries. */
-            uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+            /* Extract the existing output IPA from the L3 entry. For
+             * non-identity mapped regions, pa is a VA not a GPA, so we
+             * must use the IPA already stored in the descriptor (set by
+             * guest_split_block).
+             *
+             * For invalidated entries (set to 0 by guest_invalidate_ptes),
+             * the stored IPA is 0 — wrong. Fall back to computing the
+             * identity-mapped IPA (base + pa). This is correct for TTBR0
+             * user-space regions where VA == IPA == GPA. Non-identity
+             * mapped regions (rosetta VA aliases) should never have
+             * invalidated entries that get re-activated here. */
+            uint64_t page_ipa;
+            if (l3[l3_idx] & PT_VALID)
+                page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+            else
+                page_ipa = base + (pa & ~(PAGE_SIZE - 1));
             l3[l3_idx] = make_page_desc(page_ipa, perms);
         }
 
@@ -1408,98 +1807,3 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
     return 0;
 }
 
-/* ---------- Debug: ARM64 page table descriptor dump ---------- */
-
-void guest_dump_ptes(const guest_t *g, uint64_t start, uint64_t end) {
-    uint64_t base = g->ipa_base;
-    uint64_t l0_gpa_off = g->ttbr0 - base;
-    uint64_t *l0 = (uint64_t *)((uint8_t *)g->host_base + l0_gpa_off);
-
-    start = start & ~(PAGE_SIZE - 1);
-    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    fprintf(stderr, "hl: PTE dump for 0x%llx-0x%llx (base=0x%llx):\n",
-            (unsigned long long)start, (unsigned long long)end,
-            (unsigned long long)base);
-
-    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t ipa = base + addr;
-        unsigned l0_idx = (unsigned)(ipa / (512ULL * BLOCK_1GB));
-
-        if (!(l0[l0_idx] & PT_VALID)) {
-            fprintf(stderr, "  0x%llx: L0[%u] INVALID\n",
-                    (unsigned long long)addr, l0_idx);
-            continue;
-        }
-
-        uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l1 = (uint64_t *)((uint8_t *)g->host_base + (l1_ipa - base));
-        unsigned l1_idx = (unsigned)((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
-
-        if (l1_idx >= 512 || !(l1[l1_idx] & PT_VALID)) {
-            fprintf(stderr, "  0x%llx: L1[%u] INVALID\n",
-                    (unsigned long long)addr, l1_idx);
-            continue;
-        }
-
-        uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
-        uint64_t *l2 = (uint64_t *)((uint8_t *)g->host_base + (l2_ipa - base));
-        unsigned l2_idx = (unsigned)((ipa % BLOCK_1GB) / BLOCK_2MB);
-        uint64_t l2_desc = l2[l2_idx];
-
-        if (!(l2_desc & 1)) {
-            fprintf(stderr, "  0x%llx: L2[%u] INVALID (0x%llx)\n",
-                    (unsigned long long)addr, l2_idx,
-                    (unsigned long long)l2_desc);
-            continue;
-        }
-
-        /* Block descriptor: bits[1:0]=01 */
-        if ((l2_desc & 3) == 1) {
-            uint64_t block_ipa = l2_desc & 0xFFFFFFE00000ULL;
-            int perms = desc_to_perms(l2_desc);
-            fprintf(stderr, "  0x%llx: L2 BLOCK ipa=0x%llx perms=%c%c%c "
-                    "desc=0x%llx\n",
-                    (unsigned long long)addr,
-                    (unsigned long long)block_ipa,
-                    (perms & MEM_PERM_R) ? 'R' : '-',
-                    (perms & MEM_PERM_W) ? 'W' : '-',
-                    (perms & MEM_PERM_X) ? 'X' : '-',
-                    (unsigned long long)l2_desc);
-            continue;
-        }
-
-        /* Table descriptor: bits[1:0]=11 → L3 page table */
-        uint64_t l3_ipa = l2_desc & 0xFFFFFFFFF000ULL;
-        uint64_t *l3 = (uint64_t *)((uint8_t *)g->host_base + (l3_ipa - base));
-        unsigned l3_idx = (unsigned)((addr % BLOCK_2MB) / PAGE_SIZE);
-        uint64_t l3_desc = l3[l3_idx];
-
-        if (!(l3_desc & 1)) {
-            fprintf(stderr, "  0x%llx: L3[%u] INVALID (0x%llx) "
-                    "l2=TABLE→0x%llx\n",
-                    (unsigned long long)addr, l3_idx,
-                    (unsigned long long)l3_desc,
-                    (unsigned long long)l3_ipa);
-            continue;
-        }
-
-        uint64_t page_ipa = l3_desc & 0xFFFFFFFFF000ULL;
-        int perms = desc_to_perms(l3_desc);
-
-        /* Verify data through PTE vs direct host_base offset */
-        uint8_t *pte_data = (uint8_t *)g->host_base + (page_ipa - base);
-        uint8_t *direct_data = (uint8_t *)g->host_base + addr;
-        int data_match = (pte_data == direct_data);
-
-        fprintf(stderr, "  0x%llx: L3[%u] ipa=0x%llx perms=%c%c%c "
-                "desc=0x%llx data_%s\n",
-                (unsigned long long)addr, l3_idx,
-                (unsigned long long)page_ipa,
-                (perms & MEM_PERM_R) ? 'R' : '-',
-                (perms & MEM_PERM_W) ? 'W' : '-',
-                (perms & MEM_PERM_X) ? 'X' : '-',
-                (unsigned long long)l3_desc,
-                data_match ? "OK" : "MISMATCH!");
-    }
-}

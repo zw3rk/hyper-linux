@@ -93,6 +93,6 @@ int main(void) {
         } else FAIL("signalfd create failed");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-signalfd");
     return fails > 0 ? 1 : 0;
 }

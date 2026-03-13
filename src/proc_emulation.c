@@ -7,6 +7,14 @@
  * paths. Returns host fds for synthetic content, or -2 if the path is
  * not intercepted (caller falls through to real syscall).
  */
+
+/* Maximum /proc/self/maps entries. Array is sized to this; loop bounds
+ * use MAPS_ENTRY_MAX - 1 to leave room for safe increment. */
+#define MAPS_ENTRY_MAX      256
+
+/* Column at which the region name starts in /proc/self/maps output.
+ * Matches observed Linux kernel formatting (verified via strace). */
+#define MAPS_NAME_COLUMN    73
 #include "proc_emulation.h"
 #include "syscall_proc.h"    /* proc_get_pid, proc_get_ppid, proc_get_cmdline, proc_get_elf_path */
 #include "syscall_internal.h" /* fd_to_host, FD_TABLE_SIZE */
@@ -84,9 +92,11 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /dev/fd/N -> dup(N) */
     if (strncmp(path, "/dev/fd/", 8) == 0) {
-        int n = atoi(path + 8);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 8, &endptr, 10);
+        if (endptr == path + 8 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
         return dup(host_fd);
     }
@@ -112,7 +122,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             off += snprintf(buf + off, sizeof(buf) - off,
                 "processor\t: %d\n"
                 "BogoMIPS\t: 48.00\n"
-                "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics\n"
+                "Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics\n"
                 "CPU implementer\t: 0x61\n"
                 "CPU architecture: 8\n"
                 "CPU variant\t: 0x1\n"
@@ -139,10 +149,19 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         }
         vm_rss_kb /= 1024;
 
+        /* Extract basename from ELF path for the Name field (Linux uses
+         * the comm name, which is basename truncated to 15 chars) */
+        const char *exe = proc_get_elf_path();
+        const char *name = "hl";
+        if (exe) {
+            const char *slash = strrchr(exe, '/');
+            name = slash ? slash + 1 : exe;
+        }
+
         int threads = thread_active_count();
         char buf[2048];
         int len = snprintf(buf, sizeof(buf),
-            "Name:\thl\n"
+            "Name:\t%.15s\n"
             "State:\tR (running)\n"
             "Tgid:\t%lld\n"
             "Pid:\t%lld\n"
@@ -153,6 +172,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "VmSize:\t%llu kB\n"
             "VmRSS:\t%llu kB\n"
             "Threads:\t%d\n",
+            name,
             (long long)proc_get_pid(),
             (long long)proc_get_pid(),
             (long long)proc_get_ppid(),
@@ -160,6 +180,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             (unsigned long long)vm_size_kb,
             (unsigned long long)vm_rss_kb,
             threads);
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -174,91 +196,198 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
     /* /proc/self/maps -> generated from guest region tracking.
      * Addresses are page-aligned (rounded down/up) to match real Linux
      * behavior. Rosetta's VMAllocationTracker asserts page alignment.
+     *
      * Non-identity mapped regions (via sys_mmap_high_va) are tracked by
      * GPA for gap-finder collision avoidance, but /proc/self/maps must
-     * show the VA that was returned to the guest (e.g., 0xf00000000000
-     * for rosetta's 384MB slab). We resolve GPA→VA via the alias table.
+     * show the VA that was returned to the guest. We use display_va for
+     * high-VA regions and va_aliases for rosetta segments.
      *
-     * Preannounced regions (x86_64 binary LOAD segments in rosetta mode)
-     * are merged into the output in sorted order. These entries let
-     * rosetta's JIT validate indirect call targets (function pointers)
-     * before rosetta itself mmaps the binary. Once rosetta's mmaps create
-     * actual regions[] entries, preannounced entries that overlap are
-     * skipped to avoid duplicate lines. */
+     * Output merges consecutive regions with the same display_va prefix,
+     * prot, and flags into a single maps line. This matches real Linux
+     * kernel behavior where a single mmap() call produces one maps entry
+     * even when the backing pages span multiple physical frames.
+     *
+     * Internal regions (shim, shim-data, stack-guard, brk, mmap-rx,
+     * mmap-rw) are hidden from /proc/self/maps in rosetta mode. Real
+     * Linux VMs only show userspace mappings visible to the ELF loader
+     * and runtime. hl's shim/brk/mmap regions are host implementation
+     * details that rosetta should not see. */
     if (strcmp(path, "/proc/self/maps") == 0) {
         char buf[16384];
         int off = 0;
 
-        /* Two-pointer merge of regions[] and preannounced[], both sorted
-         * by start address. Preannounced entries shadowed by actual
-         * regions are skipped. */
-        int ri = 0, pi = 0;
-        while ((ri < g->nregions || pi < g->npreannounced) &&
-               off < (int)sizeof(buf) - 256) {
-            const guest_region_t *r;
-            int from_preannounced = 0;
+        /* Build a flat array of (va_start, va_end, prot, flags, offset,
+         * name) from regions[] + preannounced[] with merging. */
+        typedef struct {
+            uint64_t start, end;
+            int prot, flags;
+            uint64_t offset;
+            char name[64];
+        } maps_entry_t;
+        maps_entry_t entries[MAPS_ENTRY_MAX];
+        int nentries = 0;
 
-            /* Pick the next entry in address order */
-            if (ri < g->nregions &&
-                (pi >= g->npreannounced ||
-                 g->regions[ri].start <= g->preannounced[pi].start)) {
-                r = &g->regions[ri++];
-            } else {
-                r = &g->preannounced[pi++];
-                from_preannounced = 1;
-            }
-
-            /* Skip preannounced entries that overlap with actual regions
-             * (rosetta has already mapped them via MAP_FIXED_NOREPLACE). */
-            if (from_preannounced) {
-                int shadowed = 0;
-                for (int j = 0; j < g->nregions; j++) {
-                    if (g->regions[j].start < r->end &&
-                        g->regions[j].end > r->start) {
-                        shadowed = 1;
-                        break;
-                    }
-                }
-                if (shadowed) continue;
-            }
-
+        /* First pass: convert regions[] to VA-space entries */
+        for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX - 1; i++) {
+            const guest_region_t *r = &g->regions[i];
             uint64_t start = r->start;
             uint64_t end = r->end;
 
-            /* Translate GPA→VA for non-identity mapped regions.
-             * Check if this region's GPA falls within a VA alias. */
-            for (int j = 0; j < g->naliases; j++) {
-                const guest_va_alias_t *a = &g->va_aliases[j];
-                if (start >= a->gpa_start &&
-                    end <= a->gpa_start + a->size) {
-                    uint64_t gpa_off = start - a->gpa_start;
-                    start = a->va_start + gpa_off;
-                    end = start + (r->end - r->start);
-                    break;
+            /* Skip internal hl regions in rosetta mode. These are host
+             * implementation details not visible in a real Linux VM:
+             *   - [shim]: exception vector / EL1 code
+             *   - [shim-data]: EL1 stack / data
+             *   - [stack-guard]: guard page
+             *   - brk/mmap-rx/mmap-rw pre-allocations (no name, low VA,
+             *     no display_va — these are hl's address space layout) */
+            if (g->is_rosetta) {
+                if (r->name[0] == '[' &&
+                    (strncmp(r->name, "[shim", 5) == 0 ||
+                     strcmp(r->name, "[stack-guard]") == 0))
+                    continue;
+                /* Skip large pre-allocated regions with no name that
+                 * are below the rosetta VA range and not guest-visible.
+                 * Keep [stack], [vvar], [vdso] and named regions. */
+                if (r->name[0] == '\0' && r->display_va == 0 &&
+                    start < 0x100000000ULL)
+                    continue;
+            }
+
+            /* Resolve display address */
+            if (r->display_va != 0) {
+                start = r->display_va;
+                end = r->display_end ? r->display_end
+                                     : (start + (r->end - r->start));
+            } else {
+                for (int j = 0; j < g->naliases; j++) {
+                    const guest_va_alias_t *a = &g->va_aliases[j];
+                    if (start >= a->gpa_start &&
+                        end <= a->gpa_start + a->size) {
+                        uint64_t gpa_off = start - a->gpa_start;
+                        start = a->va_start + gpa_off;
+                        end = start + (r->end - r->start);
+                        break;
+                    }
                 }
             }
 
-            start &= ~0xFFFULL;          /* page-align down */
-            end = (end + 0xFFF) & ~0xFFFULL;    /* page-align up */
-            char perms[5];
-            perms[0] = (r->prot & 0x1) ? 'r' : '-'; /* PROT_READ */
-            perms[1] = (r->prot & 0x2) ? 'w' : '-'; /* PROT_WRITE */
-            perms[2] = (r->prot & 0x4) ? 'x' : '-'; /* PROT_EXEC */
-            perms[3] = (r->flags & 0x01) ? 's' : 'p'; /* MAP_SHARED : MAP_PRIVATE */
-            perms[4] = '\0';
-            /* Format: start-end perms offset dev:major inode pathname */
-            off += snprintf(buf + off, sizeof(buf) - off,
-                "%08llx-%08llx %s %08llx 00:00 0",
-                (unsigned long long)start,
-                (unsigned long long)end,
-                perms,
-                (unsigned long long)r->offset);
-            if (r->name[0]) {
-                off += snprintf(buf + off, sizeof(buf) - off,
-                    "          %s", r->name);
+            start &= ~0xFFFULL;
+            end = (end + 0xFFF) & ~0xFFFULL;
+
+            /* Try to merge with previous entry if contiguous and
+             * same prot/flags/name. This collapses the slab's many
+             * 2MB blocks into a single maps line, matching real Linux
+             * kernel behavior. */
+            if (nentries > 0) {
+                maps_entry_t *prev = &entries[nentries - 1];
+                if (start == prev->end &&
+                    r->prot == prev->prot &&
+                    r->flags == prev->flags &&
+                    strcmp(r->name, prev->name) == 0) {
+                    prev->end = end;
+                    continue;
+                }
             }
-            off += snprintf(buf + off, sizeof(buf) - off, "\n");
+
+            maps_entry_t *e = &entries[nentries++];
+            e->start = start;
+            e->end = end;
+            e->prot = r->prot;
+            e->flags = r->flags;
+            e->offset = r->offset;
+            if (r->name[0]) {
+                strncpy(e->name, r->name, sizeof(e->name) - 1);
+                e->name[sizeof(e->name) - 1] = '\0';
+            } else {
+                e->name[0] = '\0';
+            }
         }
+
+        /* Add preannounced entries (if any) */
+        for (int pi = 0; pi < g->npreannounced && nentries < MAPS_ENTRY_MAX - 1; pi++) {
+            const guest_region_t *r = &g->preannounced[pi];
+            /* Skip if shadowed by actual regions */
+            int shadowed = 0;
+            for (int j = 0; j < g->nregions; j++) {
+                if (g->regions[j].start < r->end &&
+                    g->regions[j].end > r->start) {
+                    shadowed = 1;
+                    break;
+                }
+            }
+            if (shadowed) continue;
+            maps_entry_t *e = &entries[nentries++];
+            e->start = r->start & ~0xFFFULL;
+            e->end = (r->end + 0xFFF) & ~0xFFFULL;
+            e->prot = r->prot;
+            e->flags = r->flags;
+            e->offset = r->offset;
+            if (r->name[0]) {
+                strncpy(e->name, r->name, sizeof(e->name) - 1);
+                e->name[sizeof(e->name) - 1] = '\0';
+            } else {
+                e->name[0] = '\0';
+            }
+        }
+
+        /* Sort by start address (regions[] is sorted by GPA but we
+         * translated to VA, and rosetta regions are at high VA) */
+        for (int i = 1; i < nentries; i++) {
+            maps_entry_t tmp = entries[i];
+            int j = i - 1;
+            while (j >= 0 && entries[j].start > tmp.start) {
+                entries[j + 1] = entries[j];
+                j--;
+            }
+            entries[j + 1] = tmp;
+        }
+
+        /* Emit formatted output */
+        for (int i = 0; i < nentries && off < (int)sizeof(buf) - 256; i++) {
+            const maps_entry_t *e = &entries[i];
+            char perms[5];
+            perms[0] = (e->prot & 0x1) ? 'r' : '-';
+            perms[1] = (e->prot & 0x2) ? 'w' : '-';
+            perms[2] = (e->prot & 0x4) ? 'x' : '-';
+            perms[3] = (e->flags & 0x01) ? 's' : 'p';
+            perms[4] = '\0';
+
+            /* Format matches real Linux /proc/<pid>/maps exactly:
+             *   %lx-%lx %s %08lx %02x:%02x %lu  <padding>  %s\n
+             * Verified against strace of rosetta in a real Lima VZ VM. */
+            char line[256];
+            int lineoff = snprintf(line, sizeof(line),
+                "%llx-%llx %s %08llx 00:00 0",
+                (unsigned long long)e->start,
+                (unsigned long long)e->end,
+                perms,
+                (unsigned long long)e->offset);
+            /* Cap lineoff to buffer size (snprintf may return more
+             * than available on truncation) */
+            if (lineoff >= (int)sizeof(line))
+                lineoff = (int)sizeof(line) - 1;
+            if (e->name[0]) {
+                while (lineoff < MAPS_NAME_COLUMN && lineoff < (int)sizeof(line) - 1)
+                    line[lineoff++] = ' ';
+                int n = snprintf(line + lineoff, sizeof(line) - lineoff,
+                    "%s", e->name);
+                if (n > 0) lineoff += n;
+                if (lineoff >= (int)sizeof(line))
+                    lineoff = (int)sizeof(line) - 1;
+            } else {
+                if (lineoff < (int)sizeof(line) - 1)
+                    line[lineoff++] = ' ';
+            }
+            int wrote = snprintf(buf + off, sizeof(buf) - off, "%.*s\n",
+                                 lineoff, line);
+            if (wrote > 0 && off + wrote < (int)sizeof(buf))
+                off += wrote;
+            else
+                break;  /* Buffer full */
+        }
+
+        if (g->verbose)
+            fprintf(stderr, "hl: /proc/self/maps (%d bytes):\n%.*s", off, off, buf);
         return proc_synthetic_fd(buf, off);
     }
 
@@ -277,6 +406,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
                       + (double)(now.tv_usec - boottime.tv_usec) / 1e6;
         char buf[128];
         int len = snprintf(buf, sizeof(buf), "%.2f 0.00\n", uptime);
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -289,6 +420,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         int len = snprintf(buf, sizeof(buf), "%.2f %.2f %.2f 1/1 %lld\n",
                            loadavg[0], loadavg[1], loadavg[2],
                            (long long)proc_get_pid());
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -302,8 +435,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         memset(&entry, 0, sizeof(entry));
         entry.ut_type = LINUX_USER_PROCESS;
         entry.ut_pid = (int32_t)proc_get_pid();
-        strncpy(entry.ut_line, "pts/0", LINUX_UT_LINESIZE);
-        strncpy(entry.ut_id, "0", 4);
+        strncpy(entry.ut_line, "pts/0", LINUX_UT_LINESIZE - 1);
+        strncpy(entry.ut_id, "0", sizeof(entry.ut_id) - 1);
         const char *user = getenv("USER");
         if (!user) user = "user";
         strncpy(entry.ut_user, user, LINUX_UT_NAMESIZE - 1);
@@ -317,17 +450,20 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address.
      * Rosetta's VMAllocationTracker reads this to determine the lowest
-     * address it can mmap. Standard Linux default is 65536 (0x10000). */
+     * address it can mmap. Real Linux VZ VMs return 32768 (0x8000). */
     if (strcmp(path, "/proc/sys/vm/mmap_min_addr") == 0) {
-        const char *data = "65536\n";
+        const char *data = "32768\n";
         return proc_synthetic_fd(data, strlen(data));
     }
 
-    /* /proc/sys/kernel/randomize_va_space -> ASLR disabled.
-     * Rosetta reads this during initialization. Value 0 = disabled.
-     * In our controlled VM environment, ASLR is not applicable. */
+    /* /proc/sys/kernel/randomize_va_space -> ASLR enabled.
+     * Rosetta reads this during initialization and uses getrandom()
+     * to compute randomized stack/mmap addresses when value is 2.
+     * Real Linux VZ VMs return 2 (full ASLR). Returning 0 would
+     * cause rosetta to use deterministic addresses that may conflict
+     * with hl's fixed memory layout. */
     if (strcmp(path, "/proc/sys/kernel/randomize_va_space") == 0) {
-        const char *data = "0\n";
+        const char *data = "2\n";
         return proc_synthetic_fd(data, strlen(data));
     }
 
@@ -335,8 +471,10 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
     if (strcmp(path, "/proc/version") == 0) {
         char buf[256];
         int len = snprintf(buf, sizeof(buf),
-            "Linux version 6.1.0-hl (hl@hyper-linux) "
+            "Linux version 6.8.0-101-generic (hl@hyper-linux) "
             "(aarch64-linux-musl-gcc) #1 SMP PREEMPT\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -352,10 +490,23 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         return proc_synthetic_fd(data, strlen(data));
     }
 
+    /* /proc/self/mountinfo -> Linux mountinfo format (different from /proc/mounts).
+     * Format: id parent_id major:minor root mount_point options - type source super_options */
+    if (strcmp(path, "/proc/self/mountinfo") == 0) {
+        char buf[1024];
+        int len = snprintf(buf, sizeof(buf),
+            "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+            "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
+            "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+        return proc_synthetic_fd(buf, len);
+    }
+
     /* /proc/mounts, /etc/mtab -> synthetic mount table */
     if (strcmp(path, "/proc/mounts") == 0 ||
         strcmp(path, "/proc/self/mounts") == 0 ||
-        strcmp(path, "/proc/self/mountinfo") == 0 ||
         strcmp(path, "/etc/mtab") == 0) {
         char buf[512];
         int len = snprintf(buf, sizeof(buf),
@@ -363,14 +514,18 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
             "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
             "devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
     /* /proc/self/fd/N -> open the target of the fd (readlink-style) */
     if (strncmp(path, "/proc/self/fd/", 14) == 0) {
-        int n = atoi(path + 14);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 14, &endptr, 10);
+        if (endptr == path + 14 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
         return dup(host_fd);
     }
@@ -425,6 +580,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             (unsigned long long)(total_kb - free_kb - cached_kb - buffers_kb),
             (unsigned long long)(cached_kb / 2),
             (unsigned long long)(total_kb / 2));
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -463,6 +620,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         int len = snprintf(buf, sizeof(buf),
             "root:x:0:0:root:/root:/bin/sh\n"
             "user:x:1000:1000:user:/home/user:/bin/sh\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -473,6 +632,8 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "root:x:0:\n"
             "staff:x:20:\n"
             "user:x:1000:\n");
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
     }
 
@@ -502,9 +663,11 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
 
     /* /proc/self/fd/N -> path of host fd (via fcntl F_GETPATH on macOS) */
     if (strncmp(path, "/proc/self/fd/", 14) == 0) {
-        int n = atoi(path + 14);
-        if (n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
-        int host_fd = fd_to_host(n);
+        char *endptr;
+        long n = strtol(path + 14, &endptr, 10);
+        if (endptr == path + 14 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
         if (host_fd < 0) { errno = EBADF; return -1; }
 
         char fdpath[MAXPATHLEN];

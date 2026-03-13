@@ -17,6 +17,7 @@
 #include "syscall_fd.h"     /* signalfd_notify */
 #include "syscall_proc.h"   /* proc_get_pid, SYSCALL_EXEC_HAPPENED */
 #include "thread.h"         /* current_thread, thread_entry_t */
+#include "vdso.h"           /* VDSO_BASE */
 
 #include <stdio.h>
 #include <string.h>
@@ -37,13 +38,14 @@ typedef struct {
     int valid;          /* Non-zero if fault info is pending */
     int si_code;        /* e.g., LINUX_TRAP_BRKPT */
     uint64_t addr;      /* Fault address (BRK PC, segfault addr, etc.) */
+    uint64_t esr;       /* Raw ESR_EL1 value (0 if not applicable) */
 } pending_fault_t;
 
 static _Thread_local pending_fault_t pending_fault;
 
 /* Protects signal actions array. Multiple threads may call rt_sigaction
- * concurrently (e.g., during musl init). Pending/blocked masks are
- * process-wide for the MVP; per-thread masks are deferred. */
+ * concurrently (e.g., during musl init). Blocked masks are per-thread
+ * (each thread_entry_t has its own `blocked` / `saved_blocked`). */
 static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 4 */
 
 /* ---------- Guest ITIMER_REAL emulation ----------
@@ -135,7 +137,8 @@ static inline int *thread_saved_valid_ptr(void) {
 
 void signal_init(void) {
     memset(&sig_state, 0, sizeof(sig_state));
-    sig_state.altstack.ss_flags = LINUX_SS_DISABLE;
+    /* Altstack is now per-thread (in thread_entry_t), initialized to
+     * SS_DISABLE by thread_register_main() and thread_alloc(). */
 }
 
 void signal_reset_for_exec(void) {
@@ -150,11 +153,24 @@ void signal_reset_for_exec(void) {
             sig_state.actions[i].sa_mask = 0;
         }
     }
-    /* Clear any saved sigsuspend state (both global and per-thread) */
+    /* Clear saved sigsuspend state (both global and per-thread) */
     sig_state.saved_blocked_valid = 0;
     if (current_thread)
         current_thread->saved_blocked_valid = 0;
+
+    /* Reset per-thread altstack (POSIX: exec disables alternate signal stack) */
+    if (current_thread) {
+        current_thread->altstack_sp = 0;
+        current_thread->altstack_flags = LINUX_SS_DISABLE;
+        current_thread->altstack_size = 0;
+        current_thread->on_altstack = 0;
+    }
     pthread_mutex_unlock(&sig_lock);
+
+    /* Clear any stale pending fault info so it doesn't leak into the
+     * new program's first signal delivery (e.g., if a BRK handler
+     * called execve with pending_fault still valid). */
+    pending_fault.valid = 0;
 }
 
 void signal_queue(int signum) {
@@ -180,10 +196,11 @@ void signal_queue(int signum) {
     thread_interrupt_all();
 }
 
-void signal_set_fault_info(int si_code, uint64_t addr) {
+void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr) {
     pending_fault.valid = 1;
     pending_fault.si_code = si_code;
     pending_fault.addr = addr;
+    pending_fault.esr = esr;
 }
 
 void signal_consume(int signum) {
@@ -210,11 +227,37 @@ int signal_pending(void) {
 }
 
 const signal_state_t *signal_get_state(void) {
+    /* Populate IPC-serializable fields from per-thread state under the
+     * lock to avoid data races with concurrent sigaction calls.
+     * This ensures fork children inherit the parent thread's blocked
+     * mask and altstack (POSIX: fork preserves signal mask). */
+    pthread_mutex_lock(&sig_lock);
+    if (current_thread) {
+        sig_state.blocked           = current_thread->blocked;
+        sig_state.altstack.ss_sp    = current_thread->altstack_sp;
+        sig_state.altstack.ss_flags = current_thread->altstack_flags;
+        sig_state.altstack._pad     = 0;
+        sig_state.altstack.ss_size  = current_thread->altstack_size;
+        sig_state.on_altstack       = current_thread->on_altstack;
+    }
+    pthread_mutex_unlock(&sig_lock);
     return &sig_state;
 }
 
 void signal_set_state(const signal_state_t *state) {
-    if (state) sig_state = *state;
+    if (!state) return;
+    pthread_mutex_lock(&sig_lock);
+    sig_state = *state;
+    /* Restore per-thread state from deserialized signal state (fork child).
+     * POSIX: fork preserves blocked mask, altstack, and on_altstack. */
+    if (current_thread) {
+        current_thread->blocked        = state->blocked;
+        current_thread->altstack_sp    = state->altstack.ss_sp;
+        current_thread->altstack_flags = state->altstack.ss_flags;
+        current_thread->altstack_size  = state->altstack.ss_size;
+        current_thread->on_altstack    = state->on_altstack;
+    }
+    pthread_mutex_unlock(&sig_lock);
 }
 
 uint64_t signal_save_blocked(void) {
@@ -245,7 +288,7 @@ void signal_restore_blocked(uint64_t saved) {
 static struct timeval monotonic_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (struct timeval){ .tv_sec = ts.tv_sec, .tv_usec = ts.tv_nsec / 1000 };
+    return (struct timeval){ .tv_sec = ts.tv_sec, .tv_usec = (int)(ts.tv_nsec / 1000) };
 }
 
 /* Helper: compare timevals. Returns <0, 0, >0. */
@@ -255,22 +298,26 @@ static int timeval_cmp(const struct timeval *a, const struct timeval *b) {
     return 0;
 }
 
-/* Helper: add two timevals with overflow saturation. */
+/* Helper: add two timevals with overflow saturation.
+ * Uses pre-check to avoid signed overflow UB. */
 static struct timeval timeval_add(const struct timeval *a,
                                   const struct timeval *b) {
+    /* Pre-check for overflow (avoid UB from signed addition) */
+    if (a->tv_sec > 0 && b->tv_sec > 0 &&
+        a->tv_sec > __LONG_MAX__ - b->tv_sec) {
+        return (struct timeval){ .tv_sec = __LONG_MAX__, .tv_usec = 999999 };
+    }
     struct timeval r = {
         .tv_sec  = a->tv_sec + b->tv_sec,
         .tv_usec = a->tv_usec + b->tv_usec,
     };
-    /* Detect overflow: if both are positive and result is negative */
-    if (a->tv_sec > 0 && b->tv_sec > 0 && r.tv_sec < 0) {
-        r.tv_sec = __LONG_MAX__;
-        r.tv_usec = 999999;
-        return r;
-    }
     if (r.tv_usec >= 1000000) {
-        r.tv_sec += 1;
-        r.tv_usec -= 1000000;
+        if (r.tv_sec == __LONG_MAX__) {
+            r.tv_usec = 999999;  /* Saturate */
+        } else {
+            r.tv_sec += 1;
+            r.tv_usec -= 1000000;
+        }
     }
     return r;
 }
@@ -300,6 +347,7 @@ void signal_set_itimer(const struct timeval *value,
                        struct timeval *old_value,
                        struct timeval *old_interval) {
     struct timeval now = monotonic_now();
+    pthread_mutex_lock(&sig_lock);
 
     /* Return old timer state */
     if (old_interval) *old_interval = guest_itimer.interval;
@@ -312,7 +360,8 @@ void signal_set_itimer(const struct timeval *value,
         }
     }
 
-    /* Set new timer */
+    /* Set new timer (value may be NULL when caller only queries old state) */
+    if (!value) { pthread_mutex_unlock(&sig_lock); return; }
     if (value->tv_sec == 0 && value->tv_usec == 0) {
         /* Disarm */
         guest_itimer.active = 0;
@@ -321,9 +370,11 @@ void signal_set_itimer(const struct timeval *value,
         guest_itimer.expiry = timeval_add(&now, value);
         guest_itimer.interval = interval ? *interval : (struct timeval){0, 0};
     }
+    pthread_mutex_unlock(&sig_lock);
 }
 
 void signal_get_itimer(struct timeval *value, struct timeval *interval) {
+    pthread_mutex_lock(&sig_lock);
     if (interval) *interval = guest_itimer.interval;
     if (value) {
         if (guest_itimer.active) {
@@ -339,26 +390,38 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval) {
             value->tv_usec = 0;
         }
     }
+    pthread_mutex_unlock(&sig_lock);
 }
 
 void signal_check_timer(void) {
     if (!guest_itimer.active) return;
 
     struct timeval now = monotonic_now();
+    pthread_mutex_lock(&sig_lock);
+
+    /* Re-check under lock (another thread may have disarmed) */
+    if (!guest_itimer.active) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
 
     if (timeval_cmp(&now, &guest_itimer.expiry) >= 0) {
-        /* Timer fired — queue SIGALRM */
-        signal_queue(LINUX_SIGALRM);
-
         if (guest_itimer.interval.tv_sec != 0 ||
             guest_itimer.interval.tv_usec != 0) {
-            /* Repeating timer: compute next expiry */
-            guest_itimer.expiry = timeval_add(&now, &guest_itimer.interval);
+            /* Re-arm from previous expiry (not now) to prevent drift.
+             * If check_timer is called late, the next expiry still
+             * advances by exactly one interval from the old expiry. */
+            guest_itimer.expiry = timeval_add(&guest_itimer.expiry,
+                                              &guest_itimer.interval);
         } else {
-            /* One-shot: disarm */
             guest_itimer.active = 0;
         }
+        pthread_mutex_unlock(&sig_lock);
+        /* Queue SIGALRM outside the lock (signal_queue acquires sig_lock) */
+        signal_queue(LINUX_SIGALRM);
+        return;
     }
+    pthread_mutex_unlock(&sig_lock);
 }
 
 /* ---------- rt_sigaction ---------- */
@@ -368,7 +431,9 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
                             uint64_t sigsetsize) {
     if (sigsetsize != 8) return -LINUX_EINVAL;
     if (signum < 1 || signum > LINUX_NSIG) return -LINUX_EINVAL;
-    if (sig_uncatchable(signum)) return -LINUX_EINVAL;
+    /* Linux allows querying (oldact != NULL, act == NULL) for SIGKILL/SIGSTOP
+     * but rejects installing a handler for them. */
+    if (sig_uncatchable(signum) && act_gva) return -LINUX_EINVAL;
 
     int idx = signum - 1;
 
@@ -390,6 +455,20 @@ int64_t signal_rt_sigaction(guest_t *g, int signum,
             pthread_mutex_unlock(&sig_lock);
             return -LINUX_EFAULT;
         }
+
+        if (g->verbose)
+            fprintf(stderr, "hl: rt_sigaction(%d): handler=0x%llx flags=0x%llx "
+                    "restorer=0x%llx mask=0x%llx%s%s%s%s\n",
+                    signum,
+                    (unsigned long long)act.sa_handler,
+                    (unsigned long long)act.sa_flags,
+                    (unsigned long long)act.sa_restorer,
+                    (unsigned long long)act.sa_mask,
+                    (act.sa_flags & LINUX_SA_SIGINFO) ? " SA_SIGINFO" : "",
+                    (act.sa_flags & LINUX_SA_ONSTACK) ? " SA_ONSTACK" : "",
+                    (act.sa_flags & LINUX_SA_RESETHAND) ? " SA_RESETHAND" : "",
+                    (act.sa_flags & LINUX_SA_NODEFER) ? " SA_NODEFER" : "");
+
         sig_state.actions[idx] = act;
     }
 
@@ -472,9 +551,9 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva,
 
         /* If no signal is pending with the new mask, restore immediately.
          * In a real kernel, sigsuspend blocks until a signal arrives. We
-         * can't truly block (single-threaded vCPU model), so we just check
-         * if any signal became deliverable. If yes, the vCPU loop will
-         * deliver it. If no, restore the mask — the caller will loop. */
+         * check if any signal became deliverable with the new mask. If
+         * yes, the vCPU loop will deliver it. If no, restore the mask —
+         * the caller will loop (musl retries on -EINTR). */
         if (!(sig_state.pending & ~*blocked)) {
             *blocked = saved_blocked;
         }
@@ -503,8 +582,10 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva,
     if (!set_gva) return -LINUX_EFAULT;
 
     pthread_mutex_lock(&sig_lock);
-    /* Return signals that are pending AND blocked by this thread */
-    uint64_t result = sig_state.pending & *thread_blocked_ptr();
+    /* Return all pending signals (matching Linux kernel do_sigpending).
+     * In practice unblocked signals are delivered before sigpending can
+     * observe them, but returning the full set is strictly correct. */
+    uint64_t result = sig_state.pending;
     pthread_mutex_unlock(&sig_lock);
 
     if (guest_write(g, set_gva, &result, 8) < 0)
@@ -515,50 +596,44 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva,
 /* ---------- sigaltstack ---------- */
 
 int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva) {
-    pthread_mutex_lock(&sig_lock);
+    thread_entry_t *t = current_thread;
+    if (!t) return -LINUX_EFAULT;
 
-    /* Return current altstack if requested */
+    /* Return current per-thread altstack if requested */
     if (old_ss_gva) {
-        linux_stack_t old_ss = sig_state.altstack;
-        /* Set SS_ONSTACK if currently delivering a signal on the altstack */
-        if (sig_state.on_altstack)
+        linux_stack_t old_ss;
+        old_ss.ss_sp    = t->altstack_sp;
+        old_ss.ss_flags = t->altstack_flags;
+        old_ss._pad     = 0;
+        old_ss.ss_size  = t->altstack_size;
+        if (t->on_altstack)
             old_ss.ss_flags |= LINUX_SS_ONSTACK;
-        if (guest_write(g, old_ss_gva, &old_ss, sizeof(old_ss)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
+        if (guest_write(g, old_ss_gva, &old_ss, sizeof(old_ss)) < 0)
             return -LINUX_EFAULT;
-        }
     }
 
     /* Install new altstack if provided */
     if (ss_gva) {
-        /* Cannot change altstack while executing on it */
-        if (sig_state.on_altstack) {
-            pthread_mutex_unlock(&sig_lock);
+        if (t->on_altstack)
             return -LINUX_EPERM;
-        }
 
         linux_stack_t ss;
-        if (guest_read(g, ss_gva, &ss, sizeof(ss)) < 0) {
-            pthread_mutex_unlock(&sig_lock);
+        if (guest_read(g, ss_gva, &ss, sizeof(ss)) < 0)
             return -LINUX_EFAULT;
-        }
 
         if (ss.ss_flags & LINUX_SS_DISABLE) {
-            /* Disable the altstack */
-            sig_state.altstack.ss_sp = 0;
-            sig_state.altstack.ss_flags = LINUX_SS_DISABLE;
-            sig_state.altstack.ss_size = 0;
+            t->altstack_sp    = 0;
+            t->altstack_flags = LINUX_SS_DISABLE;
+            t->altstack_size  = 0;
         } else {
-            if (ss.ss_size < LINUX_MINSIGSTKSZ) {
-                pthread_mutex_unlock(&sig_lock);
+            if (ss.ss_size < LINUX_MINSIGSTKSZ)
                 return -LINUX_ENOMEM;
-            }
-            sig_state.altstack = ss;
-            sig_state.altstack.ss_flags = 0;
+            t->altstack_sp    = ss.ss_sp;
+            t->altstack_flags = 0;
+            t->altstack_size  = ss.ss_size;
         }
     }
 
-    pthread_mutex_unlock(&sig_lock);
     return 0;
 }
 
@@ -566,21 +641,62 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva) {
 
 /* FPSIMD context header (required by musl for setjmp/longjmp).
  * Linux places this immediately after sigcontext.__reserved starts. */
-#define FPSIMD_MAGIC      0x46508001U
-#define FPSIMD_CONTEXT_SIZE (8 + 4 + 4 + 32 * 16 + 4 + 4)  /* 528 bytes */
+#define FPSIMD_MAGIC        0x46508001U
+#define FPSIMD_CONTEXT_SIZE (8 + 4 + 4 + 32 * 16)  /* 528 bytes */
 
-/* Build a minimal FPSIMD context block in the __reserved area. */
-static void build_fpsimd_context(uint8_t *reserved) {
-    /* struct fpsimd_context { __u32 head.magic, head.size;
-     *   __u32 fpsr, fpcr; __uint128_t vregs[32]; } */
-    uint32_t magic = FPSIMD_MAGIC;
-    uint32_t size = FPSIMD_CONTEXT_SIZE;
-    memcpy(reserved, &magic, 4);
-    memcpy(reserved + 4, &size, 4);
-    /* fpsr=0, fpcr=0, vregs[32]=0 — all zeroed (already zero from memset) */
+/* ESR context header (Linux places this after FPSIMD for synchronous faults).
+ * Rosetta's SIGTRAP handler reads this to determine the BRK immediate value. */
+#define ESR_MAGIC           0x45535201U
+#define ESR_CONTEXT_SIZE    16  /* { __u32 magic, size; __u64 esr; } */
 
-    /* Terminator: zero magic/size after FPSIMD block */
-    memset(reserved + FPSIMD_CONTEXT_SIZE, 0, 8);
+/* Build the extended context chain in the __reserved area.
+ * Linux kernel (arch/arm64/kernel/signal.c) builds:
+ *   1. FPSIMD context (always present)
+ *   2. ESR context (present for synchronous faults: BRK, segfault, etc.)
+ *   3. Terminator (magic=0, size=0)
+ * The esr parameter is the raw ESR_EL1 value; if non-zero, the ESR context
+ * block is included. */
+static void build_sigcontext_reserved(uint8_t *reserved, uint64_t esr,
+                                      hv_vcpu_t vcpu) {
+    uint32_t off = 0;
+
+    /* 1. FPSIMD context — save actual FP/SIMD state so it is correctly
+     * restored by rt_sigreturn. Without this, a signal handler that
+     * modifies FP registers would corrupt the interrupted code's state. */
+    uint32_t fpsimd_magic = FPSIMD_MAGIC;
+    uint32_t fpsimd_size = FPSIMD_CONTEXT_SIZE;
+    memcpy(reserved + off, &fpsimd_magic, 4);
+    memcpy(reserved + off + 4, &fpsimd_size, 4);
+
+    /* Save FPSR and FPCR (32-bit each, at offsets 8 and 12) */
+    uint64_t fpsr_val = 0, fpcr_val = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_FPSR, &fpsr_val);
+    hv_vcpu_get_reg(vcpu, HV_REG_FPCR, &fpcr_val);
+    uint32_t fpsr32 = (uint32_t)fpsr_val;
+    uint32_t fpcr32 = (uint32_t)fpcr_val;
+    memcpy(reserved + off + 8, &fpsr32, 4);
+    memcpy(reserved + off + 12, &fpcr32, 4);
+
+    /* Save V0-V31 (128-bit each, at offset 16) */
+    for (int i = 0; i < 32; i++) {
+        hv_simd_fp_uchar16_t vreg;
+        hv_vcpu_get_simd_fp_reg(vcpu, HV_SIMD_FP_REG_Q0 + i, &vreg);
+        memcpy(reserved + off + 16 + (size_t)i * 16, &vreg, 16);
+    }
+    off += FPSIMD_CONTEXT_SIZE;
+
+    /* 2. ESR context (only for synchronous faults with valid ESR) */
+    if (esr != 0) {
+        uint32_t esr_magic = ESR_MAGIC;
+        uint32_t esr_size = ESR_CONTEXT_SIZE;
+        memcpy(reserved + off, &esr_magic, 4);
+        memcpy(reserved + off + 4, &esr_size, 4);
+        memcpy(reserved + off + 8, &esr, 8);
+        off += ESR_CONTEXT_SIZE;
+    }
+
+    /* 3. Terminator: zero magic/size */
+    memset(reserved + off, 0, 8);
 }
 
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
@@ -615,7 +731,9 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
 
     /* Check handler type */
     if (act->sa_handler == LINUX_SIG_IGN) {
-        /* Ignored — discard signal */
+        /* Ignored — discard signal. Clear any stale fault info so it
+         * doesn't leak into a later signal delivery. */
+        pending_fault.valid = 0;
         pthread_mutex_unlock(&sig_lock);
         return 0;
     }
@@ -623,6 +741,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     if (act->sa_handler == LINUX_SIG_DFL) {
         /* Apply default disposition */
         sig_disposition_t disp = signal_default_disposition(signum);
+        pending_fault.valid = 0;
         switch (disp) {
         case SIG_DISP_TERM:
         case SIG_DISP_CORE:
@@ -682,41 +801,62 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
 
     /* sigcontext — save all registers.
      * fault_address: for synchronous faults (BRK, segfault), set to the
-     * faulting address; for asynchronous signals, zero. */
-    frame.uc.uc_mcontext.fault_address =
-        pending_fault.valid ? pending_fault.addr : 0;
+     * faulting address; for asynchronous signals, zero.
+     * frame_esr: raw ESR_EL1 for the extended context chain. Rosetta's
+     * SIGTRAP handler reads this to determine BRK immediate value. */
+    uint64_t frame_esr = 0;
+    if (pending_fault.valid) {
+        frame.uc.uc_mcontext.fault_address = pending_fault.addr;
+        frame_esr = pending_fault.esr;
+        pending_fault.valid = 0;  /* Consume (one-shot) */
+    }
 
-    /* Consume the pending fault info (one-shot) */
-    pending_fault.valid = 0;
     for (int i = 0; i < 31; i++)
         frame.uc.uc_mcontext.regs[i] = saved_regs[i];
     frame.uc.uc_mcontext.sp = saved_sp;
     frame.uc.uc_mcontext.pc = saved_pc;
     frame.uc.uc_mcontext.pstate = saved_pstate;
 
-    /* FPSIMD context in __reserved area (musl reads this) */
-    build_fpsimd_context(frame.uc.uc_mcontext.__reserved);
+    /* Extended context chain in __reserved area (FPSIMD + optional ESR).
+     * The ESR context is critical for rosetta: its SIGTRAP handler reads
+     * the BRK immediate from ESR ISS[15:0] to determine the trap type
+     * (BRK #3=AOT, #7=indirect, #8=retranslate). Without it, rosetta
+     * can't distinguish BRK traps and may mishandle them. */
+    build_sigcontext_reserved(frame.uc.uc_mcontext.__reserved, frame_esr, vcpu);
 
-    /* Save the altstack info in uc_stack so gdb/tools can see it */
-    frame.uc.uc_stack = sig_state.altstack;
-    if (sig_state.on_altstack)
+    /* Save the per-thread altstack info in uc_stack for gdb/tools */
+    thread_entry_t *thr = current_thread;
+    frame.uc.uc_stack.ss_sp    = thr ? thr->altstack_sp    : 0;
+    frame.uc.uc_stack.ss_flags = thr ? thr->altstack_flags  : LINUX_SS_DISABLE;
+    frame.uc.uc_stack._pad     = 0;
+    frame.uc.uc_stack.ss_size  = thr ? thr->altstack_size   : 0;
+    if (thr && thr->on_altstack)
         frame.uc.uc_stack.ss_flags |= LINUX_SS_ONSTACK;
 
     /* 3. Determine stack for signal frame: use altstack if SA_ONSTACK
-     * is set, an altstack is configured, and we're not already on it. */
+     * is set, an altstack is configured, and we're not already on it.
+     * Note: across fork, only the forking thread's altstack is preserved
+     * (via signal_get_state). Worker thread altstacks start as SS_DISABLE
+     * in the child — matches Linux kernel per-thread altstack semantics. */
     uint64_t signal_sp = saved_sp;
     int use_altstack = 0;
-    if ((act->sa_flags & LINUX_SA_ONSTACK) &&
-        !(sig_state.altstack.ss_flags & LINUX_SS_DISABLE) &&
-        !sig_state.on_altstack) {
+    if (thr && (act->sa_flags & LINUX_SA_ONSTACK) &&
+        !(thr->altstack_flags & LINUX_SS_DISABLE) &&
+        !thr->on_altstack) {
         /* Place frame at top of altstack (stack grows down) */
-        signal_sp = sig_state.altstack.ss_sp + sig_state.altstack.ss_size;
+        signal_sp = thr->altstack_sp + thr->altstack_size;
         use_altstack = 1;
     }
     uint64_t frame_sp = (signal_sp - sizeof(frame)) & ~15ULL;
 
     if (guest_write(g, frame_sp, &frame, sizeof(frame)) < 0) {
         /* Can't write frame — terminate with default disposition */
+        fprintf(stderr, "hl: signal_deliver: guest_write failed for "
+                "frame_sp=0x%llx (signal_sp=0x%llx signum=%d "
+                "frame_size=%zu)\n",
+                (unsigned long long)frame_sp,
+                (unsigned long long)signal_sp,
+                signum, sizeof(frame));
         *exit_code = 128 + signum;
         pthread_mutex_unlock(&sig_lock);
         return -1;
@@ -731,8 +871,20 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     /* X0 = signal number */
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t)signum);
 
-    /* X30 (LR) = sa_restorer (musl's __restore_rt which calls rt_sigreturn) */
-    hv_vcpu_set_reg(vcpu, HV_REG_X30, act->sa_restorer);
+    /* X30 (LR) = return address for signal handler.
+     * On aarch64-linux, the kernel always sets LR to the vDSO's
+     * __kernel_rt_sigreturn (mov x8,#139; svc #0; ret). The sa_restorer
+     * field is architecturally unused on aarch64 — the kernel ignores it.
+     * However, musl explicitly sets sa_restorer to its own __restore_rt
+     * trampoline. We honor sa_restorer if set (for musl compatibility),
+     * otherwise use the vDSO trampoline. The vDSO is built unconditionally
+     * in both native aarch64 and rosetta modes (hl.c + syscall_exec.c). */
+    uint64_t restorer = act->sa_restorer;
+    if (restorer == 0) {
+        /* vDSO __kernel_rt_sigreturn: first trampoline in text section */
+        restorer = VDSO_BASE + VDSO_OFF_TEXT;
+    }
+    hv_vcpu_set_reg(vcpu, HV_REG_X30, restorer);
 
     if (act->sa_flags & LINUX_SA_SIGINFO) {
         /* X1 = pointer to siginfo, X2 = pointer to ucontext */
@@ -740,6 +892,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         uint64_t ucontext_addr = frame_sp + sizeof(linux_siginfo_t);
         hv_vcpu_set_reg(vcpu, HV_REG_X1, siginfo_addr);
         hv_vcpu_set_reg(vcpu, HV_REG_X2, ucontext_addr);
+
     }
 
     /* 5. Update blocked mask during handler execution */
@@ -749,9 +902,9 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     /* Never block SIGKILL/SIGSTOP */
     *blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
 
-    /* 6. Track altstack usage */
-    if (use_altstack)
-        sig_state.on_altstack = 1;
+    /* 6. Track per-thread altstack usage */
+    if (use_altstack && thr)
+        thr->on_altstack = 1;
 
     /* 7. Reset to SIG_DFL if SA_RESETHAND is set */
     if (act->sa_flags & LINUX_SA_RESETHAND) {
@@ -772,11 +925,8 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
 
     /* Read the rt_sigframe from guest stack */
     linux_rt_sigframe_t frame;
-    if (guest_read(g, sp, &frame, sizeof(frame)) < 0) {
-        fprintf(stderr, "hl: rt_sigreturn: failed to read frame at 0x%llx\n",
-                (unsigned long long)sp);
+    if (guest_read(g, sp, &frame, sizeof(frame)) < 0)
         return -LINUX_EFAULT;
-    }
 
     /* Restore all 31 GPRs */
     for (int i = 0; i < 31; i++)
@@ -785,14 +935,49 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
     /* Restore SP, PC, PSTATE */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, frame.uc.uc_mcontext.sp);
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, frame.uc.uc_mcontext.pc);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, frame.uc.uc_mcontext.pstate);
+    /* Sanitize PSTATE: clear EL0-prohibited bits to prevent a corrupted
+     * sigframe from causing unexpected behavior. Matches Linux kernel's
+     * valid_user_regs(): M[4:0]=mode+AArch32 flag, DAIF[9:6]=exception
+     * masks, IL[20]=illegal state, SS[21]=software step. Bit 4 (M[4])
+     * must be 0 for AArch64; bit 5 is RES0. */
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1,
+                         frame.uc.uc_mcontext.pstate & ~0x003F03FFULL);
 
-    /* Restore signal mask and clear altstack-in-use flag */
+    /* Restore FPSIMD state from the sigcontext __reserved area.
+     * The FPSIMD context starts at offset 0 of __reserved (after magic/size). */
+    const uint8_t *reserved = frame.uc.uc_mcontext.__reserved;
+    uint32_t fpsimd_magic;
+    memcpy(&fpsimd_magic, reserved, 4);
+    if (fpsimd_magic == FPSIMD_MAGIC) {
+        uint32_t fpsr32, fpcr32;
+        memcpy(&fpsr32, reserved + 8, 4);
+        memcpy(&fpcr32, reserved + 12, 4);
+        hv_vcpu_set_reg(vcpu, HV_REG_FPSR, fpsr32);
+        hv_vcpu_set_reg(vcpu, HV_REG_FPCR, fpcr32);
+        for (int i = 0; i < 32; i++) {
+            hv_simd_fp_uchar16_t vreg;
+            memcpy(&vreg, reserved + 16 + (size_t)i * 16, 16);
+            hv_vcpu_set_simd_fp_reg(vcpu, HV_SIMD_FP_REG_Q0 + i, vreg);
+        }
+    }
+
+    /* Restore signal mask and update altstack-in-use flag.
+     * If the restored SP is still within the altstack range (nested signal
+     * case), keep on_altstack=1.  Matches Linux kernel's restore_altstack. */
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
     *blocked = frame.uc.uc_sigmask;
     *blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
-    sig_state.on_altstack = 0;
+    if (current_thread) {
+        uint64_t restored_sp = frame.uc.uc_mcontext.sp;
+        if (current_thread->altstack_sp &&
+            restored_sp >= current_thread->altstack_sp &&
+            restored_sp < current_thread->altstack_sp +
+                          current_thread->altstack_size)
+            current_thread->on_altstack = 1;
+        else
+            current_thread->on_altstack = 0;
+    }
     pthread_mutex_unlock(&sig_lock);
 
     /* Return SYSCALL_EXEC_HAPPENED to skip the normal X0 writeback,

@@ -81,7 +81,9 @@
 #define SYS_setitimer       103
 #define SYS_nanosleep       101
 #define SYS_clock_gettime   113
+#define SYS_clock_getres    114
 #define SYS_clock_nanosleep 115
+#define SYS_sched_setaffinity 122
 #define SYS_sched_getaffinity 123
 #define SYS_sched_yield     124
 #define SYS_kill            129
@@ -166,8 +168,6 @@
 #define SYS_fremovexattr    18
 /* chroot */
 #define SYS_chroot          51
-/* scheduling */
-#define SYS_sched_setaffinity 122
 /* network batch I/O */
 #define SYS_recvmmsg        243
 #define SYS_sendmmsg        269
@@ -188,8 +188,28 @@
 #define SYS_mincore         232
 #define SYS_eventfd2        19
 #define SYS_signalfd4       74
+#define SYS_rt_tgsigqueueinfo 240
 #define SYS_clone3          435
 #define SYS_close_range     436
+#define SYS_ptrace          117
+
+/* ---------- Linux ptrace constants ---------- */
+#define LINUX_PTRACE_CONT       7
+#define LINUX_PTRACE_GETREGSET  0x4204
+#define LINUX_PTRACE_SETREGSET  0x4205
+#define LINUX_PTRACE_SEIZE      0x4206
+#define LINUX_PTRACE_INTERRUPT  0x4207
+#define LINUX_NT_PRSTATUS       1
+
+/* Linux aarch64 user_pt_regs — matches the kernel's struct user_pt_regs.
+ * Used by PTRACE_GETREGSET/SETREGSET with NT_PRSTATUS to exchange
+ * GPR state between tracer and tracee threads. */
+typedef struct {
+    uint64_t regs[31];  /* X0-X30 */
+    uint64_t sp;        /* SP_EL0 */
+    uint64_t pc;        /* ELR_EL1 */
+    uint64_t pstate;    /* SPSR_EL1 */
+} linux_user_pt_regs_t;
 
 /* ---------- Linux errno values ---------- */
 #define LINUX_EPERM       1
@@ -250,6 +270,25 @@
 #define LINUX_EDESTADDRREQ 89
 #define LINUX_EPROTOTYPE   91
 #define LINUX_ETIMEDOUT    110
+#define LINUX_ENOBUFS      105
+#define LINUX_ENOTSUP      95   /* Same as EOPNOTSUPP on Linux */
+#define LINUX_EPROTONOSUPPORT 93
+#define LINUX_ESOCKTNOSUPPORT 94
+#define LINUX_ENETDOWN     100
+#define LINUX_ENETRESET    102
+#define LINUX_ESHUTDOWN    108
+#define LINUX_ETOOMANYREFS 109
+#define LINUX_EDQUOT       122
+#define LINUX_ESTALE       116
+#define LINUX_ENOTRECOVERABLE 131
+#define LINUX_EOWNERDEAD   130
+/* Additional errno values needed for complete macOS→Linux mapping */
+#define LINUX_ENOMSG       42   /* No message of desired type */
+#define LINUX_ENOLINK      67   /* Link has been severed */
+#define LINUX_EPROTO       71   /* Protocol error */
+#define LINUX_EMULTIHOP    72   /* Multihop attempted */
+#define LINUX_EILSEQ       84   /* Illegal byte sequence */
+#define LINUX_EHOSTDOWN   112   /* Host is down */
 
 /* ---------- Linux FD flags ---------- */
 #define LINUX_FD_CLOEXEC   1
@@ -277,6 +316,7 @@
 #define LINUX_O_RDWR     0x0002
 #define LINUX_O_CREAT    0x0040
 #define LINUX_O_EXCL     0x0080
+#define LINUX_O_NOCTTY   0x0100
 #define LINUX_O_TRUNC    0x0200
 #define LINUX_O_APPEND   0x0400
 #define LINUX_O_NONBLOCK 0x0800
@@ -291,7 +331,8 @@
 /* ---------- Linux AT_* constants ---------- */
 #define LINUX_AT_FDCWD             (-100)
 #define LINUX_AT_SYMLINK_NOFOLLOW  0x100
-#define LINUX_AT_REMOVEDIR         0x200
+#define LINUX_AT_REMOVEDIR         0x200  /* for unlinkat */
+#define LINUX_AT_EACCESS           0x200  /* for faccessat (same value, context-dependent) */
 #define LINUX_AT_SYMLINK_FOLLOW    0x400
 #define LINUX_AT_EMPTY_PATH        0x1000
 
@@ -555,6 +596,9 @@ typedef struct {
 
 /* Initialize the syscall subsystem (FD table, etc.) */
 void syscall_init(void);
+
+/* Reset mmap gap-finder hints after execve. */
+void mmap_reset_hints(void);
 
 /* Dispatch a syscall. Reads X8 (nr) and X0-X5 (args) from vCPU registers.
  * Writes result back to X0. Sets *exit_code if the process should exit.

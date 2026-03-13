@@ -301,6 +301,6 @@ int main(void) {
     test_no_cloexec_survives_fork();
     test_cloexec_inherited_in_fork();
 
-    printf("\ntest-cloexec: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-cloexec");
     return fails > 0 ? 1 : 0;
 }

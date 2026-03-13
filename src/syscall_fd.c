@@ -26,7 +26,8 @@
 
 /* Mutex protecting timerfd/eventfd/signalfd per-slot state.  Prevents
  * races when two threads operate on the same special FD concurrently
- * (e.g., two threads reading the same eventfd). Lock order: 5. */
+ * (e.g., two threads reading the same eventfd). Lock order: 5a
+ * (after thread_lock(5), never held together with it). */
 static pthread_mutex_t sfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ================================================================
@@ -89,7 +90,7 @@ int64_t sys_timerfd_create(int clockid, int flags) {
     if (gfd < 0) { close(kq); return -LINUX_EMFILE; }
 
     int slot = timerfd_alloc();
-    if (slot < 0) { close(kq); return -LINUX_ENOMEM; }
+    if (slot < 0) { fd_mark_closed(gfd); close(kq); return -LINUX_ENOMEM; }
 
     timerfd_state[slot].guest_fd = gfd;
     timerfd_state[slot].kq_fd = kq;
@@ -109,12 +110,22 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
                              uint64_t old_value_gva) {
     (void)flags; /* TFD_TIMER_ABSTIME not supported */
 
+    pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
 
     linux_itimerspec_t its;
-    if (guest_read(g, new_value_gva, &its, sizeof(its)) < 0)
+    if (guest_read(g, new_value_gva, &its, sizeof(its)) < 0) {
+        pthread_mutex_unlock(&sfd_lock);
         return -LINUX_EFAULT;
+    }
+
+    /* Validate nanosecond fields (Linux rejects tv_nsec >= 1e9 or < 0) */
+    if (its.it_value_nsec < 0 || its.it_value_nsec >= 1000000000LL ||
+        its.it_interval_nsec < 0 || its.it_interval_nsec >= 1000000000LL) {
+        pthread_mutex_unlock(&sfd_lock);
+        return -LINUX_EINVAL;
+    }
 
     /* Return old value if requested (compute remaining time) */
     if (old_value_gva) {
@@ -133,15 +144,32 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
                 old.it_value_nsec = remaining % 1000000000LL;
             }
         }
-        guest_write(g, old_value_gva, &old, sizeof(old));
+        if (guest_write(g, old_value_gva, &old, sizeof(old)) < 0) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EFAULT;
+        }
     }
 
     int kq = timerfd_state[slot].kq_fd;
-    /* Convert directly to microseconds for best precision with NOTE_USECONDS */
-    int64_t value_us = its.it_value_sec * 1000000LL + its.it_value_nsec / 1000;
-    int64_t interval_ns = its.it_interval_sec * 1000000000LL + its.it_interval_nsec;
+    /* Clamp large seconds values to prevent signed integer overflow.
+     * INT64_MAX / 1e6 ≈ 9.2e12 seconds; INT64_MAX / 1e9 ≈ 9.2e9. */
+    int64_t val_sec = its.it_value_sec;
+    int64_t int_sec = its.it_interval_sec;
+    if (val_sec > INT64_MAX / 1000000LL)   val_sec = INT64_MAX / 1000000LL;
+    if (int_sec > INT64_MAX / 1000000000LL) int_sec = INT64_MAX / 1000000000LL;
+    int64_t value_us = val_sec * 1000000LL + its.it_value_nsec / 1000;
+    int64_t interval_ns = int_sec * 1000000000LL + its.it_interval_nsec;
 
-    if (value_us == 0 && its.it_value_nsec == 0) {
+    if (hl_verbose)
+        fprintf(stderr, "hl: timerfd_settime: gfd=%d value=%lld.%09lld "
+                "interval=%lld.%09lld (value_us=%lld interval_ns=%lld "
+                "oneshot=%d)\n",
+                fd, (long long)its.it_value_sec, (long long)its.it_value_nsec,
+                (long long)its.it_interval_sec, (long long)its.it_interval_nsec,
+                (long long)value_us, (long long)interval_ns,
+                interval_ns == 0);
+
+    if (its.it_value_sec == 0 && its.it_value_nsec == 0) {
         /* Disarm timer */
         struct kevent kev;
         EV_SET(&kev, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
@@ -156,17 +184,24 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
         timerfd_state[slot].armed = 0;
         timerfd_state[slot].expirations = 0;
     } else {
-        /* Arm timer */
+        /* Arm timer.  Always use EV_ONESHOT: for repeating timers where
+         * initial value != interval, kqueue would repeat at the wrong
+         * period (initial instead of interval).  timerfd_read re-arms
+         * with the interval after the first read. */
         struct kevent kev;
-        uint16_t kflags = EV_ADD | EV_ENABLE;
-        if (interval_ns == 0) kflags |= EV_ONESHOT;
-        EV_SET(&kev, 1, EVFILT_TIMER, kflags, NOTE_USECONDS,
-               value_us, NULL);
-        if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+        EV_SET(&kev, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT,
+               NOTE_USECONDS, value_us, NULL);
+        if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0) {
+            pthread_mutex_unlock(&sfd_lock);
             return linux_errno();
+        }
         timerfd_state[slot].armed = 1;
         timerfd_state[slot].interval_ns = interval_ns;
-        timerfd_state[slot].initial_ns = its.it_value_sec * 1000000000LL + its.it_value_nsec;
+        /* Use separate clamping for nanosecond computation: val_sec is clamped
+         * for microsecond use (INT64_MAX / 1e6), which overflows when * 1e9. */
+        int64_t init_sec = its.it_value_sec;
+        if (init_sec > INT64_MAX / 1000000000LL) init_sec = INT64_MAX / 1000000000LL;
+        timerfd_state[slot].initial_ns = init_sec * 1000000000LL + its.it_value_nsec;
         timerfd_state[slot].expirations = 0;
 
         /* Record arm time for gettime remaining-time calculation */
@@ -175,12 +210,14 @@ int64_t sys_timerfd_settime(guest_t *g, int fd, int flags,
         timerfd_state[slot].arm_time_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
     }
 
+    pthread_mutex_unlock(&sfd_lock);
     return 0;
 }
 
 int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
 
     linux_itimerspec_t its = {0};
     if (timerfd_state[slot].armed) {
@@ -218,7 +255,9 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva) {
             its.it_value_nsec = remaining % 1000000000LL;
         }
     }
-    guest_write(g, curr_value_gva, &its, sizeof(its));
+    pthread_mutex_unlock(&sfd_lock);
+    if (guest_write(g, curr_value_gva, &its, sizeof(its)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -253,10 +292,24 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return -LINUX_EAGAIN;
         }
 
-        /* Blocking: release lock, wait for the timer, re-lock */
+        /* If the timer was never armed, there's no kevent registered —
+         * kevent(NULL timeout) would block forever. Return EAGAIN. */
+        if (!timerfd_state[slot].armed) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EAGAIN;
+        }
+
+        /* Blocking: release lock, wait for the timer, re-lock.
+         * Another thread may close the fd while we wait — kevent()
+         * returns EBADF in that case, and we re-validate the slot. */
         pthread_mutex_unlock(&sfd_lock);
         nev = kevent(kq, NULL, 0, &kev, 1, NULL);
         pthread_mutex_lock(&sfd_lock);
+        /* Re-validate: slot may have been freed by timerfd_close() */
+        if (timerfd_state[slot].guest_fd != guest_fd) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EBADF;
+        }
         if (nev > 0) {
             uint64_t fires = (uint64_t)kev.data;
             if (fires == 0) fires = 1;
@@ -270,7 +323,33 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     uint64_t val = timerfd_state[slot].expirations;
     timerfd_state[slot].expirations = 0;
+    int armed = timerfd_state[slot].armed;
+    int64_t intv = timerfd_state[slot].interval_ns;
+    int rearm_kq = timerfd_state[slot].kq_fd;
+
+    /* Re-arm repeating timers with the interval period.  The initial
+     * fire used EV_ONESHOT (see timerfd_settime), so we re-arm here
+     * to get correct interval timing even when initial != interval. */
+    if (intv > 0 && armed) {
+        int64_t interval_us = intv / 1000;
+        if (interval_us == 0) interval_us = 1; /* Minimum 1us */
+        struct kevent rearm_kev;
+        EV_SET(&rearm_kev, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT,
+               NOTE_USECONDS, interval_us, NULL);
+        kevent(rearm_kq, &rearm_kev, 1, NULL, 0, NULL);
+
+        /* Update arm time for gettime remaining-time calculation */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        timerfd_state[slot].arm_time_ns = now.tv_sec * 1000000000LL + now.tv_nsec;
+        timerfd_state[slot].initial_ns = intv; /* Next fire is one interval */
+    }
     pthread_mutex_unlock(&sfd_lock);
+
+    if (hl_verbose)
+        fprintf(stderr, "hl: timerfd_read: gfd=%d expirations=%llu armed=%d "
+                "interval_ns=%lld\n",
+                guest_fd, (unsigned long long)val, armed, (long long)intv);
 
     if (guest_write(g, buf_gva, &val, 8) < 0)
         return -LINUX_EFAULT;
@@ -278,14 +357,18 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     return 8;
 }
 
-/* Clean up timerfd state when guest closes the fd. */
+/* Clean up timerfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent timerfd_read. */
 void timerfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
-    if (slot < 0) return;
-    /* kq_fd is closed by sys_close() as host_fd */
-    timerfd_state[slot].guest_fd = -1;
-    timerfd_state[slot].expirations = 0;
-    timerfd_state[slot].armed = 0;
+    if (slot >= 0) {
+        /* kq_fd is closed by sys_close() as host_fd */
+        timerfd_state[slot].guest_fd = -1;
+        timerfd_state[slot].expirations = 0;
+        timerfd_state[slot].armed = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 /* ================================================================
@@ -349,7 +432,7 @@ int64_t sys_eventfd2(unsigned int initval, int flags) {
     if (gfd < 0) { close(pipefd[0]); close(pipefd[1]); return -LINUX_EMFILE; }
 
     int slot = eventfd_slot_alloc();
-    if (slot < 0) { close(pipefd[0]); close(pipefd[1]); return -LINUX_ENOMEM; }
+    if (slot < 0) { fd_mark_closed(gfd); close(pipefd[0]); close(pipefd[1]); return -LINUX_ENOMEM; }
 
     eventfd_state[slot].guest_fd = gfd;
     eventfd_state[slot].pipe_rd = pipefd[0];
@@ -369,14 +452,18 @@ int64_t sys_eventfd2(unsigned int initval, int flags) {
     return gfd;
 }
 
-/* Clean up eventfd state when guest closes the fd. */
+/* Clean up eventfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent eventfd_write/eventfd_read. */
 void eventfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
-    if (slot < 0) return;
-    close(eventfd_state[slot].pipe_wr);
-    /* pipe_rd is closed by sys_close() as host_fd */
-    eventfd_state[slot].guest_fd = -1;
-    eventfd_state[slot].counter = 0;
+    if (slot >= 0) {
+        close(eventfd_state[slot].pipe_wr);
+        /* pipe_rd is closed by sys_close() as host_fd */
+        eventfd_state[slot].guest_fd = -1;
+        eventfd_state[slot].counter = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 /* Read from eventfd: return 8-byte counter value, then reset to 0.
@@ -393,13 +480,24 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
         }
-        /* Blocking mode: release lock, block on pipe, re-lock */
+        /* Blocking mode: release lock, block on pipe, re-lock.
+         * The pipe is O_NONBLOCK — temporarily make it blocking so
+         * read() actually waits for the writer. Matches signalfd_read.
+         * Another thread may close the fd while we wait — read()
+         * returns EBADF in that case, and we re-validate the slot. */
         int rd_fd = eventfd_state[slot].pipe_rd;
         pthread_mutex_unlock(&sfd_lock);
         uint8_t byte;
+        fcntl(rd_fd, F_SETFL, 0);          /* Make temporarily blocking */
         ssize_t r = read(rd_fd, &byte, 1);
+        fcntl(rd_fd, F_SETFL, O_NONBLOCK); /* Restore non-blocking */
         if (r < 0) return linux_errno();
         pthread_mutex_lock(&sfd_lock);
+        /* Re-validate: slot may have been freed by eventfd_close() */
+        if (eventfd_state[slot].guest_fd != guest_fd) {
+            pthread_mutex_unlock(&sfd_lock);
+            return -LINUX_EBADF;
+        }
         /* Counter was updated by the writer — re-check */
         if (eventfd_state[slot].counter == 0) {
             pthread_mutex_unlock(&sfd_lock);
@@ -456,11 +554,27 @@ int64_t eventfd_write(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
     int was_zero = (eventfd_state[slot].counter == 0);
     eventfd_state[slot].counter += val;
 
-    /* Signal readability via pipe if counter transitioned from 0 */
+    /* Signal readability via pipe if counter transitioned from 0.
+     * The pipe is non-blocking; retry on EINTR and warn on other errors
+     * since a missed wakeup here can deadlock ppoll/epoll waiters. */
     if (was_zero && eventfd_state[slot].counter > 0) {
         uint8_t byte = 1;
-        write(eventfd_state[slot].pipe_wr, &byte, 1);
+        ssize_t wr;
+        do {
+            wr = write(eventfd_state[slot].pipe_wr, &byte, 1);
+        } while (wr < 0 && errno == EINTR);
+        if (wr < 0)
+            fprintf(stderr, "hl: eventfd_write: pipe write failed: %s "
+                    "(gfd=%d pipe_wr=%d)\n",
+                    strerror(errno), guest_fd, eventfd_state[slot].pipe_wr);
     }
+    /* Always log eventfd writes — critical for diagnosing shutdown hangs */
+    if (hl_verbose)
+        fprintf(stderr, "hl: eventfd_write: gfd=%d val=%llu counter=%llu "
+                "was_zero=%d pipe_wr=%d\n",
+                guest_fd, (unsigned long long)val,
+                (unsigned long long)eventfd_state[slot].counter,
+                was_zero, eventfd_state[slot].pipe_wr);
     pthread_mutex_unlock(&sfd_lock);
 
     return 8;
@@ -535,14 +649,18 @@ static int signalfd_slot_alloc(void) {
     return -1;
 }
 
-/* Clean up signalfd state when guest closes the fd. */
+/* Clean up signalfd state when guest closes the fd. Must hold sfd_lock
+ * to prevent racing with concurrent signalfd_notify. */
 void signalfd_close(int guest_fd) {
+    pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find(guest_fd);
-    if (slot < 0) return;
-    close(signalfd_state[slot].pipe_wr);
-    /* pipe_rd is closed by sys_close() as host_fd */
-    signalfd_state[slot].guest_fd = -1;
-    signalfd_state[slot].mask = 0;
+    if (slot >= 0) {
+        close(signalfd_state[slot].pipe_wr);
+        /* pipe_rd is closed by sys_close() as host_fd */
+        signalfd_state[slot].guest_fd = -1;
+        signalfd_state[slot].mask = 0;
+    }
+    pthread_mutex_unlock(&sfd_lock);
 }
 
 int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,
@@ -578,14 +696,20 @@ int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,
     int gfd = fd_alloc(FD_SIGNALFD, pipefd[0]);
     if (gfd < 0) { close(pipefd[0]); close(pipefd[1]); return -LINUX_EMFILE; }
 
+    pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_slot_alloc();
-    if (slot < 0) { close(pipefd[0]); close(pipefd[1]); return -LINUX_ENOMEM; }
+    if (slot < 0) {
+        pthread_mutex_unlock(&sfd_lock);
+        fd_mark_closed(gfd); close(pipefd[0]); close(pipefd[1]);
+        return -LINUX_ENOMEM;
+    }
 
     signalfd_state[slot].guest_fd = gfd;
     signalfd_state[slot].pipe_rd = pipefd[0];
     signalfd_state[slot].pipe_wr = pipefd[1];
     signalfd_state[slot].mask = mask;
     signalfd_state[slot].nonblock = (flags & LINUX_SFD_NONBLOCK) ? 1 : 0;
+    pthread_mutex_unlock(&sfd_lock);
 
     fd_table[gfd].linux_flags = (flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
 
@@ -596,12 +720,19 @@ int64_t sys_signalfd4(guest_t *g, int fd, uint64_t mask_gva,
  * Each signal produces one signalfd_siginfo (128 bytes).
  * Returns number of bytes read, or -EAGAIN if nothing pending. */
 int64_t signalfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count) {
+    /* Capture slot state under sfd_lock, then release BEFORE calling
+     * signal_get_state() which acquires sig_lock(4). Holding sfd_lock(5a)
+     * while taking sig_lock(4) would violate lock ordering. */
+    pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EBADF; }
 
     uint64_t mask = signalfd_state[slot].mask;
+    int nonblock = signalfd_state[slot].nonblock;
+    int pipe_rd = signalfd_state[slot].pipe_rd;
     size_t max_signals = count / sizeof(linux_signalfd_siginfo_t);
-    if (max_signals == 0) return -LINUX_EINVAL;
+    if (max_signals == 0) { pthread_mutex_unlock(&sfd_lock); return -LINUX_EINVAL; }
+    pthread_mutex_unlock(&sfd_lock);
 
     const signal_state_t *sig = signal_get_state();
     /* Match pending signals against the signalfd mask. Do NOT filter by
@@ -610,10 +741,28 @@ int64_t signalfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
     uint64_t deliverable = sig->pending & mask;
 
     if (deliverable == 0) {
-        if (signalfd_state[slot].nonblock) return -LINUX_EAGAIN;
-        /* In blocking mode, we'd block on the pipe. For single-threaded
-         * guests, signals only arrive between syscalls, so return EAGAIN. */
-        return -LINUX_EAGAIN;
+        if (nonblock)
+            return -LINUX_EAGAIN;
+        /* Blocking mode: wait for signalfd_notify() to write to the pipe.
+         * Re-validate slot after wake. */
+        uint8_t byte;
+        /* pipe_rd is O_NONBLOCK — temporarily make it blocking for the wait */
+        fcntl(pipe_rd, F_SETFL, 0);
+        ssize_t r = read(pipe_rd, &byte, 1);
+        fcntl(pipe_rd, F_SETFL, O_NONBLOCK);
+        if (r <= 0) return -LINUX_EAGAIN;
+
+        /* Re-validate: slot may have been freed by signalfd_close() */
+        pthread_mutex_lock(&sfd_lock);
+        int still_valid = (signalfd_state[slot].guest_fd == guest_fd);
+        pthread_mutex_unlock(&sfd_lock);
+        if (!still_valid) return -LINUX_EBADF;
+
+        /* Re-check: a signal matching our mask should now be pending */
+        sig = signal_get_state();
+        deliverable = sig->pending & mask;
+        if (deliverable == 0)
+            return -LINUX_EAGAIN;
     }
 
     size_t total = 0;
@@ -637,10 +786,14 @@ int64_t signalfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count
         total++;
     }
 
-    /* Drain pipe readability */
-    uint8_t drain;
-    while (read(signalfd_state[slot].pipe_rd, &drain, 1) > 0)
-        ;
+    /* Drain pipe: consume exactly one byte per signal read. If we
+     * drain ALL bytes, we'd lose notifications for signals that
+     * arrived between sfd_lock release and this drain. Draining
+     * the consumed count preserves new notifications. */
+    for (size_t i = 0; i < total; i++) {
+        uint8_t drain;
+        if (read(pipe_rd, &drain, 1) <= 0) break;
+    }
 
     return (int64_t)(total * sizeof(linux_signalfd_siginfo_t));
 }

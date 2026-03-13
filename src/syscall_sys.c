@@ -29,8 +29,11 @@ int64_t sys_uname(guest_t *g, uint64_t buf_gva) {
     memset(&uts, 0, sizeof(uts));
     strncpy(uts.sysname, "Linux", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.nodename, "hl", LINUX_UTSNAME_LEN - 1);
-    strncpy(uts.release, "6.1.0", LINUX_UTSNAME_LEN - 1);
-    strncpy(uts.version, "#1 SMP", LINUX_UTSNAME_LEN - 1);
+    /* Kernel version must match what Rosetta expects from a VZ guest.
+     * Rosetta parses the release string and may enable/disable features
+     * based on it. Use a version matching real VZ VMs (Ubuntu 24.04). */
+    strncpy(uts.release, "6.8.0-101-generic", LINUX_UTSNAME_LEN - 1);
+    strncpy(uts.version, "#101-Ubuntu SMP PREEMPT_DYNAMIC", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.machine, "aarch64", LINUX_UTSNAME_LEN - 1);
     strncpy(uts.domainname, "(none)", LINUX_UTSNAME_LEN - 1);
 
@@ -79,13 +82,28 @@ int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size) {
 int64_t sys_sched_getaffinity(guest_t *g, int pid, uint64_t size,
                               uint64_t mask_gva) {
     (void)pid;
-    /* Single-vCPU model: return a 1-CPU affinity mask.
-     * The mask is a bitmask where bit 0 = CPU 0. */
+    /* Return a 1-CPU affinity mask for simplicity.
+     * sched_setaffinity is not implemented; all threads see CPU 0. */
     if (size < 8) return -LINUX_EINVAL;
 
     uint64_t mask = 1;  /* CPU 0 only */
     if (guest_write(g, mask_gva, &mask, 8) < 0)
         return -LINUX_EFAULT;
+
+    /* Linux zeroes remaining bytes past the 8-byte mask.
+     * Use guest_write in chunks for bounds safety. */
+    if (size > 8) {
+        uint8_t zeros[256] = {0};
+        uint64_t off = 8;
+        uint64_t rem = size - 8;
+        while (rem > 0) {
+            size_t chunk = (rem > sizeof(zeros)) ? sizeof(zeros) : (size_t)rem;
+            if (guest_write(g, mask_gva + off, zeros, chunk) < 0)
+                return -LINUX_EFAULT;
+            off += chunk;
+            rem -= chunk;
+        }
+    }
 
     return 8;  /* Returns size of written mask */
 }
@@ -103,13 +121,17 @@ int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva) {
     for (int i = 0; i < ngroups; i++)
         linux_groups[i] = (uint32_t)groups[i];
 
-    if (guest_write(g, list_gva, linux_groups, ngroups * 4) < 0)
+    if (guest_write(g, list_gva, linux_groups, (size_t)ngroups * 4) < 0)
         return -LINUX_EFAULT;
 
     return ngroups;
 }
 
 int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva) {
+    /* Linux RUSAGE_SELF=0, RUSAGE_CHILDREN=-1, RUSAGE_THREAD=1.
+     * macOS has the same values. Reject unknown values early. */
+    if (who != 0 && who != -1 && who != 1) return -LINUX_EINVAL;
+
     struct rusage mac_usage;
     if (getrusage(who, &mac_usage) < 0)
         return linux_errno();
@@ -120,7 +142,7 @@ int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva) {
     lin_usage.ru_utime.tv_usec = mac_usage.ru_utime.tv_usec;
     lin_usage.ru_stime.tv_sec  = mac_usage.ru_stime.tv_sec;
     lin_usage.ru_stime.tv_usec = mac_usage.ru_stime.tv_usec;
-    lin_usage.ru_maxrss  = mac_usage.ru_maxrss;
+    lin_usage.ru_maxrss  = mac_usage.ru_maxrss / 1024; /* macOS: bytes → Linux: KB */
     lin_usage.ru_minflt  = mac_usage.ru_minflt;
     lin_usage.ru_majflt  = mac_usage.ru_majflt;
     lin_usage.ru_inblock = mac_usage.ru_inblock;
@@ -148,21 +170,36 @@ int64_t sys_sysinfo(guest_t *g, uint64_t info_gva) {
         si.uptime = now.tv_sec - boottime.tv_sec;
     }
 
-    /* Total RAM from hw.memsize */
+    /* Total RAM: cap to 4GB to match real Linux VZ VM behavior.
+     *
+     * Rosetta uses sysinfo.totalram to size its JIT slab (the mmap at
+     * 0xf00000000000). With the host Mac's full RAM (e.g. 16GB+), rosetta
+     * allocates a 384MB slab; the real Lima VZ VM with 4GB reports ~61MB.
+     * The different slab size changes rosetta's internal memory layout
+     * (hash tables, block arrays, JIT code regions) and can affect JIT
+     * code translation behavior. Cap to 4GB to match real VZ VM. */
     uint64_t memsize = 0;
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = { CTL_HW, HW_MEMSIZE };
     if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        si.totalram = memsize;
+        const uint64_t VM_RAM_CAP = 4094595072ULL; /* Match Lima VZ 4GB VM */
+        si.totalram = (memsize > VM_RAM_CAP) ? VM_RAM_CAP : memsize;
     }
 
-    /* Free RAM from vm_statistics64 */
+    /* Free RAM from vm_statistics64 (scaled proportionally to capped total) */
     vm_statistics64_data_t vmstat;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+    mach_port_t host_port = mach_host_self();
+    if (host_statistics64(host_port, HOST_VM_INFO64,
                           (host_info64_t)&vmstat, &count) == KERN_SUCCESS) {
-        uint64_t page_size = 4096;
-        si.freeram = (uint64_t)vmstat.free_count * page_size;
+        uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
+        uint64_t real_free = (uint64_t)vmstat.free_count * page_size;
+        /* Scale freeram proportionally if we capped totalram */
+        if (memsize > 0 && memsize > si.totalram) {
+            si.freeram = real_free * si.totalram / memsize;
+        } else {
+            si.freeram = real_free;
+        }
     }
 
     /* Load averages (× 65536 for fixed-point) */
@@ -209,28 +246,51 @@ int64_t sys_prlimit64(guest_t *g, int pid, int resource,
     int mac_res = translate_rlimit_resource(resource);
     if (mac_res < 0) return -LINUX_EINVAL;
 
+    /* Get old limits BEFORE setting new ones (Linux prlimit64 atomically
+     * returns old values and sets new ones; approximate by get-then-set). */
+    linux_rlimit64_t old_lim = {0};
+    if (old_gva != 0) {
+        struct rlimit rl;
+        if (getrlimit(mac_res, &rl) < 0)
+            return linux_errno();
+
+        /* Translate macOS RLIM_INFINITY → Linux RLIM_INFINITY.
+         * macOS: 0x7FFFFFFFFFFFFFFF, Linux: 0xFFFFFFFFFFFFFFFF.
+         * Rosetta and musl both check for RLIM_INFINITY to determine
+         * uncapped resources (e.g., stack size for thread stacks). */
+        old_lim.rlim_cur = (rl.rlim_cur == RLIM_INFINITY)
+                           ? UINT64_MAX : rl.rlim_cur;
+        old_lim.rlim_max = (rl.rlim_max == RLIM_INFINITY)
+                           ? UINT64_MAX : rl.rlim_max;
+
+        /* RLIMIT_STACK: macOS returns ~8372224 (~8MB-16KB) which differs
+         * from Linux's standard 8388608 (8MB = 8192*1024). Rosetta uses
+         * this to size its internal stack allocations. Round up to the
+         * standard Linux default for consistency. */
+        if (resource == 3 /* RLIMIT_STACK */ &&
+            old_lim.rlim_cur > 0 && old_lim.rlim_cur < 8388608)
+            old_lim.rlim_cur = 8388608;
+    }
+
     /* Set new limits if requested */
     if (new_gva != 0) {
         linux_rlimit64_t new_lim;
         if (guest_read(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
             return -LINUX_EFAULT;
 
+        /* Translate Linux RLIM_INFINITY (UINT64_MAX) back to macOS
+         * RLIM_INFINITY (0x7FFFFFFFFFFFFFFF) for setrlimit. */
         struct rlimit rl;
-        rl.rlim_cur = new_lim.rlim_cur;
-        rl.rlim_max = new_lim.rlim_max;
+        rl.rlim_cur = (new_lim.rlim_cur == UINT64_MAX)
+                       ? RLIM_INFINITY : new_lim.rlim_cur;
+        rl.rlim_max = (new_lim.rlim_max == UINT64_MAX)
+                       ? RLIM_INFINITY : new_lim.rlim_max;
         if (setrlimit(mac_res, &rl) < 0)
             return linux_errno();
     }
 
-    /* Get current limits if requested */
+    /* Write old limits to guest after set (so guest sees pre-set values) */
     if (old_gva != 0) {
-        struct rlimit rl;
-        if (getrlimit(mac_res, &rl) < 0)
-            return linux_errno();
-
-        linux_rlimit64_t old_lim;
-        old_lim.rlim_cur = rl.rlim_cur;
-        old_lim.rlim_max = rl.rlim_max;
         if (guest_write(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
             return -LINUX_EFAULT;
     }

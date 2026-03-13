@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hyper-linux — Run Linux binaries on macOS</title>
+  <meta name="description" content="Run aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon. No VM, no Docker, no kernel. Millisecond startup, native speed.">
+  <meta name="author" content="zw3rk pte. ltd.">
+  <link rel="stylesheet" href="style.css">
+  <!-- Open Graph (Facebook, Slack, Discord, LinkedIn, etc.) -->
+  <meta property="og:title" content="hyper-linux — Run Linux binaries on macOS">
+  <meta property="og:description" content="Execute aarch64/x86_64 Linux ELF binaries on Apple Silicon. No VM, no Docker, no kernel. 1–3ms startup, native speed, ~160 syscalls.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hyper-linux.app">
+  <meta property="og:image" content="https://hyper-linux.app/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~160 syscalls, 300KB binary, native ARM64 speed.">
+  <meta property="og:site_name" content="hyper-linux">
+  <!-- Twitter / X -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="hyper-linux — Run Linux binaries on macOS">
+  <meta name="twitter:description" content="No VM, no Docker, no kernel. A single 300KB binary that translates Linux syscalls to macOS. 1–3ms startup, native ARM64 speed.">
+  <meta name="twitter:image" content="https://hyper-linux.app/og-image.png">
+  <meta name="twitter:image:alt" content="hyper-linux: Run Linux binaries on macOS. ~1-3ms startup, ~160 syscalls, 300KB binary, native ARM64 speed.">
+</head>
+<body>
+
+<!-- ── Navigation ──────────────────────────────────────────────── -->
+<nav>
+  <div class="container">
+    <a href="#" class="logo">hyper-<span>linux</span></a>
+    <ul class="nav-links">
+      <li><a href="#how-it-works" class="hide-mobile">How it works</a></li>
+      <li><a href="#comparison" class="hide-mobile">Compare</a></li>
+      <li><a href="#programs" class="hide-mobile">Programs</a></li>
+      <li><a href="#install">Install</a></li>
+      <li>
+        <a href="https://github.com/zw3rk/hyper-linux" class="nav-github" rel="noopener">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ── Hero ─────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="container">
+    <h1>Run Linux binaries on macOS.</h1>
+    <p class="tagline">
+      No Docker, no full VM &mdash; just a lightweight per-process virtual machine
+      that translates Linux syscalls to macOS equivalents. Millisecond startup,
+      native speed, ~160 syscalls.
+    </p>
+
+    <div class="install-widget">
+      <div class="install-tabs">
+        <button class="install-tab active" data-cmd="curl -fsSL https://hyper-linux.app/install.sh | sh">Shell</button>
+        <button class="install-tab" data-cmd="nix run github:zw3rk/hyper-linux">Nix</button>
+        <button class="install-tab" data-cmd="brew install zw3rk/hyper-linux/hl">Brew</button>
+      </div>
+      <div class="install-box" onclick="copyInstall(this)" title="Click to copy">
+        <span class="prompt">$</span>
+        <span class="cmd">curl -fsSL https://hyper-linux.app/install.sh | sh</span>
+        <span class="copy-hint">click to copy</span>
+      </div>
+    </div>
+
+    <div class="hero-links">
+      <a href="https://github.com/zw3rk/hyper-linux/releases" class="btn btn-primary">
+        Download v0.1.1
+      </a>
+      <a href="https://github.com/zw3rk/hyper-linux" class="btn btn-outline">
+        View source
+      </a>
+      <a href="#how-it-works" class="btn btn-outline">
+        How it works
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ── Stats ────────────────────────────────────────────────────── -->
+<section style="padding-top:0; border-top:none;">
+  <div class="container">
+    <div class="stats">
+      <div class="stat">
+        <span class="stat-value">~1&ndash;3 ms</span>
+        <span class="stat-label">VM startup time</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">~160</span>
+        <span class="stat-label">Linux syscalls</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">300 KB</span>
+        <span class="stat-label">Single binary</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">17,600</span>
+        <span class="stat-label">Lines of C + asm</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Value propositions ──────────────────────────────────────── -->
+<section id="features">
+  <div class="container">
+    <div class="section-label">Why hyper-linux</div>
+    <h2>Everything you need, nothing you don't</h2>
+    <p class="section-desc">
+      A single 300KB native macOS binary. No daemon, no disk image, no multi-GB download.
+    </p>
+
+    <div class="props-grid">
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x26A1;</span>
+        <h3>Millisecond startup</h3>
+        <p>VM creation takes ~1&ndash;3ms. Docker container start is seconds; full VM boot is minutes. <code>hl</code> is imperceptible in pipelines.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F3CE;</span>
+        <h3>Native speed</h3>
+        <p>Guest aarch64 code runs on real ARM64 hardware &mdash; zero instruction emulation. x86_64 runs via Apple's Rosetta with hardware-accelerated JIT/AOT.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F4BB;</span>
+        <h3>Both architectures</h3>
+        <p>aarch64-linux natively, x86_64-linux via Rosetta. Both from the same tool, auto-detected from the ELF header.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F517;</span>
+        <h3>Static + dynamic binaries</h3>
+        <p>Statically linked ELFs work out of the box. Dynamically linked work with <code>--sysroot</code> (musl or glibc).</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F4C2;</span>
+        <h3>Direct filesystem access</h3>
+        <p>The guest reads and writes the macOS filesystem directly. No overlay, no volume mount, no copy. Changes are instant.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F9F5;</span>
+        <h3>Real threading</h3>
+        <p>Up to 64 concurrent guest threads, each mapped 1:1 to a host pthread with its own HVF vCPU. Full futex support.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F50D;</span>
+        <h3>~160 Linux syscalls</h3>
+        <p>I/O, filesystem, networking, signals, threading, process management, time, epoll, inotify, /proc, /dev &mdash; all translated.</p>
+      </div>
+      <div class="prop-card">
+        <span class="prop-icon" aria-hidden="true">&#x1F4E6;</span>
+        <h3>Zero dependencies</h3>
+        <p>A single native macOS binary. No daemon, no runtime, no disk image. Runs from anywhere &mdash; even a USB stick.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── How it works ─────────────────────────────────────────────── -->
+<section id="how-it-works">
+  <div class="container">
+    <div class="section-label">Architecture</div>
+    <h2>How it works</h2>
+    <p class="section-desc">
+      A 5-step pipeline that translates Linux syscalls to macOS equivalents
+      inside a lightweight HVF virtual machine.
+    </p>
+
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <h3>Load</h3>
+          <p><code>hl</code> parses the ELF binary and maps PT_LOAD segments into a demand-paged guest address space (up to 1TB &mdash; only touched pages use RAM).</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <h3>Boot</h3>
+          <p>A minimal EL1 kernel shim (~500 lines of AArch64 assembly) provides exception vectors. The MMU is enabled inside the guest on the first instruction.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <h3>Run</h3>
+          <p>The guest binary executes at full native hardware speed on an Apple Hypervisor.framework vCPU.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-content">
+          <h3>Translate</h3>
+          <p>When the guest makes a Linux syscall (SVC #0), the shim forwards it via HVC. <code>hl</code> translates it to the equivalent macOS call &mdash; errno codes, flag values, struct layouts, all converted.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">5</div>
+        <div class="step-content">
+          <h3>Return</h3>
+          <p>Results flow back to the guest. The vCPU resumes. This loop repeats for every syscall &mdash; typically microseconds per round-trip.</p>
+        </div>
+      </div>
+    </div>
+
+    <p class="mt-3" style="color: var(--text-muted); font-size: 0.9rem;">
+      <strong style="color: var(--text);">For x86_64 binaries:</strong>
+      Apple's Rosetta Linux translator is loaded as a co-resident aarch64 binary.
+      Rosetta JIT/AOT-translates x86_64 instructions to ARM64 at runtime.
+      All resulting syscalls appear as ARM64 SVC #0 &mdash; <code>hl</code>'s existing
+      syscall handlers work transparently.
+    </p>
+  </div>
+</section>
+
+<!-- ── Comparison table ─────────────────────────────────────────── -->
+<section id="comparison">
+  <div class="container">
+    <div class="section-label">Comparison</div>
+    <h2>How it compares</h2>
+    <p class="section-desc">
+      <code>hl</code> is not a replacement for Docker or a full VM.
+      It runs single Linux binaries with minimal overhead.
+    </p>
+
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="highlight">hyper-linux</th>
+            <th>Docker Desktop</th>
+            <th>Lima</th>
+            <th>UTM / QEMU</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>What runs</td>
+            <td class="highlight">Single Linux binary</td>
+            <td>Full Linux VM + containers</td>
+            <td>Full Linux VM + containerd</td>
+            <td>Full Linux/other VM</td>
+          </tr>
+          <tr>
+            <td>Linux kernel</td>
+            <td class="highlight">None (syscall translation)</td>
+            <td>Yes (in VM)</td>
+            <td>Yes (in VM)</td>
+            <td>Yes (in VM)</td>
+          </tr>
+          <tr>
+            <td>Startup time</td>
+            <td class="highlight">~1&ndash;3 ms</td>
+            <td>~2&ndash;10 s</td>
+            <td>~5&ndash;30 s</td>
+            <td>~10&ndash;60 s</td>
+          </tr>
+          <tr>
+            <td>Memory overhead</td>
+            <td class="highlight">Used pages only (~MB)</td>
+            <td>Fixed VM RAM (2&ndash;8 GB)</td>
+            <td>Fixed VM RAM (2&ndash;4 GB)</td>
+            <td>Fixed VM RAM</td>
+          </tr>
+          <tr>
+            <td>Disk overhead</td>
+            <td class="highlight">~300 KB binary</td>
+            <td>Multi-GB image</td>
+            <td>Multi-GB image</td>
+            <td>Multi-GB image</td>
+          </tr>
+          <tr>
+            <td>Filesystem</td>
+            <td class="highlight">Direct macOS FS access</td>
+            <td>Volume mount / virtiofs</td>
+            <td>virtiofs / sshfs</td>
+            <td>Shared folders</td>
+          </tr>
+          <tr>
+            <td>x86_64 support</td>
+            <td class="highlight">Via Rosetta (fast)</td>
+            <td>Via QEMU (slow)</td>
+            <td>Via QEMU (slow)</td>
+            <td>Via QEMU (slow)</td>
+          </tr>
+          <tr>
+            <td>Threading</td>
+            <td class="highlight">1:1 HVF vCPUs (up to 64)</td>
+            <td>Full kernel scheduler</td>
+            <td>Full kernel scheduler</td>
+            <td>Full kernel scheduler</td>
+          </tr>
+          <tr>
+            <td>Networking</td>
+            <td class="highlight">In-process translation</td>
+            <td>Virtual network</td>
+            <td>Virtual network</td>
+            <td>Virtual network</td>
+          </tr>
+          <tr>
+            <td>Install</td>
+            <td class="highlight">Single binary or nix&nbsp;run</td>
+            <td>Desktop app</td>
+            <td>brew install</td>
+            <td>Desktop app</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── What it runs ─────────────────────────────────────────────── -->
+<section id="programs">
+  <div class="container">
+    <div class="section-label">Compatibility</div>
+    <h2>What it runs</h2>
+    <p class="section-desc">
+      Verified with real-world programs &mdash; from coreutils to Haskell
+      binaries. Both aarch64 and x86_64 via Rosetta.
+    </p>
+
+    <div class="showcase-grid">
+      <div class="showcase-item">
+        <h3>GNU Coreutils 9.9</h3>
+        <p>104 tools tested: ls, cat, sort, grep, wc, cp, mv, rm, chmod, date, head, tail, tr, cut, uniq, seq, stat, du, df, and many more.</p>
+        <span class="tag">static + dynamic</span>
+      </div>
+      <div class="showcase-item">
+        <h3>BusyBox 1.37.0</h3>
+        <p>60+ applets including awk, sed, grep, tar, gzip, bzip2, find, bc, diff, hexdump, wget, nc, ash shell.</p>
+        <span class="tag">static</span>
+      </div>
+      <div class="showcase-item">
+        <h3>Shells</h3>
+        <p>bash (arrays, associative arrays, regex, arithmetic, subshells/fork), dash (loops, conditionals, recursion, case/glob).</p>
+        <span class="tag">static + dynamic</span>
+      </div>
+      <div class="showcase-item">
+        <h3>Developer tools</h3>
+        <p>jq (JSON processing), GNU grep, GNU sed, GNU find, tree, diffutils.</p>
+        <span class="tag">static</span>
+      </div>
+      <div class="showcase-item">
+        <h3>SQLite3</h3>
+        <p>CREATE, INSERT, SELECT, ORDER BY, recursive CTEs, string functions. Full database engine running in the guest.</p>
+        <span class="tag">static</span>
+      </div>
+      <div class="showcase-item">
+        <h3>Languages</h3>
+        <p>Lua interpreter (Sieve of Eratosthenes, Fibonacci), GNU awk (Mandelbrot renderer).</p>
+        <span class="tag">static</span>
+      </div>
+      <div class="showcase-item">
+        <h3>pandoc</h3>
+        <p>Markdown&rarr;HTML, HTML&rarr;Markdown, JSON AST. Exercises GHC RTS + Lua FFI.</p>
+        <span class="tag">haskell &middot; dynamic</span>
+      </div>
+      <div class="showcase-item">
+        <h3>ShellCheck</h3>
+        <p>Shell script linter. Exercises GHC threaded RTS + regex engines.</p>
+        <span class="tag">haskell &middot; dynamic</span>
+      </div>
+      <div class="showcase-item">
+        <h3>x86_64 via Rosetta</h3>
+        <p>All of the above also work as x86_64-linux binaries, auto-detected from the ELF header.</p>
+        <span class="tag">rosetta &middot; JIT + AOT</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Usage examples ──────────────────────────────────────────── -->
+<section id="usage" class="examples">
+  <div class="container">
+    <div class="section-label">Usage</div>
+    <h2>Quick start</h2>
+    <p class="section-desc">
+      <code>hl</code> takes a Linux ELF binary and runs it. That's it.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header"><span>terminal</span></div>
+<pre><code><span style="color:#3fb950">$</span> <span style="color:#e6edf3">hl ./hello-static</span>
+Hello, world!
+
+<span style="color:#3fb950">$</span> <span style="color:#e6edf3">hl /path/to/jq '.name' data.json</span>
+"hyper-linux"
+
+<span style="color:#8b949e"># Run bash interactively with a musl sysroot</span>
+<span style="color:#3fb950">$</span> <span style="color:#e6edf3">hl --sysroot ./musl-sysroot /path/to/bash</span>
+bash-5.2$
+
+<span style="color:#8b949e"># x86_64 binaries are auto-detected via ELF header</span>
+<span style="color:#3fb950">$</span> <span style="color:#e6edf3">hl ./my-x86_64-binary</span>
+
+<span style="color:#8b949e"># Verbose output for debugging</span>
+<span style="color:#3fb950">$</span> <span style="color:#e6edf3">hl --verbose ./my-program arg1 arg2</span></code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── Performance ─────────────────────────────────────────────── -->
+<section id="performance">
+  <div class="container">
+    <div class="section-label">Performance</div>
+    <h2>Overhead characteristics</h2>
+    <p class="section-desc">
+      Pure computation runs at native ARM64 hardware speed.
+      The only overhead is per-syscall VM exit round-trips.
+    </p>
+
+    <div class="perf-grid">
+      <div class="perf-card">
+        <span class="perf-metric">~1&ndash;3 ms</span>
+        <h3>VM startup</h3>
+        <p>mmap + hv_vm_create + page table setup. Imperceptible in pipelines.</p>
+      </div>
+      <div class="perf-card">
+        <span class="perf-metric">~1&ndash;5 &micro;s</span>
+        <h3>Per-syscall overhead</h3>
+        <p>Each VM exit round-trip for syscall translation. Microseconds, not milliseconds.</p>
+      </div>
+      <div class="perf-card">
+        <span class="perf-metric">Zero</span>
+        <h3>Computation overhead</h3>
+        <p>Guest aarch64 code runs on real ARM64 hardware. No instruction emulation, no interpretation.</p>
+      </div>
+      <div class="perf-card">
+        <span class="perf-metric">Demand-paged</span>
+        <h3>Memory usage</h3>
+        <p>Address space up to 1TB, but only touched pages consume physical RAM. macOS handles the rest.</p>
+      </div>
+    </div>
+
+    <p class="mt-4" style="color: var(--text-muted); font-size: 0.9rem;">
+      <strong style="color: var(--text);">In practice:</strong>
+      Single-command tools (echo, true, basename) are dominated by 1&ndash;3ms startup.
+      Long-running programs (bash sessions, pandoc) amortize startup to zero &mdash;
+      steady-state performance is native + microseconds per syscall.
+    </p>
+  </div>
+</section>
+
+<!-- ── Installation ─────────────────────────────────────────────── -->
+<section id="install">
+  <div class="container">
+    <div class="section-label">Get started</div>
+    <h2>Installation</h2>
+    <p class="section-desc">
+      Apple Silicon Mac (M1+), macOS 13+. macOS 15+ recommended for 1TB address space.
+    </p>
+
+    <div class="install-methods">
+      <div class="install-method">
+        <h3>Quick install</h3>
+        <p>One command. Downloads, codesigns, and installs to <code>/usr/local/bin</code>.</p>
+        <pre><code>curl -fsSL https://hyper-linux.app/install.sh | sh</code></pre>
+      </div>
+      <div class="install-method">
+        <h3>Homebrew</h3>
+        <p>Via the zw3rk tap. Handles codesigning automatically.</p>
+        <pre><code>brew install zw3rk/hyper-linux/hl</code></pre>
+      </div>
+      <div class="install-method">
+        <h3>Nix</h3>
+        <p>Run directly without installing, or add to your flake inputs.</p>
+        <pre><code>nix run github:zw3rk/hyper-linux</code></pre>
+      </div>
+      <div class="install-method">
+        <h3>macOS Installer</h3>
+        <p>Download <code>.pkg</code> from GitHub Releases. Double-click to install.</p>
+        <a href="https://github.com/zw3rk/hyper-linux/releases" class="btn btn-primary" style="width:100%;justify-content:center;">
+          Download v0.1.1
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Technical deep dive ─────────────────────────────────────── -->
+<section id="architecture">
+  <div class="container">
+    <div class="section-label">Under the hood</div>
+    <h2>Technical architecture</h2>
+    <p class="section-desc">
+      Key innovations that make kernel-less Linux binary execution possible.
+    </p>
+
+    <div class="props-grid mt-4">
+      <div class="prop-card">
+        <h3>Syscall translation, not emulation</h3>
+        <p>Every Linux syscall is intercepted via HVC and translated to the equivalent macOS call in-process. Full translation of errno codes, flag values, struct layouts, and socket address formats.</p>
+      </div>
+      <div class="prop-card">
+        <h3>W^X demand paging</h3>
+        <p>Apple HVF enforces write-xor-execute even with SCTLR.WXN=0. The page table system handles this via 4KB L3 splitting when mixed permissions are needed within a 2MB block.</p>
+      </div>
+      <div class="prop-card">
+        <h3>Fork via IPC serialization</h3>
+        <p>HVF allows only one VM per process. Fork spawns a new <code>hl</code> process and serializes entire VM state &mdash; registers, memory, FDs via SCM_RIGHTS, signals &mdash; over a Unix socket.</p>
+      </div>
+      <div class="prop-card">
+        <h3>Multi-vCPU threading</h3>
+        <p>Guest threads map 1:1 to host pthreads, each with its own HVF vCPU sharing the same physical memory. 7-operation futex enables musl pthread support.</p>
+      </div>
+      <div class="prop-card">
+        <h3>Rosetta integration</h3>
+        <p>x86_64 binaries run by co-loading Apple's Rosetta at 128TB using 48-bit IPA. AOT translation via rosettad supported for complex binaries with indirect calls.</p>
+      </div>
+      <div class="prop-card">
+        <h3>/proc &amp; /dev emulation</h3>
+        <p>/proc/self/exe, /proc/cpuinfo, /proc/meminfo, /proc/self/maps, /dev/null, /dev/urandom, and more &mdash; synthesized responses that match Linux format.</p>
+      </div>
+    </div>
+
+    <div class="code-block mt-4">
+      <div class="code-header"><span>Guest memory layout</span></div>
+<pre><code>0x010000      Page table pool (960KB)
+0x100000      Shim code (2MB, RX)
+0x200000      Shim data/stack (2MB, RW)
+0x400000      ELF LOAD segments
+0x1000000     brk heap (grows up)
+0x7E00000     Stack guard page
+0x7E01000     Stack (2MB, grows down)
+0x10000000    mmap RX region (256MB initial, extends on demand)
+0x200000000   mmap RW region (8GB, 256MB initial, extends on demand)
+interp_base   Dynamic linker (60GB / 1020GB)</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── CLI Reference ───────────────────────────────────────────── -->
+<section id="cli" class="cli-ref">
+  <div class="container">
+    <div class="section-label">Reference</div>
+    <h2>CLI usage</h2>
+
+    <div class="code-block">
+      <div class="code-header"><span>hl --help</span></div>
+<pre><code>USAGE:
+    hl [OPTIONS] [--] &lt;elf-path&gt; [args...]
+
+OPTIONS:
+    -h, --help              Display the manual page
+    -V, --version           Print version and exit
+    -v, --verbose           Enable verbose diagnostic output on stderr
+    -t, --timeout SECONDS   Per-iteration vCPU timeout (default: 10s)
+    --sysroot PATH          Musl/glibc sysroot for dynamically-linked binaries
+    --                      Stop processing hl options
+
+EXIT STATUS:
+    The exit status of hl is the exit status of the guest binary.
+
+ENVIRONMENT:
+    Guest inherits the host environment verbatim. No special variables.</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── Known limitations ───────────────────────────────────────── -->
+<section id="limitations">
+  <div class="container">
+    <div class="section-label">Transparency</div>
+    <h2>Known limitations</h2>
+    <p class="section-desc">
+      <code>hl</code> translates syscalls, not the kernel.
+      Some things are outside scope by design.
+    </p>
+
+    <div class="limits-grid">
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>Apple Silicon only</h4>
+          <p>Requires M1/M2/M3/M4 or later. Intel Macs are not supported.</p>
+        </div>
+      </div>
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>No Linux kernel features</h4>
+          <p>No namespaces, cgroups, or kernel modules. This is syscall translation, not a full kernel.</p>
+        </div>
+      </div>
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>No ptrace / debuggers</h4>
+          <p>GDB/LLDB cannot attach to the guest process.</p>
+        </div>
+      </div>
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>64 thread limit</h4>
+          <p>Up to 64 concurrent guest threads per VM instance.</p>
+        </div>
+      </div>
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>MAP_SHARED as MAP_PRIVATE</h4>
+          <p>Shared memory semantics are not preserved across processes (guest is process-scoped).</p>
+        </div>
+      </div>
+      <div class="limit-item">
+        <div class="limit-icon">&#x25B3;</div>
+        <div>
+          <h4>Some x86_64 binaries need AOT</h4>
+          <p>Complex x86_64 binaries with indirect calls may need rosettad AOT translation.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ──────────────────────────────────────────────────── -->
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/zw3rk/hyper-linux">GitHub</a>
+      <a href="https://github.com/zw3rk/hyper-linux/releases">Releases</a>
+      <a href="https://github.com/zw3rk/hyper-linux/issues">Issues</a>
+      <a href="https://github.com/zw3rk/hyper-linux/blob/master/LICENSE">Apache 2.0</a>
+    </div>
+    <p>
+      Made with &#x2764;&#xFE0F; in Singapore &#x1F1F8;&#x1F1EC; by
+      <a href="https://zw3rk.com">zw3rk pte. ltd.</a>
+    </p>
+  </div>
+</footer>
+
+<!-- ── Minimal JS (copy to clipboard) ──────────────────────────── -->
+<script>
+/* Tab switching for hero install box */
+document.querySelectorAll('.install-tab').forEach(function(tab) {
+  tab.addEventListener('click', function() {
+    document.querySelectorAll('.install-tab').forEach(function(t) {
+      t.classList.remove('active');
+    });
+    tab.classList.add('active');
+    var box = document.querySelector('.install-box .cmd');
+    box.textContent = tab.getAttribute('data-cmd');
+    /* Reset copy hint */
+    var hint = document.querySelector('.install-box .copy-hint');
+    hint.textContent = 'click to copy';
+    hint.style.color = '';
+  });
+});
+
+/* Click-to-copy */
+function copyInstall(el) {
+  var cmd = el.querySelector('.cmd').textContent;
+  navigator.clipboard.writeText(cmd).then(function() {
+    var hint = el.querySelector('.copy-hint');
+    hint.textContent = 'copied!';
+    hint.style.color = '#3fb950';
+    setTimeout(function() {
+      hint.textContent = 'click to copy';
+      hint.style.color = '';
+    }, 2000);
+  });
+}
+</script>
+
+</body>
+</html>

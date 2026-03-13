@@ -52,11 +52,14 @@
 /* Protects mmap/brk bump allocators and page table extension. Multiple
  * threads may call mmap/brk concurrently; without this lock they could
  * get overlapping allocations or corrupt page table structures. */
-static pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
+pthread_mutex_t mmap_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 1 */
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close).
  * File descriptor operations from concurrent threads must be serialized. */
-static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
+pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
+
+/* ---------- Global verbose flag (set by hl.c main) ---------- */
+int hl_verbose = 0;
 
 /* ---------- FD table ---------- */
 fd_entry_t fd_table[FD_TABLE_SIZE];
@@ -86,6 +89,7 @@ void syscall_init(void) {
     signalfd_init();
     timerfd_init();
     inotify_init();
+    wakeup_pipe_init();
 
     /* Mark all FDs as free in bitmap */
     memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
@@ -135,6 +139,8 @@ int fd_alloc(int type, int host_fd) {
         fd_bitmap_set_used(fd);
         fd_table[fd].type = type;
         fd_table[fd].host_fd = host_fd;
+        fd_table[fd].linux_flags = 0;
+        fd_table[fd].dir = NULL;
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -148,6 +154,8 @@ int fd_alloc_from(int minfd, int type, int host_fd) {
         fd_bitmap_set_used(fd);
         fd_table[fd].type = type;
         fd_table[fd].host_fd = host_fd;
+        fd_table[fd].linux_flags = 0;
+        fd_table[fd].dir = NULL;
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -158,16 +166,25 @@ int fd_alloc_from(int minfd, int type, int host_fd) {
  * Returns -1 if out of range. */
 int fd_alloc_at(int fd, int type, int host_fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -1;
+
+    /* Snapshot old slot state under fd_lock, then replace atomically.
+     * Cleanup happens AFTER releasing fd_lock to avoid lock ordering
+     * violation: cleanup functions acquire sfd_lock/inotify_lock. */
+    int old_type = FD_CLOSED;
+    int old_host_fd = -1;
+    DIR *old_dir = NULL;
+    void *old_epoll = NULL;
+
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
-        /* Clean up type-specific resources before closing host fd */
+        old_type = fd_table[fd].type;
+        old_host_fd = fd_table[fd].host_fd;
         if (fd_table[fd].dir) {
-            if (fd_table[fd].type == FD_DIR)
-                closedir((DIR *)fd_table[fd].dir);
-            else if (fd_table[fd].type == FD_EPOLL)
-                free(fd_table[fd].dir);
+            if (old_type == FD_DIR)
+                old_dir = (DIR *)fd_table[fd].dir;
+            else if (old_type == FD_EPOLL)
+                old_epoll = fd_table[fd].dir;
         }
-        close(fd_table[fd].host_fd);
     }
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
@@ -175,21 +192,66 @@ int fd_alloc_at(int fd, int type, int host_fd) {
     fd_table[fd].dir = NULL;
     fd_bitmap_set_used(fd);
     pthread_mutex_unlock(&fd_lock);
+
+    /* Clean up old resources outside fd_lock */
+    if (old_type != FD_CLOSED) {
+        if (old_dir)   closedir(old_dir);
+        if (old_epoll) free(old_epoll);
+        switch (old_type) {
+        case FD_EVENTFD:  eventfd_close(fd);  break;
+        case FD_SIGNALFD: signalfd_close(fd); break;
+        case FD_TIMERFD:  timerfd_close(fd);  break;
+        case FD_INOTIFY:  inotify_close(fd);  break;
+        default: break;
+        }
+        /* Don't close host stdin/stdout/stderr — hl uses them for
+         * diagnostics. The guest may dup2() over fd 0/1/2 but the
+         * host process still needs the original stdio fds. */
+        if (old_type != FD_STDIO)
+            close(old_host_fd);
+    }
+
     return fd;
+}
+
+/* Internal: mark fd closed with fd_lock already held.
+ * Clear host_fd and dir BEFORE marking the slot free in the bitmap.
+ * Otherwise another thread could fd_alloc() this slot, populate it
+ * with a new host_fd/dir, and then our stale writes would corrupt
+ * the new entry. */
+void fd_mark_closed_unlocked(int fd) {
+    fd_table[fd].type = FD_CLOSED;
+    fd_table[fd].host_fd = -1;
+    fd_table[fd].dir = NULL;
+    fd_table[fd].linux_flags = 0;
+    fd_bitmap_set_free(fd);
 }
 
 void fd_mark_closed(int fd) {
     pthread_mutex_lock(&fd_lock);
+    fd_mark_closed_unlocked(fd);
+    pthread_mutex_unlock(&fd_lock);
+}
+
+/* Atomically snapshot an fd entry and mark it closed.  Returns 1 if the
+ * slot was open (snapshot written to *out), 0 if already closed.  This
+ * eliminates the TOCTOU race where two concurrent sys_close() calls
+ * both snapshot the same open entry and double-close the host fd. */
+int fd_snapshot_and_close(int fd, fd_entry_t *out) {
+    if (fd < 0 || fd >= FD_TABLE_SIZE) return 0;
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[fd].type == FD_CLOSED) {
+        pthread_mutex_unlock(&fd_lock);
+        return 0;
+    }
+    *out = fd_table[fd];
     fd_table[fd].type = FD_CLOSED;
-    /* Clear host_fd and dir BEFORE marking the slot free in the bitmap.
-     * Otherwise another thread could fd_alloc() this slot, populate it
-     * with a new host_fd/dir, and then our stale writes would corrupt
-     * the new entry. */
     fd_table[fd].host_fd = -1;
     fd_table[fd].dir = NULL;
     fd_table[fd].linux_flags = 0;
     fd_bitmap_set_free(fd);
     pthread_mutex_unlock(&fd_lock);
+    return 1;
 }
 
 /* Look up a guest FD. Returns host FD or -1 if invalid. */
@@ -237,7 +299,10 @@ int64_t linux_errno(void) {
     case ENOTEMPTY:    return -LINUX_ENOTEMPTY;    /* mac 66 → linux 39 */
     case ELOOP:        return -LINUX_ELOOP;        /* mac 62 → linux 40 */
     case ENOPROTOOPT:  return -LINUX_ENOPROTOOPT;  /* mac 42 → linux 92 */
-    case EOPNOTSUPP:   return -LINUX_EOPNOTSUPP;   /* mac 45 → linux 95 */
+    case EOPNOTSUPP:   return -LINUX_EOPNOTSUPP;   /* mac 102 → linux 95 */
+#if ENOTSUP != EOPNOTSUPP
+    case ENOTSUP:      return -LINUX_EOPNOTSUPP;   /* mac 45 → linux 95 */
+#endif
     case EOVERFLOW:    return -LINUX_EOVERFLOW;    /* mac 84 → linux 75 */
     /* Networking errno values */
     case ECONNREFUSED: return -LINUX_ECONNREFUSED; /* mac 61 → linux 111 */
@@ -257,6 +322,30 @@ int64_t linux_errno(void) {
     case EDESTADDRREQ: return -LINUX_EDESTADDRREQ; /* mac 39 → linux 89 */
     case EPROTOTYPE:   return -LINUX_EPROTOTYPE;   /* mac 41 → linux 91 */
     case ETIMEDOUT:    return -LINUX_ETIMEDOUT;    /* mac 60 → linux 110 */
+    case ENOBUFS:      return -LINUX_ENOBUFS;      /* mac 55 → linux 105 */
+    /* ENOTSUP (mac 45) and EOPNOTSUPP (mac 102) are distinct on modern
+     * macOS (__DARWIN_UNIX03). Both map to Linux EOPNOTSUPP (95). */
+    case EPROTONOSUPPORT: return -LINUX_EPROTONOSUPPORT; /* mac 43 → linux 93 */
+    case ESOCKTNOSUPPORT: return -LINUX_ESOCKTNOSUPPORT; /* mac 44 → linux 94 */
+    case ENETDOWN:     return -LINUX_ENETDOWN;     /* mac 50 → linux 100 */
+    case ENETRESET:    return -LINUX_ENETRESET;    /* mac 52 → linux 102 */
+    case ESHUTDOWN:    return -LINUX_ESHUTDOWN;    /* mac 58 → linux 108 */
+    case ETOOMANYREFS: return -LINUX_ETOOMANYREFS; /* mac 59 → linux 109 */
+    case EDQUOT:       return -LINUX_EDQUOT;       /* mac 69 → linux 122 */
+    case ESTALE:       return -LINUX_ESTALE;       /* mac 70 → linux 116 */
+    /* Additional macOS-specific errno values that diverge from Linux */
+    case ENOMSG:       return -LINUX_ENOMSG;       /* mac 91 → linux 42 */
+    case EILSEQ:       return -LINUX_EILSEQ;       /* mac 92 → linux 84 */
+    case EHOSTDOWN:    return -LINUX_EHOSTDOWN;    /* mac 64 → linux 112 */
+    case EMULTIHOP:    return -LINUX_EMULTIHOP;    /* mac 95 → linux 72 */
+    case ENOLINK:      return -LINUX_ENOLINK;      /* mac 97 → linux 67 */
+    case EPROTO:       return -LINUX_EPROTO;       /* mac 100 → linux 71 */
+#ifdef ENOTRECOVERABLE
+    case ENOTRECOVERABLE: return -LINUX_ENOTRECOVERABLE; /* mac 104 → linux 131 */
+#endif
+#ifdef EOWNERDEAD
+    case EOWNERDEAD:   return -LINUX_EOWNERDEAD;   /* mac 105 → linux 130 */
+#endif
     default:
         /* For errno values 1-34 not listed above, numeric values match.
          * For unmapped values, pass through (best effort). */
@@ -268,6 +357,7 @@ int64_t linux_errno(void) {
 /* ---------- Linux AT_* flags translation ---------- */
 
 /* Translate Linux AT_* flags to macOS equivalents.
+ * For unlinkat, fstatat, linkat, fchmodat, fchownat, utimensat.
  * Linux and macOS use different values for AT_SYMLINK_NOFOLLOW etc. */
 int translate_at_flags(int linux_flags) {
     int mac_flags = 0;
@@ -278,6 +368,19 @@ int translate_at_flags(int linux_flags) {
     if (linux_flags & LINUX_AT_REMOVEDIR)
         mac_flags |= AT_REMOVEDIR;
     /* AT_EMPTY_PATH not supported on macOS */
+    return mac_flags;
+}
+
+/* Translate Linux faccessat flags to macOS equivalents.
+ * Linux AT_EACCESS (0x200) shares the same value as AT_REMOVEDIR — the
+ * meaning is context-dependent: 0x200 means AT_REMOVEDIR for unlinkat,
+ * but AT_EACCESS for faccessat. */
+int translate_faccessat_flags(int linux_flags) {
+    int mac_flags = 0;
+    if (linux_flags & LINUX_AT_EACCESS)
+        mac_flags |= AT_EACCESS;
+    if (linux_flags & LINUX_AT_SYMLINK_NOFOLLOW)
+        mac_flags |= AT_SYMLINK_NOFOLLOW;
     return mac_flags;
 }
 
@@ -303,10 +406,31 @@ int translate_open_flags(int linux_flags) {
     if (linux_flags & LINUX_O_NOFOLLOW)  flags |= O_NOFOLLOW;
     if (linux_flags & LINUX_O_CLOEXEC)   flags |= O_CLOEXEC;
     if (linux_flags & LINUX_O_DIRECTORY) flags |= O_DIRECTORY;
+    if (linux_flags & LINUX_O_NOCTTY)  flags |= O_NOCTTY;
     /* LINUX_O_LARGEFILE: ignored — macOS always uses 64-bit offsets */
     /* LINUX_O_DIRECT: ignored — no O_DIRECT equivalent on macOS */
 
     return flags;
+}
+
+/* Translate macOS status flags (from fcntl F_GETFL) to Linux equivalents.
+ * Only status flags differ — access mode (low 2 bits) is the same. */
+int mac_to_linux_status_flags(int mac_flags) {
+    int linux_flags = mac_flags & O_ACCMODE;  /* O_RDONLY/WRONLY/RDWR same */
+    if (mac_flags & O_NONBLOCK)  linux_flags |= LINUX_O_NONBLOCK;
+    if (mac_flags & O_APPEND)    linux_flags |= LINUX_O_APPEND;
+    if (mac_flags & O_ASYNC)     linux_flags |= 0x2000;  /* LINUX_O_ASYNC */
+    return linux_flags;
+}
+
+/* Translate Linux status flags (for fcntl F_SETFL) to macOS equivalents.
+ * F_SETFL only modifies status flags, not access mode or creation flags. */
+int linux_to_mac_status_flags(int linux_flags) {
+    int mac_flags = 0;
+    if (linux_flags & LINUX_O_NONBLOCK)  mac_flags |= O_NONBLOCK;
+    if (linux_flags & LINUX_O_APPEND)    mac_flags |= O_APPEND;
+    if (linux_flags & 0x2000)            mac_flags |= O_ASYNC;  /* LINUX_O_ASYNC */
+    return mac_flags;
 }
 
 /* ---------- Gap-finding allocator for mmap ---------- */
@@ -325,6 +449,14 @@ int translate_open_flags(int linux_flags) {
 static uint64_t mmap_rw_gap_hint = 0;
 static uint64_t mmap_rx_gap_hint = 0;
 
+/* Reset mmap gap hints after execve. Without this, the gap-finder starts
+ * searching past the previous binary's allocations, wasting address space
+ * and potentially causing issues with the new dynamic linker. */
+void mmap_reset_hints(void) {
+    mmap_rw_gap_hint = 0;
+    mmap_rx_gap_hint = 0;
+}
+
 static uint64_t find_free_gap_inner(const guest_t *g, uint64_t length,
                                      uint64_t min_addr, uint64_t max_addr) {
     uint64_t gap_start = min_addr;
@@ -333,8 +465,13 @@ static uint64_t find_free_gap_inner(const guest_t *g, uint64_t length,
         /* Skip regions entirely before the current search position */
         if (g->regions[i].end <= gap_start) continue;
 
-        /* If this region starts far enough after gap_start, we have a gap */
-        if (g->regions[i].start >= gap_start + length) return gap_start;
+        /* If this region starts far enough after gap_start, we have a gap.
+         * Must also verify the gap is within max_addr — regions[] may
+         * contain entries beyond max_addr (e.g., rosetta semantic regions
+         * at 128TB VA) that could push gap_start past the valid range. */
+        if (g->regions[i].start >= gap_start + length &&
+            gap_start + length <= max_addr)
+            return gap_start;
 
         /* Region overlaps — advance past it */
         gap_start = g->regions[i].end;
@@ -418,10 +555,12 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
     if (new_off > g->brk_base) {
         /* Remove old heap region and add updated one */
         guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
-        guest_region_add(g, g->brk_base, new_off,
-                         LINUX_PROT_READ | LINUX_PROT_WRITE,
-                         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                         0, "[heap]");
+        if (guest_region_add(g, g->brk_base, new_off,
+                             LINUX_PROT_READ | LINUX_PROT_WRITE,
+                             LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                             0, "[heap]") < 0) {
+            /* Non-fatal: heap is mapped, just untracked in /proc/self/maps */
+        }
     } else {
         /* brk shrank back to base — remove heap region */
         guest_region_remove(g, g->brk_base, old_brk > g->brk_base ? old_brk : g->brk_base + 1);
@@ -454,54 +593,147 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
      *
      * The GPA must be 2MB-aligned because the L2 block descriptor maps
      * the entire 2MB VA-aligned range to the 2MB GPA-aligned range. */
+    if (va > UINT64_MAX - length) return -LINUX_ENOMEM;
     uint64_t va_block_start = va & ~(BLOCK_2MB - 1);
     uint64_t va_block_end   = (va + length + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
 
     int alloc_count = 0, skip_count = 0;
+    uint64_t total_blocks = (va_block_end - va_block_start) / BLOCK_2MB;
+    if (total_blocks > 2 && hl_verbose)
+        fprintf(stderr, "hl: mmap_high_va: mapping %llu 2MB blocks "
+                "[0x%llx,0x%llx)\n", (unsigned long long)total_blocks,
+                (unsigned long long)va_block_start,
+                (unsigned long long)va_block_end);
     for (uint64_t bva = va_block_start; bva < va_block_end; bva += BLOCK_2MB) {
         /* Check if this 2MB block already has a page table mapping.
          * guest_ptr uses page table walking for high VAs. */
         if (prot != LINUX_PROT_NONE && guest_ptr(g, bva) != NULL) {
+            /* Block already mapped — update permissions for the portion
+             * of this block that falls within the new mmap's VA range.
+             *
+             * This handles the case where two mmaps with different perms
+             * share a 2MB block. E.g., rosetta maps a 32KB control region
+             * (RW) at 0xefffffff8000, then a 128MB JIT slab (RWX) ending
+             * just below it. They share the 2MB block at 0xefffffe00000.
+             * Without per-page permission updates, the JIT slab's portion
+             * of the shared block keeps the control region's RW perms,
+             * causing instruction permission faults when rosetta executes
+             * JIT code. Splitting the block into L3 pages and updating
+             * only the new mmap's portion preserves both sets of perms. */
+            uint64_t update_start = (va > bva) ? va : bva;
+            uint64_t update_end = (va + length < bva + BLOCK_2MB)
+                                  ? va + length : bva + BLOCK_2MB;
+            if (update_start < update_end && page_perms != 0) {
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap_high_va: upgrading block "
+                            "0x%llx perms for [0x%llx,0x%llx) perms=%d\n",
+                            (unsigned long long)bva,
+                            (unsigned long long)update_start,
+                            (unsigned long long)update_end,
+                            page_perms);
+                if (guest_split_block(g, bva) < 0 && hl_verbose)
+                    fprintf(stderr, "hl: mmap_high_va: split_block failed "
+                            "for 0x%llx\n", (unsigned long long)bva);
+                guest_update_perms(g, update_start, update_end, page_perms);
+                g->need_tlbi = 1;
+            }
             skip_count++;
             continue;  /* Already mapped — reuse existing GPA */
         }
 
-        /* Allocate a new 2MB-aligned GPA block */
-        uint64_t raw_off = find_free_gap(g, BLOCK_2MB, MMAP_BASE,
+        /* Allocate a new 2MB-aligned GPA block.  Request 2*BLOCK_2MB to
+         * guarantee room for rounding up to 2MB alignment — the raw offset
+         * may not be 2MB-aligned, and rounding up could push gpa+BLOCK_2MB
+         * past the end of a BLOCK_2MB-sized gap. */
+        uint64_t gpa;
+        uint64_t raw_off = find_free_gap(g, BLOCK_2MB * 2, MMAP_BASE,
                                           g->mmap_limit);
-        if (raw_off == UINT64_MAX) {
-            fprintf(stderr, "hl: sys_mmap_high_va: find_free_gap failed for "
-                    "bva=0x%llx (va=0x%llx len=0x%llx)\n",
-                    (unsigned long long)bva,
-                    (unsigned long long)va,
-                    (unsigned long long)length);
-            return -LINUX_ENOMEM;
-        }
-        uint64_t gpa = (raw_off + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
-
-        /* Create L2 block entry: VA block → GPA block */
-        if (prot != LINUX_PROT_NONE) {
-            if (guest_map_va_range(g, bva, bva + BLOCK_2MB,
-                                    gpa, page_perms) < 0) {
-                fprintf(stderr, "hl: sys_mmap_high_va: guest_map_va_range "
-                        "failed for bva=0x%llx gpa=0x%llx\n",
-                        (unsigned long long)bva, (unsigned long long)gpa);
+        if (raw_off != UINT64_MAX) {
+            gpa = (raw_off + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
+        } else {
+            /* Primary buffer exhausted — allocate from overflow segment.
+             * This happens on M2 (64GB primary buffer) when rosetta's JIT
+             * allocates many high-VA 2MB blocks for large x86_64 binaries. */
+            gpa = guest_overflow_alloc(g);
+            if (gpa == UINT64_MAX) {
+                fprintf(stderr, "hl: sys_mmap_high_va: GPA exhausted for "
+                        "bva=0x%llx (va=0x%llx len=0x%llx)\n",
+                        (unsigned long long)bva,
+                        (unsigned long long)va,
+                        (unsigned long long)length);
                 return -LINUX_ENOMEM;
             }
         }
 
-        /* Track for gap-finder collision avoidance */
+        /* Create L2 block entry: VA block → GPA block.
+         * Even PROT_NONE mappings need page table entries so that
+         * guest_ptr() can resolve the VA when a subsequent MAP_FIXED
+         * with real permissions lands within this reserved range.
+         * Rosetta loads PIE x86_64 binaries via a two-phase mmap:
+         *   1. mmap(0x555555554000, PROT_NONE, MAP_FIXED) — reserve
+         *   2. mmap(0x555555554000, PROT_READ, MAP_FIXED, fd) — load
+         * Without page table entries from phase 1, phase 2's
+         * guest_ptr() returns NULL and fails with -ENOMEM. */
+        int map_perms = (prot == LINUX_PROT_NONE) ? MEM_PERM_R : page_perms;
+        if (guest_map_va_range(g, bva, bva + BLOCK_2MB,
+                                gpa, map_perms) < 0) {
+            fprintf(stderr, "hl: sys_mmap_high_va: guest_map_va_range "
+                    "failed for bva=0x%llx gpa=0x%llx\n",
+                    (unsigned long long)bva, (unsigned long long)gpa);
+            return -LINUX_ENOMEM;
+        }
+
+        alloc_count++;
+
+        /* Track for gap-finder collision avoidance. The region is stored
+         * at the GPA for the gap finder, with display_va set to the actual
+         * high VA so /proc/self/maps shows the correct address.
+         *
+         * For /proc/self/maps accuracy, the LAST block's display region
+         * must end at the exact requested VA (va + length), not at the
+         * next 2MB boundary. Rosetta parses /proc/self/maps to size its
+         * internal data structures (hash tables, block arrays). A 2MB-
+         * rounded size (e.g., 62MB instead of 61MB) changes internal
+         * layout and causes JIT translation failures. */
         int track_flags = is_anon ? (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS)
                                   : LINUX_MAP_PRIVATE;
         guest_region_add(g, gpa, gpa + BLOCK_2MB, prot, track_flags, 0, NULL);
 
+        const guest_region_t *added = guest_region_find(g, gpa);
+        if (added) {
+            /* Safe cast: we just added this, and guest_region_find returns
+             * a const pointer into the mutable regions array. */
+            ((guest_region_t *)added)->display_va = bva;
+
+            /* For the last block: set display_end to the exact mmap end.
+             * The backing 2MB GPA is fully allocated (for page table
+             * alignment), but /proc/self/maps must report the actual
+             * requested range. Rosetta parses /proc/self/maps to size
+             * internal data structures (hash tables, block arrays).
+             * A 2MB-rounded region causes different sizing and triggers
+             * JIT translation failures ("BasicBlock requested for
+             * unrecognized address"). */
+            uint64_t va_end_exact = va + length;
+            if (bva + BLOCK_2MB >= va_block_end &&
+                va_end_exact < bva + BLOCK_2MB) {
+                ((guest_region_t *)added)->display_end = va_end_exact;
+            }
+        }
+
         /* Update high-water mark */
         if (gpa + BLOCK_2MB > g->mmap_next)
             g->mmap_next = gpa + BLOCK_2MB;
-        alloc_count++;
     }
-    (void)alloc_count;
-    (void)skip_count;
+    if (total_blocks > 2 && hl_verbose)
+        fprintf(stderr, "hl: mmap_high_va: allocated=%d skipped=%d "
+                "total=%llu\n", alloc_count, skip_count,
+                (unsigned long long)total_blocks);
+
+    /* PROT_NONE is purely an address reservation — no data to write.
+     * Page table entries are already created (for guest_ptr resolution),
+     * regions are tracked (for /proc/self/maps). Just return the VA. */
+    if (prot == LINUX_PROT_NONE)
+        return (int64_t)va;
 
     /* Write data using page-table-resolved host pointers.
      * This is correct even when guest_map_va_range reused an existing L2
@@ -527,13 +759,19 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
         uint64_t chunk = (length - written < block_remain)
                        ? length - written : block_remain;
 
-        if (is_anon)
-            memset(ptr, 0, chunk);
+        /* Always zero first, then overlay with file data. This matches
+         * Linux MAP_FIXED semantics: pages beyond EOF are zeroed, and
+         * MAP_ANONYMOUS regions are zero-filled. Without this, GPA
+         * memory that was previously used (e.g., by a prior mmap that
+         * was munmapped) could contain stale data. */
+        memset(ptr, 0, chunk);
 
         if (!is_anon && fd >= 0) {
             int host_fd = fd_to_host(fd);
             if (host_fd < 0) return -LINUX_EBADF;
-            pread(host_fd, ptr, chunk, offset + (int64_t)written);
+            ssize_t nr = pread(host_fd, ptr, chunk,
+                               offset + (int64_t)written);
+            if (nr < 0) return linux_errno();
         }
         written += chunk;
     }
@@ -548,17 +786,29 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
     int is_prot_none = (prot == LINUX_PROT_NONE);
 
     /* We handle all mmap variants. For file-backed MAP_SHARED, we fall
-     * back to MAP_PRIVATE semantics (copy-on-write). Since the guest
-     * is single-process, shared vs private is equivalent. */
+     * back to MAP_PRIVATE semantics (copy-on-write). All threads share
+     * the same guest_t address space (CLONE_VM semantics), so MAP_SHARED
+     * and MAP_PRIVATE are equivalent within the guest. */
 
-    /* Round length up to page size */
+    /* Linux rejects zero-length mmap */
+    if (length == 0) return -LINUX_EINVAL;
+
+    /* Linux requires page-aligned offset for file-backed mmap */
+    if (!is_anon && (offset & 4095)) return -LINUX_EINVAL;
+
+    /* Round length up to page size (detect UINT64_MAX overflow → 0) */
     length = (length + 4095) & ~4095ULL;
+    if (length == 0) return -LINUX_ENOMEM;
+
+    /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
+    int is_fixed = (flags & LINUX_MAP_FIXED) ||
+                   (flags & LINUX_MAP_FIXED_NOREPLACE);
+    if (is_fixed && (addr & 4095))
+        return -LINUX_EINVAL;
 
     /* MAP_FIXED_NOREPLACE: like MAP_FIXED but fail with -EEXIST if the
      * range overlaps any existing mapping. Used by rosetta to reserve
      * address space without clobbering existing mappings. */
-    int is_fixed = (flags & LINUX_MAP_FIXED) ||
-                   (flags & LINUX_MAP_FIXED_NOREPLACE);
     int is_noreplace = (flags & LINUX_MAP_FIXED_NOREPLACE) != 0;
 
     uint64_t result_off;  /* Result as offset (0-based) */
@@ -576,14 +826,22 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
          * kernel VA's TTBR1 mapping, so CPU access works either way. */
         if (addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
             uint64_t koff = addr - KBUF_VA_BASE;
-            if (koff + length > KBUF_SIZE) return -LINUX_ENOMEM;
+            if (koff + length > KBUF_SIZE) {
+                fprintf(stderr, "hl: mmap: kernel buffer exhausted "
+                        "(koff=0x%llx + len=0x%llx > KBUF_SIZE=0x%llx)\n",
+                        (unsigned long long)koff,
+                        (unsigned long long)length,
+                        (unsigned long long)KBUF_SIZE);
+                return -LINUX_ENOMEM;
+            }
 
             /* File-backed: pread data into kbuf */
             if (!is_anon && fd >= 0) {
                 int host_fd = fd_to_host(fd);
                 if (host_fd < 0) return -LINUX_EBADF;
-                pread(host_fd, (uint8_t *)g->kbuf_base + koff,
-                      length, offset);
+                ssize_t nr = pread(host_fd, (uint8_t *)g->kbuf_base + koff,
+                                   length, offset);
+                if (nr < 0) return linux_errno();
             } else {
                 memset((uint8_t *)g->kbuf_base + koff, 0, length);
             }
@@ -617,13 +875,20 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             /* High VA (above primary buffer): allocate backing GPA and
              * create non-identity page table mapping. Used by rosetta's
              * internal allocators (slab, translation cache, etc.). */
+            /* sys_mmap_high_va modifies page tables, regions, and
+             * overflow segments — thread-safe because the caller
+             * (syscall_dispatch) holds mmap_lock around sys_mmap. */
             return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset);
         }
         result_off = off;
 
         /* MAP_FIXED_NOREPLACE: reject if any existing region overlaps.
          * This is how rosetta reserves address space without clobbering
-         * existing mappings (e.g., reserving the x86_64 binary's region). */
+         * existing mappings (e.g., reserving the x86_64 binary's region).
+         *
+         * NOTE: preannounced[] entries are NOT checked here — they exist
+         * only for /proc/self/maps visibility (rosetta JIT validation).
+         * Rosetta's own NOREPLACE calls must succeed to map the binary. */
         if (is_noreplace) {
             for (int i = 0; i < g->nregions; i++) {
                 if (g->regions[i].start >= result_off + length) break;
@@ -661,11 +926,31 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
              * onto an existing 2MB block (e.g., .data RW over .text RX). */
             guest_update_perms(g, result_off, result_off + length, page_perms);
 
-            /* Zero the region for MAP_ANONYMOUS. Host memory is demand-
-             * paged MAP_ANON (zero on first touch), but previously-used
-             * pages may contain stale data from earlier mappings. */
-            if (is_anon)
+            /* For MAP_ANONYMOUS: zero the region (host memory may contain
+             * stale data from earlier mappings).
+             * For file-backed: read file contents into guest memory.
+             * Short reads leave the remainder zeroed (memset first). */
+            if (is_anon) {
                 memset((uint8_t *)g->host_base + result_off, 0, length);
+            } else if (fd >= 0) {
+                /* Zero first, then overlay with file data. This matches
+                 * Linux MAP_FIXED semantics: pages beyond EOF are zeroed. */
+                memset((uint8_t *)g->host_base + result_off, 0, length);
+                int host_fd = fd_to_host(fd);
+                if (host_fd < 0) return -LINUX_EBADF;
+                ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
+                                   length, offset);
+                if (nr < 0) return linux_errno();
+            }
+        } else {
+            /* PROT_NONE with MAP_FIXED: invalidate existing page table
+             * entries so the region becomes truly inaccessible. Without
+             * this, stale PTEs from initial page table setup (e.g., ELF
+             * segment pre-mapping) remain valid, making pages accessible
+             * when they should fault on access. A real Linux kernel's
+             * mmap(MAP_FIXED, PROT_NONE) removes existing VMAs and their
+             * page table entries, making the range fault on access. */
+            guest_invalidate_ptes(g, result_off, result_off + length);
         }
     }
 
@@ -678,7 +963,17 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission. */
             result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
-            if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+            if (result_off == UINT64_MAX) {
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap: RX address space exhausted "
+                            "(len=0x%llx, limit=0x%llx, %u-bit IPA "
+                            "/ %lluGB)\n",
+                            (unsigned long long)length,
+                            (unsigned long long)g->mmap_limit,
+                            g->ipa_bits,
+                            (unsigned long long)(g->guest_size >> 30));
+                return -LINUX_ENOMEM;
+            }
             /* High-water mark for fork IPC state transfer */
             uint64_t rx_hwm = result_off + length;
             if (rx_hwm > g->mmap_rx_next) g->mmap_rx_next = rx_hwm;
@@ -697,7 +992,17 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             }
             if (result_off == UINT64_MAX)
                 result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
-            if (result_off == UINT64_MAX) return -LINUX_ENOMEM;
+            if (result_off == UINT64_MAX) {
+                if (hl_verbose)
+                    fprintf(stderr, "hl: mmap: RW address space exhausted "
+                            "(len=0x%llx, limit=0x%llx, %u-bit IPA "
+                            "/ %lluGB)\n",
+                            (unsigned long long)length,
+                            (unsigned long long)g->mmap_limit,
+                            g->ipa_bits,
+                            (unsigned long long)(g->guest_size >> 30));
+                return -LINUX_ENOMEM;
+            }
             /* High-water mark for fork IPC state transfer */
             uint64_t rw_hwm = result_off + length;
             if (rw_hwm > g->mmap_next) g->mmap_next = rw_hwm;
@@ -723,6 +1028,10 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
             if (guest_extend_page_tables(g, ext_start, ext_end,
                                           MEM_PERM_RX) < 0)
                 return -LINUX_ENOMEM;
+            /* Re-validate any previously-invalidated L3 entries (see
+             * the RW path comment below for the full explanation). */
+            guest_update_perms(g, result_off, result_off + length,
+                               MEM_PERM_RX);
             if (ext_end > g->mmap_rx_end)
                 g->mmap_rx_end = ext_end;
         } else {
@@ -731,22 +1040,24 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
                                & ~(BLOCK_2MB - 1);
             if (ext_end > g->mmap_limit) ext_end = g->mmap_limit;
             /* Preserve execute permission for RWX requests (e.g., rosetta's
-             * JIT buffer). make_block_desc/make_page_desc handle combined
-             * W+X by setting AP=RW_EL0 with UXN/PXN=0. HVF stage-2 is
-             * already mapped RWX; stage-1 RWX entries let rosetta JIT
-             * write and execute code without W^X page toggling. */
+             * JIT buffer). Stage-2 (hv_vm_map) is RWX for the whole
+             * buffer; stage-1 PTEs set AP=RW_EL0 with UXN/PXN=0 for
+             * combined W+X. HVF allows this in stage-1 even though
+             * normal W^X enforcement disallows it per HV_MEMORY flags. */
             int ext_perms = MEM_PERM_RW;
             if (prot & LINUX_PROT_EXEC) ext_perms |= MEM_PERM_X;
             if (guest_extend_page_tables(g, ext_start, ext_end,
                                           ext_perms) < 0)
                 return -LINUX_ENOMEM;
-            /* For RWX: update any pre-existing blocks to add execute.
-             * guest_extend_page_tables skips already-mapped blocks, so
-             * blocks created during initial page table setup with RW
-             * permissions need explicit update. */
-            if (ext_perms & MEM_PERM_X)
-                guest_update_perms(g, result_off, result_off + length,
-                                   ext_perms);
+            /* Update permissions on the allocated range. This handles two cases:
+             * 1. RWX: pre-existing RW blocks need execute permission added
+             * 2. L3 split entries: if an L2 block was previously split into
+             *    L3 page entries (e.g., via mprotect(PROT_NONE) on a sub-block
+             *    range), guest_extend_page_tables skips the L2 entry (it sees
+             *    a valid table descriptor). The L3 entries may be invalidated,
+             *    so we must re-create them with the correct permissions. */
+            guest_update_perms(g, result_off, result_off + length,
+                               ext_perms);
             if (ext_end > g->mmap_end)
                 g->mmap_end = ext_end;
         }
@@ -757,8 +1068,10 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
 
     /* For file-backed mmap, read file contents into the region.
      * Short reads are acceptable (region is already zeroed above),
-     * but total failure means the mapping is useless. */
-    if (!is_anon && fd >= 0) {
+     * but total failure means the mapping is useless.
+     * Skip for PROT_NONE: the region has no page table entries yet;
+     * data is faulted in when mprotect makes the pages accessible. */
+    if (!is_anon && fd >= 0 && !is_prot_none) {
         int host_fd = fd_to_host(fd);
         if (host_fd < 0) return -LINUX_EBADF;
         ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
@@ -787,25 +1100,8 @@ static void thread_force_exit_cb(thread_entry_t *t, void *ctx) {
     hv_vcpus_exit(&t->vcpu, 1);
 }
 
-/* Callback for thread_for_each: join each worker thread with a timeout.
- * This allows CLONE_CHILD_CLEARTID futex wake to complete before the
- * main thread exits. Skips the calling thread. */
-static void thread_join_workers_cb(thread_entry_t *t, void *ctx) {
-    (void)ctx;
-    if (t == current_thread) return;
-    if (!t->active) return;
-
-    /* Timed join: wait up to 100ms for each worker to finish.
-     * If it doesn't respond, we proceed anyway to avoid deadlock. */
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += 100000000L; /* 100ms */
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec += 1;
-        deadline.tv_nsec -= 1000000000L;
-    }
-    pthread_join(t->host_thread, NULL);
-}
+/* Defined in thread.c — joins workers outside thread_lock so
+ * they can call thread_deactivate() to set active=0. */
 
 /* ---------- Main dispatch ---------- */
 
@@ -836,115 +1132,6 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     /* ---- Tier 1: assembly hello world ---- */
     case SYS_write:
         result = sys_write(g, (int)x0, x1, x2);
-        /* Detect rosetta assertion failure and dump guest registers.
-         * Rosetta writes "BasicBlock requested for unrecognized address"
-         * to stderr right before aborting. Capture the register state
-         * to identify which address was "unrecognized". */
-        if ((int)x0 == 2 && x2 > 20 && x2 < 256) {
-            char peek[64];
-            if (guest_read(g, x1, peek, sizeof(peek)) == 0 &&
-                memcmp(peek, "assertion", 9) == 0) {
-                fprintf(stderr, "hl: *** ROSETTA ASSERTION DETECTED ***\n");
-                fprintf(stderr, "hl: assertion text at 0x%llx (%llu bytes)\n",
-                        (unsigned long long)x1, (unsigned long long)x2);
-                /* Dump callee-saved registers (X19-X28) — rosetta's
-                 * internal state at the time of the assertion. The
-                 * "unrecognized address" is likely in one of these. */
-                for (int ri = 0; ri <= 30; ri++) {
-                    uint64_t rv;
-                    hv_vcpu_get_reg(vcpu, (hv_reg_t)(HV_REG_X0 + ri), &rv);
-                    fprintf(stderr, "hl:   X%-2d = 0x%016llx\n",
-                            ri, (unsigned long long)rv);
-                }
-                uint64_t sp_el0, elr_el1, spsr_el1;
-                hv_vcpu_get_reg(vcpu, HV_REG_PC, &elr_el1);
-                hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr_el1);
-                hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &spsr_el1);
-                hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &sp_el0);
-                fprintf(stderr, "hl:   ELR_EL1 = 0x%016llx\n",
-                        (unsigned long long)elr_el1);
-                fprintf(stderr, "hl:   SPSR    = 0x%016llx\n",
-                        (unsigned long long)spsr_el1);
-                /* Walk page tables for key addresses */
-                uint64_t check_addrs[] = {
-                    0x401064,  /* x86_64 entry point */
-                    0x401000,  /* .text start */
-                    0x400000,  /* ELF base */
-                };
-                for (int ci = 0; ci < 3; ci++) {
-                    void *hp = guest_ptr(g, check_addrs[ci]);
-                    fprintf(stderr, "hl:   guest_ptr(0x%llx) = %p\n",
-                            (unsigned long long)check_addrs[ci], hp);
-                }
-                /* Walk stack frames via FP chain to find call context.
-                 * On AArch64, [FP+0]=prev_FP, [FP+8]=prev_LR */
-                uint64_t fp_val;
-                hv_vcpu_get_reg(vcpu, HV_REG_FP, &fp_val);
-                fprintf(stderr, "hl:   FP = 0x%016llx\n",
-                        (unsigned long long)fp_val);
-                for (int fi = 0; fi < 8 && fp_val != 0; fi++) {
-                    uint64_t prev_fp = 0, prev_lr = 0;
-                    if (guest_read(g, fp_val, &prev_fp, 8) == 0 &&
-                        guest_read(g, fp_val + 8, &prev_lr, 8) == 0) {
-                        fprintf(stderr, "hl:   frame[%d]: FP=0x%llx LR=0x%llx\n",
-                                fi, (unsigned long long)prev_fp,
-                                (unsigned long long)prev_lr);
-                        fp_val = prev_fp;
-                    } else {
-                        fprintf(stderr, "hl:   frame[%d]: FP=0x%llx (unreadable)\n",
-                                fi, (unsigned long long)fp_val);
-                        break;
-                    }
-                }
-                /* Extract the bad pointer from TaggedPointer::set_pointer's
-                 * caller (frame[4]). The caller at 0x800000037518 saves:
-                 *   [FP+0]  = prev_FP
-                 *   [FP+8]  = LR
-                 *   [FP+16] = X21
-                 *   [FP+32] = X20
-                 *   [FP+40] = X19 (= arg0 = bad pointer)
-                 * Walk 5 FP dereferences from current FP to reach frame[4]. */
-                {
-                    uint64_t fp2;
-                    hv_vcpu_get_reg(vcpu, HV_REG_FP, &fp2);
-                    for (int skip = 0; skip < 5 && fp2; skip++) {
-                        uint64_t next_fp = 0;
-                        guest_read(g, fp2, &next_fp, 8);
-                        fp2 = next_fp;
-                    }
-                    if (fp2) {
-                        uint64_t saved_x19 = 0, saved_x20 = 0, saved_x21 = 0;
-                        guest_read(g, fp2 + 40, &saved_x19, 8);
-                        guest_read(g, fp2 + 32, &saved_x20, 8);
-                        guest_read(g, fp2 + 16, &saved_x21, 8);
-                        fprintf(stderr, "hl:   frame[4] FP=0x%llx\n",
-                                (unsigned long long)fp2);
-                        fprintf(stderr, "hl:   frame[4] saved X19 (bad_ptr)=0x%llx\n",
-                                (unsigned long long)saved_x19);
-                        fprintf(stderr, "hl:   frame[4] saved X20=0x%llx\n",
-                                (unsigned long long)saved_x20);
-                        fprintf(stderr, "hl:   frame[4] saved X21=0x%llx\n",
-                                (unsigned long long)saved_x21);
-                        /* If X19 is a kernel VA, show which kbuf region it's in */
-                        if (saved_x19 >= KBUF_VA_BASE) {
-                            uint64_t koff = saved_x19 - KBUF_VA_BASE;
-                            fprintf(stderr, "hl:   → kernel VA! kbuf offset=0x%llx\n",
-                                    (unsigned long long)koff);
-                        }
-                        /* Dump 64 bytes at the bad pointer for context */
-                        if (saved_x19) {
-                            uint8_t dump[64];
-                            if (guest_read(g, saved_x19, dump, 64) == 0) {
-                                fprintf(stderr, "hl:   [X19] = ");
-                                for (int di = 0; di < 64; di++)
-                                    fprintf(stderr, "%02x ", dump[di]);
-                                fprintf(stderr, "\n");
-                            }
-                        }
-                    }
-                }
-            }
-        }
         break;
     case SYS_exit:
         /* Per-thread exit: if multiple threads are active, only this one
@@ -960,6 +1147,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         exit_group_code = (int)x0;
         exit_group_requested = 1;
 
+        /* Wake threads blocked in host poll/select/kevent so they can
+         * see exit_group_requested and exit. hv_vcpus_exit only cancels
+         * hv_vcpu_run — threads in host blocking syscalls need this. */
+        wakeup_pipe_signal();
+
         /* Force-cancel all worker vCPUs. The main thread's vCPU is
          * handled by the normal should_exit path below. */
         thread_for_each(thread_force_exit_cb, NULL);
@@ -967,7 +1159,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         /* Join worker threads to allow CLONE_CHILD_CLEARTID futex wake
          * to complete before the process exits. Without this, the main
          * thread may exit before workers finish their cleanup. */
-        thread_for_each(thread_join_workers_cb, NULL);
+        thread_join_workers();
 
         *exit_code = (int)x0;
         should_exit = 1;
@@ -1016,6 +1208,9 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_clock_gettime:
         result = sys_clock_gettime(g, (int)x0, x1);
         break;
+    case SYS_clock_getres:
+        result = sys_clock_getres(g, (int)x0, x1);
+        break;
     case SYS_rt_sigaction:
         result = signal_rt_sigaction(g, (int)x0, x1, x2, x3);
         break;
@@ -1047,17 +1242,26 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         break;
     case SYS_munmap: {
         uint64_t unmap_addr = x0;
+        /* Linux returns EINVAL for non-page-aligned address or zero length */
+        if ((unmap_addr & 4095) || x1 == 0) { result = -LINUX_EINVAL; break; }
         uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
+        if (unmap_len == 0) { result = -LINUX_EINVAL; break; }  /* overflow */
+        if (unmap_addr > UINT64_MAX - unmap_len) {
+            result = -LINUX_EINVAL;
+            break;
+        }
         pthread_mutex_lock(&mmap_lock);
 
         if (unmap_addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
             /* Kernel VA (TTBR1 kbuf): zero the backing memory and
              * remove region tracking. PTEs remain valid — kbuf L2
-             * block descriptors are pre-built. */
+             * block descriptors are pre-built. Only process addresses
+             * within the kbuf range. */
             uint64_t koff = unmap_addr - KBUF_VA_BASE;
-            if (koff + unmap_len <= KBUF_SIZE)
+            if (koff + unmap_len <= KBUF_SIZE) {
                 memset((uint8_t *)g->kbuf_base + koff, 0, unmap_len);
-            guest_region_remove(g, unmap_addr, unmap_addr + unmap_len);
+                guest_region_remove(g, unmap_addr, unmap_addr + unmap_len);
+            }
         } else if (unmap_addr > 0x0000FFFFFFFFFFFFULL) {
             /* Kernel VA without kbuf: no-op */
         } else {
@@ -1085,8 +1289,21 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 }
                 /* Remove region tracking. The gap-finding allocator
                  * will reuse this freed address space for future mmap
-                 * calls. Note: page table entries are NOT reclaimed —
-                 * only semantic region tracking is updated. */
+                 * calls.
+                 *
+                 * Note: TTBR0 page table entries are NOT invalidated here.
+                 * This is intentional — invalidating PTEs on every munmap
+                 * is expensive and unnecessary because:
+                 * 1. The host backing memory is zeroed above (data leak
+                 *    prevention), so stale PTEs only expose zeroed pages
+                 * 2. Future MAP_FIXED mmaps at these addresses will create
+                 *    correct PTEs via guest_extend_page_tables()
+                 * 3. PROT_NONE mmaps at these addresses DO invalidate PTEs
+                 *    (handled in the MAP_FIXED PROT_NONE path above)
+                 *
+                 * Kernel VA (TTBR1) munmap DOES invalidate PTEs — see the
+                 * kbuf path above — because rosetta relies on fault-on-access
+                 * semantics for kernel VA unmaps. */
                 guest_region_remove(g, unmap_off, end);
 
                 /* Reset gap-finder hints if freed space precedes them,
@@ -1105,8 +1322,17 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     }
     case SYS_mprotect: {
         uint64_t mprot_addr = x0;
+        /* Linux returns EINVAL for non-page-aligned address */
+        if (mprot_addr & 4095) { result = -LINUX_EINVAL; break; }
+        /* Linux: zero length is a no-op */
+        if (x1 == 0) { result = 0; break; }
         uint64_t mprot_len = (x1 + 4095) & ~4095ULL;
+        if (mprot_len == 0) { result = -LINUX_EINVAL; break; }  /* overflow */
         int mprot_prot = (int)x2;
+        if (mprot_addr > UINT64_MAX - mprot_len) {
+            result = -LINUX_EINVAL;
+            break;
+        }
         pthread_mutex_lock(&mmap_lock);
 
         if (mprot_addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
@@ -1124,12 +1350,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                     guest_kbuf_split_block(g, a);
                 guest_kbuf_update_perms(g, mprot_addr, kbuf_end, page_perms);
             }
+            g->need_tlbi = 1;
         } else if (mprot_addr > 0x0000FFFFFFFFFFFFULL) {
             /* Kernel VA without kbuf: no-op */
         } else {
             /* TTBR0 (user VA) region */
             uint64_t mprot_off = mprot_addr - g->ipa_base;
             if (mprot_off + mprot_len <= g->guest_size) {
+                /* Low VA: within primary buffer (identity-mapped) */
+
                 /* Update region tracking with new protection bits */
                 guest_region_set_prot(g, mprot_off, mprot_off + mprot_len,
                                       mprot_prot);
@@ -1139,14 +1368,48 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                     if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
                     if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
 
-                    guest_extend_page_tables(g, mprot_off,
-                                              mprot_off + mprot_len, page_perms);
+                    if (guest_extend_page_tables(g, mprot_off,
+                                              mprot_off + mprot_len, page_perms) < 0) {
+                        pthread_mutex_unlock(&mmap_lock);
+                        result = -LINUX_ENOMEM;
+                        break;
+                    }
                     guest_update_perms(g, mprot_off, mprot_off + mprot_len,
                                        page_perms);
-                }
-                if (mprot_prot == LINUX_PROT_NONE) {
+                } else {
+                    /* PROT_NONE: invalidate page table entries */
                     guest_invalidate_ptes(g, mprot_off, mprot_off + mprot_len);
                 }
+                g->need_tlbi = 1;
+            } else {
+                /* High VA: above primary buffer. Page table entries were
+                 * created by sys_mmap_high_va via guest_map_va_range.
+                 * Walk page tables to find the backing GPA, then update
+                 * permissions on the GPA-based entries. */
+                uint64_t va_end = mprot_addr + mprot_len;
+                int page_perms = MEM_PERM_R;
+                if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
+                if (mprot_prot & LINUX_PROT_EXEC)  page_perms |= MEM_PERM_X;
+
+                for (uint64_t va = mprot_addr & ~4095ULL;
+                     va < va_end; va += 4096) {
+                    void *ptr = guest_ptr(g, va);
+                    if (!ptr) continue;
+
+                    /* Compute GPA from host pointer (handles both primary
+                     * buffer and overflow segments) */
+                    uint64_t gpa;
+                    if (guest_host_to_gpa(g, ptr, &gpa) < 0) continue;
+
+                    if (mprot_prot == LINUX_PROT_NONE) {
+                        guest_invalidate_ptes(g, gpa, gpa + 4096);
+                    } else {
+                        guest_split_block(g, gpa & ~(BLOCK_2MB - 1));
+                        guest_update_perms(g, gpa, gpa + 4096,
+                                           page_perms);
+                    }
+                }
+                g->need_tlbi = 1;
             }
         }
         pthread_mutex_unlock(&mmap_lock);
@@ -1373,44 +1636,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             break;
         case LINUX_PR_SET_MEM_MODEL: {
             /* PR_SET_MEM_MODEL: set per-thread memory ordering model.
-             * On Apple Silicon, TSO mode (model=1) sets ACTLR_EL1.EnTSO
-             * (bit 1), giving ARM64 loads/stores x86-style total store
-             * ordering. Required by Rosetta for correct x86_64 semantics.
-             * Args: x1=model (0=default, 1=TSO), x2-x4 must be 0. */
-            if (x2 || x3 || x4) {
-                result = -LINUX_EINVAL;
-                break;
-            }
-            switch ((int)x1) {
-            case LINUX_PR_SET_MEM_MODEL_DEFAULT:
-                /* Disable TSO: clear ACTLR_EL1.EnTSO */
-                if (current_thread) {
-                    hv_vcpu_set_sys_reg(current_thread->vcpu,
-                                        HV_SYS_REG_ACTLR_EL1, 0);
-                }
-                result = 0;
-                break;
-            case LINUX_PR_SET_MEM_MODEL_TSO:
-                /* Enable TSO: set ACTLR_EL1.EnTSO (bit 1) */
-                if (current_thread) {
-                    hv_return_t rv = hv_vcpu_set_sys_reg(
-                        current_thread->vcpu,
-                        HV_SYS_REG_ACTLR_EL1, 1ULL << 1);
-                    if (rv != HV_SUCCESS) {
-                        fprintf(stderr, "hl: ACTLR_EL1 TSO enable "
-                                "failed: %d\n", (int)rv);
-                        result = -LINUX_EINVAL;
-                    } else {
-                        result = 0;
-                    }
-                } else {
-                    result = -LINUX_EINVAL;
-                }
-                break;
-            default:
-                result = -LINUX_EINVAL;
-                break;
-            }
+             *
+             * Real Linux VZ VMs return -EINVAL because standard kernels
+             * don't implement PR_SET_MEM_MODEL (it's an Apple/Asahi
+             * extension). Rosetta handles this gracefully — it emits
+             * memory barriers in translated code instead of relying on
+             * hardware TSO. Returning success here causes rosetta to
+             * take a different JIT code path that leads to "BasicBlock
+             * requested for unrecognized address" assertion failures.
+             *
+             * Verified by strace comparison: Lima VZ VM returns -EINVAL
+             * for both prctl(PR_SET_MEM_MODEL, TSO) calls, and rosetta
+             * runs complex binaries successfully without TSO. */
+            result = -LINUX_EINVAL;
             break;
         }
         case LINUX_PR_GET_MEM_MODEL: {
@@ -1467,13 +1705,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         sync();
         result = 0;
         break;
-    case SYS_fsync:
-        result = (fsync(fd_to_host((int)x0)) < 0) ? linux_errno() : 0;
+    case SYS_fsync: {
+        int fsync_fd = fd_to_host((int)x0);
+        if (fsync_fd < 0) { result = -LINUX_EBADF; break; }
+        result = (fsync(fsync_fd) < 0) ? linux_errno() : 0;
         break;
-    case SYS_fdatasync:
+    }
+    case SYS_fdatasync: {
         /* macOS has no fdatasync; fsync is the closest equivalent */
-        result = (fsync(fd_to_host((int)x0)) < 0) ? linux_errno() : 0;
+        int fdsync_fd = fd_to_host((int)x0);
+        if (fdsync_fd < 0) { result = -LINUX_EBADF; break; }
+        result = (fsync(fdsync_fd) < 0) ? linux_errno() : 0;
         break;
+    }
     case SYS_sched_yield:
         sched_yield();
         result = 0;
@@ -1493,11 +1737,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         int sig = (int)x1;
         int pid = (int)x0;
         int64_t our_pid = proc_get_pid();
-        if (sig == 0) {
+        if (sig < 0 || sig > LINUX_NSIG) {
+            result = -LINUX_EINVAL;
+        } else if (sig == 0) {
             /* Signal 0: just check if process exists */
-            result = (pid == (int)our_pid || pid == 0 || pid == -1) ? 0 : -LINUX_ESRCH;
-        } else if (pid == (int)our_pid || pid == 0 || pid == -1) {
-            /* Sending to self (or all processes in our model) */
+            result = (pid == (int)our_pid || pid == 0 || pid == -1
+                      || pid == -(int)our_pid) ? 0 : -LINUX_ESRCH;
+        } else if (pid == (int)our_pid || pid == 0 || pid == -1
+                   || pid == -(int)our_pid) {
+            /* Sending to self or our process group */
             signal_queue(sig);
             result = 0;
         } else {
@@ -1508,6 +1756,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_tgkill: {
         int sig = (int)x2;
         int tid = (int)x1;
+        if (sig < 0 || sig > LINUX_NSIG) {
+            result = -LINUX_EINVAL;
+            break;
+        }
         /* Accept tgkill targeting any active thread in our process */
         thread_entry_t *target = thread_find((int64_t)tid);
         if (!target) {
@@ -1521,6 +1773,75 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         } else {
             result = -LINUX_ESRCH;
         }
+        break;
+    }
+    case SYS_rt_tgsigqueueinfo: {
+        /* rt_tgsigqueueinfo(tgid, tid, sig, uinfo): send signal with
+         * siginfo to a specific thread. Used by Rosetta's runtime_signal_handler
+         * to re-deliver SIGTRAP during BRK-based JIT trap-and-translate.
+         *
+         * Critical: we must read the siginfo payload from guest memory and
+         * preserve si_code + fault address. Without this, re-delivered
+         * SIGTRAP lacks the BRK fault address and Rosetta's translate()
+         * cannot find the code to translate. */
+        int tgid = (int)x0;
+        int tid = (int)x1;
+        int sig = (int)x2;
+        uint64_t uinfo_gva = x3;
+        (void)tgid;  /* Single-process: tgid is always ours */
+
+        if (sig < 1 || sig > LINUX_NSIG) {
+            result = -LINUX_EINVAL;
+            break;
+        }
+
+        /* Find the target thread */
+        thread_entry_t *target = thread_find((int64_t)tid);
+        if (!target) {
+            int64_t our_pid = proc_get_pid();
+            if (tid == (int)our_pid) target = current_thread;
+        }
+        if (!target) {
+            result = -LINUX_ESRCH;
+            break;
+        }
+
+        /* Read siginfo from guest memory to preserve fault information */
+        linux_siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (uinfo_gva && guest_read(g, uinfo_gva, &info, sizeof(info)) == 0) {
+            /* For fault-type signals, extract si_addr (uint64_t at byte
+             * offset 16, overlapping si_pid/si_uid in the siginfo union).
+             * Set pending fault info so signal_deliver() populates the
+             * signal frame with the correct fault address. */
+            int is_fault = (sig == LINUX_SIGTRAP || sig == LINUX_SIGSEGV ||
+                            sig == LINUX_SIGBUS  || sig == LINUX_SIGFPE  ||
+                            sig == LINUX_SIGILL);
+            if (is_fault && info.si_code > 0) {
+                uint64_t fault_addr;
+                memcpy(&fault_addr, &info.si_pid, sizeof(fault_addr));
+                signal_set_fault_info(info.si_code, fault_addr, 0);
+
+                if (verbose)
+                    fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                            "sig=%d, si_code=%d, fault_addr=0x%llx)\n",
+                            tgid, tid, sig, info.si_code,
+                            (unsigned long long)fault_addr);
+            } else {
+                if (verbose)
+                    fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                            "sig=%d, si_code=%d)\n",
+                            tgid, tid, sig, info.si_code);
+            }
+        } else {
+            if (verbose)
+                fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
+                        "sig=%d, uinfo=0x%llx [unreadable])\n",
+                        tgid, tid, sig, (unsigned long long)uinfo_gva);
+        }
+
+        signal_queue(sig);
+        result = 0;
         break;
     }
     case SYS_rt_sigsuspend:
@@ -1630,7 +1951,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             }
             /* Write the resolved path into guest memory temporarily.
              * Use the top of the stack scratch area (above stack_top). */
-            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            uint64_t tmp_gva = g->stack_top + 0x1000;
             size_t pathlen = strlen(fd_path) + 1;
             if (guest_write(g, tmp_gva, fd_path, pathlen) < 0) {
                 result = -LINUX_EFAULT;
@@ -1658,7 +1979,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 break;
             }
             close(tmp_fd);
-            uint64_t tmp_gva = STACK_TOP + 0x1000;
+            uint64_t tmp_gva = g->stack_top + 0x1000;
             size_t pathlen = strlen(resolved) + 1;
             if (guest_write(g, tmp_gva, resolved, pathlen) < 0) {
                 result = -LINUX_EFAULT;
@@ -1671,7 +1992,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         break;
     }
     case SYS_clone:
+        if (verbose)
+            fprintf(stderr, "hl: clone(flags=0x%llx, stack=0x%llx, ptid=0x%llx, tls=0x%llx, ctid=0x%llx)\n",
+                    (unsigned long long)x0, (unsigned long long)x1,
+                    (unsigned long long)x2, (unsigned long long)x3,
+                    (unsigned long long)x4);
         result = sys_clone(vcpu, g, x0, x1, x2, x3, x4, verbose);
+        break;
+    case SYS_ptrace:
+        if (verbose)
+            fprintf(stderr, "hl: ptrace(request=0x%llx, pid=%lld, addr=0x%llx, data=0x%llx)\n",
+                    (unsigned long long)x0, (long long)(int64_t)x1,
+                    (unsigned long long)x2, (unsigned long long)x3);
+        result = sys_ptrace(g, x0, (int64_t)x1, x2, x3);
         break;
     case SYS_wait4:
         result = sys_wait4(g, (int)x0, x1, (int)x2, x3);
@@ -1830,6 +2163,9 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         unlink(template);  /* Unlink immediately — fd keeps it alive */
         int gfd = fd_alloc(FD_REGULAR, fd);
         if (gfd < 0) { close(fd); result = -LINUX_ENOMEM; break; }
+        /* MFD_CLOEXEC = 1 on Linux */
+        if ((int)x1 & 1)
+            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
         result = gfd;
         break;
     }

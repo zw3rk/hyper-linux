@@ -55,6 +55,10 @@ const char *proc_get_hl_path(void);
  * argv is a NULL-terminated array of strings. */
 void proc_set_cmdline(int argc, const char **argv);
 
+/* Set cmdline from a raw pre-formatted buffer (NUL-separated args).
+ * Used by fork_child_main to restore parent's cmdline from IPC. */
+void proc_set_cmdline_raw(const char *buf, size_t len);
+
 /* Get the stored cmdline buffer and its length. Returns NULL if not set. */
 const char *proc_get_cmdline(size_t *len_out);
 
@@ -89,11 +93,20 @@ typedef struct {
     int     exit_status;/* wait status (as returned by waitpid) */
 } proc_entry_t;
 
-/* Register a child process in the process table. */
-void proc_register_child(pid_t host_pid, int64_t guest_pid);
+/* Register a child process in the process table.
+ * Returns 0 on success, -1 if the table is full. */
+int proc_register_child(pid_t host_pid, int64_t guest_pid);
 
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);
+
+/* ---------- ptrace ---------- */
+
+/* Linux ptrace syscall implementation. Supports SEIZE, CONT, INTERRUPT,
+ * GETREGSET, and SETREGSET — sufficient for Rosetta's two-process JIT.
+ * Returns 0 on success or negative Linux errno. */
+int64_t sys_ptrace(guest_t *g, uint64_t request, int64_t pid,
+                   uint64_t addr, uint64_t data);
 
 /* ---------- wait ---------- */
 

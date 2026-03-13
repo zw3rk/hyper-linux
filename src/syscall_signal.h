@@ -108,11 +108,20 @@ typedef struct {
 /* si_code values */
 #define LINUX_SI_USER    0
 #define LINUX_SI_KERNEL  128
-#define LINUX_SI_TIMER   -2
+#define LINUX_SI_TIMER   (-2)
 
 /* si_code values for SIGTRAP (from include/uapi/asm-generic/siginfo.h) */
 #define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
 #define LINUX_TRAP_TRACE  2   /* Process trace trap (single-step) */
+
+/* si_code values for SIGSEGV (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_SEGV_MAPERR 1   /* Address not mapped to object */
+#define LINUX_SEGV_ACCERR 2   /* Invalid permissions for mapped object */
+
+/* si_code values for SIGBUS (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_BUS_ADRALN  1   /* Invalid address alignment */
+#define LINUX_BUS_ADRERR  2   /* Non-existent physical address */
+#define LINUX_BUS_OBJERR  3   /* Object-specific hardware error */
 
 /* ---------- Linux sigcontext (aarch64) ---------- */
 /* From arch/arm64/include/uapi/asm/sigcontext.h */
@@ -122,14 +131,14 @@ typedef struct {
     uint64_t sp;             /* SP_EL0 */
     uint64_t pc;             /* ELR_EL1 at time of signal */
     uint64_t pstate;         /* SPSR_EL1 at time of signal */
-    /* 8 bytes reserved for extensions (FPSIMD etc.) */
+    /* Extension space for FPSIMD, ESR, SVE contexts (4096 bytes) */
     uint8_t  __reserved[4096] __attribute__((aligned(16)));
 } linux_sigcontext_t;
 
 /* ---------- Linux stack_t and sigaltstack constants ---------- */
 #define LINUX_SS_ONSTACK   1    /* Currently executing on altstack */
 #define LINUX_SS_DISABLE   2    /* Altstack is disabled */
-#define LINUX_MINSIGSTKSZ  2048 /* Minimum altstack size (aarch64) */
+#define LINUX_MINSIGSTKSZ  5120 /* Minimum altstack size (aarch64, post-SVE) */
 
 typedef struct {
     uint64_t ss_sp;
@@ -190,10 +199,12 @@ void signal_reset_for_exec(void);
 void signal_queue(int signum);
 
 /* Set fault info for the next signal delivery. When set, signal_deliver()
- * populates si_code, si_addr, and fault_address from these values instead
- * of using the default SI_USER/si_pid fields. Consumed (cleared) after
- * one delivery. Used for synchronous faults: BRK→SIGTRAP, etc. */
-void signal_set_fault_info(int si_code, uint64_t addr);
+ * populates si_code, si_addr, fault_address, and ESR context from these
+ * values instead of using the default SI_USER/si_pid fields. Consumed
+ * (cleared) after one delivery. Used for synchronous faults: BRK→SIGTRAP,
+ * SIGSEGV, etc. The esr parameter is the raw ESR_EL1 value; if non-zero,
+ * an esr_context block is appended to __reserved after FPSIMD. */
+void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr);
 
 /* Consume (clear) a pending signal. Used by signalfd reads. */
 void signal_consume(int signum);

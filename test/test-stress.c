@@ -11,55 +11,13 @@
  *                     mprotect(226), pipe2(59), close(57), exit(93)
  */
 #include "test-harness.h"
+#include "raw-syscall.h"
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
 #include <sys/mman.h>
-#include <linux/futex.h>
 
 int passes = 0, fails = 0;
-
-/* ---------- Inline syscall helpers ---------- */
-
-static long raw_syscall6(long nr, long a, long b, long c,
-                         long d, long e, long f) {
-    register long x0 __asm__("x0") = a;
-    register long x1 __asm__("x1") = b;
-    register long x2 __asm__("x2") = c;
-    register long x3 __asm__("x3") = d;
-    register long x4 __asm__("x4") = e;
-    register long x5 __asm__("x5") = f;
-    register long x8 __asm__("x8") = nr;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x3),
-                       "r"(x4), "r"(x5), "r"(x8)
-                     : "memory", "cc");
-    return x0;
-}
-
-static long raw_clone(unsigned long flags, void *child_stack,
-                      int *ptid, unsigned long tls, int *ctid) {
-    return raw_syscall6(__NR_clone, (long)flags, (long)child_stack,
-                        (long)ptid, (long)tls, (long)ctid, 0);
-}
-
-static long raw_futex_wait(int *addr, int val) {
-    return raw_syscall6(__NR_futex, (long)addr,
-                        FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                        (long)val, 0, 0, 0);
-}
-
-static long raw_futex_wake(int *addr, int count) {
-    return raw_syscall6(__NR_futex, (long)addr,
-                        FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-                        (long)count, 0, 0, 0);
-}
-
-static long raw_exit(int code) {
-    return raw_syscall6(__NR_exit, (long)code, 0, 0, 0, 0, 0);
-}
 
 /* ---------- Test 1: 32 concurrent threads ---------- */
 
@@ -316,6 +274,6 @@ int main(void) {
     test_mprotect_cycling();
     test_large_mmap();
 
-    printf("\ntest-stress: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-stress");
     return fails > 0 ? 1 : 0;
 }

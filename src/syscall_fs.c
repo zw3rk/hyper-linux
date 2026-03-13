@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/xattr.h>
+#include <pthread.h>
 
 /* ---------- stat translation ---------- */
 
@@ -84,6 +85,28 @@ typedef struct {
     /* char d_name[] follows */
 } __attribute__((packed)) linux_dirent64_t;
 
+/* ---------- sysroot path resolution ---------- */
+
+/* Resolve an absolute path through the sysroot: tries sysroot+path first,
+ * then sysroot/lib/basename as fallback for nix store library paths.
+ * Returns the resolved path (may point into buf) or the original path
+ * if no sysroot is set or no match is found. */
+static const char *resolve_sysroot_path(const char *path, char *buf, size_t bufsz) {
+    const char *sr = proc_get_sysroot();
+    if (!sr || path[0] != '/') return path;
+
+    snprintf(buf, bufsz, "%s%s", sr, path);
+    if (access(buf, F_OK) == 0) return buf;
+
+    /* Fallback: sysroot/lib/basename — handles nix store lib paths */
+    const char *base = strrchr(path, '/');
+    if (base) {
+        snprintf(buf, bufsz, "%s/lib/%s", sr, base + 1);
+        if (access(buf, F_OK) == 0) return buf;
+    }
+    return path;
+}
+
 /* ---------- open/close ---------- */
 
 int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
@@ -110,31 +133,9 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     }
     /* intercepted == -2: not intercepted, fall through to real openat */
 
-    /* Sysroot path resolution: when a sysroot is configured and the guest
-     * opens an absolute path, try sysroot+path first. This enables the
-     * dynamic linker to find shared libraries under the sysroot.
-     * Fallback: if sysroot+path doesn't exist but path looks like a shared
-     * library (under /lib/ or /nix/store/.../lib/), try sysroot/lib/basename.
-     * This handles nix store paths where PT_INTERP and DT_NEEDED encode
-     * full /nix/store/... paths. */
-    const char *open_path = path;
     char sysroot_buf[LINUX_PATH_MAX];
-    const char *sr = proc_get_sysroot();
-    if (sr && path[0] == '/') {
-        snprintf(sysroot_buf, sizeof(sysroot_buf), "%s%s", sr, path);
-        if (access(sysroot_buf, F_OK) == 0) {
-            open_path = sysroot_buf;
-        } else {
-            /* Fallback: sysroot/lib/basename — handles nix store lib paths */
-            const char *base = strrchr(path, '/');
-            if (base) {
-                snprintf(sysroot_buf, sizeof(sysroot_buf),
-                         "%s/lib/%s", sr, base + 1);
-                if (access(sysroot_buf, F_OK) == 0)
-                    open_path = sysroot_buf;
-            }
-        }
-    }
+    const char *open_path = resolve_sysroot_path(path, sysroot_buf,
+                                                  sizeof(sysroot_buf));
 
     int host_dirfd;
     if (dirfd == LINUX_AT_FDCWD) {
@@ -185,17 +186,12 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
 int64_t sys_close(int fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
 
-    /* Snapshot the entry and mark closed atomically under fd_lock.
-     * This prevents another thread from seeing the fd as open while
-     * we're cleaning up, or from fd_alloc() reusing this slot too early. */
+    /* Atomically snapshot and mark closed under fd_lock.  This prevents
+     * a TOCTOU race where two concurrent sys_close() calls both read
+     * the same open entry and double-close the host fd. */
     fd_entry_t snap;
-    snap = fd_table[fd];
-    if (snap.type == FD_CLOSED) return -LINUX_EBADF;
-
-    /* Mark closed first (fd_mark_closed acquires fd_lock internally
-     * and clears host_fd/dir/linux_flags before marking the slot free
-     * in the bitmap, preventing races with concurrent fd_alloc). */
-    fd_mark_closed(fd);
+    if (!fd_snapshot_and_close(fd, &snap))
+        return -LINUX_EBADF;
 
     /* Now do cleanup on the snapshot — no lock needed since slot is
      * already marked closed and no other thread will touch it. */
@@ -254,11 +250,22 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
-    /* Translate Linux AT_* flags to macOS equivalents */
-    int mac_flags = translate_at_flags(flags);
     struct stat mac_st;
-    if (fstatat(host_dirfd, path, &mac_st, mac_flags) < 0)
-        return linux_errno();
+
+    /* AT_EMPTY_PATH with empty path: stat the fd itself (fstat).
+     * macOS fstatat() doesn't support AT_EMPTY_PATH. */
+    if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
+        if (host_dirfd < 0 || host_dirfd == AT_FDCWD) return -LINUX_EBADF;
+        if (fstat(host_dirfd, &mac_st) < 0)
+            return linux_errno();
+    } else {
+        char sysroot_buf[LINUX_PATH_MAX];
+        const char *stat_path = resolve_sysroot_path(path, sysroot_buf,
+                                                      sizeof(sysroot_buf));
+        int mac_flags = translate_at_flags(flags);
+        if (fstatat(host_dirfd, stat_path, &mac_st, mac_flags) < 0)
+            return linux_errno();
+    }
 
     linux_stat_t lin_st;
     translate_stat(&mac_st, &lin_st);
@@ -274,8 +281,12 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
+    /* Apply sysroot redirect for absolute paths */
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *fs_path = resolve_sysroot_path(path, sysroot_buf,
+                                                sizeof(sysroot_buf));
     struct statfs mac_st;
-    if (statfs(path, &mac_st) < 0)
+    if (statfs(fs_path, &mac_st) < 0)
         return linux_errno();
 
     linux_statfs_t lin_st;
@@ -314,10 +325,22 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
     int host_dirfd = resolve_dirfd(dirfd);
     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
 
-    int mac_flags = translate_at_flags(flags);
     struct stat mac_st;
-    if (fstatat(host_dirfd, path, &mac_st, mac_flags) < 0)
-        return linux_errno();
+
+    /* AT_EMPTY_PATH with empty path: stat the fd itself (fstat).
+     * macOS fstatat() doesn't support AT_EMPTY_PATH. */
+    if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
+        if (host_dirfd < 0 || host_dirfd == AT_FDCWD) return -LINUX_EBADF;
+        if (fstat(host_dirfd, &mac_st) < 0)
+            return linux_errno();
+    } else {
+        char sysroot_buf[LINUX_PATH_MAX];
+        const char *statx_path = resolve_sysroot_path(path, sysroot_buf,
+                                                        sizeof(sysroot_buf));
+        int mac_flags = translate_at_flags(flags);
+        if (fstatat(host_dirfd, statx_path, &mac_st, mac_flags) < 0)
+            return linux_errno();
+    }
 
     /* Translate struct stat → struct statx */
     linux_statx_t sx;
@@ -383,9 +406,11 @@ int64_t sys_dup(int oldfd) {
 
 int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
     if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+    if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+    /* Linux dup3(2): EINVAL if oldfd == newfd (unlike dup2 which is a no-op) */
+    if (oldfd == newfd) return -LINUX_EINVAL;
     int host_fd = fd_to_host(oldfd);
     if (host_fd < 0) return -LINUX_EBADF;
-    if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
 
     int new_host_fd = dup(host_fd);
     if (new_host_fd < 0) return linux_errno();
@@ -450,10 +475,14 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
         else
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
         return 0;
-    case 3: /* F_GETFL */
-        return fcntl(host_fd, F_GETFL);
+    case 3: { /* F_GETFL */
+        int mac_fl = fcntl(host_fd, F_GETFL);
+        if (mac_fl < 0) return linux_errno();
+        return mac_to_linux_status_flags(mac_fl);
+    }
     case 4: /* F_SETFL */
-        return fcntl(host_fd, F_SETFL, (int)arg);
+        return fcntl(host_fd, F_SETFL, linux_to_mac_status_flags((int)arg)) < 0
+               ? linux_errno() : 0;
     case 5:  /* F_GETLK */
     case 6:  /* F_SETLK */
     case 7: { /* F_SETLKW */
@@ -461,9 +490,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
          * Linux aarch64 layout: {short l_type, short l_whence,
          *   long l_start, long l_len, int l_pid, pad[4]}
          * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
-         *   short l_type, short l_whence} */
-        uint8_t *lflock = guest_ptr(g, arg);
-        if (!lflock) return -LINUX_EFAULT;
+         *   short l_type, short l_whence}
+         * Use guest_read/guest_write (not guest_ptr) to safely handle
+         * structs that span 2MB page table block boundaries. */
+        uint8_t lflock[32];  /* Linux struct flock is 32 bytes on aarch64 */
+        if (guest_read(g, arg, lflock, sizeof(lflock)) < 0)
+            return -LINUX_EFAULT;
 
         /* Read Linux flock fields */
         int16_t l_type, l_whence;
@@ -490,11 +522,14 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
             int16_t rt = mac_fl.l_type, rw = mac_fl.l_whence;
             int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
             int32_t rp = mac_fl.l_pid;
+            memset(lflock, 0, sizeof(lflock));
             memcpy(lflock + 0, &rt, 2);
             memcpy(lflock + 2, &rw, 2);
             memcpy(lflock + 8, &rs, 8);
             memcpy(lflock + 16, &rl, 8);
             memcpy(lflock + 24, &rp, 4);
+            if (guest_write(g, arg, lflock, sizeof(lflock)) < 0)
+                return -LINUX_EFAULT;
         }
         return 0;
     }
@@ -509,37 +544,52 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
     }
 }
 
+#define LINUX_CLOSE_RANGE_CLOEXEC 4
+
 int64_t sys_close_range(unsigned int first, unsigned int last,
                         unsigned int flags) {
-    (void)flags;
     /* Linux returns EINVAL when first > last (even if both are valid) */
     if (first > last) return -LINUX_EINVAL;
+    /* Reject unknown flags */
+    if (flags & ~(unsigned)LINUX_CLOSE_RANGE_CLOEXEC) return -LINUX_EINVAL;
     /* Clamp to FD table size (Linux clamps ~0U to NR_OPEN_MAX) */
     if (last >= (unsigned)FD_TABLE_SIZE) last = FD_TABLE_SIZE - 1;
-    for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type != FD_CLOSED) {
-            fd_entry_t snap = fd_table[i];
-            fd_mark_closed(i);
 
-            if (snap.dir) {
-                if (snap.type == FD_DIR)
-                    closedir((DIR *)snap.dir);
-                else if (snap.type == FD_EPOLL)
-                    free(snap.dir);
-            }
-
-            /* Clean up emulated I/O subsystem state */
-            switch (snap.type) {
-            case FD_EVENTFD:  eventfd_close(i);  break;
-            case FD_SIGNALFD: signalfd_close(i); break;
-            case FD_TIMERFD:  timerfd_close(i);  break;
-            case FD_INOTIFY:  inotify_close(i);  break;
-            default: break;
-            }
-
-            if (snap.type != FD_STDIO)
-                close(snap.host_fd);
+    /* CLOSE_RANGE_CLOEXEC: mark FDs as CLOEXEC without closing them.
+     * Hold fd_lock to prevent races with concurrent fd_alloc/close. */
+    if (flags & LINUX_CLOSE_RANGE_CLOEXEC) {
+        pthread_mutex_lock(&fd_lock);
+        for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
+            if (fd_table[i].type != FD_CLOSED)
+                fd_table[i].linux_flags |= LINUX_O_CLOEXEC;
         }
+        pthread_mutex_unlock(&fd_lock);
+        return 0;
+    }
+
+    for (unsigned int i = first; i <= last && i < (unsigned)FD_TABLE_SIZE; i++) {
+        fd_entry_t snap;
+        if (!fd_snapshot_and_close((int)i, &snap))
+            continue;
+
+        if (snap.dir) {
+            if (snap.type == FD_DIR)
+                closedir((DIR *)snap.dir);
+            else if (snap.type == FD_EPOLL)
+                free(snap.dir);
+        }
+
+        /* Clean up emulated I/O subsystem state */
+        switch (snap.type) {
+        case FD_EVENTFD:  eventfd_close((int)i);  break;
+        case FD_SIGNALFD: signalfd_close((int)i); break;
+        case FD_TIMERFD:  timerfd_close((int)i);  break;
+        case FD_INOTIFY:  inotify_close((int)i);  break;
+        default: break;
+        }
+
+        if (snap.type != FD_STDIO)
+            close(snap.host_fd);
     }
     return 0;
 }
@@ -555,11 +605,16 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     DIR *dir = (DIR *)fd_table[fd].dir;
     if (!dir) return -LINUX_ENOTDIR;
 
-    uint8_t *guest_buf = guest_ptr(g, buf_gva);
-    if (!guest_buf) return -LINUX_EFAULT;
+    if (!guest_ptr(g, buf_gva)) return -LINUX_EFAULT;
 
     size_t guest_pos = 0;
     struct dirent *de;
+
+    /* Temp buffer for dirent serialization — max dirent64 is 280 bytes
+     * (19-byte header + NAME_MAX=255 + null + padding to 8). Using a
+     * stack buffer avoids guest_ptr boundary issues: guest_write() handles
+     * 2MB block crossings that raw memcpy into guest_ptr() cannot. */
+    uint8_t entry_buf[280];
 
     while (1) {
         /* Save position BEFORE readdir so we can rewind if the entry
@@ -585,11 +640,16 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
         lde.d_reclen = (uint16_t)reclen;
         lde.d_type = de->d_type;
 
-        memcpy(guest_buf + guest_pos, &lde, sizeof(lde));
-        memcpy(guest_buf + guest_pos + 19, de->d_name, name_len + 1);
+        /* Serialize entry into temp buffer, then copy to guest via
+         * guest_write() which handles 2MB block boundary crossings. */
+        memcpy(entry_buf, &lde, sizeof(lde));
+        memcpy(entry_buf + 19, de->d_name, name_len + 1);
         size_t pad_start = 19 + name_len + 1;
         if (pad_start < reclen)
-            memset(guest_buf + guest_pos + pad_start, 0, reclen - pad_start);
+            memset(entry_buf + pad_start, 0, reclen - pad_start);
+
+        if (guest_write(g, buf_gva + guest_pos, entry_buf, reclen) < 0)
+            return guest_pos > 0 ? (int64_t)guest_pos : -LINUX_EFAULT;
 
         guest_pos += reclen;
     }
@@ -620,8 +680,21 @@ int64_t sys_chroot(guest_t *g, uint64_t path_gva) {
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-    if (chroot(path) < 0)
-        return linux_errno();
+    /* Emulate chroot by updating the sysroot prefix.  All path resolution
+     * already redirects through sysroot.  chroot("/") is a no-op — the
+     * guest already sees "/" as root, and resetting sysroot to "/" would
+     * break dynamic linker resolution.  Real chroot() requires root and
+     * doesn't make sense in hl's single-process VM.  This enables
+     * coreutils stdbuf (which does fork → chroot("/") → exec) and the
+     * chroot coreutil itself. */
+    if (strcmp(path, "/") != 0) {
+        struct stat st;
+        if (stat(path, &st) < 0)
+            return linux_errno();
+        if (!S_ISDIR(st.st_mode))
+            return -LINUX_ENOTDIR;
+        proc_set_sysroot(path);
+    }
     return 0;
 }
 
@@ -644,13 +717,24 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags) {
         return -LINUX_ENOMEM;
     }
 
+    /* Apply O_NONBLOCK to host FDs if requested */
+    if (linux_flags & LINUX_O_NONBLOCK) {
+        fcntl(host_fds[0], F_SETFL, O_NONBLOCK);
+        fcntl(host_fds[1], F_SETFL, O_NONBLOCK);
+    }
+
     /* Propagate O_CLOEXEC if set in flags */
     fd_table[guest_fds[0]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
     fd_table[guest_fds[1]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
 
     int32_t fds[2] = { guest_fds[0], guest_fds[1] };
-    if (guest_write(g, fds_gva, fds, sizeof(fds)) < 0)
+    if (guest_write(g, fds_gva, fds, sizeof(fds)) < 0) {
+        fd_mark_closed(guest_fds[0]);
+        fd_mark_closed(guest_fds[1]);
+        close(host_fds[0]);
+        close(host_fds[1]);
         return -LINUX_EFAULT;
+    }
 
     return 0;
 }
@@ -694,7 +778,11 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
-    ssize_t len = readlinkat(host_dirfd, path, link, sizeof(link) - 1);
+    /* Apply sysroot redirect for absolute paths */
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *read_path = resolve_sysroot_path(path, sysroot_buf,
+                                                  sizeof(sysroot_buf));
+    ssize_t len = readlinkat(host_dirfd, read_path, link, sizeof(link) - 1);
     if (len < 0) return linux_errno();
 
     size_t copy_len = (size_t)len < bufsiz ? (size_t)len : bufsiz;
@@ -743,9 +831,12 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
     return 0;
 }
 
+/* Linux RENAME_* flags for renameat2 */
+#define LINUX_RENAME_NOREPLACE  (1 << 0)
+#define LINUX_RENAME_EXCHANGE   (1 << 1)
+
 int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                       int newdirfd, uint64_t newpath_gva, int flags) {
-    (void)flags; /* Linux RENAME_NOREPLACE etc. — ignore for now */
     char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
     if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
         return -LINUX_EFAULT;
@@ -756,6 +847,33 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
     int host_newdir = (newdirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(newdirfd);
     if (host_olddir < 0 && olddirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
     if (host_newdir < 0 && newdirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+
+    /* RENAME_NOREPLACE: fail if destination exists. macOS renamex_np
+     * supports RENAME_EXCL for the same semantics. Only supported for
+     * AT_FDCWD paths (renamex_np doesn't take dirfd arguments). */
+    if (flags & LINUX_RENAME_NOREPLACE) {
+        if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
+            if (renamex_np(oldpath, newpath, RENAME_EXCL) < 0)
+                return linux_errno();
+            return 0;
+        }
+        /* For non-CWD dirfds, emulate with link+unlink (not atomic, but
+         * link fails if dest exists, approximating RENAME_NOREPLACE) */
+        if (linkat(host_olddir, oldpath, host_newdir, newpath, 0) < 0)
+            return linux_errno();
+        unlinkat(host_olddir, oldpath, 0);
+        return 0;
+    }
+
+    /* RENAME_EXCHANGE: swap two paths. macOS renamex_np supports RENAME_SWAP. */
+    if (flags & LINUX_RENAME_EXCHANGE) {
+        if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
+            if (renamex_np(oldpath, newpath, RENAME_SWAP) < 0)
+                return linux_errno();
+            return 0;
+        }
+        return -LINUX_EINVAL;  /* RENAME_EXCHANGE requires AT_FDCWD on macOS */
+    }
 
     if (renameat(host_olddir, oldpath, host_newdir, newpath) < 0)
         return linux_errno();
@@ -775,7 +893,7 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
 
     /* Only support FIFO creation; other node types need root */
     if (S_ISFIFO(mode)) {
-        if (mkfifo(path, mode & 0777) < 0)
+        if (mkfifoat(host_dirfd, path, mode & 0777) < 0)
             return linux_errno();
         return 0;
     }
@@ -830,7 +948,6 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
 
 int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
                       int mode, int flags) {
-    (void)flags;
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
@@ -843,7 +960,12 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
-    if (faccessat(host_dirfd, path, mode, 0) < 0)
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *check_path = resolve_sysroot_path(path, sysroot_buf,
+                                                   sizeof(sysroot_buf));
+
+    int mac_flags = translate_faccessat_flags(flags);
+    if (faccessat(host_dirfd, check_path, mode, mac_flags) < 0)
         return linux_errno();
 
     return 0;
@@ -863,7 +985,12 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length) {
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-    if (truncate(path, length) < 0)
+
+    char sysroot_buf[LINUX_PATH_MAX];
+    const char *trunc_path = resolve_sysroot_path(path, sysroot_buf,
+                                                   sizeof(sysroot_buf));
+
+    if (truncate(trunc_path, length) < 0)
         return linux_errno();
     return 0;
 }
@@ -998,11 +1125,23 @@ int64_t sys_getxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Use a host-side buffer to avoid guest_ptr spanning 2MB block
+     * boundaries.  Cap at 64KB (Linux XATTR_SIZE_MAX). */
+    if (size > 65536) return -LINUX_E2BIG;
+    void *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = getxattr(path, name, buf, size, 0, opts);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret < 0) {
+        free(buf);
+        return linux_errno();
+    }
+    if (guest_write(g, value_gva, buf, (size_t)ret) < 0) {
+        free(buf);
+        return -LINUX_EFAULT;
+    }
+    free(buf);
+    return ret;
 }
 
 int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
@@ -1014,8 +1153,17 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf && size > 0) return -LINUX_EFAULT;
+    /* Use host-side buffer to safely read from guest memory. */
+    if (size > 65536) return -LINUX_E2BIG;
+    void *buf = NULL;
+    if (size > 0) {
+        buf = malloc(size);
+        if (!buf) return -LINUX_ENOMEM;
+        if (guest_read(g, value_gva, buf, size) < 0) {
+            free(buf);
+            return -LINUX_EFAULT;
+        }
+    }
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
     /* Linux flags: XATTR_CREATE=1, XATTR_REPLACE=2 — same on macOS */
@@ -1023,6 +1171,7 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (flags & 2) opts |= XATTR_REPLACE;
 
     int ret = setxattr(path, name, buf, size, 0, opts);
+    free(buf);
     return ret < 0 ? linux_errno() : 0;
 }
 
@@ -1039,11 +1188,17 @@ int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, list_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = listxattr(path, buf, size, opts);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, list_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_removexattr(guest_t *g, uint64_t path_gva,
@@ -1073,11 +1228,17 @@ int64_t sys_fgetxattr(guest_t *g, int fd, uint64_t name_gva,
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = fgetxattr(host_fd, name, buf, size, 0, 0);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, value_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
@@ -1089,15 +1250,22 @@ int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
-    void *buf = guest_ptr(g, value_gva);
-    if (!buf && size > 0) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = NULL;
+    if (size > 0) {
+        buf = malloc(size);
+        if (!buf) return -LINUX_ENOMEM;
+        if (guest_read(g, value_gva, buf, size) < 0) { free(buf); return -LINUX_EFAULT; }
+    }
 
     int opts = 0;
     if (flags & 1) opts |= XATTR_CREATE;
     if (flags & 2) opts |= XATTR_REPLACE;
 
     int ret = fsetxattr(host_fd, name, buf, size, 0, opts);
-    return ret < 0 ? linux_errno() : 0;
+    int64_t result = ret < 0 ? linux_errno() : 0;
+    free(buf);
+    return result;
 }
 
 int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
@@ -1109,11 +1277,17 @@ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
         return ret < 0 ? linux_errno() : ret;
     }
 
-    void *buf = guest_ptr(g, list_gva);
-    if (!buf) return -LINUX_EFAULT;
+    /* Bounce buffer: guest region may span a 2MB block boundary. */
+    char *buf = malloc(size);
+    if (!buf) return -LINUX_ENOMEM;
 
     ssize_t ret = flistxattr(host_fd, buf, size, 0);
-    return ret < 0 ? linux_errno() : ret;
+    if (ret >= 0 && guest_write(g, list_gva, buf, ret) < 0)
+        ret = -LINUX_EFAULT;
+    else if (ret < 0)
+        ret = linux_errno();
+    free(buf);
+    return ret;
 }
 
 int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva) {

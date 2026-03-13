@@ -180,6 +180,6 @@ int main(void) {
         } else FAIL("open failed");
     }
 
-    printf("\nResults: %d passed, %d failed\n", passes, fails);
+    SUMMARY("test-proc");
     return fails > 0 ? 1 : 0;
 }

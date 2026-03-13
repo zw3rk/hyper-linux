@@ -1,17 +1,19 @@
-# CI — build, test, and release hl
+# CI — build, lint, test, and release hl
 #
 # Pipeline:
-#   guest-bins (ubuntu) ──┐
-#                          ├──▸ test (macOS, self-hosted)
-#   build (macOS)        ──┘
+#   lint (macOS)                          (independent)
+#   build (macOS)                      ──┐
+#   guest-bins (x86_64-linux)          ──├──▸ test (macOS, HVF)
+#   haskell-bins (aarch64-linux)       ──┤
+#   haskell-x64-bins (x86_64-linux)    ──┘
 #   build ──▸ dist ──▸ release
 #
-# guest-bins builds cross-compiled aarch64-linux-musl guest binaries on
-# a GitHub-hosted Linux runner (~$0.02/run with warm cache), then uploads
-# them as an artifact.  All macOS jobs run on self-hosted Apple Silicon
-# runners (tart-run) to avoid the 10x macOS billing multiplier.
-# Self-hosted runners don't hit the HVF resource exhaustion issue that
-# plagued shared CI runners, so integration tests are enabled.
+# The build job validates both nix and make build paths.  guest-bins
+# cross-compiles aarch64 + x86_64 test binaries on x86_64-linux.
+# haskell-bins and haskell-x64-bins build native pandoc + shellcheck
+# on their respective architectures (GHC Template Haskell can't
+# cross-compile).  The test job builds hl locally (fast with nix
+# cache) and runs the full test suite with HVF entitlement.
 
 name: CI
 
@@ -21,11 +23,17 @@ on:
     tags: ['v*']
   pull_request:
 
-# Nix configuration for all jobs.  Tart VMs may have nix pre-installed
-# without flakes/nix-command enabled, so NIX_CONFIG ensures they work.
+# Cancel redundant runs: only the latest commit on each branch/PR runs.
+# Self-hosted runners are a shared resource — don't queue stale builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NIX_CONFIG: |
     extra-experimental-features = nix-command flakes
+    extra-substituters = https://cache.zw3rk.com
+    extra-trusted-public-keys = loony-tools:pr9m4BkM/5/eSTZlkQyRt57Jz7OMBxNSUiMC4FkcNfk=
 
 jobs:
   # ── Build hl (macOS, self-hosted) ──────────────────────────────
@@ -38,17 +46,30 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
         continue-on-error: true
 
-      # Validate the nix package builds correctly
       - name: Build hl (nix package)
         run: nix build
 
-      # Also validate the Makefile build path (used by dist + test)
       - name: Build hl (make)
         run: nix develop .#ci -c make hl
 
-  # ── Guest binaries (Linux, GitHub-hosted) ──────────────────────
-  # Cross-compile aarch64-linux-musl test binaries on x86_64-linux.
-  # Linux runners are $0.006/min (1x multiplier) — ~$0.02/run cached.
+  # ── Lint & static analysis (macOS, self-hosted) ─────────────────
+  # Runs clang-tidy for lint checks.  scan-build (make analyze) and
+  # clang-format (make format) are available locally but not in CI yet:
+  # scan-build needs ccc-analyzer (not in Apple SDK clang), and format
+  # has 5000+ violations requiring a dedicated reformatting pass.
+  lint:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Run clang-tidy
+        run: nix develop .#ci -c make lint
+
+  # ── Guest binaries (x86_64-linux, GitHub-hosted) ────────────────
   guest-bins:
     runs-on: ubuntu-latest
     steps:
@@ -56,6 +77,7 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Build guest-bundle
         run: nix build .#packages.x86_64-linux.guest-bundle
@@ -69,12 +91,71 @@ jobs:
           name: guest-bins
           path: guest-bins.tar.gz
 
-  # ── Test suite (macOS + guest binaries) ─────────────────────────
-  # Downloads guest-bins from the Linux job, builds hl on macOS,
-  # then runs unit tests + integration tests.  Requires bare-metal
-  # HVF access (nested virt in tart VMs doesn't work on M1).
+  # ── Haskell binaries (aarch64-linux, GitHub-hosted ARM) ────────
+  # Native aarch64-linux build — GHC Template Haskell can't cross-compile.
+  haskell-bins:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Build haskell-bundle
+        run: nix build .#packages.aarch64-linux.haskell-bundle
+
+      - name: Package haskell binaries
+        run: tar -czf haskell-bins.tar.gz -C result .
+
+      - name: Upload haskell-bins artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haskell-bins
+          path: haskell-bins.tar.gz
+
+  # ── Haskell binaries (x86_64-linux, GitHub-hosted) ──────────────
+  # Native x86_64-linux build — mirrors haskell-bins for x86_64.
+  haskell-x64-bins:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Build x64 haskell-bundle
+        run: nix build .#packages.x86_64-linux.haskell-x64-bundle
+
+      - name: Package x64 haskell binaries
+        run: tar -czf haskell-x64-bins.tar.gz -C result .
+
+      - name: Upload haskell-x64-bins artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haskell-x64-bins
+          path: haskell-x64-bins.tar.gz
+
+  # ── Test suite (macOS + HVF) ───────────────────────────────────
+  # Builds hl locally (fast — nix caches compiler + deps), downloads
+  # guest binaries, runs full test suite on bare-metal Apple Silicon
+  # with HVF entitlement.
+  #
+  # Test ordering:
+  #   1. Native HVF validation (multi-vCPU, W^X)
+  #   2. aarch64-linux tests (unit, coreutils, busybox, static, dynamic musl/glibc, haskell)
+  #   3. x86_64-linux tests via Rosetta (unit, coreutils, busybox, static, dynamic musl/glibc, haskell)
   test:
-    needs: [build, guest-bins]
+    needs: [build, guest-bins, haskell-bins, haskell-x64-bins]
     runs-on: [self-hosted, macOS, ARM64, hvf]
     timeout-minutes: 90
     steps:
@@ -89,36 +170,75 @@ jobs:
         with:
           name: guest-bins
 
+      - name: Download haskell-bins artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: haskell-bins
+
+      - name: Download haskell-x64-bins artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: haskell-x64-bins
+
       - name: Extract guest binaries
         run: |
           mkdir -p guest-bins
           tar -xzf guest-bins.tar.gz -C guest-bins
           chmod -R +x guest-bins/*/bin/*
+          mkdir -p haskell-bins
+          tar -xzf haskell-bins.tar.gz -C haskell-bins
+          chmod -R +x haskell-bins/*/bin/*
+          mkdir -p haskell-x64-bins
+          tar -xzf haskell-x64-bins.tar.gz -C haskell-x64-bins
+          chmod -R +x haskell-x64-bins/*/bin/*
 
       - name: Build hl
         run: nix develop .#ci -c make hl
 
-      - name: Run unit tests (test-all)
+      # ── Native HVF validation ──────────────────────────────────
+      - name: "[native] Multi-vCPU HVF validation"
+        id: native-multi-vcpu
+        run: nix develop .#ci -c make test-multi-vcpu
+
+      - name: "[native] W^X page table validation"
+        id: native-rwx
+        run: nix develop .#ci -c make test-rwx
+
+      # ── aarch64-linux tests ─────────────────────────────────────
+      # Each test step uses if: always() so that a failure in one suite
+      # doesn't skip all subsequent suites. The summary step reports
+      # per-suite pass/fail status.
+      - name: "[aarch64] Unit tests"
+        id: aarch64-unit
+        if: always()
         env:
           GUEST_TEST_BINARIES: ${{ github.workspace }}/guest-bins/test-binaries
         run: nix develop .#ci -c make test-all
 
-      - name: Run coreutils integration tests
+      - name: "[aarch64] Coreutils (static musl)"
+        id: aarch64-coreutils
+        if: always()
         env:
           COREUTILS_BIN: ${{ github.workspace }}/guest-bins/coreutils/bin
         run: nix develop .#ci -c make test-coreutils
 
-      - name: Run busybox integration tests
+      - name: "[aarch64] Busybox"
+        id: aarch64-busybox
+        if: always()
         env:
           BUSYBOX_BIN: ${{ github.workspace }}/guest-bins/busybox/bin/busybox
         run: nix develop .#ci -c make test-busybox
 
-      - name: Run static binary integration tests
+      - name: "[aarch64] Static bins (bash, jq, sqlite, lua, ...)"
+        id: aarch64-static
+        if: always()
         env:
           STATIC_BINS_DIR: ${{ github.workspace }}/guest-bins/static-bins/bin
         run: nix develop .#ci -c make test-static-bins
 
-      - name: Run dynamic linking tests
+      - name: "[aarch64] Dynamic coreutils (musl --sysroot)"
+        id: aarch64-dynamic-musl
+        if: always()
         env:
           SYSROOT_DIR: ${{ github.workspace }}/guest-bins/sysroot
           GUEST_SYSROOT: ${{ github.workspace }}/guest-bins/sysroot
@@ -129,11 +249,175 @@ jobs:
           nix develop .#ci -c make test-dynamic
           nix develop .#ci -c make test-dynamic-coreutils
 
-      - name: Run Haskell integration tests
+      - name: "[aarch64] Dynamic coreutils (glibc --sysroot)"
+        id: aarch64-dynamic-glibc
+        if: always()
         env:
-          HASKELL_HELLO: ${{ github.workspace }}/guest-bins/haskell-hello/bin/hello-hyper
+          GLIBC_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/glibc-sysroot
+          GUEST_GLIBC_SYSROOT: ${{ github.workspace }}/guest-bins/glibc-sysroot
+          GUEST_GLIBC_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/glibc-dynamic-tests
+          GUEST_GLIBC_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/glibc-dynamic-coreutils
+          GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/glibc-dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-glibc-dynamic
+          nix develop .#ci -c make test-glibc-coreutils
+
+      - name: "[aarch64] Haskell smoke test (hello-hyper)"
+        id: aarch64-haskell-smoke
+        if: always()
+        env:
+          HASKELL_HELLO: ${{ github.workspace }}/haskell-bins/haskell-hello/bin/hello-hyper
           SYSROOT_DIR: ${{ github.workspace }}/guest-bins/sysroot
         run: nix develop .#ci -c make test-haskell
+
+      - name: "[aarch64] Haskell bins (pandoc + shellcheck)"
+        id: aarch64-haskell-bins
+        if: always()
+        env:
+          HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-bins/haskell-bins/bin
+          HASKELL_SYSROOT: ${{ github.workspace }}/haskell-bins/haskell-sysroot
+        run: nix develop .#ci -c make test-haskell-bins
+
+      # ── x86_64-linux tests (via Rosetta) ────────────────────────
+      - name: "[x86_64] Unit tests"
+        id: x86_64-unit
+        if: always()
+        env:
+          GUEST_X64_TEST_BINARIES: ${{ github.workspace }}/guest-bins/x64-test-binaries
+        run: nix develop .#ci -c make test-x64-all
+
+      - name: "[x86_64] Coreutils (static musl)"
+        id: x86_64-coreutils
+        if: always()
+        env:
+          X64_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-coreutils/bin
+        run: nix develop .#ci -c make test-x64-coreutils
+
+      - name: "[x86_64] Busybox"
+        id: x86_64-busybox
+        if: always()
+        env:
+          X64_BUSYBOX_BIN: ${{ github.workspace }}/guest-bins/x64-busybox/bin/busybox
+        run: nix develop .#ci -c make test-x64-busybox
+
+      - name: "[x86_64] Static bins (bash, jq, sqlite, lua, ...)"
+        id: x86_64-static
+        if: always()
+        env:
+          X64_STATIC_BINS_DIR: ${{ github.workspace }}/guest-bins/x64-static-bins/bin
+        run: nix develop .#ci -c make test-x64-static-bins
+
+      # x86_64 dynamic musl: requires 48-bit IPA (M3+) for rosetta's
+      # dynamic linker mapping.  M1 (36-bit IPA) crashes with SIGFPE.
+      - name: "[x86_64] Dynamic coreutils (musl --sysroot)"
+        id: x86_64-dynamic-musl
+        if: always()
+        continue-on-error: true
+        env:
+          X64_MUSL_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
+          GUEST_X64_MUSL_SYSROOT: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
+          GUEST_X64_MUSL_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/x64-musl-dynamic-tests
+          GUEST_X64_MUSL_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/x64-musl-dynamic-coreutils
+          X64_MUSL_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-musl-dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-x64-musl-dynamic
+          nix develop .#ci -c make test-x64-musl-coreutils
+
+      - name: "[x86_64] Dynamic coreutils (glibc --sysroot)"
+        id: x86_64-dynamic-glibc
+        if: always()
+        env:
+          X64_GLIBC_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot
+          GUEST_X64_GLIBC_SYSROOT: ${{ github.workspace }}/guest-bins/x64-glibc-sysroot
+          GUEST_X64_GLIBC_DYNAMIC_TESTS: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-tests
+          GUEST_X64_GLIBC_DYNAMIC_COREUTILS: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-coreutils
+          X64_GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-coreutils/bin
+        run: |
+          nix develop .#ci -c make test-x64-glibc-dynamic
+          nix develop .#ci -c make test-x64-glibc-coreutils
+
+      # x86_64 haskell hello: dynamically linked, requires 48-bit IPA (M3+).
+      - name: "[x86_64] Haskell smoke test (hello-hyper)"
+        id: x86_64-haskell-smoke
+        if: always()
+        continue-on-error: true
+        env:
+          X64_HASKELL_HELLO: ${{ github.workspace }}/haskell-x64-bins/haskell-hello/bin/hello-hyper
+          X64_MUSL_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
+          GUEST_X64_MUSL_SYSROOT: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
+        run: nix develop .#ci -c make test-x64-haskell
+
+      # x86_64 Haskell bins: glibc dynamic linking requires 48-bit IPA (M3+).
+      # M1 (36-bit IPA) can't map glibc's dynamic linker at high VA.
+      - name: "[x86_64] Haskell bins (pandoc + shellcheck)"
+        id: x86_64-haskell-bins
+        if: always()
+        continue-on-error: true
+        env:
+          X64_HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-x64-bins/haskell-bins/bin
+          X64_HASKELL_SYSROOT: ${{ github.workspace }}/haskell-x64-bins/haskell-sysroot
+        run: nix develop .#ci -c make test-x64-haskell-bins
+
+      # ── Test summary ──────────────────────────────────────────────
+      - name: Test summary
+        if: always()
+        run: |
+          icon() { if [ "$1" = "success" ]; then echo "✅"; elif [ "$1" = "skipped" ]; then echo "⏭️"; else echo "❌"; fi; }
+          {
+            echo "## Test Results"
+            echo ""
+            echo "| Suite | Status |"
+            echo "|-------|--------|"
+            echo "| [native] Multi-vCPU HVF | $(icon '${{ steps.native-multi-vcpu.outcome }}') |"
+            echo "| [native] W^X page tables | $(icon '${{ steps.native-rwx.outcome }}') |"
+            echo "| [aarch64] Unit tests | $(icon '${{ steps.aarch64-unit.outcome }}') |"
+            echo "| [aarch64] Coreutils (musl) | $(icon '${{ steps.aarch64-coreutils.outcome }}') |"
+            echo "| [aarch64] Busybox | $(icon '${{ steps.aarch64-busybox.outcome }}') |"
+            echo "| [aarch64] Static bins | $(icon '${{ steps.aarch64-static.outcome }}') |"
+            echo "| [aarch64] Dynamic (musl) | $(icon '${{ steps.aarch64-dynamic-musl.outcome }}') |"
+            echo "| [aarch64] Dynamic (glibc) | $(icon '${{ steps.aarch64-dynamic-glibc.outcome }}') |"
+            echo "| [aarch64] Haskell smoke | $(icon '${{ steps.aarch64-haskell-smoke.outcome }}') |"
+            echo "| [aarch64] Haskell bins | $(icon '${{ steps.aarch64-haskell-bins.outcome }}') |"
+            echo "| [x86_64] Unit tests | $(icon '${{ steps.x86_64-unit.outcome }}') |"
+            echo "| [x86_64] Coreutils (musl) | $(icon '${{ steps.x86_64-coreutils.outcome }}') |"
+            echo "| [x86_64] Busybox | $(icon '${{ steps.x86_64-busybox.outcome }}') |"
+            echo "| [x86_64] Static bins | $(icon '${{ steps.x86_64-static.outcome }}') |"
+            echo "| [x86_64] Dynamic (musl) ⚠️ | $(icon '${{ steps.x86_64-dynamic-musl.outcome }}') |"
+            echo "| [x86_64] Dynamic (glibc) | $(icon '${{ steps.x86_64-dynamic-glibc.outcome }}') |"
+            echo "| [x86_64] Haskell smoke ⚠️ | $(icon '${{ steps.x86_64-haskell-smoke.outcome }}') |"
+            echo "| [x86_64] Haskell bins ⚠️ | $(icon '${{ steps.x86_64-haskell-bins.outcome }}') |"
+            echo ""
+            echo "_⚠️ = optional (requires 48-bit IPA / M3+)_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail the job if any required test suite failed.
+          FAILED=0
+          # Note: x86_64-dynamic-musl, x86_64-haskell-smoke, and
+          # x86_64-haskell-bins are excluded — they require 48-bit IPA
+          # (M3+) for rosetta dynamic linking at high VA.  M1 runners
+          # only support 36-bit IPA.
+          for outcome in \
+            "${{ steps.native-multi-vcpu.outcome }}" \
+            "${{ steps.native-rwx.outcome }}" \
+            "${{ steps.aarch64-unit.outcome }}" \
+            "${{ steps.aarch64-coreutils.outcome }}" \
+            "${{ steps.aarch64-busybox.outcome }}" \
+            "${{ steps.aarch64-static.outcome }}" \
+            "${{ steps.aarch64-dynamic-musl.outcome }}" \
+            "${{ steps.aarch64-dynamic-glibc.outcome }}" \
+            "${{ steps.aarch64-haskell-smoke.outcome }}" \
+            "${{ steps.aarch64-haskell-bins.outcome }}" \
+            "${{ steps.x86_64-unit.outcome }}" \
+            "${{ steps.x86_64-coreutils.outcome }}" \
+            "${{ steps.x86_64-busybox.outcome }}" \
+            "${{ steps.x86_64-static.outcome }}" \
+            "${{ steps.x86_64-dynamic-glibc.outcome }}"; do
+            if [ "$outcome" = "failure" ]; then FAILED=1; fi
+          done
+          if [ "$FAILED" = "1" ]; then
+            echo "::error::One or more test suites failed — see summary above"
+            exit 1
+          fi
 
   # ── Distribution artifacts (master + tags) ──────────────────────
   dist:
@@ -143,7 +427,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history for git describe
+          fetch-depth: 0
 
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
@@ -161,28 +445,24 @@ jobs:
             dist/out/*.pkg
 
   # ── GitHub Release (tags only) ──────────────────────────────────
+  # Downloads the dist artifact built above instead of rebuilding.
   release:
     needs: [dist, test]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-        continue-on-error: true
-
-      - name: Build distribution
-        run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
+          name: hl-dist
+          path: dist-out
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/out/*.zip
-            dist/out/*.pkg
+            dist-out/**/*.zip
+            dist-out/**/*.pkg
           generate_release_notes: true

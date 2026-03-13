@@ -38,7 +38,12 @@ int main(int argc, char *argv[]) {
     struct utsname uts;
     CHECK(uname(&uts) == 0, "uname succeeds");
     CHECK(strcmp(uts.sysname, "Linux") == 0, "sysname == Linux");
+#if defined(__aarch64__)
     CHECK(strcmp(uts.machine, "aarch64") == 0, "machine == aarch64");
+#elif defined(__x86_64__)
+    /* Under rosetta, uname returns "x86_64" for the emulated architecture */
+    CHECK(strcmp(uts.machine, "x86_64") == 0, "machine == x86_64");
+#endif
 
     /* 4. PID */
     CHECK(getpid() > 0, "getpid > 0");

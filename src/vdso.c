@@ -16,6 +16,12 @@
  * The image is mapped into guest memory at VDSO_BASE and its address is
  * provided via AT_SYSINFO_EHDR in the auxiliary vector.
  *
+ * CRITICAL: Rosetta requires DT_HASH in the vDSO's dynamic section for
+ * symbol resolution (Vdso.cpp:78). Without it, rosetta aborts with:
+ *   "assertion failed [hash_table != nullptr]: Failed to find vdso DT_HASH"
+ * We provide PT_DYNAMIC with DT_HASH, DT_SYMTAB, DT_STRTAB entries, and
+ * a minimal ELF hash table (.hash section) with 1 bucket.
+ *
  * The vDSO is built as a position-independent ET_DYN with p_vaddr=0.
  * Rosetta computes load_offset = AT_SYSINFO_EHDR - p_vaddr, then
  * accesses sections via load_offset + sh_offset. All internal addresses
@@ -27,14 +33,14 @@
  *   Offset  Content              Size
  *   0x000   ELF64 header         64 bytes
  *   0x040   Phdr[0] (PT_LOAD)    56 bytes
- *   0x078   .text trampolines    48 bytes (4 × 12)
- *   0x0A8   .dynstr strings      90 bytes
- *   0x108   .dynsym entries      120 bytes (NULL + 4 symbols)
- *   0x180   Shdr[0] (SHN_UNDEF)  64 bytes
- *   0x1C0   Shdr[1] (.text)      64 bytes
- *   0x200   Shdr[2] (.dynstr)    64 bytes
- *   0x240   Shdr[3] (.dynsym)    64 bytes
- *   0x280   end
+ *   0x078   Phdr[1] (PT_DYNAMIC) 56 bytes
+ *   0x0B0   .text trampolines    48 bytes (4 × 12)
+ *   0x0E0   .dynstr strings      90 bytes
+ *   0x13C   .dynsym entries      120 bytes (NULL + 4 symbols)
+ *   0x1B4   .hash (ELF hash)     32 bytes (1 bucket, 5 chains)
+ *   0x1D8   .dynamic             96 bytes (6 entries × 16)
+ *   0x238   Shdr[0..5]           384 bytes (6 × 64)
+ *   0x3B8   end
  */
 #include "vdso.h"
 #include "elf.h"
@@ -57,14 +63,31 @@ typedef struct {
     uint64_t sh_entsize;    /* Entry size if section holds table */
 } elf64_shdr_t;
 
+/* ---------- ELF dynamic section entry ---------- */
+
+typedef struct {
+    int64_t  d_tag;         /* Dynamic entry type */
+    uint64_t d_val;         /* Value (address or size) */
+} elf64_dyn_t;
+
 /* ELF section types */
 #define SHT_NULL     0
 #define SHT_STRTAB   3
+#define SHT_HASH     5
+#define SHT_DYNAMIC  6
 #define SHT_DYNSYM  11
 
 /* ELF section flags */
 #define SHF_ALLOC     (1ULL << 1)
 #define SHF_EXECINSTR (1ULL << 2)
+
+/* ELF dynamic tags */
+#define DT_NULL     0
+#define DT_HASH     4
+#define DT_STRTAB   5
+#define DT_SYMTAB   6
+#define DT_STRSZ   10
+#define DT_SYMENT  11
 
 /* ---------- ELF symbol table entry ---------- */
 
@@ -86,13 +109,28 @@ typedef struct {
 
 #define VDSO_OFF_EHDR    0x000
 #define VDSO_OFF_PHDR    0x040   /* = sizeof(elf64_ehdr_t) */
-#define VDSO_OFF_TEXT    0x078   /* = PHDR + sizeof(elf64_phdr_t) */
-#define VDSO_OFF_DYNSTR  0x0A8   /* after .text (4 × 12 = 48 bytes) */
-#define VDSO_OFF_DYNSYM  0x108   /* after .dynstr (90 bytes), 8-byte aligned */
-#define VDSO_OFF_SHDR    0x180   /* after .dynsym (5 × 24 = 120 bytes) */
+#define VDSO_OFF_PHDR1   0x078   /* = PHDR + sizeof(elf64_phdr_t) */
+/* VDSO_OFF_TEXT defined in vdso.h (shared with syscall_signal.c) */
+#define VDSO_OFF_DYNSTR  0x0E0   /* after .text (4 × 12 = 48 bytes) */
+/* DYNSTR_SIZE = 90 bytes → ends at 0x13A, round up to 4-byte align: 0x13C */
+#define VDSO_OFF_DYNSYM  0x13C   /* after .dynstr (92 bytes padded) */
+/* DYNSYM = 5 × 24 = 120 bytes → ends at 0x1B4 (already 4-byte aligned) */
+#define VDSO_OFF_HASH    0x1B4   /* after .dynsym */
+/* HASH = 4+4+4+20 = 32 bytes → ends at 0x1D4, round up to 8-byte: 0x1D8 */
+#define VDSO_OFF_DYNAMIC 0x1D8   /* after .hash */
+/* DYNAMIC = 6 × 16 = 96 bytes → ends at 0x238 */
+#define VDSO_OFF_SHDR    0x238   /* after .dynamic */
+/* SHDR = 6 × 64 = 384 bytes → ends at 0x3B8 */
 
 /* Number of vDSO symbols (excluding the mandatory NULL entry) */
 #define VDSO_NUM_SYMS 4
+
+/* Number of ELF hash table entries: NULL symbol + 4 named symbols */
+#define HASH_NCHAIN (VDSO_NUM_SYMS + 1)  /* 5 */
+/* Single-bucket hash table: all symbols chain through bucket 0 */
+#define HASH_NBUCKET 1
+/* Hash table size: 2 words (nbucket, nchain) + nbucket + nchain */
+#define HASH_SIZE ((2 + HASH_NBUCKET + HASH_NCHAIN) * sizeof(uint32_t))
 
 /* .text trampolines: each is 3 ARM64 instructions (12 bytes).
  * The trampolines are simple syscall wrappers that rosetta uses
@@ -132,6 +170,13 @@ static const uint32_t sym_name_offsets[VDSO_NUM_SYMS] = {
     68,  /* __kernel_gettimeofday */
 };
 
+/* ELF SysV hash (DT_HASH) is defined as:
+ *   uint32_t h = 0; while (*name) { h = (h<<4) + *name++;
+ *   uint32_t g = h & 0xf0000000; if (g) h ^= g >> 24; h &= ~g; }
+ * With only 1 hash bucket (nbucket=1), all symbols map to bucket[0]
+ * regardless of their hash value (hash % 1 == 0). So the hash function
+ * is not called at runtime — the chain is walked linearly. */
+
 uint64_t vdso_build(guest_t *g) {
     /* Get host pointer to the vDSO page */
     uint8_t *page = (uint8_t *)guest_ptr(g, VDSO_BASE);
@@ -162,24 +207,37 @@ uint64_t vdso_build(guest_t *g) {
     ehdr->e_flags     = 0;
     ehdr->e_ehsize    = sizeof(elf64_ehdr_t);
     ehdr->e_phentsize = sizeof(elf64_phdr_t);
-    ehdr->e_phnum     = 1;
+    ehdr->e_phnum     = 2;           /* PT_LOAD + PT_DYNAMIC */
     ehdr->e_shentsize = sizeof(elf64_shdr_t);
-    ehdr->e_shnum     = 4;           /* NULL + .text + .dynstr + .dynsym */
+    ehdr->e_shnum     = 6;           /* NULL + .text + .dynstr + .dynsym + .hash + .dynamic */
     ehdr->e_shstrndx  = 2;           /* .dynstr doubles as shstrtab */
 
-    /* ---- Program header: single PT_LOAD covering the whole page ----
+    /* ---- Phdr[0]: PT_LOAD covering the whole page ----
      * p_vaddr = 0: standard position-independent convention for ET_DYN.
      * Rosetta computes load_offset = AT_SYSINFO_EHDR - p_vaddr = VDSO_BASE.
      * All file offsets are then resolved as load_offset + offset. */
-    elf64_phdr_t *phdr = (elf64_phdr_t *)(page + VDSO_OFF_PHDR);
-    phdr->p_type   = PT_LOAD;
-    phdr->p_flags  = PF_R | PF_X;
-    phdr->p_offset = 0;
-    phdr->p_vaddr  = 0;              /* Position-independent: base = 0 */
-    phdr->p_paddr  = 0;
-    phdr->p_filesz = VDSO_SIZE;
-    phdr->p_memsz  = VDSO_SIZE;
-    phdr->p_align  = 0x1000;         /* Page-aligned */
+    elf64_phdr_t *phdr0 = (elf64_phdr_t *)(page + VDSO_OFF_PHDR);
+    phdr0->p_type   = PT_LOAD;
+    phdr0->p_flags  = PF_R | PF_X;
+    phdr0->p_offset = 0;
+    phdr0->p_vaddr  = 0;              /* Position-independent: base = 0 */
+    phdr0->p_paddr  = 0;
+    phdr0->p_filesz = VDSO_SIZE;
+    phdr0->p_memsz  = VDSO_SIZE;
+    phdr0->p_align  = 0x1000;         /* Page-aligned */
+
+    /* ---- Phdr[1]: PT_DYNAMIC pointing to .dynamic section ----
+     * Rosetta locates .dynamic via this phdr, then walks DT entries to find
+     * DT_HASH for symbol resolution during vDSO initialization. */
+    elf64_phdr_t *phdr1 = (elf64_phdr_t *)(page + VDSO_OFF_PHDR1);
+    phdr1->p_type   = PT_DYNAMIC;
+    phdr1->p_flags  = PF_R;
+    phdr1->p_offset = VDSO_OFF_DYNAMIC;
+    phdr1->p_vaddr  = VDSO_OFF_DYNAMIC;   /* Relative to load base (0) */
+    phdr1->p_paddr  = VDSO_OFF_DYNAMIC;
+    phdr1->p_filesz = 6 * sizeof(elf64_dyn_t);  /* 6 entries */
+    phdr1->p_memsz  = 6 * sizeof(elf64_dyn_t);
+    phdr1->p_align  = 8;
 
     /* ---- .text: syscall trampolines ---- */
     memcpy(page + VDSO_OFF_TEXT, trampoline_code, sizeof(trampoline_code));
@@ -205,6 +263,51 @@ uint64_t vdso_build(guest_t *g) {
                                (uint64_t)i * TRAMPOLINE_SIZE;
         sym[i + 1].st_size  = TRAMPOLINE_SIZE;
     }
+
+    /* ---- .hash: ELF hash table for symbol lookup ----
+     * Rosetta parses the vDSO's PT_DYNAMIC looking for DT_HASH and asserts
+     * it's non-NULL (Vdso.cpp:78). The hash table must be a valid SysV ELF
+     * hash table (not GNU hash).
+     *
+     * Layout: { nbucket, nchain, bucket[nbucket], chain[nchain] }
+     * With 1 bucket, all symbols chain through bucket[0].
+     * chain[i] = next symbol index with same hash, or STN_UNDEF (0). */
+    uint32_t *hash = (uint32_t *)(page + VDSO_OFF_HASH);
+    hash[0] = HASH_NBUCKET;     /* nbucket = 1 */
+    hash[1] = HASH_NCHAIN;      /* nchain = 5 (NULL + 4 symbols) */
+
+    /* bucket[0]: first symbol in the single chain.
+     * Build chain by computing hash of each symbol name (mod nbucket = 0
+     * for all since nbucket=1) and linking them. */
+    hash[2] = 0;  /* bucket[0]: will be overwritten below */
+
+    /* chain[0..4]: chain[i] = next symbol index with same bucket, or 0 */
+    uint32_t *chain = &hash[2 + HASH_NBUCKET];  /* chain starts after bucket[] */
+    memset(chain, 0, HASH_NCHAIN * sizeof(uint32_t));
+
+    /* With 1 bucket, all symbols go in bucket[0]. Build a linked list.
+     * chain[0] = 0 (NULL symbol has no "next" in bucket sense, but bucket[0]
+     * starts with the first real symbol). Walk symbols 1..4 and link them. */
+    uint32_t first_sym = 0;  /* No symbols yet in bucket 0 */
+    for (int i = VDSO_NUM_SYMS; i >= 1; i--) {
+        /* All symbols map to bucket 0 (single bucket, hash % 1 == 0).
+         * Prepend to chain: chain[i] = old head, bucket[0] = i. */
+        chain[i] = first_sym;
+        first_sym = (uint32_t)i;
+    }
+    hash[2] = first_sym;  /* bucket[0] = head of chain */
+
+    /* ---- .dynamic: dynamic section entries ----
+     * Rosetta walks PT_DYNAMIC entries to locate DT_HASH, DT_SYMTAB, and
+     * DT_STRTAB. All addresses are relative to load base 0; rosetta adds
+     * the load_offset (VDSO_BASE) to resolve them. */
+    elf64_dyn_t *dyn = (elf64_dyn_t *)(page + VDSO_OFF_DYNAMIC);
+    dyn[0].d_tag = DT_HASH;    dyn[0].d_val = VDSO_OFF_HASH;
+    dyn[1].d_tag = DT_SYMTAB;  dyn[1].d_val = VDSO_OFF_DYNSYM;
+    dyn[2].d_tag = DT_STRTAB;  dyn[2].d_val = VDSO_OFF_DYNSTR;
+    dyn[3].d_tag = DT_STRSZ;   dyn[3].d_val = DYNSTR_SIZE;
+    dyn[4].d_tag = DT_SYMENT;  dyn[4].d_val = sizeof(elf64_sym_t);
+    dyn[5].d_tag = DT_NULL;    dyn[5].d_val = 0;
 
     /* ---- Section header table ---- */
     elf64_shdr_t *shdr = (elf64_shdr_t *)(page + VDSO_OFF_SHDR);
@@ -247,6 +350,30 @@ uint64_t vdso_build(guest_t *g) {
     shdr[3].sh_info      = 1;        /* First non-local symbol index */
     shdr[3].sh_addralign = 8;
     shdr[3].sh_entsize   = sizeof(elf64_sym_t);
+
+    /* shdr[4]: .hash (SHT_HASH) — linked to .dynsym (section 3) */
+    shdr[4].sh_name      = 0;
+    shdr[4].sh_type      = SHT_HASH;
+    shdr[4].sh_flags     = SHF_ALLOC;
+    shdr[4].sh_addr      = VDSO_OFF_HASH;
+    shdr[4].sh_offset    = VDSO_OFF_HASH;
+    shdr[4].sh_size      = HASH_SIZE;
+    shdr[4].sh_link      = 3;        /* Index of associated .dynsym */
+    shdr[4].sh_info      = 0;
+    shdr[4].sh_addralign = 4;
+    shdr[4].sh_entsize   = 4;
+
+    /* shdr[5]: .dynamic (SHT_DYNAMIC) — linked to .dynstr (section 2) */
+    shdr[5].sh_name      = 0;
+    shdr[5].sh_type      = SHT_DYNAMIC;
+    shdr[5].sh_flags     = SHF_ALLOC;
+    shdr[5].sh_addr      = VDSO_OFF_DYNAMIC;
+    shdr[5].sh_offset    = VDSO_OFF_DYNAMIC;
+    shdr[5].sh_size      = 6 * sizeof(elf64_dyn_t);
+    shdr[5].sh_link      = 2;        /* Index of associated .dynstr */
+    shdr[5].sh_info      = 0;
+    shdr[5].sh_addralign = 8;
+    shdr[5].sh_entsize   = sizeof(elf64_dyn_t);
 
     return VDSO_BASE;
 }

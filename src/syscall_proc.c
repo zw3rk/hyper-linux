@@ -14,6 +14,7 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"
 #include "hv_util.h"
+#include "crash_report.h"
 #include "thread.h"
 #include "futex.h"
 
@@ -56,10 +57,16 @@ static char hl_path[LINUX_PATH_MAX] = {0};
 /* Sysroot path for dynamic linker library resolution */
 static char sysroot_path[LINUX_PATH_MAX] = {0};
 
+/* W^X toggle counters for JIT debugging */
+static _Atomic uint64_t wxcount_to_rx = 0;  /* RW→RX (exec fault) */
+static _Atomic uint64_t wxcount_to_rw = 0;  /* RX→RW (write fault) */
+static _Atomic uint64_t sysreg_write_count = 0;  /* EC=0x18 Dir=0 (DC CVAU, IC IVAU, etc.) */
+
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
 static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
+static pthread_cond_t  pid_cond = PTHREAD_COND_INITIALIZER;  /* Signaled on child exit */
 
 /* Global flag for exit_group: signals all threads to terminate.
  * Atomic to avoid undefined behavior under C11 memory model when
@@ -68,6 +75,126 @@ _Atomic int exit_group_requested = 0;
 
 /* Exit code set by the thread that calls exit_group */
 _Atomic int exit_group_code = 0;
+
+/* ---------- Rosetta memory dump for debugging ---------- */
+
+/* Dump guest memory regions to files for post-mortem analysis.
+ * Called when rosetta's JIT assertion fires (BRK → SIG_DFL SIGTRAP).
+ * Writes:
+ *   /tmp/hl-dump-regs.txt   — vCPU register state
+ *   /tmp/hl-dump-regions.txt — guest region listing
+ *   /tmp/hl-dump-XXXX-XXXX.bin — binary dumps of each region
+ */
+static void dump_rosetta_state(hv_vcpu_t vcpu, guest_t *g) {
+    fprintf(stderr, "hl: === ROSETTA STATE DUMP ===\n");
+
+    /* 1. Dump all vCPU registers */
+    FILE *rf = fopen("/tmp/hl-dump-regs.txt", "w");
+    if (rf) {
+        for (int i = 0; i <= 30; i++) {
+            uint64_t v;
+            hv_vcpu_get_reg(vcpu, (hv_reg_t)(HV_REG_X0 + i), &v);
+            fprintf(rf, "X%-2d = 0x%016llx\n", i, (unsigned long long)v);
+        }
+        uint64_t sp, pc, cpsr;
+        hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
+        hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
+        uint64_t elr;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+        fprintf(rf, "SP  = 0x%016llx\n", (unsigned long long)sp);
+        fprintf(rf, "PC  = 0x%016llx\n", (unsigned long long)pc);
+        fprintf(rf, "ELR = 0x%016llx\n", (unsigned long long)elr);
+        fprintf(rf, "CPSR= 0x%016llx\n", (unsigned long long)cpsr);
+        fclose(rf);
+        fprintf(stderr, "hl: dumped registers → /tmp/hl-dump-regs.txt\n");
+    }
+
+    /* 2. Dump region listing + binary data */
+    FILE *lf = fopen("/tmp/hl-dump-regions.txt", "w");
+    for (int i = 0; i < g->nregions; i++) {
+        guest_region_t *r = &g->regions[i];
+        uint64_t start = r->start;
+        uint64_t end   = r->end;
+        uint64_t size  = end - start;
+
+        /* Resolve display VA for aliases */
+        uint64_t disp_start = start;
+        uint64_t disp_end   = end;
+        if (r->display_va) {
+            disp_start = r->display_va;
+            disp_end   = r->display_va + size;
+        } else {
+            for (int j = 0; j < g->naliases; j++) {
+                if (start >= g->va_aliases[j].gpa_start &&
+                    end <= g->va_aliases[j].gpa_start + g->va_aliases[j].size) {
+                    disp_start = g->va_aliases[j].va_start +
+                                 (start - g->va_aliases[j].gpa_start);
+                    disp_end = disp_start + size;
+                    break;
+                }
+            }
+        }
+
+        char perms[5] = "----";
+        if (r->prot & 1) perms[0] = 'r';
+        if (r->prot & 2) perms[1] = 'w';
+        if (r->prot & 4) perms[2] = 'x';
+        perms[3] = (r->flags & 1) ? 's' : 'p';
+
+        if (lf) {
+            fprintf(lf, "%012llx-%012llx %s %s (gpa %012llx, %llu bytes)\n",
+                    (unsigned long long)disp_start,
+                    (unsigned long long)disp_end,
+                    perms,
+                    r->name[0] ? r->name : "<anon>",
+                    (unsigned long long)start,
+                    (unsigned long long)size);
+        }
+
+        /* Dump binary contents of interesting regions
+         * (skip huge anonymous regions to avoid multi-GB dumps) */
+        if (size > 0 && size <= (uint64_t)16 * 1024 * 1024 &&
+            start < g->guest_size) {
+            char path[256];
+            snprintf(path, sizeof(path),
+                     "/tmp/hl-dump-%012llx-%012llx.bin",
+                     (unsigned long long)disp_start,
+                     (unsigned long long)disp_end);
+            FILE *bf = fopen(path, "wb");
+            if (bf) {
+                uint64_t safe_size = size;
+                if (start + safe_size > g->guest_size)
+                    safe_size = g->guest_size - start;
+                fwrite((uint8_t *)g->host_base + start, 1, safe_size, bf);
+                fclose(bf);
+            }
+        }
+    }
+
+    /* Also dump kbuf pages that were W^X toggled (rosetta JIT slab).
+     * The kbuf sits at g->kbuf_gpa in the primary buffer. Dump the
+     * first 16MB of it (covers rosetta's active JIT pages). */
+    if (g->kbuf_base) {
+        char path[256];
+        uint64_t dump_size = (uint64_t)16 * 1024 * 1024;
+        snprintf(path, sizeof(path), "/tmp/hl-dump-kbuf-16MB.bin");
+        FILE *bf = fopen(path, "wb");
+        if (bf) {
+            fwrite(g->kbuf_base, 1, dump_size, bf);
+            fclose(bf);
+            if (lf) fprintf(lf, "kbuf: %012llx (host %p, 16MB dumped)\n",
+                            (unsigned long long)g->kbuf_gpa, g->kbuf_base);
+        }
+    }
+
+    if (lf) {
+        fclose(lf);
+        fprintf(stderr, "hl: dumped regions → /tmp/hl-dump-regions.txt\n");
+    }
+
+    fprintf(stderr, "hl: === END DUMP ===\n");
+}
 
 /* ---------- Public API ---------- */
 
@@ -147,6 +274,12 @@ void proc_set_cmdline(int argc, const char **argv) {
     cmdline_len = off;
 }
 
+void proc_set_cmdline_raw(const char *buf, size_t len) {
+    if (len > sizeof(cmdline_buf)) len = sizeof(cmdline_buf);
+    memcpy(cmdline_buf, buf, len);
+    cmdline_len = len;
+}
+
 const char *proc_get_cmdline(size_t *len_out) {
     if (cmdline_len == 0) return NULL;
     if (len_out) *len_out = cmdline_len;
@@ -206,7 +339,7 @@ static int proc_reap_finished(void) {
     return reaped;
 }
 
-void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
+int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
     pthread_mutex_lock(&pid_lock);
     for (int i = 0; i < PROC_TABLE_SIZE; i++) {
         if (!proc_table[i].active) {
@@ -216,7 +349,7 @@ void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
             proc_table[i].exited = 0;
             proc_table[i].exit_status = 0;
             pthread_mutex_unlock(&pid_lock);
-            return;
+            return 0;
         }
     }
 
@@ -230,7 +363,7 @@ void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
                 proc_table[i].exited = 0;
                 proc_table[i].exit_status = 0;
                 pthread_mutex_unlock(&pid_lock);
-                return;
+                return 0;
             }
         }
     }
@@ -238,6 +371,7 @@ void proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
 
     fprintf(stderr, "hl: process table full (%d slots), child PID %lld dropped\n",
             PROC_TABLE_SIZE, (long long)guest_pid_val);
+    return -1;
 }
 
 void proc_mark_child_exited(pid_t host_pid, int status) {
@@ -246,6 +380,7 @@ void proc_mark_child_exited(pid_t host_pid, int status) {
         if (proc_table[i].active && proc_table[i].host_pid == host_pid) {
             proc_table[i].exited = 1;
             proc_table[i].exit_status = status;
+            pthread_cond_broadcast(&pid_cond);
             pthread_mutex_unlock(&pid_lock);
             return;
         }
@@ -253,14 +388,133 @@ void proc_mark_child_exited(pid_t host_pid, int status) {
     pthread_mutex_unlock(&pid_lock);
 }
 
+/* ---------- sys_ptrace ---------- */
+
+int64_t sys_ptrace(guest_t *g, uint64_t request, int64_t pid,
+                   uint64_t addr, uint64_t data) {
+    switch (request) {
+
+    case LINUX_PTRACE_SEIZE: {
+        /* Attach to target thread without stopping it. The tracee
+         * can later be stopped via PTRACE_INTERRUPT or BRK-induced
+         * ptrace-stop. Unlike PTRACE_ATTACH, SEIZE does not send
+         * SIGSTOP — Rosetta relies on this. */
+        thread_entry_t *target = thread_find(pid);
+        if (!target)
+            return -LINUX_ESRCH;
+        if (target->ptraced)
+            return -LINUX_EPERM;
+
+        target->ptraced    = 1;
+        target->tracer_tid = current_thread->guest_tid;
+        return 0;
+    }
+
+    case LINUX_PTRACE_CONT: {
+        /* Resume a stopped tracee, optionally injecting a signal.
+         * data = signal to inject (0 = none). */
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced)
+            return -LINUX_ESRCH;
+        if (!target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        thread_ptrace_cont(target, (int)data);
+        return 0;
+    }
+
+    case LINUX_PTRACE_INTERRUPT: {
+        /* Force a running tracee into ptrace-stop. Uses hv_vcpus_exit
+         * to break the tracee out of hv_vcpu_run; the tracee will then
+         * enter ptrace-stop in its HV_EXIT_REASON_CANCELED handler. */
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced)
+            return -LINUX_ESRCH;
+        if (target->ptrace_stopped)
+            return 0;  /* Already stopped */
+
+        hv_vcpus_exit(&target->vcpu, 1);
+        return 0;
+    }
+
+    case LINUX_PTRACE_GETREGSET: {
+        /* Read tracee registers via iovec. addr = NT_PRSTATUS (1),
+         * data = guest pointer to linux iovec_t {base, len}. */
+        if (addr != LINUX_NT_PRSTATUS)
+            return -LINUX_EINVAL;
+
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced || !target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        /* Read guest iovec */
+        linux_iovec_t iov;
+        if (guest_read(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        /* Copy register data (truncate if iovec is smaller) */
+        size_t copy_len = sizeof(linux_user_pt_regs_t);
+        if (iov.iov_len < copy_len)
+            copy_len = iov.iov_len;
+
+        if (guest_write(g, iov.iov_base, &target->ptrace_regs, copy_len) < 0)
+            return -LINUX_EFAULT;
+
+        /* Write back actual bytes transferred */
+        iov.iov_len = copy_len;
+        if (guest_write(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        return 0;
+    }
+
+    case LINUX_PTRACE_SETREGSET: {
+        /* Write tracee registers via iovec. addr = NT_PRSTATUS (1),
+         * data = guest pointer to linux iovec_t {base, len}. */
+        if (addr != LINUX_NT_PRSTATUS)
+            return -LINUX_EINVAL;
+
+        thread_entry_t *target = thread_find(pid);
+        if (!target || !target->ptraced || !target->ptrace_stopped)
+            return -LINUX_ESRCH;
+
+        /* Read guest iovec */
+        linux_iovec_t iov;
+        if (guest_read(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        /* Copy register data from guest */
+        size_t copy_len = sizeof(linux_user_pt_regs_t);
+        if (iov.iov_len < copy_len)
+            copy_len = iov.iov_len;
+
+        if (guest_read(g, iov.iov_base, &target->ptrace_regs, copy_len) < 0)
+            return -LINUX_EFAULT;
+
+        target->ptrace_regs_dirty = 1;
+
+        /* Write back actual bytes transferred */
+        iov.iov_len = copy_len;
+        if (guest_write(g, data, &iov, sizeof(iov)) < 0)
+            return -LINUX_EFAULT;
+
+        return 0;
+    }
+
+    default:
+        return -LINUX_EINVAL;
+    }
+}
+
 /* Write a macOS struct rusage to guest memory as linux_rusage_t.
- * The structs have identical field layout on LP64. */
+ * Field layout matches on LP64, but ru_maxrss must be converted
+ * from macOS bytes to Linux kilobytes. */
 static int write_rusage_to_guest(guest_t *g, uint64_t gva,
                                   const struct rusage *ru) {
     linux_rusage_t lru = {
         .ru_utime   = { ru->ru_utime.tv_sec,  ru->ru_utime.tv_usec },
         .ru_stime   = { ru->ru_stime.tv_sec,  ru->ru_stime.tv_usec },
-        .ru_maxrss  = ru->ru_maxrss,
+        .ru_maxrss  = ru->ru_maxrss / 1024, /* macOS: bytes → Linux: KB */
         .ru_ixrss   = ru->ru_ixrss,
         .ru_idrss   = ru->ru_idrss,
         .ru_isrss   = ru->ru_isrss,
@@ -283,58 +537,126 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
 int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                   int options, uint64_t rusage_gva) {
 
+    /* First check for ptraced or vm-clone children in the thread table.
+     * Rosetta's two-process JIT uses clone(CLONE_VM) + ptrace, and the
+     * child runs as an in-process thread, not a separate host process.
+     * thread_ptrace_wait handles both ptrace-stopped and vm-exited states. */
+    if (current_thread) {
+        int ptrace_status = 0;
+        int64_t ptrace_tid = thread_ptrace_wait(
+            current_thread->guest_tid, pid, &ptrace_status, options);
+        if (ptrace_tid > 0) {
+            if (status_gva) {
+                int32_t ls = ptrace_status;
+                if (guest_write(g, status_gva, &ls, sizeof(ls)) < 0)
+                    return -LINUX_EFAULT;
+            }
+            return ptrace_tid;
+        }
+        /* ptrace_tid == 0: no matching children or WNOHANG — fall through
+         * to the process table for regular fork children. */
+    }
+
     /* Translate Linux wait options */
     int mac_options = 0;
-    if (options & 1) mac_options |= WNOHANG;   /* WNOHANG = 1 on both */
-    if (options & 2) mac_options |= WUNTRACED; /* WUNTRACED = 2 on both */
+    if (options & 1) mac_options |= WNOHANG;     /* WNOHANG = 1 on both */
+    if (options & 2) mac_options |= WUNTRACED;   /* WUNTRACED = 2 on both */
+    if (options & 8) mac_options |= WCONTINUED;  /* WCONTINUED: Linux=8, macOS=0x10 */
 
     pthread_mutex_lock(&pid_lock);
 
     if (pid == -1) {
-        /* Wait for any child. Find any active entry in process table. */
-        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
-            if (proc_table[i].active) {
+        /* Wait for any child.  Always poll with WNOHANG first so we
+         * don't block on one specific child while another exits.  If
+         * blocking (no WNOHANG) and no child is ready, sleep briefly
+         * and retry — this gives correct "wait for any" semantics. */
+        for (;;) {
+            int found_any_child = 0;
+            for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+                if (!proc_table[i].active)
+                    continue;
+                found_any_child = 1;
                 if (proc_table[i].exited) {
                     /* Already reaped (from CLONE_VFORK wait) */
                     int64_t gpid = proc_table[i].guest_pid;
                     int32_t linux_status = proc_table[i].exit_status;
                     proc_table[i].active = 0;
                     pthread_mutex_unlock(&pid_lock);
-                    if (status_gva)
-                        guest_write(g, status_gva, &linux_status, 4);
+                    if (status_gva &&
+                        guest_write(g, status_gva, &linux_status, 4) < 0)
+                        return -LINUX_EFAULT;
+                    /* Pre-exited entries have no rusage; zero-fill. */
+                    if (rusage_gva)
+                        write_rusage_to_guest(g, rusage_gva,
+                                              &(struct rusage){0});
                     return gpid;
                 }
 
                 pid_t host_pid = proc_table[i].host_pid;
                 int64_t gpid = proc_table[i].guest_pid;
+                int slot = i;
                 pthread_mutex_unlock(&pid_lock);
 
                 int status;
                 struct rusage ru;
-                pid_t ret = wait4(host_pid, &status, mac_options,
+                pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
                                   rusage_gva ? &ru : NULL);
                 if (ret > 0) {
                     if (status_gva) {
                         int32_t linux_status = status;
-                        guest_write(g, status_gva, &linux_status, 4);
+                        if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                            /* Child already reaped — match Linux: return EFAULT */
+                            pthread_mutex_lock(&pid_lock);
+                            if (proc_table[slot].active &&
+                                proc_table[slot].host_pid == host_pid)
+                                proc_table[slot].active = 0;
+                            pthread_mutex_unlock(&pid_lock);
+                            return -LINUX_EFAULT;
+                        }
                     }
-                    if (rusage_gva)
-                        write_rusage_to_guest(g, rusage_gva, &ru);
+                    if (rusage_gva &&
+                        write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                        pthread_mutex_lock(&pid_lock);
+                        if (proc_table[slot].active &&
+                            proc_table[slot].host_pid == host_pid)
+                            proc_table[slot].active = 0;
+                        pthread_mutex_unlock(&pid_lock);
+                        return -LINUX_EFAULT;
+                    }
                     pthread_mutex_lock(&pid_lock);
-                    proc_table[i].active = 0;
+                    if (proc_table[slot].active &&
+                        proc_table[slot].host_pid == host_pid)
+                        proc_table[slot].active = 0;
                     pthread_mutex_unlock(&pid_lock);
                     return gpid;
-                } else if (ret == 0) {
-                    /* WNOHANG and child not yet exited */
-                    return 0;
                 }
-                /* waitpid failed — try next child */
+                /* ret == 0 (not exited) or ret < 0 (error): try next */
                 pthread_mutex_lock(&pid_lock);
             }
+
+            if (!found_any_child) {
+                pthread_mutex_unlock(&pid_lock);
+                return -LINUX_ECHILD;
+            }
+            if (mac_options & WNOHANG) {
+                pthread_mutex_unlock(&pid_lock);
+                return 0;
+            }
+
+            /* Blocking mode: no child exited yet.  Wait on condvar for
+             * a child exit notification (signaled by proc_mark_child_exited).
+             * Use timedwait with 100ms timeout as a safety net — the condvar
+             * handles normal exits, the timeout catches edge cases where
+             * the host wait4 detects exit before proc_mark_child_exited. */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 100000000; /* 100ms */
+            if (ts.tv_nsec >= 1000000000) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000;
+            }
+            pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
         }
-        pthread_mutex_unlock(&pid_lock);
-        /* No children */
-        return -LINUX_ECHILD;
     }
 
     /* Wait for specific guest PID */
@@ -345,13 +667,19 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
                 int32_t linux_status = proc_table[i].exit_status;
                 proc_table[i].active = 0;
                 pthread_mutex_unlock(&pid_lock);
-                if (status_gva)
-                    guest_write(g, status_gva, &linux_status, 4);
+                if (status_gva &&
+                    guest_write(g, status_gva, &linux_status, 4) < 0)
+                    return -LINUX_EFAULT;
+                /* Pre-exited entries have no rusage; zero-fill. */
+                if (rusage_gva)
+                    write_rusage_to_guest(g, rusage_gva,
+                                          &(struct rusage){0});
                 return gpid;
             }
 
             pid_t host_pid = proc_table[i].host_pid;
             int64_t gpid = proc_table[i].guest_pid;
+            int slot = i;
             pthread_mutex_unlock(&pid_lock);
 
             int status;
@@ -361,12 +689,29 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
             if (ret > 0) {
                 if (status_gva) {
                     int32_t linux_status = status;
-                    guest_write(g, status_gva, &linux_status, 4);
+                    if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+                        pthread_mutex_lock(&pid_lock);
+                        if (proc_table[slot].active &&
+                            proc_table[slot].host_pid == host_pid)
+                            proc_table[slot].active = 0;
+                        pthread_mutex_unlock(&pid_lock);
+                        return -LINUX_EFAULT;
+                    }
                 }
-                if (rusage_gva)
-                    write_rusage_to_guest(g, rusage_gva, &ru);
+                if (rusage_gva &&
+                    write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+                    pthread_mutex_lock(&pid_lock);
+                    if (proc_table[slot].active &&
+                        proc_table[slot].host_pid == host_pid)
+                        proc_table[slot].active = 0;
+                    pthread_mutex_unlock(&pid_lock);
+                    return -LINUX_EFAULT;
+                }
                 pthread_mutex_lock(&pid_lock);
-                proc_table[i].active = 0;
+                /* Re-validate slot: another thread may have reaped it */
+                if (proc_table[slot].active &&
+                    proc_table[slot].host_pid == host_pid)
+                    proc_table[slot].active = 0;
                 pthread_mutex_unlock(&pid_lock);
                 /* Queue SIGCHLD for parent process */
                 signal_queue(LINUX_SIGCHLD);
@@ -405,10 +750,13 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
 
 int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                    uint64_t infop_gva, int options) {
-    /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2 */
+    /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2,
+     * WCONTINUED=8, WNOWAIT=0x01000000 */
+#define LINUX_WNOWAIT 0x01000000
     int mac_options = 0;
     if (options & 1) mac_options |= WNOHANG;
     if (options & 2) mac_options |= WUNTRACED;
+    if (options & 8) mac_options |= WCONTINUED;
     /* WEXITED (4) is implied by waitpid */
 
     /* Convert idtype+id to a waitpid-compatible pid argument */
@@ -420,72 +768,117 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
     default:     return -LINUX_EINVAL;
     }
 
-    /* Search process table for matching entry */
+    /* Search process table for matching entry.  P_ALL must scan all
+     * children (not block on the first non-exited one), so we always
+     * use WNOHANG in the inner loop and retry with timedwait if the
+     * caller requested blocking. */
     pthread_mutex_lock(&pid_lock);
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
-        if (!proc_table[i].active) continue;
+    for (;;) {
+        int found_any = 0;
 
-        /* Match: P_ALL matches any, P_PID matches guest_pid */
-        if (idtype == P_PID && proc_table[i].guest_pid != wait_pid)
-            continue;
+        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+            if (!proc_table[i].active) continue;
 
-        int status;
-        pid_t ret;
-        int32_t gpid32 = (int32_t)proc_table[i].guest_pid;
+            /* Match: P_ALL matches any, P_PID matches guest_pid */
+            if (idtype == P_PID && proc_table[i].guest_pid != wait_pid)
+                continue;
 
-        if (proc_table[i].exited) {
-            /* Already reaped (from CLONE_VFORK wait) */
-            status = proc_table[i].exit_status;
-            ret = proc_table[i].host_pid;
-        } else {
-            pid_t host_pid = proc_table[i].host_pid;
-            pthread_mutex_unlock(&pid_lock);
-            ret = waitpid(host_pid, &status, mac_options);
-            if (ret == 0) return 0; /* WNOHANG, child not yet exited */
-            if (ret < 0) return linux_errno();
-            pthread_mutex_lock(&pid_lock);
-        }
+            found_any = 1;
+            int status;
+            pid_t ret;
+            int32_t gpid32 = (int32_t)proc_table[i].guest_pid;
 
-        /* Fill siginfo_t in guest memory */
-        if (infop_gva) {
-            uint8_t si[SIGINFO_SIZE];
-            memset(si, 0, sizeof(si));
-
-            int32_t signo = LINUX_SIGCHLD;
-            int32_t si_code;
-            int32_t si_status;
-
-            if (WIFEXITED(status)) {
-                si_code = CLD_EXITED;
-                si_status = WEXITSTATUS(status);
-            } else if (WIFSIGNALED(status)) {
-                si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
-                si_status = WTERMSIG(status);
+            if (proc_table[i].exited) {
+                /* Already reaped (from CLONE_VFORK wait) */
+                status = proc_table[i].exit_status;
+                ret = proc_table[i].host_pid;
             } else {
-                si_code = CLD_EXITED;
-                si_status = 0;
+                pid_t host_pid = proc_table[i].host_pid;
+                pthread_mutex_unlock(&pid_lock);
+                ret = waitpid(host_pid, &status, WNOHANG);
+                if (ret == 0) {
+                    /* This child hasn't exited yet — continue checking
+                     * others (P_ALL must scan all children). */
+                    pthread_mutex_lock(&pid_lock);
+                    continue;
+                }
+                if (ret < 0) {
+                    pthread_mutex_lock(&pid_lock);
+                    continue; /* Child may have been reaped concurrently */
+                }
+                pthread_mutex_lock(&pid_lock);
             }
 
-            memcpy(si + SIGINFO_OFF_SIGNO, &signo, 4);
-            memcpy(si + SIGINFO_OFF_CODE, &si_code, 4);
-            memcpy(si + SIGINFO_OFF_PID, &gpid32, 4);
-            uint32_t uid = 0;
-            memcpy(si + SIGINFO_OFF_UID, &uid, 4);
-            memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
+            /* Fill siginfo_t in guest memory */
+            if (infop_gva) {
+                uint8_t si[SIGINFO_SIZE];
+                memset(si, 0, sizeof(si));
 
-            guest_write(g, infop_gva, si, SIGINFO_SIZE);
+                int32_t signo = LINUX_SIGCHLD;
+                int32_t si_code;
+                int32_t si_status;
+
+                if (WIFEXITED(status)) {
+                    si_code = CLD_EXITED;
+                    si_status = WEXITSTATUS(status);
+                } else if (WIFSIGNALED(status)) {
+                    si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
+                    si_status = WTERMSIG(status);
+                } else {
+                    si_code = CLD_EXITED;
+                    si_status = 0;
+                }
+
+                memcpy(si + SIGINFO_OFF_SIGNO, &signo, 4);
+                memcpy(si + SIGINFO_OFF_CODE, &si_code, 4);
+                memcpy(si + SIGINFO_OFF_PID, &gpid32, 4);
+                uint32_t uid = 0;
+                memcpy(si + SIGINFO_OFF_UID, &uid, 4);
+                memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
+
+                if (guest_write(g, infop_gva, si, SIGINFO_SIZE) < 0) {
+                    pthread_mutex_unlock(&pid_lock);
+                    return -LINUX_EFAULT;
+                }
+            }
+
+            /* Don't remove from table if WNOWAIT is set.
+             * Re-validate slot after re-locking (another thread may have
+             * reused it while we released the lock for waitpid). */
+            if (!(options & LINUX_WNOWAIT) &&
+                proc_table[i].active && proc_table[i].host_pid == ret)
+                proc_table[i].active = 0;
+
+            pthread_mutex_unlock(&pid_lock);
+            return 0; /* waitid returns 0 on success */
         }
 
-        /* Don't remove from table if WNOWAIT is set */
-        if (!(options & 0x01000000))
-            proc_table[i].active = 0;
+        if (!found_any) {
+            pthread_mutex_unlock(&pid_lock);
+            return -LINUX_ECHILD;
+        }
 
-        pthread_mutex_unlock(&pid_lock);
-        return 0; /* waitid returns 0 on success */
+        if (mac_options & WNOHANG) {
+            pthread_mutex_unlock(&pid_lock);
+            /* Per POSIX/Linux: zero siginfo when WNOHANG returns with
+             * no waitable children, so callers can distinguish via si_pid. */
+            if (infop_gva) {
+                uint8_t zeros[SIGINFO_SIZE] = {0};
+                guest_write(g, infop_gva, zeros, SIGINFO_SIZE);
+            }
+            return 0;
+        }
+
+        /* Blocking: wait on condvar (100ms timeout as safety net) */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100000000;
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
     }
-    pthread_mutex_unlock(&pid_lock);
-
-    return -LINUX_ECHILD;
 }
 
 /* ---------- vCPU run loop ---------- */
@@ -550,7 +943,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         if (is_main)
             alarm((unsigned)timeout_sec);
 
-        HV_CHECK(hv_vcpu_run(vcpu));
+        HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         /* Main: disarm timeout */
         if (is_main)
@@ -587,6 +980,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     (unsigned long long)elr,
                     (unsigned long long)sctlr_val);
 
+            crash_report(vcpu, g, CRASH_TIMEOUT, NULL);
             exit_code = 124;
             break;
         }
@@ -604,6 +998,36 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 switch (imm) {
                 case 5: {
                     /* HVC #5: Linux syscall forwarding */
+
+                    /* Track rosetta TLS JIT gate flag. Bit 0 of
+                     * [X18+0x1b8] must be set for the SIGTRAP handler
+                     * to perform JIT retranslation. Log when it changes. */
+                    if (verbose && g->is_rosetta) {
+                        static _Thread_local uint32_t prev_jit_gate = 0xDEADBEEF;
+                        static _Thread_local uint64_t prev_x18 = 0;
+                        uint64_t x18_val;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18_val);
+                        if (x18_val != prev_x18) {
+                            fprintf(stderr, "%s: X18 changed: 0x%llx → 0x%llx "
+                                    "(iter %d)\n", prefix,
+                                    (unsigned long long)prev_x18,
+                                    (unsigned long long)x18_val, iter);
+                            prev_x18 = x18_val;
+                            prev_jit_gate = 0xDEADBEEF; /* force re-check */
+                        }
+                        if (x18_val) {
+                            uint32_t jit_gate;
+                            if (guest_read(g, x18_val + 0x1b8, &jit_gate, 4) == 0 &&
+                                jit_gate != prev_jit_gate) {
+                                fprintf(stderr, "%s: JIT gate [0x%llx+0x1b8] "
+                                        "changed: 0x%x → 0x%x (iter %d)\n",
+                                        prefix, (unsigned long long)x18_val,
+                                        prev_jit_gate, jit_gate, iter);
+                                prev_jit_gate = jit_gate;
+                            }
+                        }
+                    }
+
                     int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
                     if (ret == 1)
                         running = 0;
@@ -613,14 +1037,20 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
                     signal_check_timer();
 
-                    /* Diagnostic: log signal state after exec to help
-                     * debug ELR_EL1 corruption from stale handlers. */
+                    /* Diagnostic: log signal state after exec/sigreturn
+                     * to help debug signal delivery issues. */
                     if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
                         const signal_state_t *ss = signal_get_state();
-                        fprintf(stderr, "%s: post-exec signal state: "
-                                "pending=0x%llx blocked=0x%llx\n", prefix,
+                        uint64_t tblocked = current_thread ?
+                            current_thread->blocked : 0xDEAD;
+                        fprintf(stderr, "%s: post-sigreturn state: "
+                                "pending=0x%llx global_blocked=0x%llx "
+                                "thread_blocked=0x%llx "
+                                "signal_pending=%d\n", prefix,
                                 (unsigned long long)ss->pending,
-                                (unsigned long long)ss->blocked);
+                                (unsigned long long)ss->blocked,
+                                (unsigned long long)tblocked,
+                                signal_pending());
                     }
 
                     /* Deliver pending signals after each syscall */
@@ -641,6 +1071,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         if (verify_elr == 0) {
                             fprintf(stderr, "%s: FATAL: ELR_EL1=0 after "
                                     "exec, register sync failed\n", prefix);
+                            crash_report(vcpu, g, CRASH_ELR_ZERO,
+                                         "ELR_EL1=0 after exec");
                             exit_code = 128;
                             running = 0;
                         }
@@ -722,10 +1154,79 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         (crn << 7)  | (crm << 3)  | op2);
 
                     uint64_t value = 0;
-                    hv_return_t ret = hv_vcpu_get_sys_reg(vcpu, reg, &value);
+
+                    /* ID register emulation: return VZ-sanitized values
+                     * matching a real VZ (Lima) VM BEFORE trying HVF.
+                     * HVF's hv_vcpu_get_sys_reg succeeds for ID registers
+                     * but returns raw hardware values — which include
+                     * features the hypervisor doesn't actually virtualize.
+                     * Rosetta's JIT uses these to select code generation
+                     * paths; exposing unsupported features causes wrong
+                     * JIT code and assertion failures.
+                     *
+                     * Values captured from a Lima VZ VM on Apple Silicon
+                     * via inline MRS from EL0 (kernel trap-and-emulate).
+                     * These are checked first, before the HVF call. */
+                    int have_vz_override = 0;
+
+                    /* ID_AA64MMFR0_EL1 (3,0,0,7,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 0) {
+                        value = 0x00000111ff000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64MMFR1_EL1 (3,0,0,7,1) — VZ returns 0.
+                     * Raw hardware (e.g., 0x11212000) exposes HPDS, PAN,
+                     * LO, XNX etc. that VZ doesn't virtualize. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 1) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64MMFR2_EL1 (3,0,0,7,2) — VZ returns 0. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 7 && op2 == 2) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64ISAR0_EL1 (3,0,0,6,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 6 && op2 == 0) {
+                        value = 0x0021100110212120ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64ISAR1_EL1 (3,0,0,6,1) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 6 && op2 == 1) {
+                        value = 0x0000101110211402ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64PFR0_EL1 (3,0,0,4,0) */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 4 && op2 == 0) {
+                        value = 0x0001000000110011ULL;
+                        have_vz_override = 1;
+                    }
+                    /* ID_AA64PFR1_EL1 (3,0,0,4,1) — VZ returns 0. */
+                    if (op0 == 3 && op1 == 0 && crn == 0 &&
+                        crm == 4 && op2 == 1) {
+                        value = 0x0000000000000000ULL;
+                        have_vz_override = 1;
+                    }
+
+                    if (have_vz_override) {
+                        if (verbose)
+                            fprintf(stderr, "%s: MRS trap: Op0=%u Op1=%u "
+                                    "CRn=%u CRm=%u Op2=%u → 0x%llx (VZ)\n",
+                                    prefix, op0, op1, crn, crm, op2,
+                                    (unsigned long long)value);
+                    }
+
+                    hv_return_t ret = have_vz_override ? HV_SUCCESS
+                        : hv_vcpu_get_sys_reg(vcpu, reg, &value);
                     if (ret != HV_SUCCESS) {
-                        /* HVF doesn't expose all system registers. Provide
-                         * host-side values for known registers that trap. */
+                        /* HVF doesn't expose this register. Provide a
+                         * host-side fallback for known registers. */
                         int have_fallback = 0;
 
                         /* CNTFRQ_EL0 (3,3,14,0,0): counter frequency.
@@ -737,6 +1238,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                              : "=r"(value));
                             have_fallback = 1;
                         }
+
+                        /* Non-ID register fallbacks for registers
+                         * that HVF doesn't expose. ID registers are
+                         * handled above (VZ overrides). */
 
                         if (verbose) {
                             if (have_fallback) {
@@ -759,6 +1264,16 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 prefix, op0, op1, crn, crm, op2,
                                 (unsigned long long)value);
                     }
+
+                    /* ID_AA64MMFR1_EL1 (3,0,0,7,1): pass through real
+                     * hardware value without modification. Real Lima VZ
+                     * VMs return the actual hardware value (no FEAT_AFP
+                     * on M1/M2), and rosetta runs successfully with
+                     * quality=1 JIT. Faking FEAT_AFP to unlock quality=2
+                     * combined with other hl-specific behaviors causes
+                     * "BasicBlock requested for unrecognized address"
+                     * assertion failures. */
+
                     hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
                     break;
                 }
@@ -791,6 +1306,12 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     uint64_t page_end = page_start + 4096;
                     int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
 
+                    /* Count W^X toggles for JIT debugging */
+                    if (type == 0)
+                        atomic_fetch_add(&wxcount_to_rx, 1);
+                    else
+                        atomic_fetch_add(&wxcount_to_rw, 1);
+
                     if (verbose)
                         fprintf(stderr, "%s: W^X toggle at 0x%llx → %s "
                                 "(page 0x%llx)\n",
@@ -800,16 +1321,33 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
 
                     /* Route to TTBR1 handler for kernel VA addresses
                      * (rosetta's JIT cache, internal allocations) or
-                     * TTBR0 handler for normal user VA addresses. */
+                     * TTBR0 handler for normal user VA addresses.
+                     *
+                     * Hold mmap_lock for TTBR0 modifications to prevent
+                     * races with concurrent mmap/mprotect/munmap from
+                     * other vCPU threads. TTBR1 (kbuf) has its own
+                     * page tables so no lock needed there. */
                     if (far >= KBUF_VA_BASE && g->kbuf_base) {
-                        guest_kbuf_split_block(g, far & ~(BLOCK_2MB - 1));
-                        guest_kbuf_update_perms(g, page_start, page_end,
-                                                new_perms);
+                        int sr = guest_kbuf_split_block(g,
+                                     far & ~(BLOCK_2MB - 1));
+                        int ur = guest_kbuf_update_perms(g, page_start,
+                                     page_end, new_perms);
+                        if (verbose && (sr < 0 || ur < 0))
+                            fprintf(stderr, "%s: W^X kbuf toggle FAILED "
+                                    "(split=%d update=%d)\n",
+                                    prefix, sr, ur);
                     } else {
+                        pthread_mutex_lock(&mmap_lock);
                         uint64_t block_start = far & ~(BLOCK_2MB - 1);
-                        guest_split_block(g, block_start);
-                        guest_update_perms(g, page_start, page_end,
-                                           new_perms);
+                        int sr = guest_split_block(g, block_start);
+                        int ur = guest_update_perms(g, page_start,
+                                     page_end, new_perms);
+                        pthread_mutex_unlock(&mmap_lock);
+                        if (verbose && (sr < 0 || ur < 0))
+                            fprintf(stderr, "%s: W^X user toggle FAILED "
+                                    "(split=%d update=%d) far=0x%llx\n",
+                                    prefix, sr, ur,
+                                    (unsigned long long)far);
                     }
                     /* TLB flush is done by the shim (tlbi_restore_eret) */
                     g->need_tlbi = 0;
@@ -817,15 +1355,16 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 }
 
                 case 10: {
-                    /* HVC #10: BRK from EL0 → deliver SIGTRAP.
+                    /* HVC #10: BRK from EL0 → deliver SIGTRAP or ptrace-stop.
                      *
                      * Rosetta's JIT uses BRK instructions as trampolines
-                     * and internal breakpoints. The guest registers a SIGTRAP
-                     * handler via rt_sigaction. We queue SIGTRAP and deliver
-                     * it synchronously (build signal frame, redirect to handler).
+                     * and internal breakpoints. If the thread is ptraced,
+                     * the BRK enters a ptrace-stop (the tracer reads/writes
+                     * registers then CONT's). Otherwise we queue SIGTRAP
+                     * and deliver it via the signal frame mechanism.
                      *
                      * The shim has already restored all GPRs to their EL0
-                     * values, so signal_deliver reads the correct state.
+                     * values, so signal_deliver / ptrace_stop read correct state.
                      *
                      * The Linux kernel sets si_code=TRAP_BRKPT, si_addr=BRK_PC,
                      * and fault_address=BRK_PC for BRK-triggered SIGTRAP.
@@ -834,22 +1373,150 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     uint64_t brk_pc;
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
 
-                    if (verbose)
-                        fprintf(stderr, "%s: BRK at 0x%llx → SIGTRAP\n",
-                                prefix, (unsigned long long)brk_pc);
+                    if (verbose) {
+                        fprintf(stderr, "%s: BRK at 0x%llx → %s\n",
+                                prefix, (unsigned long long)brk_pc,
+                                current_thread->ptraced ? "ptrace-stop" : "SIGTRAP");
+                    }
 
-                    signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc);
-                    signal_queue(5);  /* SIGTRAP = 5 on aarch64-linux */
+                    if (current_thread->ptraced) {
+                        /* Ptrace-stop: suspend vCPU, notify tracer.
+                         * thread_ptrace_stop blocks until tracer CONT's. */
+                        int cont_sig = thread_ptrace_stop(current_thread, 5);
+                        if (cont_sig > 0) {
+                            signal_queue(cont_sig);
+                            int sr = signal_deliver(vcpu, g, &exit_code);
+                            if (sr < 0) running = 0;
+                        }
+                    } else {
+                        /* Non-ptraced: deliver SIGTRAP via signal frame.
+                         * Read ESR_EL1 to include in sigcontext — rosetta's
+                         * handler reads the BRK immediate from the ESR to
+                         * determine the trap type (#3=AOT, #7=indirect, etc). */
+                        uint64_t brk_esr;
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
+                        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc, brk_esr);
+                        signal_queue(LINUX_SIGTRAP);
+                        if (verbose) {
+                            uint64_t thread_blocked = current_thread ?
+                                current_thread->blocked : 0xDEAD;
+                            fprintf(stderr, "%s: BRK: thread_blocked=0x%llx "
+                                    "pending=0x%llx\n",
+                                    prefix,
+                                    (unsigned long long)thread_blocked,
+                                    (unsigned long long)signal_get_state()->pending);
+                        }
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        if (verbose)
+                            fprintf(stderr, "%s: signal_deliver returned %d\n",
+                                    prefix, sig_ret);
+                        if (sig_ret < 0) {
+                            /* SIG_DFL for SIGTRAP: rosetta assertion crash.
+                             * Dump all memory state for post-mortem analysis
+                             * of the JIT/AOT translation failure. */
+                            dump_rosetta_state(vcpu, g);
+                            running = 0;
+                        }
+                    }
+                    break;
+                }
+
+                case 11: {
+                    /* HVC #11: EL0 fault → deliver SIGSEGV.
+                     *
+                     * The shim forwards translation faults, access flag
+                     * faults, and read permission faults from EL0 here.
+                     * A real Linux kernel delivers SIGSEGV for these.
+                     * This enables fault-driven lazy JIT translation:
+                     * rosetta registers a SIGSEGV handler and uses faults
+                     * to discover untranslated code addresses.
+                     *
+                     * Decode fault type from ESR_EL1:
+                     *   EC=0x20 (instruction abort) or EC=0x24 (data abort)
+                     *   xFSC[5:2]: 0x01=translation, 0x03=permission
+                     *   WnR (bit 6): 1=write, 0=read (data abort only)
+                     *
+                     * si_code mapping:
+                     *   Translation fault → SEGV_MAPERR (address not mapped)
+                     *   Permission fault  → SEGV_ACCERR (bad permissions) */
+                    uint64_t esr, far_addr;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
+
+                    uint32_t fault_ec = (uint32_t)((esr >> 26) & 0x3F);
+                    uint32_t fsc = (uint32_t)(esr & 0x3F);
+                    uint32_t fsc_type = (fsc >> 2) & 0xF;  /* xFSC[5:2] */
+
+                    /* Determine si_code based on fault type */
+                    int si_code;
+                    if (fsc_type == 0x03) {
+                        si_code = LINUX_SEGV_ACCERR;  /* Permission fault */
+                    } else {
+                        si_code = LINUX_SEGV_MAPERR;  /* Translation/other */
+                    }
+
+                    if (verbose) {
+                        const char *fault_type =
+                            (fault_ec == 0x20) ? "inst" : "data";
+                        const char *code_name =
+                            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
+                        fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
+                                "(ESR=0x%llx FSC=0x%x) → SIGSEGV/%s\n",
+                                prefix, fault_type,
+                                (unsigned long long)far_addr,
+                                (unsigned long long)esr,
+                                fsc, code_name);
+                    }
+
+                    signal_set_fault_info(si_code, far_addr, esr);
+                    signal_queue(LINUX_SIGSEGV);
                     int sig_ret = signal_deliver(vcpu, g, &exit_code);
                     if (verbose)
-                        fprintf(stderr, "%s: signal_deliver returned %d\n",
+                        fprintf(stderr, "%s: SIGSEGV deliver returned %d\n",
                                 prefix, sig_ret);
                     if (sig_ret < 0) {
-                        /* Default action: terminate */
+                        /* Default action: core dump (we just terminate) */
                         running = 0;
                     }
-                    /* sig_ret == 0: no handler (shouldn't happen, signal just queued)
-                     * sig_ret == 1: signal frame built, ERET resumes at handler */
+                    break;
+                }
+
+                case 12: {
+                    /* HVC #12: System instruction trap (EC=0x18 Direction=0).
+                     * The shim forwards trapped cache maintenance instructions
+                     * (DC CVAU, IC IVAU, etc.) here for logging/counting.
+                     * The shim has already executed IC IALLU and advanced PC. */
+                    atomic_fetch_add(&sysreg_write_count, 1);
+                    if (verbose) {
+                        uint64_t esr;
+                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+                        uint32_t iss = (uint32_t)(esr & 0x1FFFFFF);
+                        /* Decode ISS for system instruction:
+                         *   Op0[21:20] Op2[19:17] Op1[16:14]
+                         *   CRn[13:10] Rt[9:5] CRm[4:1] Dir[0] */
+                        uint32_t op0 = (iss >> 20) & 0x3;
+                        uint32_t op2 = (iss >> 17) & 0x7;
+                        uint32_t op1 = (iss >> 14) & 0x7;
+                        uint32_t crn = (iss >> 10) & 0xF;
+                        uint32_t crm = (iss >> 1)  & 0xF;
+                        uint32_t rt  = (iss >> 5)  & 0x1F;
+                        /* DC CVAU: Op0=1,Op1=3,CRn=7,CRm=11,Op2=1
+                         * IC IVAU: Op0=1,Op1=3,CRn=7,CRm=5,Op2=1 */
+                        const char *name = "unknown";
+                        if (op0==1 && op1==3 && crn==7 && crm==11 && op2==1)
+                            name = "DC CVAU";
+                        else if (op0==1 && op1==3 && crn==7 && crm==5 && op2==1)
+                            name = "IC IVAU";
+                        else if (op0==1 && op1==3 && crn==7 && crm==10 && op2==1)
+                            name = "DC CVAC";
+                        else if (op0==1 && op1==3 && crn==7 && crm==14 && op2==1)
+                            name = "DC CIVAC";
+                        fprintf(stderr, "%s: sysreg trap #%llu: %s "
+                                "(Op0=%u Op1=%u CRn=%u CRm=%u Op2=%u Rt=X%u)\n",
+                                prefix,
+                                (unsigned long long)atomic_load(&sysreg_write_count),
+                                name, op0, op1, crn, crm, op2, rt);
+                    }
                     break;
                 }
 
@@ -879,7 +1546,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             (unsigned long long)sp_el0);
                     for (int ri = 4; ri <= 30; ri++) {
                         /* Skip X5 (clobbered by shim for vec offset) */
-                        if (ri >= 0 && ri <= 3) continue;
                         if (ri == 5) continue;
                         uint64_t rv;
                         hv_vcpu_get_reg(vcpu,
@@ -912,16 +1578,29 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 (unsigned long long)(far & 0x0000FFFFFFFFFFFFULL));
                     }
 
+                    {
+                        char detail[128];
+                        snprintf(detail, sizeof(detail),
+                                 "vec=0x%03llx ESR=0x%llx FAR=0x%llx",
+                                 (unsigned long long)x5,
+                                 (unsigned long long)x0,
+                                 (unsigned long long)x1);
+                        crash_report(vcpu, g, CRASH_BAD_EXCEPTION, detail);
+                    }
                     exit_code = 128;
                     running = 0;
                     break;
                 }
 
-                default:
+                default: {
                     fprintf(stderr, "%s: unexpected HVC #%u\n", prefix, imm);
+                    char detail[64];
+                    snprintf(detail, sizeof(detail), "HVC #%u", imm);
+                    crash_report(vcpu, g, CRASH_UNEXPECTED_HVC, detail);
                     exit_code = 128;
                     running = 0;
                     break;
+                }
                 }
             } else if (ec == 0x01) {
                 /* WFI/WFE trapped — just continue */
@@ -935,6 +1614,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                         (unsigned long long)vexit->exception.syndrome,
                         (unsigned long long)vexit->exception.virtual_address,
                         (unsigned long long)vexit->exception.physical_address);
+                {
+                    char detail[128];
+                    snprintf(detail, sizeof(detail),
+                             "EC=0x%x syndrome=0x%llx VA=0x%llx",
+                             ec,
+                             (unsigned long long)vexit->exception.syndrome,
+                             (unsigned long long)vexit->exception.virtual_address);
+                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC, detail);
+                }
                 exit_code = 128;
                 running = 0;
             }
@@ -950,8 +1638,23 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
             }
             if (atomic_load(&exit_group_requested)) {
                 exit_code = atomic_load(&exit_group_code);
-                running = 0;
                 break;
+            }
+
+            /* PTRACE_INTERRUPT: if this thread is ptraced and not already
+             * stopped, enter ptrace-stop so the tracer can inspect state.
+             * This handles hv_vcpus_exit from sys_ptrace PTRACE_INTERRUPT. */
+            if (current_thread->ptraced && !current_thread->ptrace_stopped) {
+                if (verbose)
+                    fprintf(stderr, "%s: ptrace interrupt → ptrace-stop\n",
+                            prefix);
+                int cont_sig = thread_ptrace_stop(current_thread, 5);
+                if (cont_sig > 0) {
+                    signal_queue(cont_sig);
+                    int sr = signal_deliver(vcpu, g, &exit_code);
+                    if (sr < 0) running = 0;
+                }
+                continue;
             }
 
             /* Check guest ITIMER_REAL (may have fired during tight loop) */
@@ -976,6 +1679,12 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         } else {
             fprintf(stderr, "%s: unexpected exit reason 0x%x\n",
                     prefix, vexit->reason);
+            {
+                char detail[64];
+                snprintf(detail, sizeof(detail),
+                         "exit reason 0x%x", vexit->reason);
+                crash_report(vcpu, g, CRASH_UNEXPECTED_EXIT, detail);
+            }
             exit_code = 128;
             running = 0;
         }

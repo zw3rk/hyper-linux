@@ -19,6 +19,7 @@
 #include <Hypervisor/Hypervisor.h>
 #include <pthread.h>
 #include <stdint.h>
+#include "syscall.h"  /* linux_user_pt_regs_t */
 
 /* Maximum number of concurrent guest threads in one VM. */
 #define MAX_THREADS 64
@@ -37,6 +38,40 @@ typedef struct {
     uint64_t      blocked;         /* Signal mask for this thread */
     uint64_t      saved_blocked;   /* Original mask saved by sigsuspend */
     int           saved_blocked_valid;
+
+    /* Per-thread alternate signal stack (Linux sigaltstack is per-thread).
+     * Fields mirror linux_stack_t layout for easy copy. */
+    uint64_t      altstack_sp;     /* Alternate signal stack pointer */
+    int32_t       altstack_flags;  /* SS_DISABLE / 0 */
+    uint64_t      altstack_size;   /* Alternate signal stack size */
+    int           on_altstack;     /* Non-zero if currently delivering on altstack */
+
+    /* ---------- ptrace state ----------
+     * Used by Rosetta's two-process JIT: the tracer attaches via
+     * PTRACE_SEIZE, then uses BRK-triggered SIGTRAP + wait4 to
+     * discover untranslated code on-demand. The tracee snapshots
+     * its own vCPU registers before stopping and applies any
+     * tracer-written changes on resume — this avoids cross-thread
+     * HVF register access (which may not be supported). */
+    int             ptraced;          /* Non-zero if being traced */
+    int64_t         tracer_tid;       /* TID of tracing thread */
+    int             ptrace_stopped;   /* Non-zero when in ptrace-stop */
+    int             ptrace_stop_sig;  /* Signal that caused the stop */
+    pthread_cond_t  ptrace_cond;      /* Tracee stopped → tracer wakes */
+    pthread_cond_t  resume_cond;      /* Tracer CONT → tracee wakes */
+    int             ptrace_cont_sig;  /* Signal to inject on resume (0=none) */
+    linux_user_pt_regs_t ptrace_regs; /* Register snapshot for cross-thread access */
+    int             ptrace_regs_dirty;/* Tracer modified registers */
+
+    /* ---------- VM-clone child state ----------
+     * For clone(CLONE_VM) without CLONE_THREAD: shares guest memory but
+     * has a separate TID, is waitable via wait4, and can be ptraced.
+     * Used by Rosetta's two-process JIT architecture. */
+    int             is_vm_clone;      /* Waitable via wait4 */
+    int64_t         parent_tid;       /* Parent TID for wait4 matching */
+    int             exit_signal;      /* Signal on exit (usually SIGCHLD) */
+    int             vm_exited;        /* Child has exited */
+    int             vm_exit_status;   /* Wait-format exit status */
 } thread_entry_t;
 
 /* Current thread pointer — set once per host pthread at thread start.
@@ -62,6 +97,13 @@ void thread_deactivate(thread_entry_t *t);
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);
 
+/* Lock-free check: is there an active thread with this TID?
+ * Returns 1 if found, 0 if not. Safe to call without holding
+ * any lock (used from futex_lock_pi to avoid lock order inversion
+ * with bucket locks). May return a stale true if the thread is
+ * being deactivated concurrently — callers must tolerate this. */
+int thread_tid_alive(int64_t tid);
+
 /* Count currently active threads. */
 int thread_active_count(void);
 
@@ -75,10 +117,46 @@ uint64_t thread_alloc_sp_el1(void);
  * Holds the thread table lock during iteration. */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
 
+/* Count active VM-clone threads (is_vm_clone && !vm_exited).
+ * Used to detect when the last rosetta tracee exits. */
+int thread_count_active_vm_clones(void);
+
+/* Join worker threads (all active threads except the caller).
+ * Collects thread handles under the lock, then polls/joins OUTSIDE
+ * the lock so workers can call thread_deactivate() to set active=0.
+ * Threads still alive after ~50ms are detached (process is exiting). */
+void thread_join_workers(void);
+
+/* Destroy all active worker vCPUs. Called during guest_destroy to
+ * ensure no vCPUs remain active before hv_vm_destroy(). */
+void thread_destroy_all_vcpus(void);
+
 /* Interrupt all active vCPUs by calling hv_vcpus_exit().
  * Used for signal preemption: when a signal is queued while a vCPU
  * is running in a tight loop (no syscalls), this forces it to break
  * out of hv_vcpu_run so the signal can be delivered. */
 void thread_interrupt_all(void);
+
+/* ---------- Ptrace helpers ---------- */
+
+/* Initialize ptrace-related fields (conds, zero state). Called from
+ * thread_alloc() and thread_register_main(). */
+void thread_ptrace_init(thread_entry_t *t);
+
+/* Tracee: snapshot vCPU regs, enter ptrace-stop, block until resumed.
+ * Returns the signal to inject (from tracer's PTRACE_CONT), or 0. */
+int thread_ptrace_stop(thread_entry_t *t, int sig);
+
+/* Tracer: resume a stopped tracee with optional signal injection. */
+void thread_ptrace_cont(thread_entry_t *t, int sig);
+
+/* Tracer: wait for a ptraced or vm-clone child to stop or exit.
+ * Returns child TID on success, 0 on WNOHANG with none ready,
+ * or negative Linux errno. Writes wait-format status to *out_status. */
+int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+                            int options);
+
+/* Get the thread table mutex (needed for ptrace wait blocking). */
+pthread_mutex_t *thread_get_lock(void);
 
 #endif /* THREAD_H */

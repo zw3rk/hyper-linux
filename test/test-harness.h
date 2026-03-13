@@ -15,5 +15,9 @@
 #define TEST(name) printf("  %-30s ", name)
 #define PASS()     do { printf("OK\n"); passes++; } while(0)
 #define FAIL(msg)  do { printf("FAIL: %s (errno=%d)\n", msg, errno); fails++; } while(0)
+#define SUMMARY(name) do { \
+    printf("\n%s: %d passed, %d failed%s\n", \
+           name, passes, fails, fails == 0 ? " — PASS" : " — FAIL"); \
+} while(0)
 
 #endif /* TEST_HARNESS_H */

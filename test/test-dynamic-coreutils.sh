@@ -108,7 +108,7 @@ run_pipe() {
     local name
     name=$(printf "%-14s" "$tool")
 
-    if output=$(printf '%s' "$input" | "$HL" --sysroot "$SYSROOT" "$BIN/$tool" "$@" 2>&1 | head -5); then
+    if output=$(printf '%s' "$input" | timeout 10 "$HL" --sysroot "$SYSROOT" "$BIN/$tool" "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -167,12 +167,12 @@ printf "${BLUE}── Output / text utilities ──${RESET}\n"
 run_check  cat       "hello world"          "$TMPDIR/hello.txt"
 run_check  echo      "hello"                "hello"
 run_check  printf    "42"                   "%d" 42
-# yes writes infinitely — SIGPIPE from head terminates it
-run_pipe   yes       "^y$"                 ""
+# yes writes infinitely — use timeout to limit; rc=124 (timeout) is expected
+run_timeout 2  yes    124
 run_check  head      "line1"               "$TMPDIR/lines.txt"
 run_check  tail      "line5"               "$TMPDIR/lines.txt"
 run_check  wc        "5"                   "-l" "$TMPDIR/lines.txt"
-run_check  sort      "apple"               "$TMPDIR/unsorted.txt"
+run_check  sort      "^apple"              "$TMPDIR/unsorted.txt"  # verify apple is first (sorted order)
 run_check  uniq      "aaa"                 "$TMPDIR/dups.txt"
 run_check  cut       "b"                   "-d:" "-f2" "$TMPDIR/delim.txt"
 run_pipe   tr        "HELLO"               "hello" "a-z" "A-Z"
@@ -198,12 +198,12 @@ printf "\n${BLUE}── Encoding / hashing ──${RESET}\n"
 run_check  base32    "NBSWY"              "$TMPDIR/hello.txt"
 run_check  base64    "aGVsbG8gd29ybGQ"    "$TMPDIR/hello.txt"
 run_check  basenc    "aGVsbG8"            "--base64" "$TMPDIR/hello.txt"
-run_check  md5sum    "hello.txt"          "$TMPDIR/hello.txt"
-run_check  sha1sum   "hello.txt"          "$TMPDIR/hello.txt"
-run_check  sha224sum "hello.txt"          "$TMPDIR/hello.txt"
-run_check  sha256sum "hello.txt"          "$TMPDIR/hello.txt"
-run_check  sha384sum "hello.txt"          "$TMPDIR/hello.txt"
-run_check  sha512sum "hello.txt"          "$TMPDIR/hello.txt"
+run_check  md5sum    "6f5902ac237024bdd0c176cb93063dc4"          "$TMPDIR/hello.txt"
+run_check  sha1sum   "22596363b3de40b06f981fb85d82312e8c0ed511"  "$TMPDIR/hello.txt"
+run_check  sha224sum "95041dd60ab08c0bf5636d50be85fe9790300f39eb84602858a9b430"  "$TMPDIR/hello.txt"
+run_check  sha256sum "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"  "$TMPDIR/hello.txt"
+run_check  sha384sum "6b3b69ff0a404f28d75e98a066d3fc64fffd9940870cc68bece28545b9a75086"  "$TMPDIR/hello.txt"
+run_check  sha512sum "db3974a97f2407b7cae1ae637c0030687a11913274d578492558e39c16c017de"  "$TMPDIR/hello.txt"
 run_check  b2sum     "hello.txt"          "$TMPDIR/hello.txt"
 run_check  cksum     "hello.txt"          "$TMPDIR/hello.txt"
 run_check  sum       "[0-9]"              "$TMPDIR/hello.txt"
@@ -305,9 +305,9 @@ run        "["       0    "-f" "$TMPDIR/hello.txt" "]"
 
 # ── Expected failures / skips ────────────────────────────────────
 printf "\n${BLUE}── Expected failures / skips ──${RESET}\n"
-run_xfail  timeout   "fork+exec with dynamic linker not yet supported"
-run_skip   stdbuf    "requires LD_PRELOAD"
-run_skip   chroot    "needs root privileges"
+run_timeout 10 timeout 0 "5" "$BIN/true"
+run_skip   stdbuf    "requires LD_PRELOAD (N/A for hl)"
+run        chroot    0                     "/" "$BIN/true"
 
 # ── Summary ──────────────────────────────────────────────────────
 total=$((pass + fail + expected_fail + skip))

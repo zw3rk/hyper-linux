@@ -12,10 +12,13 @@
  * HVC protocol:
  *   #0  Normal exit       (x0 = exit code)
  *   #2  Bad exception     (x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector)
- *   #4  Set sysreg        (x0 = reg ID, x1 = value; host writes via HVF)
- *   #5  Syscall forward   (registers preserved from EL0 SVC #0)
- *   #7  MRS trap          (host reads sysreg from ESR ISS; returns value in x0)
- *   #9  W^X toggle        (x0 = FAR, x1 = type: 0=exec→RX, 1=write→RW)
+ *   #4  Set sysreg        (x0 = reg ID (0-8), x1 = value)
+ *   #5  Syscall forward   (X0-X5=args, X8=syscall nr; on return X8=TLBI flag)
+ *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
+ *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec→RX, 1=write→RW)
+ *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
+ *   #11 EL0 fault         (SIGSEGV delivery; GPRs in frame)
+ *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
  *
  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
  * NOT as a statement separator. Each instruction must be on its own line.
@@ -291,7 +294,51 @@ handle_sysreg_trap:
     str x0, [sp, x10]         /* frame[Rt] = value */
     b 3f
 
-4:  /* System instruction: IC IALLU from EL1 for cache coherency */
+4:  /* System instruction: trapped cache/data operations.
+     * DC ZVA (Data Cache Zero by VA) is trapped when HCR_EL2.TDZ=1
+     * despite SCTLR.DZE=1. DC ZVA zeroes a cache-line-sized block
+     * (64 bytes on Apple Silicon) — rosetta's JIT uses it as fast
+     * memset(0) for code buffers and metadata. Failure to emulate
+     * leaves stale data, corrupting rosetta's block tables.
+     *
+     * DC CVAU, IC IVAU, and other cache maintenance instructions trap
+     * here despite SCTLR.UCI=1 (HVF sets HCR_EL2.TPU=1). We execute
+     * IC IALLU as safety net for I-cache coherency after any of these.
+     *
+     * ISS encoding for system instructions:
+     *   Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
+     * DC ZVA: Op0=01 Op2=001 Op1=011 CRn=0111 CRm=0100 Dir=0
+     *   = (01 << 20) | (001 << 17) | (011 << 14) | (0111 << 10) | (0100 << 1) | 0
+     *   = 0x12DC08 + (Rt << 5) */
+
+    /* Check for DC ZVA: extract fields around Rt and compare.
+     * DC ZVA ISS: Op0[21:20]=01 Op2[19:17]=001 Op1[16:14]=011
+     *             CRn[13:10]=0111 Rt[9:5]=xxxxx CRm[4:1]=0100 Dir[0]=0
+     * We check ISS[21:10] = 0x4B7 and ISS[4:0] = 0x08. */
+    ubfx x10, x9, #10, #12        /* x10 = ISS[21:10] */
+    mov x11, #0x4B7                /* Expected upper field value */
+    cmp x10, x11
+    b.ne 5f
+    and x10, x9, #0x1F            /* x10 = ISS[4:0] */
+    cmp x10, #0x08                 /* CRm=0100,Dir=0 → 01000 = 0x08 */
+    b.ne 5f                        /* Not DC ZVA → skip to cache maint */
+
+    /* DC ZVA emulation: zero 64 bytes at aligned address from Xt.
+     * Extract Rt register number and load the VA from saved frame. */
+    ubfx x10, x9, #5, #5          /* Rt = ISS[9:5] */
+    cmp x10, #31
+    b.eq 6f                        /* XZR → address is 0, skip (nop) */
+    lsl x10, x10, #3              /* Byte offset in frame */
+    ldr x11, [sp, x10]            /* x11 = VA from Xt */
+    and x11, x11, #~63            /* Align down to 64-byte cache line */
+    /* Zero 64 bytes using four STP pairs */
+    stp xzr, xzr, [x11, #0]
+    stp xzr, xzr, [x11, #16]
+    stp xzr, xzr, [x11, #32]
+    stp xzr, xzr, [x11, #48]
+6:  /* Forward to host for counting, then I-cache maintenance */
+
+5:  hvc #12
     ic iallu
     dsb ish
     isb
@@ -305,20 +352,30 @@ handle_sysreg_trap:
 /* ================================================================
  * handle_inst_abort — EC=0x20: Instruction abort from lower EL
  *
- * For JIT translators (rosetta): code pages are initially mapped RW
- * (for code generation). When execution is attempted, the permission
- * fault triggers here. We ask the host to flip the page to RX via
- * HVC #9, flush the TLB, then retry the instruction fetch.
+ * Two cases:
+ * 1. Permission fault (IFSC[5:2]=0x03): W^X demand toggle for JIT.
+ *    Code pages are initially RW; execution triggers permission fault.
+ *    Ask host to flip to RX via HVC #9, flush TLB, retry.
  *
- * Only handles permission faults (IFSC[5:2]=0x03). Translation faults
- * and other types fall through to bad_exception.
+ * 2. Translation fault (IFSC[5:2]=0x01) or other non-permission fault:
+ *    Address not mapped in page tables. A real Linux kernel delivers
+ *    SIGSEGV (si_code=SEGV_MAPERR) to the process. Rosetta's SIGSEGV
+ *    handler uses this for fault-driven lazy JIT translation: when
+ *    JIT code branches to an untranslated address, the translation
+ *    fault triggers SIGSEGV, the handler translates the block, then
+ *    resumes execution. Forward to host via HVC #11 for signal delivery.
  * ================================================================ */
 handle_inst_abort:
     and x11, x9, #0x3C       /* IFSC[5:2] */
     cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
-    b.ne restore_and_bad
+    b.eq 1f
 
-    mrs x0, far_el1           /* Faulting address */
+    /* Non-permission fault (translation, access flag, etc.) from EL0.
+     * Restore all GPRs and forward to host for SIGSEGV delivery.
+     * x9 still holds ESR_EL1 for the host to decode fault type. */
+    b handle_el0_fault
+
+1:  mrs x0, far_el1           /* Faulting address */
     mov x1, #0                /* Type 0 = instruction fault → flip to RX */
     hvc #9
     b tlbi_restore_eret
@@ -326,23 +383,75 @@ handle_inst_abort:
 /* ================================================================
  * handle_data_abort — EC=0x24: Data abort from lower EL
  *
- * For JIT translators: when a code page has been flipped to RX,
- * subsequent writes (for new code generation) trigger permission
- * faults. We flip the page back to RW via HVC #9 and retry.
+ * Three cases:
+ * 1. Write permission fault (WnR=1, DFSC[5:2]=0x03): W^X toggle.
+ *    Code page is RX; JIT write triggers permission fault. Flip to RW.
  *
- * Only handles write permission faults (WnR=1, DFSC[5:2]=0x03).
+ * 2. Read/write translation fault (DFSC[5:2]=0x01): Address not mapped.
+ *    Deliver SIGSEGV (SEGV_MAPERR) via host. Rosetta and other programs
+ *    may use SIGSEGV handlers for lazy allocation or guard pages.
+ *
+ * 3. Read permission fault (WnR=0, DFSC[5:2]=0x03): Permission denied.
+ *    Deliver SIGSEGV (SEGV_ACCERR) via host.
  * ================================================================ */
 handle_data_abort:
-    tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
-    b.eq restore_and_bad
     and x11, x9, #0x3C       /* DFSC[5:2] */
-    cmp x11, #0x0C            /* Permission fault? */
-    b.ne restore_and_bad
+    cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
+    b.ne handle_el0_fault     /* Translation/other fault → SIGSEGV */
+
+    tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
+    b.eq handle_el0_fault     /* Read permission fault → SIGSEGV */
 
     mrs x0, far_el1           /* Faulting address */
     mov x1, #1                /* Type 1 = write fault → flip to RW */
     hvc #9
     b tlbi_restore_eret
+
+/* ================================================================
+ * handle_el0_fault — Deliver SIGSEGV for EL0 faults
+ *
+ * Translation faults (unmapped address), access flag faults, and
+ * read permission faults from EL0 code should deliver SIGSEGV to
+ * the guest process, not crash. This is how a real Linux kernel
+ * handles faults — the process gets a signal and can either handle
+ * it (e.g., rosetta's lazy JIT translation) or die from default
+ * disposition.
+ *
+ * Restore all GPRs from the stack frame (host needs the original
+ * EL0 state for the signal frame), then forward to host via HVC #11.
+ * The host decodes the fault type from ESR_EL1 and delivers SIGSEGV
+ * with the appropriate si_code (SEGV_MAPERR or SEGV_ACCERR).
+ * ================================================================ */
+handle_el0_fault:
+    /* Restore all GPRs from stack frame (host needs EL0 state) */
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #256
+
+    /* Forward to host for SIGSEGV delivery.
+     * Host reads ESR_EL1 (fault syndrome), FAR_EL1 (faulting address),
+     * and ELR_EL1 (PC at fault) to decode the fault and build the
+     * signal frame. */
+    hvc #11
+
+    /* Host has set up signal frame (if SIGSEGV handler registered) or
+     * flagged for termination (default SIGSEGV = core dump). ERET to
+     * new PC (handler address or unchanged if terminating). */
+    eret
 
 /* ================================================================
  * Shared exit paths for exception handlers
@@ -487,9 +596,28 @@ handle_svc_0:
      * clobbered across SVC, so callers never expect it preserved. */
     cbz x8, 1f
     tlbi vmalle1is
+1:
+    /* Flush I-cache for D/I coherence after every syscall return.
+     *
+     * ARM64 I-cache and D-cache are not coherent: stores update the
+     * D-cache but the I-cache may hold stale data at the same address.
+     * JIT translators (rosetta) write translated code via stores during
+     * signal handlers (SIGTRAP for BRK trampolines, SIGSEGV for lazy
+     * translation), then return via rt_sigreturn to execute the newly
+     * written code.  Without I-cache invalidation, the CPU fetches the
+     * stale BRK/fault instruction from the I-cache, causing infinite
+     * re-traps.
+     *
+     * IC IALLU invalidates all instruction cache entries for this VM.
+     * DSB ISH ensures the invalidation completes before ISB, which
+     * flushes the pipeline so the next fetch sees the new code.
+     * On Apple Silicon, IC IALLU is a single-cycle operation; the real
+     * cost is the ISB pipeline flush (~10 cycles).  This is negligible
+     * compared to the host-side syscall overhead (HVC exit + host
+     * dispatch + HVC return ≈ 1000+ cycles). */
+    ic iallu
     dsb ish
     isb
-1:
     /* Return to EL0 — X0 now holds the syscall return value,
      * X1-X30 retain their original EL0 values. */
     eret

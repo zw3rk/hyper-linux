@@ -1,0 +1,33 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-branch-clone,
+  -bugprone-signal-handler,
+  -bugprone-misplaced-widening-cast,
+  cert-*,
+  -cert-err33-c,
+  -cert-err34-c,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-sig30-c,
+  -cert-msc54-cpp,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-unix.BlockInCriticalSection,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-optin.taint.TaintedAlloc,
+  -clang-analyzer-unix.StdCLibraryFunctions,
+  -clang-analyzer-optin.portability.UnixAPI,
+  -clang-analyzer-security.ArrayBound,
+  misc-redundant-expression,
+  performance-*,
+  -performance-no-int-to-ptr,
+  readability-inconsistent-declaration-parameter-name
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*\.h$'
+CheckOptions:
+  - key: bugprone-unsafe-functions.ReportMoreUnsafeFunctions
+    value: false

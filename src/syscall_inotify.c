@@ -21,6 +21,7 @@
 #include "syscall_inotify.h"
 #include "syscall.h"
 #include "syscall_internal.h"
+#include "syscall_proc.h"   /* exit_group_requested */
 #include "guest.h"
 
 #include <stdio.h>
@@ -28,7 +29,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 
@@ -45,8 +48,12 @@
 #define IN_DELETE        0x00000200
 #define IN_DELETE_SELF   0x00000400
 #define IN_MOVE_SELF     0x00000800
-#define IN_NONBLOCK      0x00000800  /* Same as O_NONBLOCK on aarch64 */
+#define IN_NONBLOCK      0x00000800  /* Same value as IN_MOVE_SELF — intentional.
+                                      * IN_NONBLOCK is only used in inotify_init1()
+                                      * flags, never in add_watch() event masks.
+                                      * Equals O_NONBLOCK on aarch64-linux. */
 #define IN_CLOEXEC       0x00080000  /* Same as O_CLOEXEC on aarch64 */
+#define IN_MASK_ADD      0x20000000  /* OR new events into existing mask */
 
 /* Linux struct inotify_event layout:
  *   int32_t  wd;      watch descriptor
@@ -67,6 +74,8 @@ typedef struct {
     int      host_fd;   /* Open fd to the watched path (O_EVTONLY) */
     uint32_t mask;      /* Subscribed IN_* events */
     int      is_dir;    /* 1 if watching a directory */
+    dev_t    dev;       /* Device ID (for re-add lookup by inode) */
+    ino_t    ino;       /* Inode number (for re-add lookup by inode) */
 } inotify_watch_t;
 
 typedef struct {
@@ -118,6 +127,15 @@ static int watch_find(inotify_instance_t *inst, int wd) {
 static int watch_find_by_hostfd(inotify_instance_t *inst, int host_fd) {
     for (int i = 0; i < INOTIFY_WATCHES; i++)
         if (inst->watches[i].wd != 0 && inst->watches[i].host_fd == host_fd)
+            return i;
+    return -1;
+}
+
+/* Find a watch by device/inode (for re-add lookup). Returns index or -1. */
+static int watch_find_by_devino(inotify_instance_t *inst, dev_t dev, ino_t ino) {
+    for (int i = 0; i < INOTIFY_WATCHES; i++)
+        if (inst->watches[i].wd != 0 &&
+            inst->watches[i].dev == dev && inst->watches[i].ino == ino)
             return i;
     return -1;
 }
@@ -312,6 +330,7 @@ int64_t sys_inotify_init1(int flags) {
     int slot = inotify_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
+        fd_mark_closed(gfd);
         close(kq);
         close(pipefd[0]);
         close(pipefd[1]);
@@ -348,11 +367,16 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     int host_fd = open(path, O_EVTONLY);
     if (host_fd < 0) return linux_errno();
 
-    /* Check if it's a directory */
+    /* Identify the file by dev/ino for re-add detection */
     struct stat st;
-    int is_dir = 0;
-    if (fstat(host_fd, &st) == 0 && S_ISDIR(st.st_mode))
-        is_dir = 1;
+    if (fstat(host_fd, &st) < 0) {
+        close(host_fd);
+        return linux_errno();
+    }
+    int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+
+    /* Strip IN_MASK_ADD control flag before storing */
+    uint32_t event_mask = mask & ~(uint32_t)IN_MASK_ADD;
 
     pthread_mutex_lock(&inotify_lock);
 
@@ -365,7 +389,38 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
 
     inotify_instance_t *inst = &inotify_state[slot];
 
-    /* Find or allocate a watch slot */
+    /* Linux inotify re-add semantics: if the same file (by dev/ino) is
+     * already watched, update the existing watch's mask instead of
+     * creating a new one.  IN_MASK_ADD ORs new bits; without it, the
+     * mask is replaced entirely.  Returns the existing wd. */
+    int existing = watch_find_by_devino(inst, st.st_dev, st.st_ino);
+    if (existing >= 0) {
+        inotify_watch_t *w = &inst->watches[existing];
+        if (mask & IN_MASK_ADD)
+            w->mask |= event_mask;
+        else
+            w->mask = event_mask;
+        int wd = w->wd;
+        int existing_host_fd = w->host_fd;
+        int kq_fd = inst->kq_fd;
+        uint32_t snapshot_mask = w->mask;  /* Snapshot before unlock */
+        pthread_mutex_unlock(&inotify_lock);
+
+        /* Close the duplicate fd — we keep the original */
+        close(host_fd);
+
+        /* Update kevent filter with the new mask (use snapshot —
+         * w->mask may be modified by another thread after unlock) */
+        uint32_t notes = in_mask_to_notes(snapshot_mask);
+        struct kevent kev;
+        EV_SET(&kev, (uintptr_t)existing_host_fd, EVFILT_VNODE,
+               EV_ADD | EV_CLEAR, notes, 0, NULL);
+        kevent(kq_fd, &kev, 1, NULL, 0, NULL);
+
+        return wd;
+    }
+
+    /* New watch — allocate a slot */
     int widx = watch_slot_alloc(inst);
     if (widx < 0) {
         pthread_mutex_unlock(&inotify_lock);
@@ -373,12 +428,18 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
         return -LINUX_ENOSPC;
     }
 
-    int wd = inst->wd_counter++;
+    int wd = inst->wd_counter;
+    if (inst->wd_counter >= INT_MAX)
+        inst->wd_counter = 1;  /* wrap safely, skip 0 */
+    else
+        inst->wd_counter++;
     inotify_watch_t *w = &inst->watches[widx];
     w->wd = wd;
     w->host_fd = host_fd;
-    w->mask = mask;
+    w->mask = event_mask;
     w->is_dir = is_dir;
+    w->dev = st.st_dev;
+    w->ino = st.st_ino;
 
     /* Capture kq_fd while under lock */
     int kq_fd = inst->kq_fd;
@@ -388,7 +449,7 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
      * automatically after each kevent() retrieval, matching inotify's
      * continuous monitoring behavior.
      * kevent() is thread-safe; run outside the lock to avoid blocking. */
-    uint32_t notes = in_mask_to_notes(mask);
+    uint32_t notes = in_mask_to_notes(event_mask);
     struct kevent kev;
     EV_SET(&kev, (uintptr_t)host_fd, EVFILT_VNODE,
            EV_ADD | EV_CLEAR, notes, 0, NULL);
@@ -445,8 +506,9 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd) {
 
 int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
                       uint64_t count) {
+    pthread_mutex_lock(&inotify_lock);
     int slot = inotify_find(guest_fd);
-    if (slot < 0) return -LINUX_EBADF;
+    if (slot < 0) { pthread_mutex_unlock(&inotify_lock); return -LINUX_EBADF; }
 
     inotify_instance_t *inst = &inotify_state[slot];
 
@@ -455,23 +517,38 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
         int n = collect_events(inst);
 
         if (n == 0) {
-            if (inst->nonblock)
+            if (inst->nonblock) {
+                pthread_mutex_unlock(&inotify_lock);
                 return -LINUX_EAGAIN;
+            }
 
-            /* Blocking read: wait on the kqueue for events.
+            /* Blocking read: release lock, wait on the kqueue for events.
              * The self-pipe makes poll/select/epoll work, but for direct
              * read() calls we poll the kqueue with a moderate timeout and
              * retry to avoid hanging indefinitely (allows signal delivery). */
+            int kq_fd = inst->kq_fd;
+            pthread_mutex_unlock(&inotify_lock);
+
             struct kevent kev;
             struct timespec ts = {1, 0};  /* 1 second per attempt */
-            int nev;
+            int nev = 0;
             for (int attempt = 0; attempt < 300; attempt++) {
-                nev = kevent(inst->kq_fd, NULL, 0, &kev, 1, &ts);
+                nev = kevent(kq_fd, NULL, 0, &kev, 1, &ts);
                 if (nev > 0) break;
                 if (nev < 0 && errno != EINTR) return linux_errno();
+                if (atomic_load(&exit_group_requested))
+                    return -LINUX_EINTR;
             }
             if (nev <= 0)
                 return -LINUX_EAGAIN;
+
+            /* Re-acquire lock and re-validate slot */
+            pthread_mutex_lock(&inotify_lock);
+            if (inotify_state[slot].guest_fd != guest_fd) {
+                pthread_mutex_unlock(&inotify_lock);
+                return -LINUX_EBADF;
+            }
+            inst = &inotify_state[slot];
 
             /* Process the received event */
             int host_fd = (int)kev.ident;
@@ -488,32 +565,35 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
         }
     }
 
-    if (inst->event_used == 0)
+    if (inst->event_used == 0) {
+        pthread_mutex_unlock(&inotify_lock);
         return -LINUX_EAGAIN;
+    }
 
-    /* Copy buffered events to guest, up to count bytes.
-     * Only copy whole events (don't split an event across reads). */
+    /* Copy buffered events to a local buffer under lock, then write to
+     * guest after releasing the lock (guest_write doesn't need lock). */
     size_t copied = 0;
     size_t pos = 0;
 
+    /* First pass: compute how much we can copy */
     while (pos < inst->event_used && copied + INOTIFY_EVENT_HEADER_SIZE <= count) {
-        /* Read the name_len field to determine this event's total size */
         uint32_t name_len;
         memcpy(&name_len, inst->event_buf + pos + 12, 4);
         size_t event_size = INOTIFY_EVENT_HEADER_SIZE + name_len;
 
         if (copied + event_size > count)
-            break;  /* Would exceed buffer — stop here */
-
-        if (guest_write(g, buf_gva + copied, inst->event_buf + pos,
-                         event_size) < 0)
-            return -LINUX_EFAULT;
+            break;
 
         copied += event_size;
         pos += event_size;
     }
 
-    /* Compact remaining events in the buffer */
+    /* Copy event data to a local buffer (max 4KB) */
+    uint8_t local_buf[INOTIFY_BUFSIZE];
+    if (copied > 0)
+        memcpy(local_buf, inst->event_buf, copied);
+
+    /* Compact remaining events in the instance buffer */
     if (pos > 0 && pos < inst->event_used) {
         memmove(inst->event_buf, inst->event_buf + pos,
                 inst->event_used - pos);
@@ -525,6 +605,14 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
     /* Drain self-pipe if buffer is now empty */
     if (inst->event_used == 0)
         pipe_drain(inst);
+
+    pthread_mutex_unlock(&inotify_lock);
+
+    /* Write to guest memory outside the lock */
+    if (copied > 0) {
+        if (guest_write(g, buf_gva, local_buf, copied) < 0)
+            return -LINUX_EFAULT;
+    }
 
     return (int64_t)copied;
 }

@@ -7,7 +7,8 @@
  * 1. rt_sigaction installs a handler for SIGUSR1
  * 2. kill(getpid(), SIGUSR1) delivers the signal
  * 3. Handler fires with correct signum
- * 4. rt_sigreturn restores all callee-saved registers (X19-X28)
+ * 4. rt_sigreturn restores all callee-saved registers
+ *    (aarch64: X19-X28, x86_64: rbx/r12-r15/rbp)
  * 5. sigprocmask blocks/unblocks signals correctly
  */
 #include <signal.h>
@@ -25,45 +26,78 @@ static void sigusr1_handler(int sig) {
 }
 
 /* Test that callee-saved registers survive signal delivery.
- * The inline asm loads known values into X19-X28, sends SIGUSR1
- * (which triggers delivery + rt_sigreturn), then verifies the
- * registers are unchanged. */
+ * The inline asm loads known values into callee-saved registers,
+ * sends SIGUSR1 (which triggers delivery + rt_sigreturn), then
+ * verifies the registers are unchanged.
+ *
+ * aarch64 callee-saved: X19-X28 (10 registers)
+ * x86_64 callee-saved:  rbx, r12-r15 (5 registers; rbp excluded
+ *   because GCC needs it as frame pointer in functions with calls)
+ */
 static int test_callee_saved(void) {
-    register long x19 __asm__("x19") = 0xDEAD0019;
-    register long x20 __asm__("x20") = 0xDEAD0020;
-    register long x21 __asm__("x21") = 0xDEAD0021;
-    register long x22 __asm__("x22") = 0xDEAD0022;
-    register long x23 __asm__("x23") = 0xDEAD0023;
-    register long x24 __asm__("x24") = 0xDEAD0024;
-    register long x25 __asm__("x25") = 0xDEAD0025;
-    register long x26 __asm__("x26") = 0xDEAD0026;
-    register long x27 __asm__("x27") = 0xDEAD0027;
-    register long x28 __asm__("x28") = 0xDEAD0028;
+#if defined(__aarch64__)
+    register long r0 __asm__("x19") = 0xDEAD0019;
+    register long r1 __asm__("x20") = 0xDEAD0020;
+    register long r2 __asm__("x21") = 0xDEAD0021;
+    register long r3 __asm__("x22") = 0xDEAD0022;
+    register long r4 __asm__("x23") = 0xDEAD0023;
+    register long r5 __asm__("x24") = 0xDEAD0024;
+    register long r6 __asm__("x25") = 0xDEAD0025;
+    register long r7 __asm__("x26") = 0xDEAD0026;
+    register long r8 __asm__("x27") = 0xDEAD0027;
+    register long r9 __asm__("x28") = 0xDEAD0028;
+    #define NUM_CALLEE_SAVED 10
+    long expect[] = { 0xDEAD0019, 0xDEAD0020, 0xDEAD0021, 0xDEAD0022,
+                      0xDEAD0023, 0xDEAD0024, 0xDEAD0025, 0xDEAD0026,
+                      0xDEAD0027, 0xDEAD0028 };
+    const char *names[] = { "X19","X20","X21","X22","X23",
+                            "X24","X25","X26","X27","X28" };
 
-    /* Force compiler to assign the register variables */
-    __asm__ volatile("" : "+r"(x19), "+r"(x20), "+r"(x21), "+r"(x22),
-                          "+r"(x23), "+r"(x24), "+r"(x25), "+r"(x26),
-                          "+r"(x27), "+r"(x28));
+    __asm__ volatile("" : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
+                          "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7),
+                          "+r"(r8), "+r"(r9));
 
-    /* Send signal — handler will fire, rt_sigreturn restores regs */
     kill(getpid(), SIGUSR1);
 
-    /* Prevent compiler from reloading register values from stack */
-    __asm__ volatile("" : "+r"(x19), "+r"(x20), "+r"(x21), "+r"(x22),
-                          "+r"(x23), "+r"(x24), "+r"(x25), "+r"(x26),
-                          "+r"(x27), "+r"(x28));
+    __asm__ volatile("" : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
+                          "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7),
+                          "+r"(r8), "+r"(r9));
+
+    long actual[] = { r0, r1, r2, r3, r4, r5, r6, r7, r8, r9 };
+
+#elif defined(__x86_64__)
+    register long r0 __asm__("rbx") = 0xDEAD0001;
+    register long r1 __asm__("r12") = 0xDEAD0002;
+    register long r2 __asm__("r13") = 0xDEAD0003;
+    register long r3 __asm__("r14") = 0xDEAD0004;
+    register long r4 __asm__("r15") = 0xDEAD0005;
+    #define NUM_CALLEE_SAVED 5
+    long expect[] = { 0xDEAD0001, 0xDEAD0002, 0xDEAD0003,
+                      0xDEAD0004, 0xDEAD0005 };
+    const char *names[] = { "rbx","r12","r13","r14","r15" };
+
+    __asm__ volatile("" : "+r"(r0), "+r"(r1), "+r"(r2),
+                          "+r"(r3), "+r"(r4));
+
+    kill(getpid(), SIGUSR1);
+
+    __asm__ volatile("" : "+r"(r0), "+r"(r1), "+r"(r2),
+                          "+r"(r3), "+r"(r4));
+
+    long actual[] = { r0, r1, r2, r3, r4 };
+
+#else
+#error "Unsupported architecture"
+#endif
 
     int ok = 1;
-    if (x19 != 0xDEAD0019) { printf("  X19 corrupted: 0x%lx\n", x19); ok = 0; }
-    if (x20 != 0xDEAD0020) { printf("  X20 corrupted: 0x%lx\n", x20); ok = 0; }
-    if (x21 != 0xDEAD0021) { printf("  X21 corrupted: 0x%lx\n", x21); ok = 0; }
-    if (x22 != 0xDEAD0022) { printf("  X22 corrupted: 0x%lx\n", x22); ok = 0; }
-    if (x23 != 0xDEAD0023) { printf("  X23 corrupted: 0x%lx\n", x23); ok = 0; }
-    if (x24 != 0xDEAD0024) { printf("  X24 corrupted: 0x%lx\n", x24); ok = 0; }
-    if (x25 != 0xDEAD0025) { printf("  X25 corrupted: 0x%lx\n", x25); ok = 0; }
-    if (x26 != 0xDEAD0026) { printf("  X26 corrupted: 0x%lx\n", x26); ok = 0; }
-    if (x27 != 0xDEAD0027) { printf("  X27 corrupted: 0x%lx\n", x27); ok = 0; }
-    if (x28 != 0xDEAD0028) { printf("  X28 corrupted: 0x%lx\n", x28); ok = 0; }
+    for (int i = 0; i < NUM_CALLEE_SAVED; i++) {
+        if (actual[i] != expect[i]) {
+            printf("  %s corrupted: 0x%lx\n", names[i], actual[i]);
+            ok = 0;
+        }
+    }
+    #undef NUM_CALLEE_SAVED
     return ok;
 }
 
