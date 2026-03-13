@@ -19,7 +19,7 @@ Hello from Linux!
 - **Signal delivery** — `rt_sigaction`, `rt_sigreturn`, `SIGPIPE`, `ITIMER_REAL`
 - **Socket networking** — `AF_INET`/`AF_INET6` with sockaddr/sockopt translation
 - **inotify** — emulated via kqueue `EVFILT_VNODE`
-- **`/proc` emulation** — `/proc/self/exe`, `/proc/self/maps`, `/proc/self/fd/`
+- **`/proc` emulation** — `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/self/fd/`
 - **2MB + 4KB page tables** — automatic L3 splitting for mixed-permission regions (W^X)
 - **Demand-paged memory** — up to 1TB address space, only used pages consume RAM
 
@@ -51,10 +51,10 @@ Download the latest `.pkg` or `.zip` from [Releases](https://github.com/zw3rk/hy
 
 ```
 # macOS installer package
-sudo installer -pkg hl-v0.2.1.pkg -target /
+sudo installer -pkg hl-v0.2.2.pkg -target /
 
 # or unzip manually
-unzip hl-v0.2.1.zip -d /usr/local/bin/
+unzip hl-v0.2.2.zip -d /usr/local/bin/
 ```
 
 ### With Nix

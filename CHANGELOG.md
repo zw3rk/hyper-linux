@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2] - 2026-03-13
+
+### Added
+- Emulate `/proc/self/stat` and intercept `stat()` on `/proc` paths for programs that probe process state
+
+### Fixed
+- Coalesce adjacent anonymous memory regions to prevent region table overflow
+- Handle `IP_MTU_DISCOVER` setsockopt for P2P networking (e.g. libp2p)
+- Translate Linux dynamic CPU clock IDs (`CLOCK_THREAD_CPUTIME_ID` per-thread variants) for GHC RTS timer support
+- Fix `release.sh` to work when invoked from a Claude Code session
+
 ## [0.2.1] - 2026-03-13
 
 ### Fixed
