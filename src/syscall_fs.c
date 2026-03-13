@@ -118,8 +118,10 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     /* Intercept /proc and /dev paths before touching the host filesystem */
     int intercepted = proc_intercept_open(g, path, linux_flags, mode);
     if (intercepted >= 0) {
-        /* Got a host fd from the intercept — allocate a guest fd for it */
-        int guest_fd = fd_alloc(FD_REGULAR, intercepted);
+        /* Got a host fd from the intercept — allocate a guest fd for it.
+         * Use fd range >= 128 to avoid collisions with GHC GC finalizers
+         * that close stale low-numbered fds from previously-closed files. */
+        int guest_fd = fd_alloc_from(128, FD_REGULAR, intercepted);
         if (guest_fd < 0) {
             close(intercepted);
             return -LINUX_ENOMEM;
@@ -222,10 +224,17 @@ int64_t sys_close(int fd) {
 
 int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
     int host_fd = fd_to_host(fd);
-    if (host_fd < 0) return -LINUX_EBADF;
+    if (host_fd < 0) {
+        if (g->verbose) fprintf(stderr, "hl: fstat(%d): EBADF (no host fd)\n", fd);
+        return -LINUX_EBADF;
+    }
 
     struct stat mac_st;
-    if (fstat(host_fd, &mac_st) < 0) return linux_errno();
+    if (fstat(host_fd, &mac_st) < 0) {
+        if (g->verbose) fprintf(stderr, "hl: fstat(%d→%d): host fstat failed errno=%d\n",
+                                fd, host_fd, errno);
+        return linux_errno();
+    }
 
     linux_stat_t lin_st;
     translate_stat(&mac_st, &lin_st);
@@ -259,12 +268,18 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
         if (fstat(host_dirfd, &mac_st) < 0)
             return linux_errno();
     } else {
-        char sysroot_buf[LINUX_PATH_MAX];
-        const char *stat_path = resolve_sysroot_path(path, sysroot_buf,
-                                                      sizeof(sysroot_buf));
-        int mac_flags = translate_at_flags(flags);
-        if (fstatat(host_dirfd, stat_path, &mac_st, mac_flags) < 0)
-            return linux_errno();
+        /* Try /proc interception first (macOS has no /proc filesystem) */
+        int intercepted = proc_intercept_stat(path, &mac_st);
+        if (intercepted == -1) return linux_errno();
+        if (intercepted == -2) {
+            /* Not intercepted — fall through to real fstatat */
+            char sysroot_buf[LINUX_PATH_MAX];
+            const char *stat_path = resolve_sysroot_path(path, sysroot_buf,
+                                                          sizeof(sysroot_buf));
+            int mac_flags = translate_at_flags(flags);
+            if (fstatat(host_dirfd, stat_path, &mac_st, mac_flags) < 0)
+                return linux_errno();
+        }
     }
 
     linux_stat_t lin_st;

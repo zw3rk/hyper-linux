@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/param.h>
 
@@ -585,6 +586,93 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         return proc_synthetic_fd(buf, len);
     }
 
+    /* /proc/self/io -> synthetic I/O counters.
+     * GHC's cardano-node reads this for resource monitoring metrics.
+     * We return zeroed counters since we don't track per-guest I/O.
+     *
+     * Use a persistent file (written once) and open a fresh fd each time,
+     * so the guest gets a normal file that survives threaded fd races. */
+    if (strcmp(path, "/proc/self/io") == 0) {
+        static const char proc_io_path[] = "/tmp/hl-proc-self-io";
+        static int initialized = 0;
+        if (!initialized) {
+            int wfd = open(proc_io_path, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+            if (wfd >= 0) {
+                const char data[] =
+                    "rchar: 0\n"
+                    "wchar: 0\n"
+                    "syscr: 0\n"
+                    "syscw: 0\n"
+                    "read_bytes: 0\n"
+                    "write_bytes: 0\n"
+                    "cancelled_write_bytes: 0\n";
+                (void)write(wfd, data, sizeof(data) - 1);
+                close(wfd);
+                initialized = 1;
+            }
+        }
+        int fd = open(proc_io_path, O_RDONLY);
+        return fd >= 0 ? fd : -1;
+    }
+
+    /* /proc/self/stat -> single-line process stat (man 5 proc).
+     * GHC RTS reads this for resource monitoring (utime, stime, rss, vsize).
+     * Format: pid (comm) state ppid pgrp session tty_nr tpgid flags ...
+     * Fields we populate with meaningful values: pid, comm, state, ppid,
+     * utime(14), stime(15), vsize(23), rss(24). Rest are zero/defaults. */
+    if (strcmp(path, "/proc/self/stat") == 0) {
+        /* Get process CPU times for utime/stime fields */
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        /* Convert to clock ticks (Linux USER_HZ = 100) */
+        long utime_ticks = ru.ru_utime.tv_sec * 100 + ru.ru_utime.tv_usec / 10000;
+        long stime_ticks = ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
+
+        /* Compute vsize and rss from guest region tracking */
+        uint64_t vsize = 0, rss_pages = 0;
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) page_size = 4096;
+        for (int i = 0; i < g->nregions; i++) {
+            uint64_t sz = g->regions[i].end - g->regions[i].start;
+            vsize += sz;
+            if (g->regions[i].prot != 0)  /* non-PROT_NONE = resident */
+                rss_pages += sz / (uint64_t)page_size;
+        }
+
+        const char *exe = proc_get_elf_path();
+        const char *comm = "hl";
+        if (exe) {
+            const char *slash = strrchr(exe, '/');
+            comm = slash ? slash + 1 : exe;
+        }
+
+        char buf[1024];
+        /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
+         *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
+         *   cmajflt(13) utime(14) stime(15) cutime(16) cstime(17)
+         *   priority(18) nice(19) num_threads(20) itrealvalue(21)
+         *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total) */
+        int len = snprintf(buf, sizeof(buf),
+            "%lld (%.15s) R %lld %lld %lld 0 -1 0 "       /* 1-9 */
+            "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
+            "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
+            "18446744073709551615 0 0 0 0 0 0 "             /* 25-31 */
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",    /* 32-52 */
+            (long long)proc_get_pid(),
+            comm,
+            (long long)proc_get_ppid(),
+            (long long)proc_get_pid(),  /* pgrp = pid */
+            (long long)proc_get_pid(),  /* session = pid */
+            utime_ticks,
+            stime_ticks,
+            thread_active_count(),
+            (unsigned long long)vsize,
+            (unsigned long long)rss_pages);
+        if (len < 0) len = 0;
+        if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
+        return proc_synthetic_fd(buf, len);
+    }
+
     /* /proc/stat -> synthetic CPU statistics */
     if (strcmp(path, "/proc/stat") == 0) {
         struct timeval boottime;
@@ -635,6 +723,61 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
         if (len < 0) len = 0;
         if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
         return proc_synthetic_fd(buf, len);
+    }
+
+    return -2;  /* Not intercepted */
+}
+
+int proc_intercept_stat(const char *path, struct stat *st) {
+    /* Intercept stat for /proc paths that we emulate via proc_intercept_open.
+     * Without this, Haskell's getFileStatus on /proc/self/io fails before
+     * it ever tries to open the file (GHC checks existence via stat first).
+     *
+     * We return a minimal regular file stat. Exact values don't matter —
+     * the caller just needs stat to succeed so it knows the file exists. */
+    static const char *known_proc_files[] = {
+        "/proc/self/io",
+        "/proc/self/stat",
+        "/proc/self/status",
+        "/proc/self/cmdline",
+        "/proc/self/maps",
+        "/proc/self/exe",
+        "/proc/self/mountinfo",
+        "/proc/self/mounts",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/uptime",
+        "/proc/loadavg",
+        "/proc/version",
+        "/proc/filesystems",
+        "/proc/sys/vm/mmap_min_addr",
+        "/proc/sys/kernel/randomize_va_space",
+        NULL,
+    };
+
+    for (const char **p = known_proc_files; *p; p++) {
+        if (strcmp(path, *p) == 0) {
+            memset(st, 0, sizeof(*st));
+            st->st_mode = S_IFREG | 0444;  /* Regular file, read-only */
+            st->st_nlink = 1;
+            st->st_size = 256;  /* Approximate; exact value not critical */
+            st->st_blksize = 4096;
+            st->st_blocks = 1;
+            return 0;
+        }
+    }
+
+    /* /proc/self/fd/N — stat the underlying host fd */
+    if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+        char *endptr;
+        long n = strtol(path + 14, &endptr, 10);
+        if (endptr == path + 14 || *endptr != '\0' ||
+            n < 0 || n >= FD_TABLE_SIZE) { errno = EBADF; return -1; }
+        int host_fd = fd_to_host((int)n);
+        if (host_fd < 0) { errno = EBADF; return -1; }
+        if (fstat(host_fd, st) < 0) return -1;
+        return 0;
     }
 
     return -2;  /* Not intercepted */
