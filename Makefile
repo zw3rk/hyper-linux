@@ -21,8 +21,8 @@
        test-full \
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
        test-matrix-lima-aarch64 test-matrix-lima-x64 \
-       lint analyze format \
-       site site-serve help
+       lint analyze format shellcheck \
+       site site-serve release-interactive help
 
 # ── Configuration ──────────────────────────────────────────────────
 ENTITLEMENTS := entitlements.plist
@@ -705,7 +705,7 @@ test-rwx: $(BUILD_DIR)/test-rwx
 
 # ── Static analysis ────────────────────────────────────────────────
 
-.PHONY: lint analyze format
+.PHONY: lint analyze format shellcheck
 
 ## Run clang-tidy on all source files
 lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
@@ -721,6 +721,28 @@ analyze:
 format:
 	@printf "$(BLUE)▸ Checking$(RESET) code formatting\n"
 	clang-format --dry-run --Werror $(HL_SRCS) $(HL_HDRS)
+
+# Shell scripts to lint (all .sh files in dist/, site/, test/)
+SHELL_SCRIPTS := $(wildcard dist/*.sh site/*.sh test/*.sh)
+
+## Run shellcheck on all shell scripts (warnings + errors)
+shellcheck:
+	@printf "$(BLUE)▸ Running$(RESET) shellcheck on %d scripts\n" $(words $(SHELL_SCRIPTS))
+	@fail=0; \
+	for f in $(SHELL_SCRIPTS); do \
+		if shellcheck --severity=warning "$$f" 2>&1; then \
+			printf "  $(GREEN)✓$(RESET) %s\n" "$$f"; \
+		else \
+			printf "  $(RED)✗$(RESET) %s\n" "$$f"; \
+			fail=$$((fail + 1)); \
+		fi; \
+	done; \
+	if [ "$$fail" -eq 0 ]; then \
+		printf "$(GREEN)✓ All %d scripts pass shellcheck$(RESET)\n" $(words $(SHELL_SCRIPTS)); \
+	else \
+		printf "$(RED)✗ %d script(s) have shellcheck warnings$(RESET)\n" "$$fail"; \
+		exit 1; \
+	fi
 
 # ── Cleanup ────────────────────────────────────────────────────────
 
@@ -759,6 +781,10 @@ pkg: $(BUILD_DIR)/hl
 ## Full signed + notarized release (requires SIGN_IDENTITY, INSTALLER_SIGN_IDENTITY)
 release:
 	@sh dist/build-release.sh "$(VERSION)"
+
+## Interactive release: changelog, version bump, tag, push (uses claude)
+release-interactive:
+	@sh dist/release.sh
 
 # ── Website ────────────────────────────────────────────────────────
 

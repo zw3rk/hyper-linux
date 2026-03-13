@@ -1,0 +1,432 @@
+# CI — Verify all installation methods work correctly
+#
+# Each job validates an installation method end-to-end, including
+# actually running aarch64-linux and x86_64-linux ELF binaries.
+#
+# Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Install Tests
+
+on:
+  # Validate after every release
+  release:
+    types: [published]
+  # Validate on PRs touching install infrastructure
+  pull_request:
+    paths:
+      - 'site/install.sh'
+      - 'Formula/**'
+      - 'dist/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/install-test.yml'
+  # Manual trigger for debugging
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to test (e.g. v0.1.1)'
+        required: false
+        default: ''
+
+# Cancel stale runs — self-hosted runners are a shared resource
+concurrency:
+  group: install-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NIX_CONFIG: |
+    extra-experimental-features = nix-command flakes
+    extra-substituters = https://cache.zw3rk.com
+    extra-trusted-public-keys = loony-tools:pr9m4BkM/5/eSTZlkQyRt57Jz7OMBxNSUiMC4FkcNfk=
+
+jobs:
+  # ── Build test binaries (shared by all jobs) ───────────────────
+  # Provides aarch64 and x86_64 hello-world ELF binaries for smoke tests.
+  guest-bins:
+    name: "build guest binaries"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - name: Build aarch64 + x86_64 test binaries
+        run: |
+          # Build aarch64 test binary via nix (cross-compiled on x86_64-linux)
+          nix build .#packages.x86_64-linux.test-binaries
+          mkdir -p guest-bins/aarch64
+          cp result/bin/test-hello guest-bins/aarch64/
+          # Build x86_64 test binary (native on x86_64-linux)
+          nix build .#packages.x86_64-linux.x64-test-binaries
+          mkdir -p guest-bins/x86_64
+          cp result/bin/test-hello guest-bins/x86_64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+  # ── curl installer ────────────────────────────────────────────
+  install-curl:
+    name: "curl installer"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    needs: guest-bins
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Run install script
+        run: |
+          export INSTALL_DIR="$(mktemp -d)/bin"
+          export MAN_DIR="$(mktemp -d)/man/man1"
+          mkdir -p "$INSTALL_DIR" "$MAN_DIR"
+          sed "s|/usr/local/bin|$INSTALL_DIR|g; s|/usr/local/share/man/man1|$MAN_DIR|g" \
+            site/install.sh | sh
+          echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify binary
+        run: |
+          test -x "${INSTALL_DIR}/hl"
+          "${INSTALL_DIR}/hl" --version | grep -q "hl"
+          echo "✓ curl installer: --version works"
+
+      - name: Smoke test — aarch64-linux ELF
+        run: |
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$("${INSTALL_DIR}/hl" guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ curl installer: aarch64-linux ELF runs"
+
+      - name: Smoke test — x86_64-linux ELF
+        run: |
+          chmod +x guest-bins/x86_64/test-hello
+          OUTPUT=$("${INSTALL_DIR}/hl" guest-bins/x86_64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ curl installer: x86_64-linux ELF runs"
+
+  # ── Homebrew formula ──────────────────────────────────────────
+  install-brew:
+    name: "brew formula"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 20
+    needs: guest-bins
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Validate formula syntax
+        run: |
+          ruby -c Formula/hl.rb
+          echo "✓ Ruby syntax OK"
+
+      - name: Brew audit
+        run: |
+          TAP_DIR="$(brew --repository)/Library/Taps/zw3rk/homebrew-hyper-linux"
+          trap 'rm -rf "$TAP_DIR"' EXIT
+          rm -rf "$TAP_DIR"
+          mkdir -p "${TAP_DIR}/Formula"
+          cp Formula/hl.rb "${TAP_DIR}/Formula/hl.rb"
+          cd "$TAP_DIR"
+          git init -q && git add . && git commit -q -m "init"
+          brew audit --formula "${TAP_DIR}/Formula/hl.rb"
+          brew style --formula "${TAP_DIR}/Formula/hl.rb"
+          echo "✓ Brew audit + style pass"
+
+      - name: Brew install (release only)
+        if: github.event_name == 'release'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install zw3rk/hyper-linux/hl
+          echo "BREW_HL=$(brew --prefix)/bin/hl" >> "$GITHUB_ENV"
+
+      - name: Smoke test — brew installed binary (release only)
+        if: github.event_name == 'release'
+        run: |
+          "${BREW_HL}" --version | grep -q "hl"
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$("${BREW_HL}" guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ brew install: aarch64-linux ELF runs"
+
+      - name: Brew cleanup (release only)
+        if: always() && github.event_name == 'release'
+        run: brew uninstall hl 2>/dev/null || true
+
+  # ── Nix flake ─────────────────────────────────────────────────
+  install-nix:
+    name: "nix flake"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    needs: guest-bins
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Validate nix build
+        run: |
+          nix build
+          test -x result/bin/hl
+          result/bin/hl --version | grep -q "hl"
+          echo "✓ nix build works"
+
+      - name: Validate nix run
+        run: |
+          nix run . -- --version 2>&1 | grep -q "hl"
+          echo "✓ nix run works"
+
+      - name: Smoke test — aarch64-linux ELF
+        run: |
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$(result/bin/hl guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ nix: aarch64-linux ELF runs"
+
+      - name: Smoke test — x86_64-linux ELF
+        run: |
+          chmod +x guest-bins/x86_64/test-hello
+          OUTPUT=$(result/bin/hl guest-bins/x86_64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ nix: x86_64-linux ELF runs"
+
+  # ── .pkg installer ───────────────────────────────────────────
+  install-pkg:
+    name: "pkg installer"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    needs: guest-bins
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Build pkg
+        run: |
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+          export VERSION
+          nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make pkg VERSION="$VERSION"'
+
+      - name: Validate pkg contents
+        run: |
+          PKG=$(ls dist/out/*.pkg | head -1)
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/pkg"
+          test -d "$EXPAND_DIR/pkg"
+          echo "✓ pkg builds and expands correctly"
+          rm -rf "$EXPAND_DIR"
+
+      - name: Install pkg to temp prefix
+        run: |
+          PKG=$(ls dist/out/*.pkg | head -1)
+          INSTALL_PREFIX=$(mktemp -d)
+          # --expand-full extracts payload contents directly (handles pbzx)
+          pkgutil --expand-full "$PKG" "$INSTALL_PREFIX/expanded"
+          # Binary is at usr/local/bin/hl inside the package payload
+          PKG_HL=$(find "$INSTALL_PREFIX" -name hl -type f -path '*/bin/hl' | head -1)
+          test -x "$PKG_HL"
+          # Entitlements should be bundled in pkg payload
+          PKG_ENTITLEMENTS=$(find "$INSTALL_PREFIX" -name entitlements.plist | head -1)
+          test -f "$PKG_ENTITLEMENTS"
+          echo "✓ entitlements.plist found in pkg payload"
+          codesign --entitlements "$PKG_ENTITLEMENTS" -f -s - "$PKG_HL"
+          echo "PKG_HL=$PKG_HL" >> "$GITHUB_ENV"
+
+      - name: Verify binary
+        run: |
+          "${PKG_HL}" --version | grep -q "hl"
+          echo "✓ pkg: --version works"
+
+      - name: Smoke test — aarch64-linux ELF
+        run: |
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$("${PKG_HL}" guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ pkg: aarch64-linux ELF runs"
+
+      - name: Smoke test — x86_64-linux ELF
+        run: |
+          chmod +x guest-bins/x86_64/test-hello
+          OUTPUT=$("${PKG_HL}" guest-bins/x86_64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ pkg: x86_64-linux ELF runs"
+
+  # ── From-source build ────────────────────────────────────────
+  install-source:
+    name: "from source"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    needs: guest-bins
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Clean build from source
+        run: |
+          nix develop .#ci -c sh -c 'make clean && make hl'
+          test -x _build/hl
+          _build/hl --version | grep -q "hl"
+          echo "✓ from-source build works"
+
+      - name: Smoke test — aarch64-linux ELF
+        run: |
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$(_build/hl guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ source: aarch64-linux ELF runs"
+
+      - name: Smoke test — x86_64-linux ELF
+        run: |
+          chmod +x guest-bins/x86_64/test-hello
+          OUTPUT=$(_build/hl guest-bins/x86_64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ source: x86_64-linux ELF runs"
+
+  # ── dist zip ─────────────────────────────────────────────────
+  install-dist:
+    name: "dist zip"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    needs: guest-bins
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-bins
+          path: guest-bins/
+
+      - name: Build dist zip
+        run: |
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+          export VERSION
+          nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make dist VERSION="$VERSION"'
+
+      - name: Validate zip contents
+        run: |
+          ZIP=$(ls dist/out/*.zip | head -1)
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -qo "$ZIP" -d "$EXTRACT_DIR"
+          DIR=$(find "$EXTRACT_DIR" -maxdepth 1 -type d -name 'hl-*' | head -1)
+          test -f "$DIR/hl"
+          test -f "$DIR/hl.1"
+          test -f "$DIR/entitlements.plist"
+          test -f "$DIR/configure"
+          test -f "$DIR/Makefile"
+          test -f "$DIR/LICENSE"
+          test -f "$DIR/README"
+          test -x "$DIR/hl"
+          echo "DIST_HL=$DIR/hl" >> "$GITHUB_ENV"
+          echo "DIST_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "✓ dist zip contains all expected files"
+
+      - name: Codesign dist binary
+        run: |
+          codesign --entitlements "${DIST_DIR}/entitlements.plist" \
+            -f -s - "${DIST_HL}"
+
+      - name: Smoke test — aarch64-linux ELF
+        run: |
+          chmod +x guest-bins/aarch64/test-hello
+          OUTPUT=$("${DIST_HL}" guest-bins/aarch64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ dist: aarch64-linux ELF runs"
+
+      - name: Smoke test — x86_64-linux ELF
+        run: |
+          chmod +x guest-bins/x86_64/test-hello
+          OUTPUT=$("${DIST_HL}" guest-bins/x86_64/test-hello)
+          echo "$OUTPUT" | grep -qi "hello"
+          echo "✓ dist: x86_64-linux ELF runs"
+
+  # ── Install test summary ──────────────────────────────────────
+  summary:
+    name: "install test summary"
+    needs: [install-curl, install-brew, install-nix, install-pkg, install-source, install-dist]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report results
+        env:
+          CURL_RESULT:   ${{ needs.install-curl.result }}
+          BREW_RESULT:   ${{ needs.install-brew.result }}
+          NIX_RESULT:    ${{ needs.install-nix.result }}
+          PKG_RESULT:    ${{ needs.install-pkg.result }}
+          SOURCE_RESULT: ${{ needs.install-source.result }}
+          DIST_RESULT:   ${{ needs.install-dist.result }}
+        run: |
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❌" ;;
+            esac
+          }
+          {
+            echo "## Install Test Results"
+            echo ""
+            echo "| Installer | Status |"
+            echo "|-----------|--------|"
+            echo "| curl installer (release only) | $(icon "$CURL_RESULT") |"
+            echo "| brew formula | $(icon "$BREW_RESULT") |"
+            echo "| nix flake | $(icon "$NIX_RESULT") |"
+            echo "| pkg installer | $(icon "$PKG_RESULT") |"
+            echo "| from source | $(icon "$SOURCE_RESULT") |"
+            echo "| dist zip | $(icon "$DIST_RESULT") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail summary if any required job failed.
+          # install-curl is release-only; skipped is acceptable.
+          FAILED=0
+          for result in "$BREW_RESULT" "$NIX_RESULT" "$PKG_RESULT" \
+                        "$SOURCE_RESULT" "$DIST_RESULT"; do
+            if [ "$result" = "failure" ]; then FAILED=1; fi
+          done
+          if [ "$CURL_RESULT" = "failure" ]; then FAILED=1; fi
+          if [ "$FAILED" = "1" ]; then
+            echo "::error::One or more install tests failed — see summary above"
+            exit 1
+          fi

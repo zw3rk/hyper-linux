@@ -25,7 +25,9 @@ RESET  := \033[0m
 
 .DEFAULT_GOAL := help
 
-## Install hl binary and man page
+SHAREDIR ?= $(PREFIX)/share/hl
+
+## Install hl binary, man page, and entitlements
 install:
 	@printf "$(GREEN)▸ Installing$(RESET) hl → $(BINDIR)/hl\n"
 	install -d "$(BINDIR)"
@@ -33,14 +35,23 @@ install:
 	@printf "$(GREEN)▸ Installing$(RESET) hl.1 → $(MANDIR)/man1/hl.1\n"
 	install -d "$(MANDIR)/man1"
 	install -m 644 hl.1 "$(MANDIR)/man1/hl.1"
+	@printf "$(GREEN)▸ Installing$(RESET) entitlements.plist → $(SHAREDIR)/entitlements.plist\n"
+	install -d "$(SHAREDIR)"
+	install -m 644 entitlements.plist "$(SHAREDIR)/entitlements.plist"
+	@printf "$(GREEN)▸ Codesigning$(RESET) $(BINDIR)/hl\n"
+	codesign --entitlements "$(SHAREDIR)/entitlements.plist" -f -s - "$(BINDIR)/hl" 2>/dev/null || \
+		printf "$(YELLOW)  codesign skipped$(RESET) — re-sign manually if needed\n"
 	@printf "$(GREEN)✓ Installed$(RESET) to $(PREFIX)\n"
 
-## Remove hl binary and man page
+## Remove hl binary, man page, and entitlements
 uninstall:
 	@printf "$(YELLOW)▸ Removing$(RESET) $(BINDIR)/hl\n"
 	rm -f "$(BINDIR)/hl"
 	@printf "$(YELLOW)▸ Removing$(RESET) $(MANDIR)/man1/hl.1\n"
 	rm -f "$(MANDIR)/man1/hl.1"
+	@printf "$(YELLOW)▸ Removing$(RESET) $(SHAREDIR)/entitlements.plist\n"
+	rm -f "$(SHAREDIR)/entitlements.plist"
+	rmdir "$(SHAREDIR)" 2>/dev/null || true
 	@printf "$(YELLOW)✓ Uninstalled$(RESET) from $(PREFIX)\n"
 
 ## Display this help message

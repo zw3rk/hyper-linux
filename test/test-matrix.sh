@@ -462,7 +462,7 @@ run_haskell_bins_tests() {
     local runner="$1"
     local bindir="$2"
 
-    # shellcheck tests (quick, reliable)
+    # ShellCheck tests (quick, reliable)
     if [ -f "$bindir/shellcheck" ]; then
         test_check "$runner" "shellcheck --version" "[Ss]hell[Cc]heck" "$bindir/shellcheck" --version
         test_pipe  "$runner" "shellcheck: bad script" "SC2086" \

@@ -289,7 +289,7 @@ cat > "$TMPDIR/good.sh" << 'GOOD'
 name="world"
 echo "Hello, ${name}!"
 GOOD
-# shellcheck prints nothing for a clean script (exit 0, no warnings).
+# ShellCheck prints nothing for a clean script (exit 0, no warnings).
 # Pattern ".*" matches empty output — the real assertion is the exit code.
 run_check  "shellcheck: good script"  "$SHELLCHECK_BIN" ".*" \
            -s bash "$TMPDIR/good.sh"

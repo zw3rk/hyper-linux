@@ -69,6 +69,9 @@ jobs:
       - name: Run clang-tidy
         run: nix develop .#ci -c make lint
 
+      - name: Run shellcheck
+        run: nix develop .#ci -c make shellcheck
+
   # ── Guest binaries (x86_64-linux, GitHub-hosted) ────────────────
   guest-bins:
     runs-on: ubuntu-latest
@@ -198,10 +201,12 @@ jobs:
       # ── Native HVF validation ──────────────────────────────────
       - name: "[native] Multi-vCPU HVF validation"
         id: native-multi-vcpu
+        if: always()
         run: nix develop .#ci -c make test-multi-vcpu
 
       - name: "[native] W^X page table validation"
         id: native-rwx
+        if: always()
         run: nix develop .#ci -c make test-rwx
 
       # ── aarch64-linux tests ─────────────────────────────────────
@@ -421,7 +426,7 @@ jobs:
 
   # ── Distribution artifacts (master + tags) ──────────────────────
   dist:
-    needs: build
+    needs: [build, test, lint]
     if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
     runs-on: [self-hosted, macOS, ARM64]
     steps:
@@ -434,7 +439,21 @@ jobs:
         continue-on-error: true
 
       - name: Build distribution
-        run: nix develop .#ci -c sh -c 'make hl && make dist && make pkg'
+        run: |
+          # Extract VERSION from git tag (e.g., refs/tags/v0.2.0 → v0.2.0)
+          # Falls back to git describe for master builds
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(git describe --tags --always --dirty)"
+          fi
+          export VERSION
+          nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make dist VERSION="$VERSION" && make pkg VERSION="$VERSION"'
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist/out
+          shasum -a 256 *.zip *.pkg 2>/dev/null > SHA256SUMS || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -443,26 +462,49 @@ jobs:
           path: |
             dist/out/*.zip
             dist/out/*.pkg
+            dist/out/SHA256SUMS
 
   # ── GitHub Release (tags only) ──────────────────────────────────
-  # Downloads the dist artifact built above instead of rebuilding.
+  # If release.sh already created the release with signed artifacts,
+  # skip upload to preserve Homebrew SHA256 integrity.  Only create
+  # a release (with CI-built artifacts) for manual tag pushes.
+  # dist already depends on [build, test], so needs: dist is sufficient.
   release:
-    needs: [dist, test]
+    needs: dist
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Check for release existence (not just assets) — if release.sh
+          # already created it (even with partial uploads), defer to the user.
+          if gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+               --jq '.id' >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download dist artifact
+        if: steps.check.outputs.release_exists != 'true'
         uses: actions/download-artifact@v4
         with:
           name: hl-dist
           path: dist-out
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (manual tag only)
+        if: steps.check.outputs.release_exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist-out/**/*.zip
             dist-out/**/*.pkg
+            dist-out/**/SHA256SUMS
           generate_release_notes: true
+          fail_on_unmatched_files: true

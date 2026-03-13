@@ -73,7 +73,7 @@
 
       packages.${darwinSystem}.default = darwinPkgs.stdenv.mkDerivation {
         pname = "hl";
-        version = "0.1.0";
+        version = "0.1.1";
         src = ./.;
 
         nativeBuildInputs = [
@@ -89,7 +89,7 @@
         GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
 
         buildPhase = ''
-          make hl VERSION="0.1.0+${self.shortRev or "unknown"}"
+          make hl VERSION="$version+${self.shortRev or "unknown"}"
         '';
 
         installPhase = ''
@@ -100,6 +100,7 @@
 
         meta = with darwinPkgs.lib; {
           description = "Run aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon";
+          mainProgram = "hl";
           platforms = [ "aarch64-darwin" ];
           license = licenses.asl20;
         };
@@ -124,8 +125,9 @@
 
           buildInputs = [
             darwinPkgs.gnumake
-            darwinPkgs.binutils  # objcopy for shim.bin
+            darwinPkgs.binutils   # objcopy for shim.bin
             darwinPkgs.lldb
+            darwinPkgs.shellcheck  # shell script linting
           ] ++ darwinBuildInputs;
 
           # GNU objcopy for Mach-O → raw binary conversion (shim.S).
@@ -234,7 +236,8 @@
           buildInputs = [
             darwinPkgs.gnumake
             darwinPkgs.binutils
-            darwinPkgs.xxd  # needed by shim_blob.h generation
+            darwinPkgs.xxd        # needed by shim_blob.h generation
+            darwinPkgs.shellcheck  # shell script linting
           ] ++ darwinBuildInputs;
           GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
         };

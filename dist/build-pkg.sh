@@ -19,11 +19,15 @@ if [ $# -lt 3 ]; then
 fi
 
 VERSION="$1"
+# Strip leading 'v' from version for pkgbuild (expects bare semver)
+PKG_VERSION="${VERSION#v}"
 BINARY="$2"
 MANPAGE="$3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUT_DIR="${SCRIPT_DIR}/out"
 STAGING="${SCRIPT_DIR}/staging/pkg"
+SCRIPTS="${SCRIPT_DIR}/staging/scripts"
 PKG_ID="com.zw3rk.hl"
 
 # Verify inputs exist
@@ -35,9 +39,11 @@ for f in "$BINARY" "$MANPAGE"; do
 done
 
 # Clean and create staging tree
-rm -rf "$STAGING"
+rm -rf "$STAGING" "$SCRIPTS"
 mkdir -p "${STAGING}/usr/local/bin"
 mkdir -p "${STAGING}/usr/local/share/man/man1"
+mkdir -p "${STAGING}/usr/local/share/hl"
+mkdir -p "$SCRIPTS"
 mkdir -p "$OUT_DIR"
 
 # Install files into payload
@@ -45,14 +51,28 @@ cp "$BINARY" "${STAGING}/usr/local/bin/hl"
 chmod 755 "${STAGING}/usr/local/bin/hl"
 cp "$MANPAGE" "${STAGING}/usr/local/share/man/man1/hl.1"
 chmod 644 "${STAGING}/usr/local/share/man/man1/hl.1"
+# Include entitlements.plist for manual re-signing
+cp "${PROJECT_DIR}/entitlements.plist" "${STAGING}/usr/local/share/hl/entitlements.plist"
+chmod 644 "${STAGING}/usr/local/share/hl/entitlements.plist"
+
+# Post-install script: codesign binary with Hypervisor.framework entitlement
+cat > "${SCRIPTS}/postinstall" << 'POSTINSTALL'
+#!/bin/sh
+# Ad-hoc codesign with Hypervisor.framework entitlement.
+# Must run on the end-user machine (ad-hoc signatures are local).
+codesign --entitlements /usr/local/share/hl/entitlements.plist \
+         -f -s - /usr/local/bin/hl 2>/dev/null || true
+POSTINSTALL
+chmod 755 "${SCRIPTS}/postinstall"
 
 # Build unsigned package
 UNSIGNED="${SCRIPT_DIR}/staging/hl-${VERSION}-unsigned.pkg"
 echo "Building unsigned .pkg ..."
 pkgbuild \
     --root "$STAGING" \
+    --scripts "$SCRIPTS" \
     --identifier "$PKG_ID" \
-    --version "$VERSION" \
+    --version "$PKG_VERSION" \
     --install-location / \
     "$UNSIGNED"
 
@@ -73,4 +93,4 @@ fi
 echo "Package: ${OUTPUT}"
 
 # Clean up staging
-rm -rf "$STAGING"
+rm -rf "$STAGING" "$SCRIPTS"
