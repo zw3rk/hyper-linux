@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-03-13
+
+### Fixed
+- Preserve Hypervisor.framework entitlement in nix build (`nix run` no longer killed)
+- Portable in-place sed in release script (GNU sed vs macOS sed compatibility)
+
 ## [0.2.0] - 2026-03-13
 
 ### Added

@@ -8,7 +8,7 @@
 
 set -e
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 REPO="zw3rk/hyper-linux"
 INSTALL_DIR="/usr/local/bin"
 MAN_DIR="/usr/local/share/man/man1"
