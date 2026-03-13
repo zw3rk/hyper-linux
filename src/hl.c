@@ -21,6 +21,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/sysctl.h>
 #include <libkern/OSCacheControl.h>
 #include <mach-o/dyld.h>
 
@@ -44,7 +46,7 @@
 
 /* ---------- Main ---------- */
 
-int main(int argc, const char **argv) {
+int main(int argc, char **argv) {
     int verbose = 0;
     int timeout_sec = 10;  /* Default: 10 second timeout */
     int fork_child_fd = -1; /* IPC fd for --fork-child mode */
@@ -132,9 +134,14 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    const char *elf_path = argv[arg_start];
+    /* Copy elf_path and guest_argv to heap — the original argv string data
+     * lives in a contiguous stack region that we clobber below for the
+     * process title (PostgreSQL/nginx argv-clobber technique). */
+    const char *elf_path = strdup(argv[arg_start]);
     int guest_argc = argc - arg_start;
-    const char **guest_argv = &argv[arg_start];
+    const char **guest_argv = malloc(guest_argc * sizeof(char *));
+    for (int i = 0; i < guest_argc; i++)
+        guest_argv[i] = strdup(argv[arg_start + i]);
 
     /* ---- Step 1: Load and parse ELF ---- */
     elf_info_t elf_info;
@@ -173,6 +180,79 @@ int main(int argc, const char **argv) {
     }
     g.is_rosetta = need_rosetta;
     g.verbose = verbose;
+
+    /* Set process title so ps/Activity Monitor show the guest binary name
+     * instead of "hl" (e.g. "grep (x86_64-linux)").
+     *
+     * Three mechanisms (following PostgreSQL/nginx convention):
+     * - argv[0] clobber: macOS ps reads live from KERN_PROCARGS2, so
+     *   overwriting the contiguous argv+environ area on the stack changes
+     *   what `ps -o comm` and `ps -o args` display.
+     * - kern.procname sysctl: writes the kernel p_name field (pbi_name),
+     *   which Activity Monitor reads via proc_pidinfo(PROC_PIDTBSDINFO).
+     * - setprogname: updates libc getprogname() and crash reports.
+     * - pthread_setname_np: sets main thread name (Instruments, lldb). */
+    {
+        const char *slash = strrchr(elf_path, '/');
+        const char *bin = slash ? slash + 1 : elf_path;
+        const char *arch = need_rosetta ? "x86_64" : "aarch64";
+        char title[256];
+        snprintf(title, sizeof(title), "%s (%s-linux)", bin, arch);
+
+        /* Write kernel p_name (up to 2*MAXCOMLEN=32 chars) so Activity
+         * Monitor picks up the guest binary name. setprogname() only
+         * sets the libc-internal __progname and does NOT touch the kernel. */
+        sysctlbyname("kern.procname", NULL, NULL, title, strlen(title));
+        setprogname(title);
+
+        char thread_name[64];
+        snprintf(thread_name, sizeof(thread_name), "%s (%s-linux)",
+                 bin, arch);
+        pthread_setname_np(thread_name);
+
+        /* Clobber argv[0] with the new title. On macOS, argv and environ
+         * strings are contiguous on the stack. We compute the total available
+         * buffer from argv[0] through the end of the last environ string,
+         * copy environ to the heap first (so getenv() keeps working), then
+         * overwrite the entire region with our title. */
+        extern char **environ;
+        if (argv[0] != NULL && environ != NULL) {
+            /* Find the end of the contiguous argv+environ area */
+            char *argv_end = argv[0];
+            for (int i = 0; i < argc; i++) {
+                if (argv[i] != NULL) {
+                    char *p = argv[i] + strlen(argv[i]) + 1;
+                    if (p > argv_end) argv_end = p;
+                }
+            }
+            for (int i = 0; environ[i] != NULL; i++) {
+                char *p = environ[i] + strlen(environ[i]) + 1;
+                if (p > argv_end) argv_end = p;
+            }
+            size_t avail = (size_t)(argv_end - argv[0]);
+
+            /* Copy environ to heap so getenv() survives the clobber */
+            int env_count = 0;
+            while (environ[env_count]) env_count++;
+            char **new_environ = malloc((env_count + 1) * sizeof(char *));
+            if (new_environ) {
+                for (int i = 0; i < env_count; i++)
+                    new_environ[i] = strdup(environ[i]);
+                new_environ[env_count] = NULL;
+                environ = new_environ;
+            }
+
+            /* Write title into the original argv area */
+            size_t title_len = strlen(title);
+            if (title_len < avail) {
+                memcpy(argv[0], title, title_len);
+                memset(argv[0] + title_len, '\0', avail - title_len);
+            }
+            /* Null out remaining argv pointers so ps doesn't show stale args */
+            for (int i = 1; i < argc; i++)
+                argv[i] = NULL;
+        }
+    }
 
     if (verbose) {
         fprintf(stderr, "hl: IPA size: %u bits (%lluGB primary)\n",
@@ -545,7 +625,7 @@ too_many_regions:
         proc_set_elf_path(elf_path);
     if (sysroot)
         proc_set_sysroot(sysroot);
-    extern const char **environ;
+    extern char **environ;
     uint64_t sp;
     uint64_t entry_point;
 
@@ -577,7 +657,7 @@ too_many_regions:
          * semantics: AT_PHDR/PHENT/PHNUM/ENTRY all refer to rosetta). */
         sp = build_linux_stack(&g, g.stack_top,
                                rosetta_argc, rosetta_argv,
-                               environ, &rr.rosetta_info,
+                               (const char **)environ, &rr.rosetta_info,
                                0 /* rosetta is ET_EXEC at link addr */,
                                0 /* no dynamic linker for rosetta */,
                                vdso_addr,
@@ -602,7 +682,7 @@ too_many_regions:
 
         sp = build_linux_stack(&g, g.stack_top,
                                guest_argc, guest_argv,
-                               environ, &elf_info,
+                               (const char **)environ, &elf_info,
                                elf_load_base, interp_base,
                                native_vdso,
                                -1 /* no AT_EXECFD */);
