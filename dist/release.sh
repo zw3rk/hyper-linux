@@ -33,6 +33,13 @@ warn()    { printf "${YELLOW}==>${RESET} %s\n" "$1"; }
 err()     { printf "${RED}error:${RESET} %s\n" "$1" >&2; exit 1; }
 confirm() { printf "${YELLOW}?${RESET} %s [y/N] " "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
 
+# Portable in-place sed (GNU sed vs macOS sed)
+if sed --version 2>/dev/null | grep -q 'GNU'; then
+    sedi() { sed -i "$@"; }
+else
+    sedi() { sed -i '' "$@"; }
+fi
+
 # ── Pre-flight checks ───────────────────────────────────────────
 
 command -v git   >/dev/null 2>&1 || err "git not found"
@@ -174,32 +181,32 @@ ok "CHANGELOG.md updated"
 info "Updating version references..."
 
 CURRENT_DATE="$(date '+%B %d, %Y')"
-sed -i '' "s/^\.Dd .*/\\.Dd ${CURRENT_DATE}/" hl.1
+sedi "s/^\.Dd .*/\\.Dd ${CURRENT_DATE}/" hl.1
 ok "hl.1 date → ${CURRENT_DATE}"
 
 if [ -f site/install.sh ]; then
-    sed -i '' "s/^VERSION=\".*\"/VERSION=\"${NEW_VERSION}\"/" site/install.sh
+    sedi "s/^VERSION=\".*\"/VERSION=\"${NEW_VERSION}\"/" site/install.sh
     ok "site/install.sh VERSION → ${NEW_VERSION}"
 fi
 
 if [ -f site/index.html ]; then
-    sed -i '' "s/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/v${NEW_VERSION}/g" site/index.html
+    sedi "s/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/v${NEW_VERSION}/g" site/index.html
     ok "site/index.html versions → v${NEW_VERSION}"
 fi
 
 if [ -f Formula/hl.rb ]; then
-    sed -i '' "s/^  version \".*\"/  version \"${NEW_VERSION}\"/" Formula/hl.rb
+    sedi "s/^  version \".*\"/  version \"${NEW_VERSION}\"/" Formula/hl.rb
     ok "Formula/hl.rb version → ${NEW_VERSION}"
 fi
 
 if [ -f flake.nix ]; then
     # Only need to update the version attribute — buildPhase uses ${version}
-    sed -i '' "s/version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" flake.nix
+    sedi "s/version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" flake.nix
     ok "flake.nix version → ${NEW_VERSION}"
 fi
 
 if [ -f README.md ]; then
-    sed -i '' "s/hl-v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/hl-v${NEW_VERSION}/g" README.md
+    sedi "s/hl-v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/hl-v${NEW_VERSION}/g" README.md
     ok "README.md versions → v${NEW_VERSION}"
 fi
 
@@ -234,7 +241,7 @@ ${CLI_FLAGS}
 
 Key capabilities (from CLAUDE.md / commit history):
 - aarch64-linux native + x86_64-linux via Rosetta
-- ~160 syscalls, multi-threading (64 vCPUs), fork/execve
+- 172 syscalls, multi-threading (64 vCPUs), fork/execve
 - COW fork, inotify via kqueue, /proc emulation
 - Homebrew: brew install zw3rk/hyper-linux/hl
 - curl installer: curl -fsSL https://hyper-linux.app/install.sh | sh
@@ -356,8 +363,8 @@ ok "SHA256SUMS generated"
 
 # Update Formula with final URL and SHA
 if [ -f Formula/hl.rb ]; then
-    sed -i '' "s|url \".*\"|url \"https://github.com/zw3rk/hyper-linux/releases/download/${NEW_TAG}/${ZIP_BASENAME}\"|" Formula/hl.rb
-    sed -i '' "s/sha256 \".*\"/sha256 \"${ZIP_SHA256}\"/" Formula/hl.rb
+    sedi "s|url \".*\"|url \"https://github.com/zw3rk/hyper-linux/releases/download/${NEW_TAG}/${ZIP_BASENAME}\"|" Formula/hl.rb
+    sedi "s/sha256 \".*\"/sha256 \"${ZIP_SHA256}\"/" Formula/hl.rb
     ok "Formula/hl.rb URL + SHA256 updated"
     # Amend the release commit with the final formula
     git add Formula/hl.rb

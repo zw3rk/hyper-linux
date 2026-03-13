@@ -10,7 +10,7 @@ Hello from Linux!
 
 ## Features
 
-- **~140 Linux syscalls** translated to macOS equivalents
+- **172 Linux syscalls** translated to macOS equivalents
 - **Static and dynamic ELF binaries** — use `--sysroot` for dynamically-linked programs
 - **x86_64-linux via Rosetta** — transparent JIT/AOT translation for x86_64 ELF binaries
 - **Multi-threading** — guest threads map 1:1 to host pthreads, each with its own HVF vCPU
@@ -30,6 +30,20 @@ Hello from Linux!
 - Hypervisor.framework entitlement (`com.apple.security.hypervisor`)
 
 ## Installation
+
+### Quick Install
+
+```
+curl -fsSL https://hyper-linux.app/install.sh | sh
+```
+
+Downloads, verifies SHA256, codesigns, and installs to `/usr/local/bin`.
+
+### With Homebrew
+
+```
+brew install zw3rk/hyper-linux/hl
+```
 
 ### From Release
 
@@ -141,25 +155,34 @@ make help
 
 ## Project Structure
 
-All source lives under `src/` (~17,600 lines of C + assembly):
+All source lives under `src/` (~23,000 lines of C + assembly):
 
 | File | Purpose |
 |------|---------|
 | `src/hl.c` | CLI, VM setup, ELF loading entry point |
 | `src/guest.c` | Guest memory, page tables, brk/mmap regions |
 | `src/elf.c` | ELF64 parser, PT_LOAD/PT_INTERP, ET_DYN |
+| `src/stack.c` | Linux initial stack builder (argc/argv/envp/auxv) |
 | `src/syscall.c` | Syscall dispatch, FD table, errno translation |
 | `src/syscall_fs.c` | Filesystem: stat, open, directory ops |
-| `src/syscall_io.c` | I/O: read/write, ioctl, splice, poll |
+| `src/syscall_fd.c` | File descriptor ops: dup, dup3, fcntl, pipe2 |
+| `src/syscall_io.c` | I/O: read/write, ioctl, splice, sendfile |
+| `src/syscall_poll.c` | Poll/select/epoll/ppoll multiplexing |
 | `src/syscall_net.c` | Socket networking, AF/sockaddr translation |
 | `src/syscall_signal.c` | Signal delivery, rt_sigframe, ITIMER |
+| `src/syscall_time.c` | Time: clock_gettime, nanosleep, setitimer |
+| `src/syscall_sys.c` | System info: uname, getrandom, sysinfo |
+| `src/syscall_inotify.c` | inotify emulation via kqueue EVFILT_VNODE |
 | `src/syscall_exec.c` | execve: ELF reload, interpreter, vCPU restart |
-| `src/syscall_proc.c` | Process state, wait4, vCPU run loop |
+| `src/syscall_proc.c` | Process state, wait4/waitid, ptrace, vCPU run loop |
 | `src/fork_ipc.c` | fork/clone via posix_spawn + IPC |
 | `src/proc_emulation.c` | /proc and /dev path interception |
+| `src/rosetta.c` | Rosetta x86_64 translator setup (phase 1-2) |
+| `src/crash_report.c` | Structured crash reports for GitHub issues |
+| `src/vdso.c` | vDSO builder for Rosetta |
 | `src/shim.S` | EL1 kernel shim, exception vectors, MMU |
 | `src/thread.c` | Multi-threading, per-thread vCPU |
-| `src/futex.c` | Futex wait/wake/requeue |
+| `src/futex.c` | Futex wait/wake/requeue/PI |
 
 ## Known Limitations
 
@@ -167,11 +190,11 @@ All source lives under `src/` (~17,600 lines of C + assembly):
 - **Single-VM fork** — macOS HVF allows one VM per process; fork uses `posix_spawn` + IPC serialization
 - **MAP_SHARED** treated as MAP_PRIVATE (single-process, so semantically equivalent)
 - **`timeout`** with dynamic linking — fork+exec with the dynamic linker has issues
-- **No robust futexes** or PI futexes (stub returns 0)
+- **No robust futexes** (set_robust_list stub returns 0)
 - **No `clone3`** — musl falls back to `clone()`
 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
 
-Copyright 2025-2026 Moritz Angermann, [zw3rk pte. ltd.](https://zw3rk.com)
+Copyright 2025-2026 [zw3rk pte. ltd.](https://zw3rk.com)

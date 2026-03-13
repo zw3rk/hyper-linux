@@ -90,8 +90,8 @@ The guest address space is organized as follows:
 .It 0x200000 Ta 0x3FFFFF Ta Shim data/stack (2MB, RW)
 .It 0x400000 Ta varies Ta ELF LOAD segments
 .It 0x1000000 Ta varies Ta brk heap (grows up)
-.It 0x7E00000 Ta 0x7E00FFF Ta Stack guard page (PROT_NONE)
-.It 0x7E01000 Ta 0x7FFFFFF Ta Stack (2MB, RW, grows down)
+.It 0x7800000 Ta 0x7800FFF Ta Stack guard page (PROT_NONE, dynamic)
+.It 0x7801000 Ta 0x7FFFFFF Ta Stack (8MB, RW, grows down)
 .It 0x10000000 Ta 0x1FFFFFFF Ta mmap RX region (256MB initial)
 .It 0x200000000 Ta 0x20FFFFFFF Ta mmap RW region (256MB initial, at 8GB)
 .El
@@ -132,7 +132,7 @@ getresgid, setpriority, getpriority, setpgid, getpgid, setsid,
 getgroups, getrusage, getrlimit, setrlimit, sched_getaffinity,
 sched_setaffinity, prlimit64, sysinfo.
 .Ss I/O Optimization and Sync
-fallocate, sendfile, sync, fsync, fdatasync, sched_yield,
+fallocate, sendfile, sync, fsync, fdatasync, msync, sched_yield,
 copy_file_range, splice, vmsplice, tee, fadvise64.
 .Ss I/O Multiplexing
 pselect6, ppoll, epoll_create1, epoll_ctl, epoll_pwait.
@@ -152,7 +152,7 @@ FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI.
 PTRACE_SEIZE, PTRACE_CONT, PTRACE_INTERRUPT, PTRACE_GETREGSET,
 PTRACE_SETREGSET.
 .Ss Stubs (no-op, return 0)
-mlock, munlock, msync, membarrier, set_robust_list.
+mlock, munlock, membarrier, set_robust_list.
 .Ss /proc and /dev Emulation
 The following virtual paths are intercepted in openat and readlinkat:
 .Pa /proc/self/exe ,
@@ -162,13 +162,22 @@ The following virtual paths are intercepted in openat and readlinkat:
 .Pa /proc/self/status ,
 .Pa /proc/self/cmdline ,
 .Pa /proc/self/mountinfo ,
+.Pa /proc/self/mounts ,
 .Pa /proc/cpuinfo ,
+.Pa /proc/meminfo ,
+.Pa /proc/stat ,
+.Pa /proc/mounts ,
 .Pa /proc/uptime ,
 .Pa /proc/loadavg ,
 .Pa /proc/version ,
 .Pa /proc/filesystems ,
 .Pa /proc/sys/vm/mmap_min_addr ,
 .Pa /proc/sys/kernel/randomize_va_space ,
+.Pa /etc/mtab ,
+.Pa /etc/passwd ,
+.Pa /etc/group ,
+.Pa /var/run/utmp ,
+.Pa /run/utmp ,
 .Pa /dev/null ,
 .Pa /dev/zero ,
 .Pa /dev/urandom ,
@@ -241,9 +250,14 @@ x86_64 mode requires the Rosetta Linux binary to be installed
 macOS HVF allows only one VM per process.
 Fork is implemented via
 .Xr posix_spawn 2
-and IPC: the parent serializes VM state (registers, memory regions,
-file descriptors via SCM_RIGHTS, signal state) over a Unix socket to a
-new
+and IPC.
+For native aarch64 binaries, the parent uses copy-on-write via
+file-backed shared memory: the backing fd is sent to the child via
+SCM_RIGHTS, and the child maps it MAP_PRIVATE for instant COW semantics
+with zero data copy.
+For x86_64 (Rosetta) binaries, the parent serializes VM state
+(registers, memory regions, file descriptors, signal state) over a Unix
+socket to a new
 .Nm
 process running in
 .Fl -fork-child

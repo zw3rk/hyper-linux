@@ -176,7 +176,7 @@ How it works:
 6. Entry point set to rosetta's entry; argv follows binfmt_misc convention:
    `[rosetta_path, x86_64_binary_path, original_argv...]`
 7. Rosetta JIT-translates x86_64→ARM64 at runtime; all syscalls appear as
-   ARM64 SVC #0 — hl's existing ~140 syscall handlers work transparently
+   ARM64 SVC #0 — hl's existing 172 syscall handlers work transparently
 
 ### Multi-Region Guest Memory
 
@@ -463,7 +463,7 @@ L3 splitting handles the cases where they share a block.
 
 ## Implemented Syscalls
 
-~140 syscalls implemented.  See the **SYSCALL SUPPORT** section in `hl.1`
+172 syscalls implemented.  See the **SYSCALL SUPPORT** section in `hl.1`
 (the man page) for the complete, authoritative list.
 
 ## Signal Delivery
@@ -586,8 +586,8 @@ MAP_FIXED to map AOT code/data sections from the translated file.
 0x000200000  - 0x0003FFFFF:  Shim data/stack (2MB block, RW)
 0x000400000  - varies:        ELF LOAD segments (PIE_LOAD_BASE for ET_DYN)
 0x001000000:                  brk base (16MB)
-0x007E00000  - 0x007E00FFF:  Stack guard page (PROT_NONE, catches overflow)
-0x007E01000  - 0x007FFFFFF:  Stack (2MB block, RW, grows down from 0x08000000)
+0x007800000  - 0x007800FFF:  Stack guard page (PROT_NONE, dynamic position)
+0x007801000  - 0x007FFFFFF:  Stack (8MB, 4×2MB blocks, RW, grows down from 0x08000000)
 0x010000000  - 0x01FFFFFFF:  mmap RX region (initial 256MB, pre-mapped RX)
 0x020000000  - mmap_limit:    mmap RX growth area (up to g->mmap_limit)
 0x200000000  - 0x20FFFFFFF:  mmap RW region (initial 256MB at 8GB, pre-mapped RW)
