@@ -44,23 +44,12 @@
 #define MAX_HW_BREAKPOINTS 16
 #define MAX_HW_WATCHPOINTS 16
 
-/* aarch64 DBGBCR enable bits:
- *   [0]     E     = 1 (enable)
- *   [2:1]   PMC   = 0b10 (EL0 only)
- *   [8:5]   BAS   = 0b1111 (match all bytes in word)
- *   [23:20] BT    = 0b0000 (unlinked address match)
- * Combined: E=1, PMC=0b10, BAS=0b1111 → 0x1E5
- * Wait, let me recalculate:
- *   bit 0: E=1
- *   bits [2:1]: PMC=0b10 → matches EL0 only
- *   bits [4:3]: 0b00 (reserved)
- *   bits [8:5]: BAS=0b1111 → 0xF << 5 = 0x1E0
- *   0x1E0 | 0x5 = 0x1E5
- * Actually:
- *   E=1: bit 0 = 1
- *   PMC=0b10: bits[2:1] = 10 → 0x4
- *   BAS=0b1111: bits[8:5] = 1111 → 0x1E0
- *   Total: 0x1E0 | 0x4 | 0x1 = 0x1E5 */
+/* aarch64 DBGBCR enable bits for EL0 address match:
+ *   [0]     E=1       (enable)
+ *   [2:1]   PMC=0b10  (EL0 only)
+ *   [8:5]   BAS=0b1111 (match all bytes in word)
+ *   [23:20] BT=0b0000  (unlinked address match)
+ * = 0x1E0 | 0x4 | 0x1 = 0x1E5 */
 #define DBGBCR_ENABLE_EL0 0x1E5
 
 /* aarch64 DBGWCR enable bits for watchpoints:
