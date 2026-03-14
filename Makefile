@@ -78,14 +78,16 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
            syscall_inotify.c syscall_time.c syscall_sys.c \
            syscall_proc.c proc_emulation.c syscall_exec.c \
            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
-           thread.c futex.c vdso.c crash_report.c rosetta.c)
+           thread.c futex.c vdso.c crash_report.c rosetta.c \
+           gdb_stub.c)
 HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_internal.h syscall_fs.h syscall_io.h \
            syscall_poll.h syscall_fd.h syscall_inotify.h \
            syscall_time.h syscall_sys.h syscall_proc.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h hv_util.h \
-           thread.h futex.h vdso.h crash_report.h rosetta.h)
+           thread.h futex.h vdso.h crash_report.h rosetta.h \
+           gdb_stub.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help

@@ -63,6 +63,22 @@ typedef struct {
     linux_user_pt_regs_t ptrace_regs; /* Register snapshot for cross-thread access */
     int             ptrace_regs_dirty;/* Tracer modified registers */
 
+    /* ---------- GDB stub state ----------
+     * Per-thread stop state for the GDB remote stub. When GDB requests
+     * a stop (breakpoint, Ctrl+C, step), the thread records its stop
+     * reason here so the stub can report it to GDB.
+     *
+     * Register access: HVF requires vCPU register reads/writes on the
+     * owning thread. When stopped, the vCPU thread snapshots registers
+     * into gdb_reg_snapshot; the GDB handler thread reads/writes that
+     * buffer. On resume, dirty changes are applied back to the vCPU. */
+    int             gdb_stopped;      /* Non-zero when stopped for GDB */
+    int             gdb_stop_reason;  /* GDB_STOP_* value */
+    uint8_t         gdb_reg_snapshot[788]; /* Register snapshot for GDB
+                                            * Layout: 31×GPR(8) + SP(8) + PC(8)
+                                            * + CPSR(4) + 32×V(16) + FPSR(4) + FPCR(4) */
+    int             gdb_regs_dirty;   /* GDB handler modified snapshot */
+
     /* ---------- VM-clone child state ----------
      * For clone(CLONE_VM) without CLONE_THREAD: shares guest memory but
      * has a separate TID, is waitable via wait4, and can be ptraced.

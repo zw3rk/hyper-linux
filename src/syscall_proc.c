@@ -17,6 +17,7 @@
 #include "crash_report.h"
 #include "thread.h"
 #include "futex.h"
+#include "gdb_stub.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1620,6 +1621,45 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                     break;
                 }
                 }
+            } else if (ec == 0x30 || ec == 0x32) {
+                /* EC=0x30: Hardware breakpoint from lower EL (EL0).
+                 * EC=0x32: Software step exception from lower EL.
+                 * Both are debug exceptions trapped to host via
+                 * hv_vcpu_set_trap_debug_exceptions(). Forward to GDB. */
+                if (gdb_stub_is_active()) {
+                    int reason = (ec == 0x30) ? GDB_STOP_BREAKPOINT
+                                              : GDB_STOP_STEP;
+                    uint64_t stop_pc;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &stop_pc);
+                    if (verbose)
+                        fprintf(stderr, "%s: debug exception EC=0x%x "
+                                "at PC=0x%llx → GDB\n",
+                                prefix, ec,
+                                (unsigned long long)stop_pc);
+                    gdb_stub_handle_stop(reason, stop_pc);
+                    /* After GDB resumes, re-sync debug registers */
+                    gdb_stub_sync_debug_regs(vcpu);
+                } else if (verbose) {
+                    fprintf(stderr, "%s: debug exception EC=0x%x "
+                            "(no GDB attached)\n", prefix, ec);
+                }
+            } else if (ec == 0x34 || ec == 0x35) {
+                /* EC=0x34: Watchpoint from lower EL (EL0, data abort).
+                 * EC=0x35: Watchpoint from current EL (shouldn't happen).
+                 * Extract FAR_EL1 for the watched address. */
+                if (gdb_stub_is_active()) {
+                    uint64_t wp_addr;
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &wp_addr);
+                    if (verbose)
+                        fprintf(stderr, "%s: watchpoint at addr=0x%llx "
+                                "→ GDB\n", prefix,
+                                (unsigned long long)wp_addr);
+                    gdb_stub_handle_stop(GDB_STOP_WATCHPOINT, wp_addr);
+                    gdb_stub_sync_debug_regs(vcpu);
+                } else if (verbose) {
+                    fprintf(stderr, "%s: watchpoint EC=0x%x "
+                            "(no GDB attached)\n", prefix, ec);
+                }
             } else if (ec == 0x01) {
                 /* WFI/WFE trapped — just continue */
                 if (verbose)
@@ -1657,6 +1697,17 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
             if (atomic_load(&exit_group_requested)) {
                 exit_code = atomic_load(&exit_group_code);
                 break;
+            }
+
+            /* GDB stub: if GDB requested a stop (Ctrl+C or another thread
+             * hit a breakpoint), enter GDB stop state. */
+            if (gdb_stub_stop_requested()) {
+                if (verbose)
+                    fprintf(stderr, "%s: GDB stop request → entering "
+                            "GDB stop\n", prefix);
+                gdb_stub_handle_stop(GDB_STOP_SIGNAL, 0);
+                gdb_stub_sync_debug_regs(vcpu);
+                continue;
             }
 
             /* PTRACE_INTERRUPT: if this thread is ptraced and not already
