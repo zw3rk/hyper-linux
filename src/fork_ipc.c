@@ -1448,11 +1448,17 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
             return -LINUX_ENOMEM;
         }
     } else {
-        /* Legacy path: enumerate and send used memory regions */
+        /* Legacy path: enumerate and send used memory regions.
+         * Hold mmap_lock during enumeration to get a consistent snapshot
+         * of the allocator state (brk_current, mmap_next, etc.). Release
+         * before data send to avoid blocking other threads for too long.
+         * Lock order: mmap_lock(1) — acquired before fd_lock(3) below. */
         #define MAX_USED_REGIONS 16
         used_region_t used[MAX_USED_REGIONS];
         unsigned int shim_sz = proc_get_shim_size();
+        pthread_mutex_lock(&mmap_lock);
         int nregions = guest_get_used_regions(g, shim_sz, used, MAX_USED_REGIONS);
+        pthread_mutex_unlock(&mmap_lock);
         uint32_t num_regions = (uint32_t)nregions;
         if (ipc_write_all(ipc_sock, &num_regions, sizeof(num_regions)) < 0) {
             close(ipc_sock);
