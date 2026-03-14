@@ -25,9 +25,10 @@
 static thread_entry_t thread_table[MAX_THREADS];
 static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 5 */
 
-/* Track the next SP_EL1 slot index. Slot 0 is the main thread (top of
- * shim data region); each subsequent thread gets the next 4KB down. */
-static int next_sp_el1_slot = 0;
+/* Bitmask tracking allocated SP_EL1 slots. Bit N set = slot N in use.
+ * MAX_THREADS=64 fits exactly in a uint64_t. Slot 0 is the main thread
+ * (top of shim data region); each subsequent slot is 4KB below. */
+static uint64_t sp_el1_allocated = 0;
 
 /* Per-thread pointer to the current thread's entry. Set once when a
  * host pthread starts running a guest vCPU. Syscall handlers read this
@@ -39,7 +40,7 @@ _Thread_local thread_entry_t *current_thread = NULL;
 void thread_init(void) {
     pthread_mutex_lock(&thread_lock);
     memset(thread_table, 0, sizeof(thread_table));
-    next_sp_el1_slot = 0;
+    sp_el1_allocated = 0;
     current_thread = NULL;
     pthread_mutex_unlock(&thread_lock);
 }
@@ -61,7 +62,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     thread_ptrace_init(t);
 
     /* Slot 0 is consumed by main thread */
-    next_sp_el1_slot = 1;
+    sp_el1_allocated = 1ULL;
 
     pthread_mutex_unlock(&thread_lock);
 
@@ -90,6 +91,17 @@ thread_entry_t *thread_alloc(int64_t tid) {
     return result;
 }
 
+/* Free an SP_EL1 slot for reuse. Must be called with thread_lock held.
+ * Derives the slot index from the IPA and clears the bitmask bit. */
+static void thread_free_sp_el1_locked(uint64_t sp) {
+    if (sp == 0) return;
+    uint64_t top = GUEST_IPA_BASE + SHIM_DATA_BASE + BLOCK_2MB;
+    if (sp > top) return;
+    int slot = (int)((top - sp) / 4096);
+    if (slot >= 0 && slot < MAX_THREADS)
+        sp_el1_allocated &= ~(1ULL << slot);
+}
+
 void thread_deactivate(thread_entry_t *t) {
     if (!t) return;
 
@@ -109,6 +121,9 @@ void thread_deactivate(thread_entry_t *t) {
         t->vm_exited = 1;
         pthread_cond_broadcast(&t->ptrace_cond);
     }
+
+    /* Free SP_EL1 slot so it can be reused by future threads */
+    thread_free_sp_el1_locked(t->sp_el1);
 
     t->active = 0;
 
@@ -183,14 +198,17 @@ uint64_t thread_alloc_sp_el1(void) {
 
     pthread_mutex_lock(&thread_lock);
 
-    if (next_sp_el1_slot >= MAX_THREADS) {
+    /* Find the first free slot (lowest clear bit in the bitmask). */
+    uint64_t free_mask = ~sp_el1_allocated;
+    if (free_mask == 0) {
         fprintf(stderr, "thread: SP_EL1 slots exhausted\n");
     } else {
+        int slot = __builtin_ctzll(free_mask);
         /* Main thread's SP_EL1 = IPA_BASE + SHIM_DATA_BASE + 2MB.
          * Each subsequent thread is 4KB below. */
         uint64_t top = GUEST_IPA_BASE + SHIM_DATA_BASE + BLOCK_2MB;
-        sp = top - (uint64_t)next_sp_el1_slot * 4096;
-        next_sp_el1_slot++;
+        sp = top - (uint64_t)slot * 4096;
+        sp_el1_allocated |= (1ULL << slot);
     }
 
     pthread_mutex_unlock(&thread_lock);
@@ -250,6 +268,7 @@ void thread_destroy_all_vcpus(void) {
         if (thread_table[i].active && thread_table[i].vcpu) {
             hv_vcpu_destroy(thread_table[i].vcpu);
             thread_table[i].vcpu = 0;
+            thread_free_sp_el1_locked(thread_table[i].sp_el1);
             thread_table[i].active = 0;
             /* Do NOT destroy condvars — same race as thread_deactivate:
              * a waiter woken by an earlier broadcast may still reference
@@ -393,6 +412,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
                  * vm-clone children do NOT call thread_deactivate() on exit
                  * (they skip it since the slot is collected here), so we
                  * must destroy condvars to avoid resource leaks. */
+                thread_free_sp_el1_locked(t->sp_el1);
                 t->active = 0;
                 pthread_cond_destroy(&t->ptrace_cond);
                 pthread_cond_destroy(&t->resume_cond);

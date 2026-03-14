@@ -230,46 +230,49 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
         }
     }
 
-    /* Dequeue waiter from the correct bucket. Requeue may have moved us
-     * to a different bucket (changed waiter.uaddr), so re-hash.
+    /* Dequeue waiter. If woken=1, the wake/requeue operation already
+     * unlinked us from the bucket list — skip dequeue. If woken=0
+     * (timeout/interrupt), we're still in the list and must self-dequeue.
      *
-     * Race: between releasing the old bucket lock and acquiring the new
-     * one, another requeue can move the waiter to yet another bucket.
-     * Loop until we successfully find and dequeue the waiter to prevent
-     * a dangling pointer in the bucket's linked list (stack-allocated
-     * waiter would become use-after-free when this function returns). */
-    for (;;) {
-        unsigned dequeue_idx = futex_hash(waiter.uaddr);
-        futex_bucket_t *b_dequeue = &buckets[dequeue_idx];
-        if (b_dequeue != b) {
-            pthread_mutex_unlock(&b->lock);
-            pthread_mutex_lock(&b_dequeue->lock);
-            b = b_dequeue;
-        }
-        /* Search for our waiter in the bucket */
-        int found = 0;
-        futex_waiter_t **pp = &b->head;
-        while (*pp) {
-            if (*pp == &waiter) {
-                *pp = waiter.next;
-                found = 1;
-                break;
+     * For the self-dequeue path: requeue may have moved us to a different
+     * bucket (changed waiter.uaddr), so re-hash. Race: between releasing
+     * the old bucket lock and acquiring the new one, another requeue can
+     * move the waiter again. Loop until we find and dequeue ourselves. */
+    if (!waiter.woken) {
+        for (;;) {
+            unsigned dequeue_idx = futex_hash(waiter.uaddr);
+            futex_bucket_t *b_dequeue = &buckets[dequeue_idx];
+            if (b_dequeue != b) {
+                pthread_mutex_unlock(&b->lock);
+                pthread_mutex_lock(&b_dequeue->lock);
+                b = b_dequeue;
             }
-            pp = &(*pp)->next;
+            /* Search for our waiter in the bucket */
+            int found = 0;
+            futex_waiter_t **pp = &b->head;
+            while (*pp) {
+                if (*pp == &waiter) {
+                    *pp = waiter.next;
+                    found = 1;
+                    break;
+                }
+                pp = &(*pp)->next;
+            }
+            if (found) break;
+            /* Not found — waiter was requeued again between our hash
+             * computation and lock acquisition. Re-read uaddr and retry. */
         }
-        if (found) break;
-        /* Not found — waiter was requeued again between our hash
-         * computation and lock acquisition. Re-read uaddr and retry. */
     }
     pthread_mutex_unlock(&b->lock);
     pthread_cond_destroy(&waiter.cond);
 
-    /* If we were woken by FUTEX_WAKE, return 0 regardless of timeout race */
     if (waiter.woken) return 0;
     return ret;
 }
 
-/* FUTEX_WAKE / FUTEX_WAKE_BITSET: wake up to val waiters at uaddr. */
+/* FUTEX_WAKE / FUTEX_WAKE_BITSET: wake up to val waiters at uaddr.
+ * Woken waiters are unlinked from the bucket list so subsequent
+ * operations don't count them as still-sleeping entries. */
 static int64_t futex_wake(uint64_t uaddr, uint32_t val, uint32_t bitset) {
     if (bitset == 0) return -LINUX_EINVAL;
 
@@ -279,14 +282,17 @@ static int64_t futex_wake(uint64_t uaddr, uint32_t val, uint32_t bitset) {
 
     pthread_mutex_lock(&b->lock);
 
-    futex_waiter_t *w = b->head;
-    while (w && (uint32_t)woken < val) {
+    futex_waiter_t **pp = &b->head;
+    while (*pp && (uint32_t)woken < val) {
+        futex_waiter_t *w = *pp;
         if (w->uaddr == uaddr && (w->bitset & bitset) != 0) {
+            *pp = w->next;  /* Unlink before signaling */
             w->woken = 1;
             pthread_cond_signal(&w->cond);
             woken++;
+        } else {
+            pp = &w->next;
         }
-        w = w->next;
     }
 
     pthread_mutex_unlock(&b->lock);
@@ -354,11 +360,12 @@ static int64_t futex_requeue(guest_t *g, uint64_t uaddr, uint32_t wake_count,
         }
 
         if ((uint32_t)woken < wake_count) {
-            /* Wake this waiter */
+            /* Wake this waiter: unlink from source, then signal */
+            *pp = w->next;
             w->woken = 1;
             pthread_cond_signal(&w->cond);
             woken++;
-            pp = &w->next;  /* waiter removes itself from list on wakeup */
+            /* Don't advance pp — *pp is already the next node */
         } else if ((uint32_t)requeued < requeue_count) {
             /* Requeue: remove from source, add to destination */
             *pp = w->next;
@@ -462,16 +469,19 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
                                            __ATOMIC_SEQ_CST,
                                            __ATOMIC_SEQ_CST));
 
-    /* Wake up to val waiters at uaddr */
+    /* Wake up to val waiters at uaddr (unlink woken entries) */
     int woken = 0;
-    futex_waiter_t *w = b1->head;
-    while (w && (uint32_t)woken < val) {
+    futex_waiter_t **pp1 = &b1->head;
+    while (*pp1 && (uint32_t)woken < val) {
+        futex_waiter_t *w = *pp1;
         if (w->uaddr == uaddr) {
+            *pp1 = w->next;
             w->woken = 1;
             pthread_cond_signal(&w->cond);
             woken++;
+        } else {
+            pp1 = &w->next;
         }
-        w = w->next;
     }
 
     /* Evaluate comparison predicate on old_val */
@@ -488,17 +498,20 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
     default: break;
     }
 
-    /* Conditionally wake up to val2 waiters at uaddr2 */
+    /* Conditionally wake up to val2 waiters at uaddr2 (unlink woken) */
     if (cond_met) {
-        w = b2->head;
+        futex_waiter_t **pp2 = &b2->head;
         int woken2 = 0;
-        while (w && (uint32_t)woken2 < val2) {
-            if (w->uaddr == uaddr2) {
-                w->woken = 1;
-                pthread_cond_signal(&w->cond);
+        while (*pp2 && (uint32_t)woken2 < val2) {
+            futex_waiter_t *w2 = *pp2;
+            if (w2->uaddr == uaddr2) {
+                *pp2 = w2->next;
+                w2->woken = 1;
+                pthread_cond_signal(&w2->cond);
                 woken2++;
+            } else {
+                pp2 = &w2->next;
             }
-            w = w->next;
         }
         woken += woken2;
     }
