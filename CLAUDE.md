@@ -22,6 +22,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
 - **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
 - **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
+- **src/gdb_stub.c/h** — GDB Remote Serial Protocol stub for guest debugging (~1100 lines).
 - **src/crash_report.c/h** — Structured crash report for GitHub issue filing (~250 lines).
 - **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
@@ -91,6 +92,27 @@ make clean       # remove _build/
 
 Requires macOS with Apple Silicon, Hypervisor.framework entitlement, and
 nix develop shell with aarch64-unknown-linux-musl cross toolchain.
+
+## GDB Remote Debugging
+
+Debug aarch64-linux guest binaries using the built-in GDB RSP stub:
+
+```
+hl --gdb 1234 ./binary                      # listen on port 1234
+hl --gdb 1234 --gdb-stop-on-entry ./binary   # stop before first instruction
+
+# Connect with GDB:
+aarch64-linux-gnu-gdb -ex "target remote :1234" ./binary
+
+# Or LLDB:
+lldb -o "gdb-remote 1234" ./binary
+```
+
+Features: hardware breakpoints (16), watchpoints (16), single-step via
+temp breakpoint, all-stop mode, full register/memory access, thread support.
+Aarch64 guests only (not rosetta/x86_64). Register access uses snapshot
+protocol — vCPU thread snapshots on stop, GDB handler reads/writes snapshot,
+dirty changes applied on resume (HVF requires register access on owning thread).
 
 ## Validation
 
