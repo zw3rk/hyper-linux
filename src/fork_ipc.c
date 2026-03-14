@@ -499,12 +499,28 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         guest_destroy(&g);
         return 1;
     }
-    if (cmdline_len_u32 > 0 && cmdline_len_u32 <= LINUX_PATH_MAX * 4) {
-        char *cmdline_buf = malloc(cmdline_len_u32);
-        if (!cmdline_buf) {
-            /* Must still drain the cmdline bytes to keep the IPC stream
-             * synchronized — subsequent reads expect region data next. */
-            fprintf(stderr, "hl: fork-child: cmdline malloc failed\n");
+    if (cmdline_len_u32 > 0) {
+        /* Always drain the cmdline bytes to keep the IPC stream in sync.
+         * If the cmdline is within a reasonable size, parse and use it. */
+        char *cmdline_buf = (cmdline_len_u32 <= LINUX_PATH_MAX * 4)
+                          ? malloc(cmdline_len_u32) : NULL;
+        if (cmdline_buf) {
+            if (ipc_read_all(ipc_fd, cmdline_buf, cmdline_len_u32) < 0) {
+                free(cmdline_buf);
+                fprintf(stderr, "hl: fork-child: failed to read cmdline\n");
+                guest_destroy(&g);
+                return 1;
+            }
+            proc_set_cmdline_raw(cmdline_buf, cmdline_len_u32);
+            free(cmdline_buf);
+        } else {
+            /* Drain cmdline bytes to keep the IPC stream synchronized —
+             * subsequent reads expect region data next. */
+            if (cmdline_len_u32 > LINUX_PATH_MAX * 4)
+                fprintf(stderr, "hl: fork-child: cmdline too large (%u), skipping\n",
+                        cmdline_len_u32);
+            else
+                fprintf(stderr, "hl: fork-child: cmdline malloc failed\n");
             char drain[256];
             uint32_t remaining = cmdline_len_u32;
             while (remaining > 0) {
@@ -515,15 +531,6 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                 }
                 remaining -= chunk;
             }
-        } else {
-            if (ipc_read_all(ipc_fd, cmdline_buf, cmdline_len_u32) < 0) {
-                free(cmdline_buf);
-                fprintf(stderr, "hl: fork-child: failed to read cmdline\n");
-                guest_destroy(&g);
-                return 1;
-            }
-            proc_set_cmdline_raw(cmdline_buf, cmdline_len_u32);
-            free(cmdline_buf);
         }
     }
 
