@@ -97,7 +97,9 @@ hl [options] <elf-binary> [args...]
 | `-V`, `--version` | Print version and exit |
 | `-v`, `--verbose` | Verbose output (ELF loading, syscalls) |
 | `-t`, `--timeout` | Per-iteration vCPU watchdog timeout (default: 10s) |
-| `--sysroot PATH` | Musl sysroot for dynamically-linked binaries |
+| `--sysroot PATH` | Musl/glibc sysroot for dynamically-linked binaries |
+| `--gdb PORT` | Start GDB RSP stub on TCP port (aarch64 only) |
+| `--gdb-stop-on-entry` | Stop at ELF entry point and wait for GDB attach |
 | `--` | Stop processing hl options |
 
 ### Examples
@@ -155,7 +157,7 @@ make help
 
 ## Project Structure
 
-All source lives under `src/` (~23,000 lines of C + assembly):
+All source lives under `src/` (~26,000 lines of C + assembly):
 
 | File | Purpose |
 |------|---------|
@@ -183,6 +185,7 @@ All source lives under `src/` (~23,000 lines of C + assembly):
 | `src/shim.S` | EL1 kernel shim, exception vectors, MMU |
 | `src/thread.c` | Multi-threading, per-thread vCPU |
 | `src/futex.c` | Futex wait/wake/requeue/PI |
+| `src/gdb_stub.c` | GDB Remote Serial Protocol stub for debugging |
 
 ## Known Limitations
 

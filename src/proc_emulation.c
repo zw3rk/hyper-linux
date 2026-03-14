@@ -588,31 +588,17 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
 
     /* /proc/self/io -> synthetic I/O counters.
      * GHC's cardano-node reads this for resource monitoring metrics.
-     * We return zeroed counters since we don't track per-guest I/O.
-     *
-     * Use a persistent file (written once) and open a fresh fd each time,
-     * so the guest gets a normal file that survives threaded fd races. */
+     * We return zeroed counters since we don't track per-guest I/O. */
     if (strcmp(path, "/proc/self/io") == 0) {
-        static const char proc_io_path[] = "/tmp/hl-proc-self-io";
-        static int initialized = 0;
-        if (!initialized) {
-            int wfd = open(proc_io_path, O_WRONLY | O_CREAT | O_TRUNC, 0444);
-            if (wfd >= 0) {
-                const char data[] =
-                    "rchar: 0\n"
-                    "wchar: 0\n"
-                    "syscr: 0\n"
-                    "syscw: 0\n"
-                    "read_bytes: 0\n"
-                    "write_bytes: 0\n"
-                    "cancelled_write_bytes: 0\n";
-                (void)write(wfd, data, sizeof(data) - 1);
-                close(wfd);
-                initialized = 1;
-            }
-        }
-        int fd = open(proc_io_path, O_RDONLY);
-        return fd >= 0 ? fd : -1;
+        static const char data[] =
+            "rchar: 0\n"
+            "wchar: 0\n"
+            "syscr: 0\n"
+            "syscw: 0\n"
+            "read_bytes: 0\n"
+            "write_bytes: 0\n"
+            "cancelled_write_bytes: 0\n";
+        return proc_synthetic_fd(data, sizeof(data) - 1);
     }
 
     /* /proc/self/stat -> single-line process stat (man 5 proc).
@@ -657,7 +643,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
             "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
             "18446744073709551615 0 0 0 0 0 0 "             /* 25-31 */
-            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",    /* 32-52 */
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",  /* 32-52 */
             (long long)proc_get_pid(),
             comm,
             (long long)proc_get_ppid(),
@@ -691,7 +677,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             off += snprintf(buf + off, sizeof(buf) - off,
                 "cpu%d 100 0 50 5000 0 0 0 0 0 0\n", i);
         }
-        off += snprintf(buf + off, sizeof(buf) - off,
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
             "intr 0\n"
             "ctxt 0\n"
             "btime %lld\n"
@@ -699,6 +685,7 @@ int proc_intercept_open(const guest_t *g, const char *path, int linux_flags, int
             "procs_running 1\n"
             "procs_blocked 0\n",
             (long long)boottime.tv_sec);
+        if (off > (int)sizeof(buf)) off = (int)sizeof(buf);
         return proc_synthetic_fd(buf, off);
     }
 

@@ -1745,6 +1745,11 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
             if (verbose)
                 fprintf(stderr, "%s: vCPU canceled (no signal pending)\n",
                         prefix);
+        } else if (vexit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+            /* Virtual timer fired. hl emulates timers host-side, so just
+             * mask the vtimer and continue. Without this, a pending vtimer
+             * would cause an "unexpected exit reason" crash. */
+            hv_vcpu_set_vtimer_mask(vcpu, true);
         } else {
             fprintf(stderr, "%s: unexpected exit reason 0x%x\n",
                     prefix, vexit->reason);
