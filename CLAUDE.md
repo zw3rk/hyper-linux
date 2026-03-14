@@ -22,7 +22,7 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 - **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
 - **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
 - **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
-- **src/gdb_stub.c/h** — GDB Remote Serial Protocol stub for guest debugging (~1100 lines).
+- **src/gdb_stub.c/h** — GDB Remote Serial Protocol stub for guest debugging (~1800 lines).
 - **src/crash_report.c/h** — Structured crash report for GitHub issue filing (~250 lines).
 - **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
@@ -76,7 +76,7 @@ memory that DC ZVA was supposed to zero), causing assertion failures.
 | #7 | MRS trap (read sysreg) | host reads reg from ESR ISS; returns value in x0 |
 | #9 | W^X toggle | x0=FAR, x1=type (0=exec→RX, 1=write→RW) |
 | #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
-| #11 | EL0 fault | SIGSEGV delivery; GPRs in frame |
+| #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | System instruction trap | cache maintenance logging (DC CVAU, IC IVAU, etc.) |
 
 ## Build

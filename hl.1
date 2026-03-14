@@ -13,6 +13,8 @@
 .Op Fl -timeout Ar seconds
 .Op Fl -sysroot Ar path
 .Op Fl -verbose
+.Op Fl -gdb Ar port
+.Op Fl -gdb-stop-on-entry
 .Op Fl -
 .Ar elf-path
 .Op Ar args ...
@@ -74,6 +76,20 @@ or
 .Pa ld-linux-aarch64.so.1 )
 from this sysroot and transparently redirects absolute path opens
 through it.
+.It Fl -gdb Ar port
+Start a GDB Remote Serial Protocol stub listening on TCP
+.Ar port .
+GDB or LLDB can then attach with
+.Ql target remote localhost: Ns Ar port .
+Only supported for aarch64 guests; ignored for x86_64 (Rosetta).
+Supports up to 16 hardware breakpoints and 16 watchpoints.
+.It Fl -gdb-stop-on-entry
+When used with
+.Fl -gdb ,
+stop the guest at the ELF entry point and wait for GDB to attach
+before executing any guest instructions.
+Without this flag, the guest runs immediately and only stops on
+breakpoints or Ctrl+C.
 .It Fl -
 Stop processing
 .Nm

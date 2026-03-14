@@ -657,12 +657,13 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
         mac_level = IPPROTO_IP;
         if (optname == LINUX_IP_TOS) mac_optname = IP_TOS;
         else if (optname == LINUX_IP_MTU_DISCOVER) {
-            /* Return IP_PMTUDISC_WANT (3) as a reasonable default */
+            /* Return IP_PMTUDISC_WANT (1) as a reasonable default.
+             * Linux: DONT=0, WANT=1, DO=2, PROBE=3. */
             uint32_t guest_optlen_val;
             if (guest_read(g, optlen_gva, &guest_optlen_val, 4) < 0)
                 return -LINUX_EFAULT;
             if (guest_optlen_val >= sizeof(int)) {
-                int val = 3; /* IP_PMTUDISC_WANT */
+                int val = 1; /* IP_PMTUDISC_WANT */
                 if (guest_write(g, optval_gva, &val, sizeof(val)) < 0)
                     return -LINUX_EFAULT;
                 uint32_t out_len = sizeof(int);

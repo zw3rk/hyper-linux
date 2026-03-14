@@ -255,6 +255,7 @@ run_unit_tests() {
     printf "\n${BLUE}── Signal tests ──${RESET}\n"
     test_check "$runner" "test-signal"        "PASS|0 failed"   "$bindir/test-signal"
     test_check "$runner" "test-signal-thread" "PASS|0 failed"   "$bindir/test-signal-thread"
+    test_check "$runner" "test-sigill"        "0 failed"        "$bindir/test-sigill"
 
     printf "\n${BLUE}── Socket tests ──${RESET}\n"
     test_check "$runner" "test-socket"        "PASS|0 failed"   "$bindir/test-socket"

@@ -1118,8 +1118,9 @@ static void handle_thread_info(int first) {
         return;
     }
 
-    /* Build comma-separated hex thread ID list */
-    char reply[1024];
+    /* Build comma-separated hex thread ID list.
+     * Worst case: MAX_THREADS(64) × 17 chars (16 hex + comma) + 1 prefix + NUL. */
+    char reply[2048];
     int pos = 0;
     reply[pos++] = 'm';
 
@@ -1623,9 +1624,6 @@ int gdb_stub_is_active(void) {
 int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr) {
     if (!gdb.initialized || gdb.client_fd < 0) return 0;
 
-    /* Remove temporary breakpoints after step completes */
-    bp_remove_temps();
-
     int64_t my_tid = current_thread ? current_thread->guest_tid : 1;
 
     /* Snapshot vCPU registers into thread entry — must happen on the
@@ -1636,26 +1634,39 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr) {
 
     pthread_mutex_lock(&gdb.lock);
 
-    /* Record stop info */
-    gdb.all_stopped = 1;
-    gdb.stop_tid = my_tid;
-    gdb.stop_reason = stop_reason;
-    gdb.stop_addr = stop_addr;
-    gdb.stop_requested = 0;
+    /* In all-stop mode, only the first thread to stop sends the reply.
+     * Other threads just block until GDB resumes. */
+    int first_to_stop = !gdb.all_stopped;
 
-    /* Update focus thread */
-    gdb.current_g_tid = my_tid;
-    gdb.current_c_tid = my_tid;
+    if (first_to_stop) {
+        /* Remove temporary breakpoints (must be under lock to avoid
+         * concurrent modification of the breakpoint table). */
+        bp_remove_temps();
+
+        /* Record stop info */
+        gdb.all_stopped = 1;
+        gdb.stop_tid = my_tid;
+        gdb.stop_reason = stop_reason;
+        gdb.stop_addr = stop_addr;
+        gdb.stop_requested = 0;
+
+        /* Update focus thread */
+        gdb.current_g_tid = my_tid;
+        gdb.current_c_tid = my_tid;
+    }
 
     pthread_mutex_unlock(&gdb.lock);
 
-    /* Stop all other vCPUs (all-stop mode) */
-    thread_interrupt_all();
+    if (first_to_stop) {
+        /* Stop all other vCPUs (all-stop mode) */
+        thread_interrupt_all();
 
-    /* Send stop reply to GDB */
-    char reply[128];
-    build_stop_reply(reply, sizeof(reply));
-    rsp_reply(reply);
+        /* Send stop reply to GDB — only the first thread to stop sends it,
+         * avoiding duplicate replies that would corrupt the RSP protocol. */
+        char reply[128];
+        build_stop_reply(reply, sizeof(reply));
+        rsp_reply(reply);
+    }
 
     /* Block this thread until GDB resumes */
     pthread_mutex_lock(&gdb.lock);

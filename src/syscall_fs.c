@@ -975,6 +975,14 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
         if (host_dirfd < 0) return -LINUX_EBADF;
     }
 
+    /* Check /proc paths first — macOS has no /proc filesystem, so
+     * access("/proc/self/stat", R_OK) etc. must be intercepted.
+     * If proc_intercept_stat succeeds, the path is a known emulated
+     * entry and we report it as accessible. */
+    struct stat dummy_st;
+    if (proc_intercept_stat(path, &dummy_st) == 0)
+        return 0;
+
     char sysroot_buf[LINUX_PATH_MAX];
     const char *check_path = resolve_sysroot_path(path, sysroot_buf,
                                                    sizeof(sysroot_buf));
