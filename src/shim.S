@@ -601,6 +601,7 @@ handle_svc_0:
      * clobbered across SVC, so callers never expect it preserved. */
     cbz x8, 1f
     tlbi vmalle1is
+    dsb ish
 1:
     /* Flush I-cache for D/I coherence after every syscall return.
      *

@@ -600,10 +600,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         return 1;
     }
     /* POSIX: "Signals pending to the parent shall not be pending to the
-     * child."  Clear pending bitmask and RT queue before applying state. */
+     * child."  Clear pending bitmask and RT queue before applying state.
+     * Note: signal_set_state() is deferred until after thread_register_main()
+     * so that current_thread is non-NULL and per-thread state (blocked mask,
+     * altstack) is properly restored. See signal_set_state() line 253. */
     sig.pending = 0;
     memset(sig.rt_queue, 0, sizeof(sig.rt_queue));
-    signal_set_state(&sig);
 
     /* Step 6d: Read shim blob (needed for exec in child) */
     uint32_t shim_size;
@@ -704,6 +706,11 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
      * accesses per-thread state (signal masks, ptrace, CLONE_THREAD)
      * will dereference NULL. */
     thread_register_main(vcpu, vexit, hdr.child_pid, regs.sp_el1);
+
+    /* Now that current_thread is set, apply signal state. This must happen
+     * after thread_register_main() so the per-thread blocked mask and
+     * altstack are properly restored to the thread entry. */
+    signal_set_state(&sig);
 
     if (verbose)
         fprintf(stderr, "hl: fork-child: entering vCPU loop\n");

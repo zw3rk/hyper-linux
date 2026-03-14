@@ -1268,7 +1268,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             /* TTBR0 (user VA): convert to offset for region tracking */
             uint64_t unmap_off = unmap_addr - g->ipa_base;
             if (unmap_off + unmap_len <= g->guest_size) {
-                /* Zero non-PROT_NONE portions (security: prevent data
+                /* Low-VA path: address within primary guest buffer.
+                 * Zero non-PROT_NONE portions (security: prevent data
                  * leaks). PROT_NONE regions were never written to (no
                  * page table entries), so host pages are still in
                  * MAP_ANON zero-fill state. Zeroing a huge PROT_NONE
@@ -1314,6 +1315,47 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                     mmap_rw_gap_hint = unmap_off;
                 if (unmap_off < mmap_rx_gap_hint)
                     mmap_rx_gap_hint = unmap_off;
+            } else {
+                /* High-VA path: address above primary buffer (rosetta
+                 * JIT slab allocator, thread stacks, PIE mappings at
+                 * ~85TB, etc.). Walk page tables to find the GPA for
+                 * each 2MB block, zero the backing data, and remove
+                 * the GPA-based region tracking entries. */
+                uint64_t va_end = unmap_addr + unmap_len;
+                for (uint64_t va = unmap_addr; va < va_end;
+                     va += BLOCK_2MB) {
+                    void *ptr = guest_ptr(g, va);
+                    if (!ptr) continue;
+                    /* Compute how much of this 2MB block to zero */
+                    uint64_t block_start = va & ~(BLOCK_2MB - 1);
+                    uint64_t zero_start = (va > block_start) ? va
+                                                             : block_start;
+                    uint64_t zero_end = (va_end < block_start + BLOCK_2MB)
+                                      ? va_end
+                                      : block_start + BLOCK_2MB;
+                    /* ptr points to the start of the resolved VA; offset
+                     * within the block to the actual unmap start */
+                    memset(ptr, 0, zero_end - zero_start);
+                }
+                /* Remove GPA-based region tracking entries that have
+                 * display_va within the unmapped VA range. Scan all
+                 * regions (high-VA regions are stored at their GPA). */
+                for (int i = g->nregions - 1; i >= 0; i--) {
+                    guest_region_t *r = &g->regions[i];
+                    if (r->display_va == 0) continue;
+                    uint64_t rva_start = r->display_va;
+                    uint64_t rva_end = r->display_end
+                                    ? r->display_end
+                                    : rva_start + (r->end - r->start);
+                    /* Remove if any part of this region's display VA
+                     * overlaps the unmapped range */
+                    if (rva_start < va_end && rva_end > unmap_addr) {
+                        guest_region_remove(g, r->start, r->end);
+                        /* Reset gap hints for freed GPA */
+                        if (r->start < mmap_rw_gap_hint)
+                            mmap_rw_gap_hint = r->start;
+                    }
+                }
             }
         }
         pthread_mutex_unlock(&mmap_lock);
