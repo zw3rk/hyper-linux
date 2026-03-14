@@ -9,6 +9,7 @@
  * 3. Handler can recover (sigreturn advances past the faulting insn)
  * 4. NULL dereference produces SIGSEGV (not SIGILL from zero-page code)
  */
+#define _GNU_SOURCE   /* REG_RIP on musl/glibc x86_64 */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
