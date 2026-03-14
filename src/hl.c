@@ -578,6 +578,14 @@ too_many_regions:
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
 
+    /* Null guard page: invalidate page 0 so NULL dereferences produce
+     * a translation fault (EC=0x20 → SIGSEGV) instead of executing
+     * zero-initialized memory (UDF #0 → EC=0x00 → SIGILL). The shim
+     * starts at SHIM_BASE=0x100000 but its 2MB L2 block covers 0x0–
+     * 0x1FFFFF with RX permissions. Splitting into L3 pages and
+     * invalidating page 0 matches Linux kernel behavior. */
+    guest_invalidate_ptes(&g, 0, 0x1000);
+
     if (verbose) {
         fprintf(stderr, "hl: TTBR0=0x%llx, IPA base=0x%llx\n",
                 (unsigned long long)ttbr0, (unsigned long long)g.ipa_base);

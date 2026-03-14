@@ -551,6 +551,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                      LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                      0, "[stack]");
 
+    /* Null guard page: invalidate page 0 (same as hl.c startup) */
+    guest_invalidate_ptes(g, 0, 0x1000);
+
     /* Step 9: Build new stack with new argv/envp */
     const char **argv_const = (const char **)argv;
     const char **envp_const = (const char **)envp;

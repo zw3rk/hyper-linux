@@ -1422,58 +1422,76 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                 }
 
                 case 11: {
-                    /* HVC #11: EL0 fault → deliver SIGSEGV.
+                    /* HVC #11: EL0 fault → deliver signal.
                      *
-                     * The shim forwards translation faults, access flag
-                     * faults, and read permission faults from EL0 here.
-                     * A real Linux kernel delivers SIGSEGV for these.
-                     * This enables fault-driven lazy JIT translation:
-                     * rosetta registers a SIGSEGV handler and uses faults
-                     * to discover untranslated code addresses.
+                     * The shim forwards EL0 faults here for signal delivery.
+                     * EC-based dispatch determines the signal:
+                     *   EC=0x20 (instruction abort) → SIGSEGV
+                     *   EC=0x24 (data abort)        → SIGSEGV
+                     *   EC=0x00 (undefined insn)    → SIGILL
+                     *   Other ECs from EL0           → SIGILL (catch-all)
                      *
-                     * Decode fault type from ESR_EL1:
-                     *   EC=0x20 (instruction abort) or EC=0x24 (data abort)
-                     *   xFSC[5:2]: 0x01=translation, 0x03=permission
-                     *   WnR (bit 6): 1=write, 0=read (data abort only)
-                     *
-                     * si_code mapping:
-                     *   Translation fault → SEGV_MAPERR (address not mapped)
-                     *   Permission fault  → SEGV_ACCERR (bad permissions) */
-                    uint64_t esr, far_addr;
+                     * For SIGSEGV, si_code is SEGV_MAPERR (translation fault)
+                     * or SEGV_ACCERR (permission fault) based on xFSC[5:2].
+                     * For SIGILL, si_code is ILL_ILLOPC (illegal opcode).
+                     * si_addr is FAR_EL1 for aborts, ELR_EL1 for SIGILL
+                     * (FAR_EL1 is UNKNOWN for EC=0 per ARM ARM). */
+                    uint64_t esr, far_addr, elr_addr;
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr_addr);
 
                     uint32_t fault_ec = (uint32_t)((esr >> 26) & 0x3F);
-                    uint32_t fsc = (uint32_t)(esr & 0x3F);
-                    uint32_t fsc_type = (fsc >> 2) & 0xF;  /* xFSC[5:2] */
 
-                    /* Determine si_code based on fault type */
+                    int signum;
                     int si_code;
-                    if (fsc_type == 0x03) {
-                        si_code = LINUX_SEGV_ACCERR;  /* Permission fault */
+                    uint64_t si_addr;
+
+                    if (fault_ec == 0x20 || fault_ec == 0x24) {
+                        /* Instruction or data abort → SIGSEGV */
+                        uint32_t fsc = (uint32_t)(esr & 0x3F);
+                        uint32_t fsc_type = (fsc >> 2) & 0xF;
+                        signum = LINUX_SIGSEGV;
+                        si_code = (fsc_type == 0x03)
+                            ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
+                        si_addr = far_addr;
+
+                        if (verbose) {
+                            const char *fault_type =
+                                (fault_ec == 0x20) ? "inst" : "data";
+                            const char *code_name =
+                                (si_code == LINUX_SEGV_MAPERR) ? "MAPERR"
+                                                               : "ACCERR";
+                            fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
+                                    "(ESR=0x%llx FSC=0x%x) → SIGSEGV/%s\n",
+                                    prefix, fault_type,
+                                    (unsigned long long)far_addr,
+                                    (unsigned long long)esr,
+                                    fsc, code_name);
+                        }
                     } else {
-                        si_code = LINUX_SEGV_MAPERR;  /* Translation/other */
+                        /* EC=0x00 (undefined instruction) or other unrecognized
+                         * EC from EL0 → SIGILL. Use ELR_EL1 as si_addr because
+                         * FAR_EL1 is UNKNOWN for non-abort exceptions. */
+                        signum = LINUX_SIGILL;
+                        si_code = LINUX_ILL_ILLOPC;
+                        si_addr = elr_addr;
+
+                        if (verbose)
+                            fprintf(stderr, "%s: EL0 undefined insn at "
+                                    "PC=0x%llx (ESR=0x%llx EC=0x%x) "
+                                    "→ SIGILL/ILL_ILLOPC\n",
+                                    prefix,
+                                    (unsigned long long)elr_addr,
+                                    (unsigned long long)esr, fault_ec);
                     }
 
-                    if (verbose) {
-                        const char *fault_type =
-                            (fault_ec == 0x20) ? "inst" : "data";
-                        const char *code_name =
-                            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
-                        fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
-                                "(ESR=0x%llx FSC=0x%x) → SIGSEGV/%s\n",
-                                prefix, fault_type,
-                                (unsigned long long)far_addr,
-                                (unsigned long long)esr,
-                                fsc, code_name);
-                    }
-
-                    signal_set_fault_info(si_code, far_addr, esr);
-                    signal_queue(LINUX_SIGSEGV);
+                    signal_set_fault_info(si_code, si_addr, esr);
+                    signal_queue(signum);
                     int sig_ret = signal_deliver(vcpu, g, &exit_code);
                     if (verbose)
-                        fprintf(stderr, "%s: SIGSEGV deliver returned %d\n",
-                                prefix, sig_ret);
+                        fprintf(stderr, "%s: signal %d deliver returned %d\n",
+                                prefix, signum, sig_ret);
                     if (sig_ret < 0) {
                         /* Default action: core dump (we just terminate) */
                         running = 0;

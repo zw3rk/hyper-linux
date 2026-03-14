@@ -17,7 +17,7 @@
  *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
  *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec→RX, 1=write→RW)
  *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
- *   #11 EL0 fault         (SIGSEGV delivery; GPRs in frame)
+ *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame)
  *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
  *
  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
@@ -271,7 +271,12 @@ not_svc:
     cmp x10, #0x3C
     b.eq handle_brk
 
-    b restore_and_bad
+    /* Unrecognized EC. Check if from EL0 (deliver signal) or EL1 (shim bug).
+     * X11 is saved on stack, safe to use as scratch. */
+    mrs x11, spsr_el1
+    and x11, x11, #0xF
+    cbnz x11, restore_and_bad   /* EL1 (M>=4): genuine shim bug */
+    b handle_el0_fault           /* EL0 (M=0): forward for signal delivery */
 
 /* ================================================================
  * handle_sysreg_trap — EC=0x18: MSR/MRS / system instruction
@@ -408,19 +413,19 @@ handle_data_abort:
     b tlbi_restore_eret
 
 /* ================================================================
- * handle_el0_fault — Deliver SIGSEGV for EL0 faults
+ * handle_el0_fault — Deliver SIGSEGV/SIGILL for EL0 faults
  *
- * Translation faults (unmapped address), access flag faults, and
- * read permission faults from EL0 code should deliver SIGSEGV to
- * the guest process, not crash. This is how a real Linux kernel
- * handles faults — the process gets a signal and can either handle
- * it (e.g., rosetta's lazy JIT translation) or die from default
- * disposition.
+ * Translation faults, access flag faults, read permission faults,
+ * and undefined instructions from EL0 code should deliver the
+ * appropriate signal (SIGSEGV or SIGILL) to the guest process.
+ * This matches real Linux kernel behavior — the process gets a
+ * signal and can either handle it (e.g., rosetta's lazy JIT
+ * translation via SIGSEGV) or die from default disposition.
  *
  * Restore all GPRs from the stack frame (host needs the original
  * EL0 state for the signal frame), then forward to host via HVC #11.
- * The host decodes the fault type from ESR_EL1 and delivers SIGSEGV
- * with the appropriate si_code (SEGV_MAPERR or SEGV_ACCERR).
+ * The host decodes the EC from ESR_EL1: EC=0x20/0x24 → SIGSEGV,
+ * EC=0x00 (undefined) or other → SIGILL.
  * ================================================================ */
 handle_el0_fault:
     /* Restore all GPRs from stack frame (host needs EL0 state) */

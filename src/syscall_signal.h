@@ -114,6 +114,11 @@ typedef struct {
 #define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
 #define LINUX_TRAP_TRACE  2   /* Process trace trap (single-step) */
 
+/* si_code values for SIGILL (from include/uapi/asm-generic/siginfo.h) */
+#define LINUX_ILL_ILLOPC  1   /* Illegal opcode */
+#define LINUX_ILL_ILLOPN  2   /* Illegal operand */
+#define LINUX_ILL_ILLADR  3   /* Illegal addressing mode */
+
 /* si_code values for SIGSEGV (from include/uapi/asm-generic/siginfo.h) */
 #define LINUX_SEGV_MAPERR 1   /* Address not mapped to object */
 #define LINUX_SEGV_ACCERR 2   /* Invalid permissions for mapped object */
