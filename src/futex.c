@@ -791,14 +791,16 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
     futex_bucket_t *b = &buckets[idx];
 
     pthread_mutex_lock(&b->lock);
-    futex_waiter_t *w = b->head;
-    while (w) {
+    futex_waiter_t **pp = &b->head;
+    while (*pp) {
+        futex_waiter_t *w = *pp;
         if (w->uaddr == uaddr) {
+            *pp = w->next;  /* Unlink before signaling */
             w->woken = 1;
             pthread_cond_signal(&w->cond);
             break;  /* Wake exactly one */
         }
-        w = w->next;
+        pp = &w->next;
     }
     pthread_mutex_unlock(&b->lock);
 
