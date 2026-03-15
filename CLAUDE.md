@@ -131,8 +131,8 @@ and a Haskell hello-hyper test — per mode.
 
 Quick unit-only tests (subset of the full matrix):
 ```
-nix develop -c make test-all       # aarch64 unit tests (38 tests)
-nix develop -c make test-x64-all   # x86_64 unit tests (34+4 xfail)
+nix develop -c make test-all       # aarch64 unit tests (40 tests)
+nix develop -c make test-x64-all   # x86_64 unit tests (35+5 xfail)
 ```
 
 ### Expected Results (M2, as of commit 9b6505a)

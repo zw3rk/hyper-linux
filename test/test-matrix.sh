@@ -300,6 +300,9 @@ run_unit_tests() {
 
     printf "\n${BLUE}── PI futex + EINTR regression ──${RESET}\n"
     test_check "$runner" "test-futex-pi"      "0 failed"        "$bindir/test-futex-pi"
+
+    printf "\n${BLUE}── X11 raw protocol ──${RESET}\n"
+    test_check "$runner" "test-x11"           "0 failed"        "$bindir/test-x11"
 }
 
 # ── Test suite: coreutils ─────────────────────────────────────────

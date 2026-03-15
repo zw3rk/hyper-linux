@@ -257,6 +257,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-futex-pi; \
 	printf "\n$(BLUE)── SIGILL / null guard tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-sigill; \
+	printf "\n$(BLUE)── X11 raw protocol tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
@@ -499,6 +501,8 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_xfail test-futex-pi "rosetta: raw clone(CLONE_THREAD) in dead-owner test hangs"; \
 	printf "\n$(BLUE)── SIGILL / null guard tests (x86_64) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sigill; \
+	printf "\n$(BLUE)── X11 raw protocol tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
