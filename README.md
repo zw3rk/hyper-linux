@@ -51,10 +51,10 @@ Download the latest `.pkg` or `.zip` from [Releases](https://github.com/zw3rk/hy
 
 ```
 # macOS installer package
-sudo installer -pkg hl-v0.2.3.pkg -target /
+sudo installer -pkg hl-v0.2.4.pkg -target /
 
 # or unzip manually
-unzip hl-v0.2.3.zip -d /usr/local/bin/
+unzip hl-v0.2.4.zip -d /usr/local/bin/
 ```
 
 ### With Nix

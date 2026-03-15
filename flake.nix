@@ -73,7 +73,7 @@
 
       packages.${darwinSystem}.default = darwinPkgs.stdenv.mkDerivation {
         pname = "hl";
-        version = "0.2.3";
+        version = "0.2.4";
         src = ./.;
 
         nativeBuildInputs = [

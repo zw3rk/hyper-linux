@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.4] - 2026-03-15
+
+### Added
+- Add GDB remote serial protocol stub for aarch64 guest debugging (hardware breakpoints, watchpoints, single-step, full register/memory access, thread support)
+- Add X11 raw wire protocol test (test-x11)
+
+### Fixed
+- Fix futex_unlock_pi to unlink woken waiter before signaling, preventing use-after-free
+- Hold mmap_lock during fork IPC region enumeration to prevent races
+- Drain oversized cmdline in fork child to prevent IPC stream desync
+- Recycle SP_EL1 slots on thread exit and unlink woken futex waiters
+- Handle EC=0 (undefined instruction) from EL0 gracefully instead of crashing
+- Add `_GNU_SOURCE` for `REG_RIP` in test-sigill.c
+
+### Documentation
+- Add GDB stub to architecture list and debugging section in CLAUDE.md
+
 ## [0.2.3] - 2026-03-13
 
 ### Added
