@@ -7,9 +7,10 @@
  * bind/connect against a per-thread cwd pinned to the resolved parent, using a
  * RELATIVE leaf — race-free, and any out-of-bind path is refused.
  *
- * Run with (--isolated so host /tmp is NOT auto-bound and stays a writable
- * out-of-bind escape target):
- *   hl --fs-mode=rooted --isolated --bind <tmp>:/home/user --guest-cwd /home/user
+ * Run with explicit isolated home and /tmp binds.  Host /var/tmp stays a
+ * writable out-of-bind escape target for the confinement checks:
+ *   hl --fs-mode=rooted --isolated --bind <tmp>:/home/user --bind /tmp:/tmp
+ *      --guest-cwd /home/user
  *
  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
@@ -64,6 +65,20 @@ int main(void) {
         else FAILF("HOME=%s", home ? home : "(unset)");
     }
 
+    TEST("explicit isolated /tmp bind sets guest TMPDIR");
+    {
+        const char *tmpdir = getenv("TMPDIR");
+        if (tmpdir && strcmp(tmpdir, "/tmp") == 0) PASS();
+        else FAILF("TMPDIR=%s", tmpdir ? tmpdir : "(unset)");
+    }
+
+    TEST("explicit isolated /tmp bind sets guest TMP");
+    {
+        const char *tmp = getenv("TMP");
+        if (tmp && strcmp(tmp, "/tmp") == 0) PASS();
+        else FAILF("TMP=%s", tmp ? tmp : "(unset)");
+    }
+
     /* Control (+): bind an AF_UNIX socket INSIDE the bind (CWD /home/user),
      * then connect a client to it — proves the confined bind+connect path
      * works end to end, otherwise the refusals below prove nothing. */
@@ -93,12 +108,12 @@ int main(void) {
     unlink(inpath);
 
     /* (−) The escape: an absolute host path outside every bind. Under
-     * --isolated host /tmp is NOT bound and is writable, so under the bug the
-     * bind created a real socket there (a confinement escape). */
+     * --isolated host /var/tmp is NOT bound and is writable, so under the bug
+     * the bind created a real socket there (a confinement escape). */
     char esc[128];
-    snprintf(esc, sizeof(esc), "/tmp/hl-vfs-escape-%d.sock", (int)getpid());
+    snprintf(esc, sizeof(esc), "/var/tmp/hl-vfs-escape-%d.sock", (int)getpid());
     unlink(esc);
-    MUST_NOT_BIND("bind escapes to host /tmp", esc);
+    MUST_NOT_BIND("bind escapes to host /var/tmp", esc);
     MUST_NOT_BIND("bind escapes to absolute /etc", "/etc/hl-vfs-escape.sock");
 
     /* Connect to an out-of-bind path must be refused before it reaches the

@@ -83,6 +83,7 @@ int main(int argc, char **argv) {
     int audio_backend_set = 0;
     int guest_cwd_set = 0;
     int home_bind_set = 0;
+    int tmp_bind_set = 0;
 
     /* Handle --version / --help before option parsing */
     if (argc > 1) {
@@ -197,9 +198,15 @@ int main(int argc, char **argv) {
                         argv[arg_start + 1]);
                 return 1;
             }
-            /* Detect explicit home bind so we don't double-bind defaults. */
-            if (strstr(argv[arg_start + 1], "/home/user") != NULL)
+            /* Inspect the parsed guest prefix, not the raw spec: host paths
+             * may themselves contain strings such as "/tmp". */
+            const hl_vfs_t *vfs = hl_vfs_get();
+            const char *guest_prefix =
+                vfs->mounts[vfs->nmounts - 1].guest_prefix;
+            if (strcmp(guest_prefix, "/home/user") == 0)
                 home_bind_set = 1;
+            if (strcmp(guest_prefix, "/tmp") == 0)
+                tmp_bind_set = 1;
             arg_start += 2;
         } else if (strcmp(argv[arg_start], "--guest-home") == 0 &&
                    arg_start + 1 < argc) {
@@ -358,8 +365,8 @@ int main(int argc, char **argv) {
 
     /* /tmp: control sockets (xmms_user.0), GTK temp files. macOS TMPDIR
      * is under /var/folders/... which is not mounted by default. */
-    int tmp_bound = 0;
-    if (!isolated && hl_vfs_mode() == HL_FS_ROOTED &&
+    int tmp_bound = tmp_bind_set;
+    if (!tmp_bound && !isolated && hl_vfs_mode() == HL_FS_ROOTED &&
         access("/tmp", F_OK) == 0) {
         if (hl_vfs_add_bind("/tmp", "/tmp", 0) == 0) {
             tmp_bound = 1;

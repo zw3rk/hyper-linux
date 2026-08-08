@@ -360,6 +360,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	rm -rf "$$tmpdir"; \
 	tmpdir=$$(mktemp -d); \
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --isolated --bind "$$tmpdir:/home/user" \
+		--bind /tmp:/tmp \
 		--guest-cwd /home/user $(TEST_DIR)/test-vfs-unix-bind; \
 	rm -rf "$$tmpdir"; \
 	tmpdir=$$(mktemp -d); \
