@@ -141,6 +141,31 @@ else
 fi
 rm -f /tmp/h6_hold.$$
 
+# ---- 6. Rooted mutating ops cannot escape the bind (H5) ----
+mdir=$(mktemp -d); mkdir -p "$mdir/bound"; echo SECRET > "$mdir/secret.txt"
+"$HL" --fs-mode=rooted --bind "$mdir/bound:/home/user" --guest-cwd /home/user \
+    --audio-backend null "$BUILD/helper-vfs-mutate" >/dev/null 2>&1
+if [ -f "$mdir/secret.txt" ] && [ "$(cat "$mdir/secret.txt")" = SECRET ]; then
+    ok "rooted mutating ops cannot escape the bind"
+else
+    bad "rooted mutating ops cannot escape the bind" \
+        "the outside secret was modified or deleted"
+fi
+rm -rf "$mdir"
+
+# ---- 7. Crash report redacts $HOME even mid-token (V26) ----
+# A guest arg carrying the host home path mid-token must appear redacted in
+# the crash report (the output meant for public issues), not raw.
+crash_out=$(HL_TRACE_REDACT=1 timeout 20 "$HL" --timeout 2 --fs-mode=legacy \
+    --audio-backend null "$BUILD/helper-crash" "--data-dir=$HOME/pandoc" 2>&1)
+if printf '%s' "$crash_out" | grep -qF "$HOME/pandoc"; then
+    bad "crash report redacts \$HOME mid-token" "raw host path in the report"
+elif printf '%s' "$crash_out" | grep -q "cmdline"; then
+    ok "crash report redacts \$HOME mid-token"
+else
+    bad "crash report redacts \$HOME mid-token" "no crash report produced"
+fi
+
 echo
 echo "test-diagnostics: $pass passed, $fail failed — $([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 [ $fail -eq 0 ]

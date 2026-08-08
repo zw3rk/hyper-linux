@@ -143,6 +143,31 @@ void hl_trace_path(char *dst, size_t dstsz, const char *path) {
     }
 }
 
+/* Redact every occurrence of $HOME (not just a prefix) and escape control
+ * characters, into dst. The one redactor shared by trace lines and the crash
+ * report — hl_trace_path() only handled a leading prefix, so a host path
+ * appearing mid-token (a guest argv like --data-dir=/Users/me/x) leaked. */
+void hl_trace_redact(char *dst, size_t dstsz, const char *src) {
+    if (!dst || dstsz == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    if (!hl_trace_redact_paths) { hl_trace_escape(dst, dstsz, src); return; }
+    const char *home = getenv("HOME");
+    size_t hl = home ? strlen(home) : 0;
+    if (hl == 0) { hl_trace_escape(dst, dstsz, src); return; }
+    char red[4096];
+    size_t o = 0;
+    for (size_t i = 0; src[i] && o + 1 < sizeof(red); ) {
+        if (strncmp(src + i, home, hl) == 0) {
+            red[o++] = '~';
+            i += hl;
+        } else {
+            red[o++] = src[i++];
+        }
+    }
+    red[o] = '\0';
+    hl_trace_escape(dst, dstsz, red);
+}
+
 void hl_tracev(uint32_t cat, const char *fmt, va_list ap) {
     if ((hl_trace_mask & cat) == 0) return;
 
@@ -165,29 +190,7 @@ void hl_tracev(uint32_t cat, const char *fmt, va_list ap) {
      * and hl_trace_escape() existed but had no callers at all, so the
      * documented redaction silently did nothing. */
     char safe[sizeof(body) * 4];
-    if (hl_trace_redact_paths) {
-        char red[sizeof(body)];
-        const char *home = getenv("HOME");
-        size_t hl = home ? strlen(home) : 0;
-        if (hl > 0) {
-            /* Replace every occurrence of $HOME with "~". */
-            size_t o = 0;
-            for (size_t i = 0; body[i] && o + 1 < sizeof(red); ) {
-                if (strncmp(body + i, home, hl) == 0) {
-                    red[o++] = '~';
-                    i += hl;
-                } else {
-                    red[o++] = body[i++];
-                }
-            }
-            red[o] = '\0';
-            hl_trace_escape(safe, sizeof(safe), red);
-        } else {
-            hl_trace_escape(safe, sizeof(safe), body);
-        }
-    } else {
-        hl_trace_escape(safe, sizeof(safe), body);
-    }
+    hl_trace_redact(safe, sizeof(safe), body);
 
     pthread_mutex_lock(&trace_lock);
     fprintf(stderr, "hl[pid=%d tid=%lu] %s %s\n",

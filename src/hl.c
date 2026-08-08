@@ -541,15 +541,22 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Write title into the original argv area */
-            size_t title_len = strlen(title);
-            if (title_len < avail) {
-                memcpy(argv[0], title, title_len);
-                memset(argv[0] + title_len, '\0', avail - title_len);
+            /* Only clobber the original argv+environ area once environ has
+             * been safely relocated to the heap. `avail` spans through the
+             * last environ string, so the memset below would otherwise WIPE
+             * the live environment when the strdup copy failed (OOM) — every
+             * later getenv() would then return garbage. Skip the cosmetic
+             * title rewrite in that case; a valid environment matters more. */
+            if (environ == new_environ && new_environ != NULL) {
+                size_t title_len = strlen(title);
+                if (title_len < avail) {
+                    memcpy(argv[0], title, title_len);
+                    memset(argv[0] + title_len, '\0', avail - title_len);
+                }
+                /* Null out remaining argv pointers so ps doesn't show stale args */
+                for (int i = 1; i < argc; i++)
+                    argv[i] = NULL;
             }
-            /* Null out remaining argv pointers so ps doesn't show stale args */
-            for (int i = 1; i < argc; i++)
-                argv[i] = NULL;
         }
     }
 

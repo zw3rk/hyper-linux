@@ -75,6 +75,11 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
     /* ── 2. Crash type ──────────────────────────────────────────── */
     fprintf(stderr, "## Crash\n");
     fprintf(stderr, "- type: %s\n", crash_type_name(type));
+    char detail_safe[4096];
+    if (detail && detail[0]) {
+        hl_trace_redact(detail_safe, sizeof(detail_safe), detail);
+        detail = detail_safe;
+    }
     if (detail && detail[0])
         fprintf(stderr, "- detail: %s\n", detail);
     fprintf(stderr, "\n");
@@ -93,10 +98,10 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
     char safe[4096 * 4];
 
     fprintf(stderr, "## Binary\n");
-    hl_trace_path(safe, sizeof(safe), elf_path ? elf_path : "(unknown)");
+    hl_trace_redact(safe, sizeof(safe), elf_path ? elf_path : "(unknown)");
     fprintf(stderr, "- path: %s\n", safe);
     if (sysroot) {
-        hl_trace_path(safe, sizeof(safe), sysroot);
+        hl_trace_redact(safe, sizeof(safe), sysroot);
         fprintf(stderr, "- sysroot: %s\n", safe);
     }
 
@@ -105,7 +110,7 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
         fprintf(stderr, "- cmdline:");
         size_t pos = 0;
         while (pos < cmdline_len) {
-            hl_trace_path(safe, sizeof(safe), cmdline + pos);
+            hl_trace_redact(safe, sizeof(safe), cmdline + pos);
             fprintf(stderr, " %s", safe);
             pos += strlen(cmdline + pos) + 1;
         }

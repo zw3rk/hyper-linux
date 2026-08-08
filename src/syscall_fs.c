@@ -8,6 +8,15 @@
  */
 #include "syscall_fs.h"
 #include "syscall_net.h"   /* hl_abstract_bind_release */
+
+/* Darwin beneath-resolution flags. O_RESOLVE_BENEATH is exposed under our
+ * build flags but AT_RESOLVE_BENEATH is not always; both are stable XNU ABI. */
+#ifndef O_RESOLVE_BENEATH
+#define O_RESOLVE_BENEATH 0x1000
+#endif
+#ifndef AT_RESOLVE_BENEATH
+#define AT_RESOLVE_BENEATH 0x2000
+#endif
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "syscall_fd.h"
@@ -229,7 +238,56 @@ static int host_dirfd_for_resolved(void) {
  * same-named file in the wrong directory and returned 0.
  * Returns AT_FDCWD (-2 on macOS) or a valid fd on success, and exactly -1
  * for a bad guest fd — so callers must test `== -1`, not `< 0`. */
-static int host_dirfd_for_op(int dirfd) {
+/* For a resolved rooted-mount host path, open the mount's canonical root and
+ * express the path relative to it, so a caller can do *at(rootfd, rel,
+ * AT_RESOLVE_BENEATH) — kernel-enforced, race-free containment that closes
+ * the rename-swap TOCTOU (H5). Returns a rootfd (caller closes) and fills
+ * relbuf, or -1 when not applicable (legacy mode, virtual mount, or a
+ * sysroot-fallback path outside the mount root) — the caller then uses its
+ * existing absolute-path host call. */
+static int beneath_dirfd(const hl_mount_t *mnt, const char *host_path,
+                         char *relbuf, size_t relsz) {
+    if (hl_vfs_mode() != HL_FS_ROOTED || !mnt || !mnt->host_path[0])
+        return -1;
+    size_t rl = strlen(mnt->host_path);
+    if (strncmp(host_path, mnt->host_path, rl) != 0)
+        return -1;                                   /* e.g. sysroot fallback */
+    const char *rel = host_path + rl;
+    while (*rel == '/') rel++;
+    if ((size_t)snprintf(relbuf, relsz, "%s", *rel ? rel : ".") >= relsz)
+        return -1;
+    return open(mnt->host_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+/* Open the PARENT of a resolved rooted-mount path beneath its mount root
+ * (O_RESOLVE_BENEATH), returning the parent fd (caller closes) and pointing
+ * *leaf at the final component within relbuf. For ops with no per-call
+ * beneath flag (readlinkat, renameat, linkat): a pinned parent inode cannot
+ * be renamed out from under the op, and the leaf is a single component, so
+ * the operation is race-safe. Returns -1 when not applicable. */
+static int beneath_parent_dirfd(const hl_mount_t *mnt, const char *host_path,
+                                char *relbuf, size_t relsz,
+                                const char **leaf) {
+    int rootfd = beneath_dirfd(mnt, host_path, relbuf, relsz);
+    if (rootfd < 0) return -1;
+    char *slash = strrchr(relbuf, '/');
+    if (!slash || relbuf[0] == '.') {   /* leaf directly under root (or ".") */
+        *leaf = relbuf;
+        return rootfd;
+    }
+    *slash = '\0';
+    *leaf = slash + 1;
+    int pfd = openat(rootfd, relbuf,
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_RESOLVE_BENEATH);
+    close(rootfd);
+    return pfd;
+}
+
+static int host_dirfd_for_op(int dirfd, const char *guest_path) {
+    /* An ABSOLUTE guest path ignores dirfd entirely on Linux — a bad/closed
+     * dirfd must NOT make an absolute-path *at() fail with EBADF (V13). */
+    if (guest_path && guest_path[0] == '/')
+        return AT_FDCWD;
     if (hl_vfs_mode() == HL_FS_ROOTED || dirfd == LINUX_AT_FDCWD)
         return AT_FDCWD;
     int hfd = fd_to_host(dirfd);
@@ -309,6 +367,11 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     char sysroot_buf[LINUX_PATH_MAX];
     const char *open_path = path;
     int host_dirfd;
+    /* Rooted mode opens beneath the bind-root fd with O_RESOLVE_BENEATH so
+     * the KERNEL resolves the path atomically and refuses any escape — this
+     * closes the rename-swap TOCTOU that string+realpath checking could not
+     * (H5). Set in the non-virtual mount branch below. */
+    int beneath_rootfd = -1;
 
     /* O_CREAT|O_EXCL never follows a final symlink on Linux: the point of
      * O_EXCL is that an existing name — symlink included — fails with
@@ -371,12 +434,29 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
         if (r.mount && (r.mount->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)) &&
             (linux_flags & (LINUX_O_WRONLY | LINUX_O_RDWR | LINUX_O_CREAT)))
             return -LINUX_EROFS;
-        snprintf(open_path_buf, sizeof(open_path_buf), "%s", r.host_path);
-        open_path = open_path_buf;
-        host_dirfd = AT_FDCWD; /* resolved absolute host path */
+        /* Open beneath the mount's canonical root, expressing the path
+         * relative to it, so the kernel enforces containment atomically. */
+        if (r.mount && r.mount->host_path[0]) {
+            beneath_rootfd = open(r.mount->host_path,
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (beneath_rootfd >= 0) {
+                const char *rel = r.guest_abs + r.mount->guest_len;
+                while (*rel == '/') rel++;
+                snprintf(open_path_buf, sizeof(open_path_buf), "%s",
+                         *rel ? rel : ".");
+                open_path = open_path_buf;
+                host_dirfd = beneath_rootfd;
+            }
+        }
+        if (beneath_rootfd < 0) {
+            /* Root not openable (rare) — fall back to the absolute path. */
+            snprintf(open_path_buf, sizeof(open_path_buf), "%s", r.host_path);
+            open_path = open_path_buf;
+            host_dirfd = AT_FDCWD;
+        }
         if (hl_trace_on(HL_TRACE_FS))
-            hl_trace(HL_TRACE_FS, "openat guest=%s host=%s flags=0x%x",
-                     r.guest_abs, open_path, linux_flags);
+            hl_trace(HL_TRACE_FS, "openat guest=%s host=%s flags=0x%x beneath=%d",
+                     r.guest_abs, open_path, linux_flags, beneath_rootfd);
     } else {
         open_path = resolve_sysroot_path(path, sysroot_buf, sizeof(sysroot_buf));
         if (dirfd == LINUX_AT_FDCWD) {
@@ -391,7 +471,10 @@ do_open:
     ; /* C requires a statement after a label before declarations */
     {
     int flags = translate_open_flags(linux_flags);
+    if (beneath_rootfd >= 0) flags |= O_RESOLVE_BENEATH;
     int host_fd = openat(host_dirfd, open_path, flags, mode);
+    int open_errno = errno;
+    if (beneath_rootfd >= 0) { close(beneath_rootfd); beneath_rootfd = -1; }
     /* Rooted miss that looked like a host path: try sysroot basename. */
     if (host_fd < 0 && path[0] == '/' && !create_mode) {
         const char *sr = resolve_sysroot_path(path, sysroot_buf,
@@ -400,10 +483,10 @@ do_open:
             if (hl_trace_on(HL_TRACE_FS))
                 hl_trace(HL_TRACE_FS, "openat sysroot-retry path=%s → %s",
                          path, sr);
-            host_fd = openat(AT_FDCWD, sr, flags, mode);
+            host_fd = openat(AT_FDCWD, sr, flags & ~O_RESOLVE_BENEATH, mode);
         }
     }
-    if (host_fd < 0) return linux_errno();
+    if (host_fd < 0) { errno = open_errno; return linux_errno(); }
 
     int is_dir = (linux_flags & LINUX_O_DIRECTORY) != 0;
 
@@ -1303,8 +1386,9 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *read_path = NULL;
+    const hl_mount_t *rl_mnt = NULL;
     int rr = resolve_path_for_op_ex(dirfd, path, 0, 0, hostbuf, sizeof(hostbuf),
-                                 &read_path, NULL);
+                                 &read_path, &rl_mnt);
     if (rr < 0) return rr;
     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
         ? host_dirfd_for_resolved()
@@ -1312,7 +1396,18 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
         return -LINUX_EBADF;
 
-    ssize_t len = readlinkat(host_dirfd, read_path, link, sizeof(link) - 1);
+    ssize_t len;
+    {
+        char rel[LINUX_PATH_MAX];
+        const char *leaf = NULL;
+        int pfd = beneath_parent_dirfd(rl_mnt, read_path, rel, sizeof(rel), &leaf);
+        if (pfd >= 0) {
+            len = readlinkat(pfd, leaf, link, sizeof(link) - 1);
+            close(pfd);
+        } else {
+            len = readlinkat(host_dirfd, read_path, link, sizeof(link) - 1);
+        }
+    }
     if (len < 0) return linux_errno();
 
     size_t copy_len = (size_t)len < bufsiz ? (size_t)len : bufsiz;
@@ -1343,8 +1438,19 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
         return -LINUX_EBADF;
 
     int host_flags = translate_at_flags(flags);
-    if (unlinkat(host_dirfd, host_path, host_flags) < 0)
-        return linux_errno();
+    {
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(mnt, host_path, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            rc = unlinkat(rootfd, rel, host_flags | AT_RESOLVE_BENEATH);
+            close(rootfd);
+        } else {
+            rc = unlinkat(host_dirfd, host_path, host_flags);
+        }
+        if (rc < 0) return linux_errno();
+        return 0;
+    }
 
     return 0;
 }
@@ -1369,8 +1475,41 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
         return -LINUX_EBADF;
 
-    if (mkdirat(host_dirfd, host_path, (mode_t)mode) < 0)
-        return linux_errno();
+    {
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(mnt, host_path, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            /* mkdirat has no per-call resolve flag, but resolving the PARENT
+             * beneath root is what matters; the leaf is a new name. Open the
+             * parent beneath root and mkdirat into it. Simpler: rel already
+             * names the new dir relative to root, and the kernel resolves its
+             * parent components beneath root when we pass a rootfd whose
+             * resolution is anchored — but mkdirat does not honour
+             * AT_RESOLVE_BENEATH. So verify the parent is beneath root by
+             * opening it O_RESOLVE_BENEATH, then mkdirat relative to that. */
+            char pbuf[LINUX_PATH_MAX];
+            snprintf(pbuf, sizeof(pbuf), "%s", rel);
+            char *slash = strrchr(pbuf, '/');
+            int pfd = rootfd;
+            int opened_parent = 0;
+            const char *leaf = rel;
+            if (slash) {
+                *slash = '\0';
+                leaf = slash + 1;
+                pfd = openat(rootfd, pbuf,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_RESOLVE_BENEATH);
+                opened_parent = 1;
+            }
+            rc = (pfd >= 0) ? mkdirat(pfd, leaf, (mode_t)mode) : -1;
+            if (opened_parent && pfd >= 0) close(pfd);
+            close(rootfd);
+        } else {
+            rc = mkdirat(host_dirfd, host_path, (mode_t)mode);
+        }
+        if (rc < 0) return linux_errno();
+        return 0;
+    }
 
     return 0;
 }
@@ -1403,37 +1542,40 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
         if ((om && (om->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) || (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))))
             return -LINUX_EROFS;
-        host_olddir = host_dirfd_for_op(olddirfd);
-        host_newdir = host_dirfd_for_op(newdirfd);
+        host_olddir = host_dirfd_for_op(olddirfd, oldpath);
+        host_newdir = host_dirfd_for_op(newdirfd, newpath);
         if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
     }
 
-    /* RENAME_NOREPLACE: fail if destination exists. macOS renamex_np
-     * supports RENAME_EXCL for the same semantics. Only supported for
-     * AT_FDCWD paths (renamex_np doesn't take dirfd arguments). */
-    if (flags & LINUX_RENAME_NOREPLACE) {
-        if (host_olddir == AT_FDCWD && host_newdir == AT_FDCWD) {
-            if (renamex_np(oh, nh, RENAME_EXCL) < 0)
-                return linux_errno();
-            return 0;
-        }
-        if (linkat(host_olddir, oh, host_newdir, nh, 0) < 0)
-            return linux_errno();
-        unlinkat(host_olddir, oh, 0);
-        return 0;
-    }
+    /* Map the Linux rename flags to macOS renamex_np flags. */
+    unsigned rx_flags = 0;
+    if (flags & LINUX_RENAME_NOREPLACE) rx_flags |= RENAME_EXCL;
+    if (flags & LINUX_RENAME_EXCHANGE)  rx_flags |= RENAME_SWAP;
 
-    if (flags & LINUX_RENAME_EXCHANGE) {
-        if (host_olddir == AT_FDCWD && host_newdir == AT_FDCWD) {
-            if (renamex_np(oh, nh, RENAME_SWAP) < 0)
-                return linux_errno();
-            return 0;
+    /* Pin both parents beneath their mount roots (TOCTOU-safe, H5) and use
+     * the dirfd-taking renameatx_np — this also makes RENAME_NOREPLACE and
+     * RENAME_EXCHANGE work via a real dirfd (V14). The old code only
+     * supported flags for AT_FDCWD paths, faked NOREPLACE with a non-atomic
+     * linkat+unchecked-unlinkat, and returned EINVAL for EXCHANGE via a
+     * dirfd. */
+    {
+        char orel[LINUX_PATH_MAX], nrel[LINUX_PATH_MAX];
+        const char *oleaf = NULL, *nleaf = NULL;
+        int opfd = beneath_parent_dirfd(om, oh, orel, sizeof(orel), &oleaf);
+        int npfd = beneath_parent_dirfd(nm, nh, nrel, sizeof(nrel), &nleaf);
+        int rc;
+        if (opfd >= 0 && npfd >= 0) {
+            rc = rx_flags ? renameatx_np(opfd, oleaf, npfd, nleaf, rx_flags)
+                          : renameat(opfd, oleaf, npfd, nleaf);
+        } else if (rx_flags) {
+            rc = renameatx_np(host_olddir, oh, host_newdir, nh, rx_flags);
+        } else {
+            rc = renameat(host_olddir, oh, host_newdir, nh);
         }
-        return -LINUX_EINVAL;
+        if (opfd >= 0) close(opfd);
+        if (npfd >= 0) close(npfd);
+        if (rc < 0) return linux_errno();
     }
-
-    if (renameat(host_olddir, oh, host_newdir, nh) < 0)
-        return linux_errno();
 
     return 0;
 }
@@ -1526,14 +1668,27 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
         if (r2 < 0) return r2;
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
         if (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_olddir = host_dirfd_for_op(olddirfd);
-        host_newdir = host_dirfd_for_op(newdirfd);
+        host_olddir = host_dirfd_for_op(olddirfd, oldpath);
+        host_newdir = host_dirfd_for_op(newdirfd, newpath);
         if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
     }
 
     int mac_flags = translate_at_flags(flags);
-    if (linkat(host_olddir, oh, host_newdir, nh, mac_flags) < 0)
-        return linux_errno();
+    {
+        char orel[LINUX_PATH_MAX], nrel[LINUX_PATH_MAX];
+        const char *oleaf = NULL, *nleaf = NULL;
+        int opfd = beneath_parent_dirfd(om, oh, orel, sizeof(orel), &oleaf);
+        int npfd = beneath_parent_dirfd(nm, nh, nrel, sizeof(nrel), &nleaf);
+        int rc;
+        if (opfd >= 0 && npfd >= 0) {
+            rc = linkat(opfd, oleaf, npfd, nleaf, mac_flags);
+        } else {
+            rc = linkat(host_olddir, oh, host_newdir, nh, mac_flags);
+        }
+        if (opfd >= 0) close(opfd);
+        if (npfd >= 0) close(npfd);
+        if (rc < 0) return linux_errno();
+    }
 
     return 0;
 }
@@ -1553,8 +1708,9 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *check_path = NULL;
+    const hl_mount_t *acc_mnt = NULL;
     int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf, sizeof(hostbuf),
-                                 &check_path, NULL);
+                                 &check_path, &acc_mnt);
     if (rr < 0) return rr;
 
     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
@@ -1564,8 +1720,18 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
         return -LINUX_EBADF;
 
     int mac_flags = translate_faccessat_flags(flags);
-    if (faccessat(host_dirfd, check_path, mode, mac_flags) < 0)
-        return linux_errno();
+    {
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(acc_mnt, check_path, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            rc = faccessat(rootfd, rel, mode, mac_flags | AT_RESOLVE_BENEATH);
+            close(rootfd);
+        } else {
+            rc = faccessat(host_dirfd, check_path, mode, mac_flags);
+        }
+        if (rc < 0) return linux_errno();
+    }
 
     return 0;
 }
@@ -1623,7 +1789,7 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_dirfd = host_dirfd_for_op(dirfd);
+        host_dirfd = host_dirfd_for_op(dirfd, path);
         if (host_dirfd == -1) return -LINUX_EBADF;
     }
 
@@ -1638,9 +1804,18 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
         }
     }
 
-    if (fchmodat(host_dirfd, host_path, mode, mac_flags) < 0)
-        return linux_errno();
-
+    {
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(mnt, host_path, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            rc = fchmodat(rootfd, rel, mode, mac_flags | AT_RESOLVE_BENEATH);
+            close(rootfd);
+        } else {
+            rc = fchmodat(host_dirfd, host_path, mode, mac_flags);
+        }
+        if (rc < 0) return linux_errno();
+    }
     return 0;
 }
 
@@ -1659,14 +1834,24 @@ int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_dirfd = host_dirfd_for_op(dirfd);
+        host_dirfd = host_dirfd_for_op(dirfd, path);
         if (host_dirfd == -1) return -LINUX_EBADF;
     }
 
     int mac_flags = translate_at_flags(flags);
-    if (fchownat(host_dirfd, host_path, owner, group, mac_flags) < 0)
-        return linux_errno();
-
+    {
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(mnt, host_path, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            rc = fchownat(rootfd, rel, owner, group,
+                          mac_flags | AT_RESOLVE_BENEATH);
+            close(rootfd);
+        } else {
+            rc = fchownat(host_dirfd, host_path, owner, group, mac_flags);
+        }
+        if (rc < 0) return linux_errno();
+    }
     return 0;
 }
 
@@ -1686,6 +1871,7 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
         return -LINUX_EBADF;
 
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
+    const hl_mount_t *g_utimensat_mnt = NULL;
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
     char hostbuf[LINUX_PATH_MAX];
@@ -1695,17 +1881,17 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
         /* Resolve in BOTH modes: the legacy branch passed the raw guest
          * path while open/stat/unlink applied the sysroot redirect. */
         {
-            const hl_mount_t *mnt = NULL;
             int rr = resolve_path_for_op_ex(dirfd, path, 0,
                                             !(flags & LINUX_AT_SYMLINK_NOFOLLOW),
                                             hostbuf, sizeof(hostbuf),
-                                            &path_arg, &mnt);
+                                            &path_arg, &g_utimensat_mnt);
             if (rr < 0) return rr;
             /* utimensat writes metadata; it never asked for the mount, so a
              * read-only bind could still have its timestamps rewritten. */
-            if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
+            if (g_utimensat_mnt &&
+                (g_utimensat_mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
                 return -LINUX_EROFS;
-            host_dirfd = host_dirfd_for_op(dirfd);
+            host_dirfd = host_dirfd_for_op(dirfd, path);
             if (host_dirfd == -1) return -LINUX_EBADF;
         }
     }
@@ -1735,8 +1921,17 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
         if (futimens(host_dirfd, times_gva ? ts : NULL) < 0)
             return linux_errno();
     } else {
-        if (utimensat(host_dirfd, path_arg, times_gva ? ts : NULL, mac_flags) < 0)
-            return linux_errno();
+        char rel[LINUX_PATH_MAX];
+        int rootfd = beneath_dirfd(g_utimensat_mnt, path_arg, rel, sizeof(rel));
+        int rc;
+        if (rootfd >= 0) {
+            rc = utimensat(rootfd, rel, times_gva ? ts : NULL,
+                           mac_flags | AT_RESOLVE_BENEATH);
+            close(rootfd);
+        } else {
+            rc = utimensat(host_dirfd, path_arg, times_gva ? ts : NULL, mac_flags);
+        }
+        if (rc < 0) return linux_errno();
     }
 
     return 0;

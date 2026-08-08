@@ -51,6 +51,9 @@ void hl_trace_escape(char *dst, size_t dstsz, const char *src);
 
 /* Optionally redact absolute host-like paths. */
 void hl_trace_path(char *dst, size_t dstsz, const char *path);
+/* Redact EVERY occurrence of $HOME (not just a prefix) and escape control
+ * chars. Shared by trace lines and the crash report. */
+void hl_trace_redact(char *dst, size_t dstsz, const char *src);
 
 /* Emit a single structured line: hl[pid=.. tid=..] cat message... */
 void hl_trace(uint32_t cat, const char *fmt, ...)

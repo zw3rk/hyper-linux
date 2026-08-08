@@ -158,6 +158,62 @@ int main(void) {
         } else PASS();
     }
 
+    /* (V13) An ABSOLUTE path ignores dirfd on Linux — a bad/closed dirfd
+     * must not make it EBADF. */
+    TEST("fchmodat(bad dirfd, absolute path) ignores the dirfd");
+    {
+        /* Fresh file under DIR_A (earlier subtests renamed "target" away). */
+        int ff = openat(dfd, "v13f", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ff >= 0) close(ff);
+        char cwd[512], abs[600];
+        if (getcwd(cwd, sizeof(cwd))) {
+            snprintf(abs, sizeof(abs), "%s/../%s/v13f", cwd, DIR_A);
+            int badfd = 999;   /* never opened */
+            errno = 0;
+            int r = fchmodat(badfd, abs, 0640, 0);
+            if (r == 0) PASS();
+            else FAILF("fchmodat(absolute) with bad dirfd: %s", strerror(errno));
+        } else { FAIL("getcwd"); }
+        unlinkat(dfd, "v13f", 0);
+    }
+
+    /* (V14) RENAME_EXCHANGE via a real dirfd (was EINVAL in legacy mode). */
+    TEST("renameat2(RENAME_EXCHANGE) works via a dirfd");
+    {
+        /* Create two files under dfd (DIR_A): x and y with distinct content. */
+        int fx = openat(dfd, "xk", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fx >= 0) { write(fx, "XX", 2); close(fx); }
+        int fy = openat(dfd, "yk", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fy >= 0) { write(fy, "YY", 2); close(fy); }
+        long rc = syscall(SYS_renameat2, dfd, "xk", dfd, "yk", 2 /*EXCHANGE*/);
+        if (rc != 0) {
+            FAILF("renameat2 EXCHANGE: %s", strerror(errno));
+        } else {
+            char b[4] = {0};
+            int f = openat(dfd, "xk", O_RDONLY);
+            ssize_t n = (f >= 0) ? read(f, b, 3) : -1;
+            if (f >= 0) close(f);
+            if (n == 2 && b[0] == 'Y') PASS();   /* xk now holds YY */
+            else FAILF("after exchange xk=%.2s (want YY)", b);
+        }
+        unlinkat(dfd, "xk", 0); unlinkat(dfd, "yk", 0);
+    }
+
+    /* (V14) RENAME_NOREPLACE via a real dirfd must fail EEXIST if dest exists. */
+    TEST("renameat2(RENAME_NOREPLACE) via a dirfd rejects an existing dest");
+    {
+        int fa = openat(dfd, "na", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fa >= 0) close(fa);
+        int fb = openat(dfd, "nb", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fb >= 0) close(fb);
+        errno = 0;
+        long rc = syscall(SYS_renameat2, dfd, "na", dfd, "nb", 1 /*NOREPLACE*/);
+        if (rc == 0) FAIL("overwrote an existing dest with NOREPLACE");
+        else if (errno == EEXIST) PASS();
+        else FAILF("errno %s, want EEXIST", strerror(errno));
+        unlinkat(dfd, "na", 0); unlinkat(dfd, "nb", 0);
+    }
+
     close(dfd);
     unlink("target"); unlink("only-in-cwd");
     if (chdir("..") == 0) {

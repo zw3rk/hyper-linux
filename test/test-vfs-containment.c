@@ -15,6 +15,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "test-harness.h"
+#include <pthread.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -43,6 +46,47 @@
         else FAILF("failed with %s, not a containment refusal",          \
                    strerror(_e));                                        \
     } while (0)
+
+static volatile int tt_stop;
+static void *tt_flip(void *a) {
+    (void)a;
+    mkdir("d_real", 0755);
+    symlink("..", "d_link");
+    while (!tt_stop) {
+        rename("d_real", "race"); rename("race", "d_real");
+        rename("d_link", "race"); rename("race", "d_link");
+    }
+    return NULL;
+}
+
+/* Race for ../secret.txt (created outside the bind by the harness) through a
+ * swapped "race" component. Returns the number of successful outside reads. */
+int toctou_escapes(void) {
+    pthread_t th;
+    tt_stop = 0;
+    if (pthread_create(&th, NULL, tt_flip, NULL) != 0) return -1;
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int escapes = 0;
+    long tries = 0;
+    for (;;) {
+        int fd = open("race/secret.txt", O_RDONLY);
+        if (fd >= 0) {
+            char b[64] = {0};
+            ssize_t n = read(fd, b, sizeof(b) - 1);
+            close(fd);
+            if (n > 0 && strstr(b, "SECRET")) escapes++;
+        }
+        if ((++tries & 0x3FFF) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - t0.tv_sec >= 4) break;
+        }
+    }
+    tt_stop = 1;
+    pthread_join(th, NULL);
+    unlink("race"); rmdir("d_real"); unlink("d_link");
+    return escapes;
+}
 
 int main(void) {
     int passes = 0, fails = 0;
@@ -102,6 +146,19 @@ int main(void) {
      * regression in that ordering). */
     MUST_NOT_OPEN("lexical .. traversal", "../../../../etc/hosts");
     MUST_NOT_OPEN("absolute host path", "/etc/hosts");
+
+    /* (H5) The rename-swap TOCTOU: a second thread atomically swaps a name
+     * between a real dir and a symlink->.. while this thread opens
+     * name/secret.txt. String+realpath checking could not close this window
+     * (a guest thread drove it to a real escape); O_RESOLVE_BENEATH resolves
+     * beneath the bind root in the kernel, so there must be ZERO escapes. */
+    TEST("no rename-swap TOCTOU escape (open path)");
+    {
+        int esc = toctou_escapes();
+        if (esc == 0) PASS();
+        else FAILF("%d reads of the outside secret", esc);
+    }
+
 
     unlink("esc"); unlink("esc2"); unlink("esc3");
     unlink("inside.txt");
