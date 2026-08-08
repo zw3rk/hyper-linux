@@ -343,6 +343,14 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	rm -rf "$$tmpdir"; \
 	tmpdir=$$(mktemp -d); \
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-inotify; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --isolated --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-unix-bind; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
 		--bind "$$tmpdir/late:/data" --bind "$(TEST_DIR):/opt/tests" \
 		--guest-cwd /home/user $(TEST_DIR)/test-vfs-rootdir; \
 	rm -rf "$$tmpdir"; \

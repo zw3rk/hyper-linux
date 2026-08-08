@@ -24,6 +24,20 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva);
 int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
                   int flags, unsigned int mask, uint64_t statxbuf_gva);
 
+/* Open a guest path O_EVTONLY for inotify, confined to the bind root in
+ * rooted mode via O_RESOLVE_BENEATH (VFS-F2). Legacy mode: a raw O_EVTONLY
+ * open (unchanged). Returns a host fd or a negative Linux errno. */
+int hl_fs_open_evtonly(guest_t *g, const char *guest_path);
+
+/* Resolve a guest path and open its PARENT beneath the bind root
+ * (O_RESOLVE_BENEATH), returning the pinned parent fd (caller closes) and the
+ * single leaf component in leaf_out. Race-free beneath-resolution primitive
+ * for ops with no *at form (AF_UNIX bind/connect via per-thread cwd, VFS-F2).
+ * create_mode=1 lets the leaf not exist. Returns the parent fd (>=0), or a
+ * negative Linux errno (-LINUX_ENOSYS in legacy mode → caller stays unchanged). */
+int hl_fs_open_parent_beneath(const char *guest_path, int create_mode,
+                              char *leaf_out, size_t leaf_sz);
+
 /* open/close/dup/fcntl */
 int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
                    int linux_flags, int mode);

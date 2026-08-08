@@ -21,6 +21,7 @@
 #include "syscall_inotify.h"
 #include "syscall.h"
 #include "syscall_internal.h"
+#include "syscall_fs.h"     /* hl_fs_open_evtonly (rooted-resolver watch open) */
 #include "syscall_proc.h"   /* exit_group_requested */
 #include "guest.h"
 
@@ -361,11 +362,14 @@ int64_t sys_inotify_add_watch(guest_t *g, int inotify_fd,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    /* Open the path for event monitoring. O_EVTONLY is macOS-specific:
-     * opens for event notification only, doesn't prevent unmount or
-     * require read access to the file contents. */
-    int host_fd = open(path, O_EVTONLY);
-    if (host_fd < 0) return linux_errno();
+    /* Open the path for event monitoring, routed through the rooted resolver
+     * so the watch is confined to the bind root (VFS-F2). In rooted mode the
+     * target is opened beneath the bind with O_RESOLVE_BENEATH — a confined
+     * guest can no longer watch /etc or any host path outside its bind. Legacy
+     * mode is unchanged (raw O_EVTONLY open). hl_fs_open_evtonly returns a host
+     * fd or a negative Linux errno already translated. */
+    int host_fd = hl_fs_open_evtonly(g, path);
+    if (host_fd < 0) return host_fd;
 
     /* Identify the file by dev/ino for re-add detection */
     struct stat st;

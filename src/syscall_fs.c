@@ -284,6 +284,96 @@ static int beneath_parent_dirfd(const hl_mount_t *mnt, const char *host_path,
     return pfd;
 }
 
+/* Open a guest path O_EVTONLY for event monitoring (inotify), routed through
+ * the rooted resolver so a watch is confined to the bind root exactly like
+ * open() is (H5). In rooted mode the target is opened beneath the mount's
+ * canonical root with O_RESOLVE_BENEATH, so the KERNEL refuses any escape
+ * (absolute path, .., or an outward symlink) race-free — a confined guest can
+ * no longer watch /etc or any host path outside its bind (VFS-F2). Legacy mode
+ * is UNCHANGED: a raw O_EVTONLY open of the guest path.
+ *
+ * O_EVTONLY (macOS-specific) opens for event notification only: it does not
+ * block unmount and needs no read permission on the target, matching the prior
+ * sys_inotify_add_watch behavior. Returns a host fd (caller fstats/closes it)
+ * or a negative Linux errno. */
+int hl_fs_open_evtonly(guest_t *g, const char *guest_path) {
+    (void)g;
+    if (hl_vfs_mode() != HL_FS_ROOTED) {
+        int fd = open(guest_path, O_EVTONLY);
+        return fd < 0 ? linux_errno() : fd;
+    }
+
+    hl_vfs_resolve_t r;
+    int rc = hl_vfs_resolve_at(LINUX_AT_FDCWD, guest_path, 1 /*follow*/,
+                              0 /*no create*/, &r);
+    if (rc < 0)
+        return rc;
+    if (r.is_virtual)
+        return -LINUX_ENOENT;   /* /dev, /proc — no host inode to watch */
+
+    if (r.mount && r.mount->host_path[0]) {
+        int rootfd = open(r.mount->host_path,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (rootfd >= 0) {
+            const char *rel = r.guest_abs + r.mount->guest_len;
+            while (*rel == '/') rel++;
+            char relbuf[LINUX_PATH_MAX];
+            snprintf(relbuf, sizeof(relbuf), "%s", *rel ? rel : ".");
+            int fd = openat(rootfd, relbuf, O_EVTONLY | O_RESOLVE_BENEATH);
+            int e = errno;
+            close(rootfd);
+            if (fd < 0) { errno = e; return linux_errno(); }
+            return fd;
+        }
+    }
+    /* Root not openable (rare) — fall back to the absolute host path. */
+    int fd = open(r.host_path, O_EVTONLY);
+    return fd < 0 ? linux_errno() : fd;
+}
+
+/* Resolve a guest path and open its PARENT directory beneath the bind root
+ * with O_RESOLVE_BENEATH (rooted mode), returning the parent fd (caller
+ * closes) and the single leaf component in leaf_out. This is the race-free
+ * beneath-resolution primitive (H5): the parent inode is pinned by the fd, so
+ * an operation on leaf_out expressed RELATIVE to that parent cannot be
+ * redirected out of the root by a concurrent rename-swap of an interior
+ * component. Used by the AF_UNIX bind/connect confinement, which has no *at
+ * form and instead sets the calling thread's cwd to this fd (VFS-F2).
+ *
+ * The final component is never followed as a symlink (the leaf is a name we
+ * act on, e.g. a socket node); interior symlinks are still resolved. With
+ * create_mode=1 the leaf need not exist (bind-style).
+ *
+ * Returns the parent fd (>=0) on success, or a negative Linux errno. In legacy
+ * mode returns -LINUX_ENOSYS so callers keep their existing (unchanged) path. */
+int hl_fs_open_parent_beneath(const char *guest_path, int create_mode,
+                              char *leaf_out, size_t leaf_sz) {
+    if (hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_ENOSYS;              /* legacy: caller unchanged */
+    if (!guest_path || !guest_path[0])
+        return -LINUX_ENOENT;
+
+    hl_vfs_resolve_t r;
+    int rc = hl_vfs_resolve_at(LINUX_AT_FDCWD, guest_path, 0 /*follow final*/,
+                              create_mode, &r);
+    if (rc < 0) return rc;                 /* escapes the bind / bad path */
+    if (r.is_virtual)
+        return -LINUX_EACCES;              /* /dev, /proc: no socket node */
+    if (!r.mount || !r.mount->host_path[0])
+        return -LINUX_EACCES;              /* sysroot-fallback etc.: refuse */
+
+    const char *leaf = NULL;
+    char rel[HL_VFS_PATH_MAX];
+    int pfd = beneath_parent_dirfd(r.mount, r.host_path, rel, sizeof(rel),
+                                   &leaf);
+    if (pfd < 0) return -LINUX_EACCES;
+    if ((size_t)snprintf(leaf_out, leaf_sz, "%s", leaf) >= leaf_sz) {
+        close(pfd);
+        return -LINUX_ENAMETOOLONG;
+    }
+    return pfd;
+}
+
 static int host_dirfd_for_op(int dirfd, const char *guest_path) {
     /* An ABSOLUTE guest path ignores dirfd entirely on Linux — a bad/closed
      * dirfd must NOT make an absolute-path *at() fail with EBADF (V13). */

@@ -14,6 +14,7 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
 #include "syscall_io.h"      /* rosettad_is_socket */
+#include "syscall_fs.h"      /* hl_fs_open_parent_beneath (rooted confinement) */
 #include "guest.h"           /* guest_ptr_avail */
 #include "syscall_stats.h"
 #include "trace.h"
@@ -200,6 +201,83 @@ void hl_abstract_bind_release(int sock_host_fd) {
         }
     }
     pthread_mutex_unlock(&abstract_lock_mtx);
+}
+
+/* ---------- Rooted AF_UNIX filesystem-path confinement (VFS-F2) ----------
+ *
+ * In rooted mode a filesystem AF_UNIX sun_path (not abstract) must resolve
+ * beneath the bind root, or a confined guest could bind/connect a socket at an
+ * arbitrary host path (e.g. /etc/x.sock, /tmp-outside/x.sock). Naming the raw
+ * absolute host string reintroduces the H5 rename-swap TOCTOU (Darwin has no
+ * bindat/connectat to pass a pinned dirfd).
+ *
+ * Fix: open the target's PARENT beneath the bind root with O_RESOLVE_BENEATH
+ * (kernel-enforced, pins the parent inode), set THIS thread's cwd to that fd
+ * via pthread_fchdir_np (per-thread — no other hl thread is affected, so it is
+ * race-free w.r.t. concurrent guest path ops), then bind/connect a RELATIVE
+ * sun_path (the leaf basename). The kernel resolves only that single leaf
+ * against the pinned parent inode, so no interior component can be swapped out
+ * of the root between check and use. Legacy mode is untouched. */
+
+/* Darwin per-thread working directory (stable ABI, used by libdispatch /
+ * NSThread). No public header declares it; the signature is int(int fd),
+ * fd == -1 clears the per-thread override back to the process cwd. */
+extern int pthread_fchdir_np(int fd);
+
+typedef struct { int parent_fd; } unix_confine_t;
+
+/* Begin confining a filesystem AF_UNIX op. guest_path is the NUL-terminated
+ * guest sun_path (relative or absolute). On rc==1 the calling thread's cwd is
+ * set to the pinned parent and rel_un + rel_len name the RELATIVE leaf — the
+ * caller performs bind/connect/sendto with those, then MUST call
+ * unix_confine_end(). rc==0: not applicable (legacy mode) — use the original
+ * address. rc<0: negative Linux errno — refuse (path escapes the bind). */
+static int unix_confine_begin(const char *guest_path, int create_mode,
+                              struct sockaddr_un *rel_un, socklen_t *rel_len,
+                              unix_confine_t *st) {
+    st->parent_fd = -1;
+    char leaf[sizeof(rel_un->sun_path)];
+    int pfd = hl_fs_open_parent_beneath(guest_path, create_mode,
+                                        leaf, sizeof(leaf));
+    if (pfd == -LINUX_ENOSYS) return 0;    /* legacy: caller unchanged */
+    if (pfd < 0) return pfd;               /* refuse: escapes the bind */
+    if (pthread_fchdir_np(pfd) != 0) { close(pfd); return -LINUX_EACCES; }
+
+    memset(rel_un, 0, sizeof(*rel_un));
+    rel_un->sun_family = AF_UNIX;
+    snprintf(rel_un->sun_path, sizeof(rel_un->sun_path), "%s", leaf);
+    rel_un->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) +
+                                strlen(rel_un->sun_path) + 1);
+    *rel_len = rel_un->sun_len;
+    st->parent_fd = pfd;
+    return 1;
+}
+
+/* Restore the thread cwd and release the pinned parent. Idempotent. */
+static void unix_confine_end(unix_confine_t *st) {
+    if (st->parent_fd < 0) return;
+    pthread_fchdir_np(-1);   /* revert this thread to the process cwd */
+    close(st->parent_fd);
+    st->parent_fd = -1;
+}
+
+/* Extract the guest sun_path from a Linux AF_UNIX sockaddr as a NUL-terminated
+ * string. Returns the path (into out) for a NON-abstract filesystem path, or
+ * NULL for abstract (sun_path[0]=='\0'), non-AF_UNIX, autobind (empty), or a
+ * malformed address — all of which skip filesystem confinement. */
+static const char *unix_guest_path(const void *linux_sa, uint32_t linux_len,
+                                   char *out, size_t out_sz) {
+    if (linux_len < 3) return NULL;                 /* no room for a path */
+    const uint8_t *src = linux_sa;
+    uint16_t fam;
+    memcpy(&fam, src, 2);
+    if (fam != LINUX_AF_UNIX) return NULL;
+    if (src[2] == '\0') return NULL;                /* abstract or autobind */
+    uint32_t plen = linux_len - 2;
+    if (plen >= out_sz) plen = (uint32_t)out_sz - 1;
+    memcpy(out, src + 2, plen);
+    out[plen] = '\0';
+    return out;
 }
 
 static int linux_to_mac_sockaddr_ex(const void *linux_sa, uint32_t linux_len,
@@ -544,6 +622,31 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
                                            &was_abstract);
     if (mac_len < 0) return -LINUX_EINVAL;
 
+    /* Rooted-mode filesystem AF_UNIX confinement (VFS-F2): bind the socket
+     * beneath the bind root via a per-thread cwd + relative leaf, so a confined
+     * guest cannot create a socket at a host path outside its bind. */
+    if (!was_abstract) {
+        char gp[128];
+        const char *guest_path = unix_guest_path(linux_sa, addrlen, gp,
+                                                 sizeof(gp));
+        if (guest_path) {
+            struct sockaddr_un rel_un;
+            socklen_t rel_len = 0;
+            unix_confine_t cf;
+            int cc = unix_confine_begin(guest_path, 1 /*create*/, &rel_un,
+                                        &rel_len, &cf);
+            if (cc < 0) return cc;                 /* refuse: escapes the bind */
+            if (cc == 1) {
+                int r = bind(host_fd, (struct sockaddr *)&rel_un, rel_len);
+                int e = errno;
+                unix_confine_end(&cf);
+                if (r < 0) { errno = e; return linux_errno(); }
+                return 0;
+            }
+            /* cc == 0: legacy mode — fall through to the absolute-path bind. */
+        }
+    }
+
     /* Abstract name: gate with the per-name flock so we never steal a name a
      * live process still holds, and only then clear a stale stand-in. */
     int lock_fd = -1;
@@ -663,8 +766,35 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
     if (mac_len < 0) return -LINUX_EINVAL;
 
+    /* Rooted-mode filesystem AF_UNIX confinement (VFS-F2): connect beneath the
+     * bind root via a per-thread cwd + relative leaf, so a confined guest
+     * cannot connect a socket at a host path outside its bind. Abstract names
+     * (rewritten to a TMPDIR stand-in) and AF_INET are unaffected. */
+    {
+        char gp[128];
+        const char *guest_path = unix_guest_path(linux_sa, addrlen, gp,
+                                                 sizeof(gp));
+        if (guest_path) {
+            struct sockaddr_un rel_un;
+            socklen_t rel_len = 0;
+            unix_confine_t cf;
+            int cc = unix_confine_begin(guest_path, 1 /*leaf optional*/,
+                                        &rel_un, &rel_len, &cf);
+            if (cc < 0) return cc;                 /* refuse: escapes the bind */
+            if (cc == 1) {
+                int r = connect(host_fd, (struct sockaddr *)&rel_un, rel_len);
+                int e = errno;
+                unix_confine_end(&cf);
+                if (r < 0) { errno = e; return linux_errno(); }
+                goto connect_ok;
+            }
+            /* cc == 0: legacy mode — fall through to the absolute-path connect. */
+        }
+    }
+
     if (connect(host_fd, (struct sockaddr *)&mac_sa, (socklen_t)mac_len) < 0)
         return linux_errno();
+connect_ok:
 
     /* Tag X11 display sockets for syscall_stats.
      * Linux sockaddr_un: family@0 (u16), path@2 (possibly abstract: path[0]==0).
@@ -790,6 +920,33 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
         struct sockaddr_storage mac_sa;
         int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
         if (mac_len < 0) return -LINUX_EINVAL;
+
+        /* Rooted-mode filesystem AF_UNIX destination confinement (VFS-F2). */
+        char gp[128];
+        const char *guest_path = unix_guest_path(linux_sa, addrlen, gp,
+                                                 sizeof(gp));
+        if (guest_path) {
+            struct sockaddr_un rel_un;
+            socklen_t rel_len = 0;
+            unix_confine_t cf;
+            int cc = unix_confine_begin(guest_path, 1 /*leaf optional*/,
+                                        &rel_un, &rel_len, &cf);
+            if (cc < 0) return cc;                 /* refuse: escapes the bind */
+            if (cc == 1) {
+                ssize_t ret = sendto(host_fd, buf, len, mac_flags,
+                                     (struct sockaddr *)&rel_un, rel_len);
+                int e = errno;
+                unix_confine_end(&cf);
+                if (ret < 0) {
+                    errno = e;
+                    if (errno == EPIPE && !suppress_sigpipe)
+                        signal_queue(LINUX_SIGPIPE);
+                    return linux_errno();
+                }
+                return ret;
+            }
+            /* cc == 0: legacy mode — fall through to the absolute-path sendto. */
+        }
 
         ssize_t ret = sendto(host_fd, buf, len, mac_flags,
                               (struct sockaddr *)&mac_sa, (socklen_t)mac_len);
@@ -1065,6 +1222,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
     struct sockaddr_storage mac_sa;
     struct sockaddr *dest_sa = NULL;
     socklen_t dest_len = 0;
+    char unix_dest_path[128];
+    int have_unix_dest = 0;              /* filesystem AF_UNIX destination */
     if (lmsg.msg_name && lmsg.msg_namelen > 0) {
         uint8_t linux_sa[128];
         if (lmsg.msg_namelen > sizeof(linux_sa)) return -LINUX_EINVAL;
@@ -1074,6 +1233,9 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
         if (ml < 0) return -LINUX_EINVAL;
         dest_sa = (struct sockaddr *)&mac_sa;
         dest_len = (socklen_t)ml;
+        have_unix_dest = unix_guest_path(linux_sa, lmsg.msg_namelen,
+                                         unix_dest_path,
+                                         sizeof(unix_dest_path)) != NULL;
     }
 
     /* Build host iovec from guest iovec */
@@ -1172,6 +1334,23 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
         }
     }
 
+    /* Rooted-mode filesystem AF_UNIX destination confinement (VFS-F2). Done
+     * last, right before sendmsg, so no early return leaks the per-thread cwd —
+     * the iov/cmsg builders above are the only failing paths and they run
+     * first. rel_un must outlive the sendmsg call. */
+    struct sockaddr_un rel_un;
+    unix_confine_t cf = { .parent_fd = -1 };
+    if (have_unix_dest) {
+        socklen_t rel_len = 0;
+        int cc = unix_confine_begin(unix_dest_path, 1 /*leaf optional*/,
+                                    &rel_un, &rel_len, &cf);
+        if (cc < 0) return cc;             /* refuse (nothing to clean up yet) */
+        if (cc == 1) {
+            dest_sa = (struct sockaddr *)&rel_un;
+            dest_len = rel_len;
+        }
+    }
+
     struct msghdr msg = {
         .msg_name = dest_sa,
         .msg_namelen = dest_len,
@@ -1183,7 +1362,10 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
     };
 
     ssize_t ret = sendmsg(host_fd, &msg, mac_flags);
+    int send_errno = errno;
+    unix_confine_end(&cf);
     if (ret < 0) {
+        errno = send_errno;
         if (errno == EPIPE && !suppress_sigpipe)
             signal_queue(LINUX_SIGPIPE);
         return linux_errno();

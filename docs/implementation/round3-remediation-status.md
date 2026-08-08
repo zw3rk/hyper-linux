@@ -62,20 +62,43 @@ Regression test `test/test-vvar-protect.c` (in `make test-all`, mutation-
 verified). `test-both-modes` 66→67 per fs mode, both green. The x86_64/rosetta
 lane was not run (change expected inert there; unverified).
 
-### VFS-F2 — inotify_add_watch and bind(AF_UNIX) bypass the rooted resolver
-In rooted mode `inotify_add_watch` opens, and `bind`/`connect`/`sendto`/
-`sendmsg` name, the RAW guest path, so a guest can watch `/etc` or bind a
-socket at a host `/tmp` path outside its bind. This is a confinement leak
-(the same host paths are freely reachable in legacy mode; rooted mode is the
-confinement feature it escapes).
+### VFS-F2 — inotify_add_watch and bind(AF_UNIX) bypass the rooted resolver — FIXED (branch `work/vfs-f2-resolver`)
+In rooted mode `inotify_add_watch` opened, and `bind`/`connect`/`sendto`/
+`sendmsg` named, the RAW guest path, so a guest could watch `/etc` or bind a
+socket at a host `/tmp` path outside its bind. Both are now routed through the
+rooted resolver; legacy mode is unchanged.
 
-A correct fix routes all of these through the resolver, but per the
-gpt-5.6-sol review Darwin has no `bindat`, so resolving `bind` to an absolute
-string reintroduces exactly the H5-style rename-swap race — strict
-containment for the socket path needs a broker/sandbox or an explicitly
-documented limitation. inotify can be closed cleanly (open the watch path
-with O_RESOLVE_BENEATH beneath the bind root); the AF_UNIX side needs the
-broker design. Left as one coherent unit rather than a half-fix.
+- **inotify** (`bda48f0`): `hl_fs_open_evtonly()` resolves the watch path and
+  opens the target beneath the mount's canonical root with `O_RESOLVE_BENEATH`
+  (the H5 open() mechanism). kqueue/EVFILT_VNODE watches the resolved fd.
+  Mutation-verified by `test-vfs-inotify` (watch on `/etc`, `/etc/hosts`,
+  `../..` refused; in-bind watch + event works).
+
+- **AF_UNIX** (`66ff55c`): Darwin has no `bindat`/`connectat`, so naming the
+  resolved absolute string would reintroduce the H5 rename-swap race. Instead
+  the fix is race-free **in-process** (no subprocess broker): open the target's
+  PARENT beneath the bind root with `O_RESOLVE_BENEATH` (pins the parent
+  inode), set the CALLING thread's cwd to that fd via `pthread_fchdir_np`
+  (per-thread — verified isolated from other threads, so no cross-thread race),
+  then bind/connect a RELATIVE leaf. Only the single leaf resolves against the
+  pinned inode, so no interior component can be swapped out between check and
+  use. `hl_fs_open_parent_beneath()` (syscall_fs.c) reuses the H5
+  `beneath_parent_dirfd`; `unix_confine_begin/end` (syscall_net.c) own the
+  per-thread fchdir. Mutation-verified by `test-vfs-unix-bind` (bind at host
+  `/tmp`/`/etc` refused; in-bind bind+connect works). This is stronger than the
+  "accept a documented TOCTOU window" fallback that was the planned floor.
+
+  **Residual (narrow, documented):** `connect()` still follows a symlink at the
+  FINAL leaf component, so a guest that plants an outward symlink at the leaf
+  and connects to it could reach a socket outside the bind. This is far
+  narrower than the closed arbitrary-absolute-path vector and is the same class
+  as H5's documented leaf residuals (readlink/rename leaf). Closing it fully
+  would need an `fstatat(parentfd, leaf, AT_SYMLINK_NOFOLLOW)` pre-check
+  (itself with a leaf-swap TOCTOU) or a connect that does not follow the final
+  symlink (no such primitive on Darwin).
+
+Suite: 68/68 both fs modes (was 66; +2 tests). All AF_UNIX/X11 socket tests
+(test-socket, test-net, test-x11, test-abstract-unix) still pass.
 
 ## Verification debt (unchanged from round 2)
 - The 4-mode matrix (`test/test-matrix.sh all`) was not run — the full
