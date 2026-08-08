@@ -11,6 +11,7 @@
 #include "syscall_internal.h"
 #include "syscall_signal.h"
 #include "syscall_proc.h"  /* exit_group_requested */
+#include "futex.h"         /* futex_interrupt_consume */
 #include "guest.h"
 
 #include <stdio.h>
@@ -224,7 +225,6 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         added_wakeup = 1;
     }
 
-    extern _Atomic int futex_interrupt_requested;
     int ret;
     /* Linux: closed/invalid fds already have POLLNVAL ready → return
      * without waiting. Sample valid host fds once (timeout 0). Never
@@ -236,32 +236,46 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
     else if (timeout_ms < 0)
         host_timeout = added_wakeup ? -1 : 200; /* fallback if no wake pipe */
 
+    /* Sample before blocking: only a change while we were parked counts. */
+    uint64_t irq_epoch = futex_interrupt_epoch();
+    /* A wake that leaves nothing for the guest must surface as EINTR, not
+     * as 0 (which poll(2) forbids for an indefinite wait) and not as an
+     * internal retry: hl delivers pending signals when a syscall returns to
+     * the guest, so looping here swallowed directed signals entirely. */
+    int pure_wake = 0;
     if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
     do {
         ret = poll(host_fds, nfds + added_wakeup, host_timeout);
 
         /* Check for exit_group / futex_interrupt after waking */
         if (atomic_load(&exit_group_requested) ||
-            atomic_load(&futex_interrupt_requested)) {
+            futex_interrupt_epoch() != irq_epoch) {
             ret = -1;
             errno = EINTR;
             break;
         }
 
-        /* Only retry when we used a sliced infinite wait without wake pipe. */
+        /* Consume our share of the broadcast and hide it from the guest —
+         * inside the loop, because a wake that leaves nothing for the guest
+         * must NOT end an indefinite poll. Returning 0 there both violates
+         * poll(2) and leaves the caller spinning: every unconsumed byte in
+         * the shared pipe made the next infinite poll return immediately. */
+        if (added_wakeup && ret > 0 && (host_fds[nfds].revents & POLLIN)) {
+            uint8_t drain;
+            (void)read(wakeup_pipe_rd, &drain, 1);
+            host_fds[nfds].revents = 0;
+            if (--ret == 0) { pure_wake = 1; break; }
+        }
+
+        /* Only retry a sliced infinite wait that has no wake pipe. */
     } while (ret == 0 && timeout_ms < 0 && !added_wakeup && !force_immediate);
 
     int saved_errno = errno;
     if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
 
-    /* Drain the wakeup pipe if it fired, and subtract from count since
-     * the wakeup pipe is not visible to the guest. Consume exactly one
-     * byte: draining the whole pipe here stole the wakes intended for the
-     * other threads parked on the same shared pipe. */
-    if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
-        uint8_t drain;
-        (void)read(wakeup_pipe_rd, &drain, 1);
-        if (ret > 0) ret--;
+    if (pure_wake) {
+        if (mask_installed) signal_restore_blocked(saved_mask);
+        return -LINUX_EINTR;
     }
 
     /* Restore original signal mask */
@@ -419,27 +433,30 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         added_wakeup = 1;
     }
 
-    extern _Atomic int futex_interrupt_requested;
     /* Fallback 200ms only when infinite and no wake pipe available. */
     struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L };
 
     /* Save fd_sets — pselect modifies them in-place to indicate ready fds.
      * Without saving/restoring, a sliced infinite retry would corrupt sets. */
-    fd_set saved_read, saved_write, saved_except;
-    if (!has_timeout && !added_wakeup) {
-        saved_read   = read_set;
-        saved_write  = write_set;
-        saved_except = except_set;
-    }
+    /* Saved unconditionally: the wake-pipe path now loops too (a pure wake
+     * must not end an indefinite select), and pselect clears every bit that
+     * is not ready — so reusing the modified sets on the next pass silently
+     * dropped the caller's fds and waited forever on nothing. */
+    fd_set saved_read = read_set, saved_write = write_set,
+           saved_except = except_set;
+    uint64_t irq_epoch = futex_interrupt_epoch();
     if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
 
     int ret;
+    int pure_wake = 0;   /* see the note in sys_ppoll */
+    int first_pass = 1;
     do {
-        if (!has_timeout && !added_wakeup) {
+        if (!first_pass) {
             read_set   = saved_read;
             write_set  = saved_write;
             except_set = saved_except;
         }
+        first_pass = 0;
 
         const struct timespec *pts;
         static const struct timespec zero_ts = { .tv_sec = 0, .tv_nsec = 0 };
@@ -459,23 +476,29 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
                       pts, NULL);
 
         if (atomic_load(&exit_group_requested) ||
-            atomic_load(&futex_interrupt_requested)) {
+            futex_interrupt_epoch() != irq_epoch) {
             ret = -1;
             errno = EINTR;
             break;
+        }
+
+        /* Drain our share of the broadcast and hide it from the guest —
+         * inside the loop, so a wake that leaves nothing ready does not end
+         * an indefinite select with a bogus 0. */
+        if (added_wakeup && ret > 0 && FD_ISSET(wakeup_pipe_rd, &read_set)) {
+            uint8_t drain;
+            (void)read(wakeup_pipe_rd, &drain, 1);
+            FD_CLR(wakeup_pipe_rd, &read_set);
+            if (--ret == 0) { pure_wake = 1; break; }
         }
     } while (ret == 0 && !has_timeout && !added_wakeup && always_count == 0);
 
     int save_errno = errno;
     if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
 
-    /* Drain wakeup pipe if it fired, and subtract from count since
-     * the wakeup pipe is not visible to the guest. */
-    if (added_wakeup && FD_ISSET(wakeup_pipe_rd, &read_set)) {
-        uint8_t drain;
-        (void)read(wakeup_pipe_rd, &drain, 1); /* one byte: see poll_waiters */
-        FD_CLR(wakeup_pipe_rd, &read_set);
-        if (ret > 0) ret--;
+    if (pure_wake) {
+        if (mask_applied) signal_restore_blocked(saved_blocked);
+        return -LINUX_EINTR;
     }
 
     /* Restore original signal mask */
@@ -755,39 +778,59 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
     if (added_wakeup && cap < 256) cap++;
     struct kevent kevents[256];
 
-    extern _Atomic int futex_interrupt_requested;
     struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
     int nready;
+    /* Count this thread as a waiter. epoll never did, so wakeup_pipe_signal
+     * sized its broadcast from the poll/select waiters alone and wrote too
+     * few bytes: threads parked here simply missed the wake. */
+    uint64_t irq_epoch = futex_interrupt_epoch();
+    int pure_wake = 0;   /* see the note in sys_ppoll */
+    if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
     do {
         nready = kevent(kq_fd, NULL, 0, kevents, cap,
                         has_timeout ? &ts : &poll_ts);
 
         if (atomic_load(&exit_group_requested) ||
-            atomic_load(&futex_interrupt_requested)) {
+            futex_interrupt_epoch() != irq_epoch) {
             nready = -1;
             errno = EINTR;
             break;
         }
+
+        /* Take the wake event out of the result set, and consume exactly
+         * one byte — and only if it actually fired. The old code drained
+         * unconditionally on every return, stealing wakes meant for other
+         * threads on the shared pipe. */
+        if (added_wakeup && nready > 0) {
+            int woke = 0;
+            for (int i = 0; i < nready; i++) {
+                if ((uintptr_t)kevents[i].udata == (uintptr_t)-1) {
+                    woke = 1;
+                    kevents[i] = kevents[nready - 1];
+                    nready--;
+                    i--;
+                }
+            }
+            if (woke) {
+                uint8_t drain;
+                (void)read(wakeup_pipe_rd, &drain, 1);
+                if (nready == 0) { pure_wake = 1; break; }
+            }
+        }
     } while (nready == 0 && !has_timeout);
+    if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
 
     int saved_errno = errno;
 
-    /* Remove wakeup pipe registration and drain if it fired */
     if (added_wakeup) {
         struct kevent del_ev;
         EV_SET(&del_ev, wakeup_pipe_rd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
         kevent(kq_fd, &del_ev, 1, NULL, 0, NULL);
-        /* Drain the wakeup pipe */
-        uint8_t drain;
-        (void)read(wakeup_pipe_rd, &drain, 1); /* one byte: see poll_waiters */
-        /* Filter out wakeup pipe events from results */
-        for (int i = 0; i < nready; i++) {
-            if ((uintptr_t)kevents[i].udata == (uintptr_t)-1) {
-                kevents[i] = kevents[nready - 1];
-                nready--;
-                i--;
-            }
-        }
+    }
+
+    if (pure_wake) {
+        if (mask_installed) signal_restore_blocked(saved_mask);
+        return -LINUX_EINTR;
     }
 
     /* Restore original signal mask after the blocking wait */

@@ -7,6 +7,7 @@
  * error. Sections: environment, crash type, binary info, registers,
  * memory layout, and instructions for filing a GitHub issue.
  */
+#include "trace.h"      /* hl_trace_path — honour HL_TRACE_REDACT */
 #include "crash_report.h"
 #include "syscall_proc.h"
 #include "version.h"
@@ -84,17 +85,28 @@ void crash_report(hv_vcpu_t vcpu, const guest_t *g,
     const char *cmdline = proc_get_cmdline(&cmdline_len);
     const char *sysroot = proc_get_sysroot();
 
+    /* This report exists to be pasted into a public bug tracker, so it is
+     * the one output that most needs HL_TRACE_REDACT — and it was the one
+     * place that ignored it, printing raw host paths and the full guest
+     * command line. hl_trace_path() also escapes control characters, which
+     * matters here because cmdline is guest-controlled. */
+    char safe[4096 * 4];
+
     fprintf(stderr, "## Binary\n");
-    fprintf(stderr, "- path: %s\n", elf_path ? elf_path : "(unknown)");
-    if (sysroot)
-        fprintf(stderr, "- sysroot: %s\n", sysroot);
+    hl_trace_path(safe, sizeof(safe), elf_path ? elf_path : "(unknown)");
+    fprintf(stderr, "- path: %s\n", safe);
+    if (sysroot) {
+        hl_trace_path(safe, sizeof(safe), sysroot);
+        fprintf(stderr, "- sysroot: %s\n", safe);
+    }
 
     /* Print command line (NUL-separated → space-separated) */
     if (cmdline && cmdline_len > 0) {
         fprintf(stderr, "- cmdline:");
         size_t pos = 0;
         while (pos < cmdline_len) {
-            fprintf(stderr, " %s", cmdline + pos);
+            hl_trace_path(safe, sizeof(safe), cmdline + pos);
+            fprintf(stderr, " %s", safe);
             pos += strlen(cmdline + pos) + 1;
         }
         fprintf(stderr, "\n");

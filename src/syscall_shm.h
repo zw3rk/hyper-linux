@@ -23,16 +23,20 @@ int64_t sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva);
  * segs[] is process-local, so a child would silently resolve SHM addresses to
  * its own COW copy of primary RAM. Export in the parent, re-establish in the
  * child. */
+#define HL_SHM_FORK_MAX_ATTACH 8
 typedef struct {
     int32_t  host_shmid;
     int32_t  nattach;
     int32_t  rmid_pending;
-    int32_t  pad;
+    int32_t  nattach_va;
     uint64_t size;
     uint64_t map_size;
     uint64_t ipa_span;
     uint64_t guest_va;
     uint64_t ipa;
+    /* Every live attach window, not just the most recent — a segment mapped
+     * twice must survive fork with both windows intact. */
+    uint64_t attach_va[HL_SHM_FORK_MAX_ATTACH];
 } hl_shm_fork_rec_t;
 
 /* Returns the number of records written (<= max), or -1. */

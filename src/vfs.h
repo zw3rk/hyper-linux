@@ -108,4 +108,17 @@ void hl_vfs_fork_import(const hl_vfs_t *src);
 /* Parse --fs-mode=legacy|rooted */
 int hl_vfs_parse_mode(const char *s, hl_fs_mode_t *out);
 
+/* Longest synthetic directory entry name, and how many fit in one. */
+#define HL_VFS_NAME_MAX 256
+#define HL_VFS_SYNTH_MAX 32
+
+/* True when guest_abs names a directory that exists only in the mount
+ * table — "/" or an interior component of a mount prefix. */
+int hl_vfs_is_synthetic_dir(const char *guest_abs);
+
+/* Names of the immediate children of a synthetic (mount-ancestor)
+ * directory, e.g. "home" and "tmp" for "/". Returns the count. */
+int hl_vfs_list_synthetic(const char *guest_abs,
+                          char (*names)[HL_VFS_NAME_MAX], int max);
+
 #endif /* HL_VFS_H */

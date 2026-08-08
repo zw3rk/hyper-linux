@@ -33,4 +33,10 @@ int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
  * CLONE_CHILD_CLEARTID cleanup. Returns number of waiters woken. */
 int futex_wake_one(guest_t *g, uint64_t uaddr);
 
+/* Interrupt broadcast as an epoch. Every indefinite wait samples
+ * futex_interrupt_epoch() BEFORE blocking and compares after waking; a
+ * change means "you were nudged". See the rationale in futex.c. */
+void     futex_interrupt_broadcast(void);
+uint64_t futex_interrupt_epoch(void);
+
 #endif /* FUTEX_H */

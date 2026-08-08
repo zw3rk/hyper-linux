@@ -23,35 +23,71 @@ static int g_nnodes = 0;
 static pthread_mutex_t dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_inited = 0;
 
-/* Pseudo device open: host /dev/null etc. */
-static int64_t open_host_dev(const char *host_path, int linux_flags) {
+/* Find a registered node by its bare name ("null", not "/dev/null"). */
+static const hl_device_node_t *node_by_name(const char *name) {
+    if (!name) return NULL;
+    pthread_mutex_lock(&dev_lock);
+    for (int i = 0; i < g_nnodes; i++) {
+        if (strcmp(g_nodes[i].name, name) == 0) {
+            const hl_device_node_t *n = &g_nodes[i];
+            pthread_mutex_unlock(&dev_lock);
+            return n;
+        }
+    }
+    pthread_mutex_unlock(&dev_lock);
+    return NULL;
+}
+
+/* Pseudo device open: host /dev/null etc.
+ *
+ * The fd remembers which node it came from. It used to be a plain
+ * FD_REGULAR over the HOST device, so fstat() reported the macOS device
+ * numbers while stat() and statx() on the same path reported the Linux ones
+ * the registry declares — /dev/null was 1:3 by path and 3:2 by fd. */
+static int64_t open_host_dev(const char *host_path, int linux_flags,
+                             const char *name) {
     int flags = translate_open_flags(linux_flags);
     int hfd = open(host_path, flags, 0);
     if (hfd < 0) return linux_errno();
-    int gfd = fd_alloc(FD_REGULAR, hfd);
+    int gfd = fd_alloc(FD_DEVICE, hfd);
     if (gfd < 0) {
         close(hfd);
         return -LINUX_EMFILE;
     }
     fd_table[gfd].linux_flags = linux_flags;
+    /* Static storage in g_nodes — never freed, so no fd-retire path owns
+     * it. (FD_DEVICE is not among the kinds whose .dir is released.) */
+    fd_table[gfd].dir = (void *)(uintptr_t)node_by_name(name);
     return gfd;
 }
 
+/* Registry mode/rdev for a guest fd opened from a virtual device node.
+ * Returns 0 when the fd is such a device, -1 otherwise. */
+int hl_device_fd_stat(int guest_fd, uint32_t *mode_out, uint64_t *rdev_out) {
+    if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) return -1;
+    if (fd_table[guest_fd].type != FD_DEVICE) return -1;
+    const hl_device_node_t *n = fd_table[guest_fd].dir;
+    if (!n) return -1;
+    if (mode_out) *mode_out = n->mode;
+    if (rdev_out) *rdev_out = (uint64_t)makedev(n->major, n->minor);
+    return 0;
+}
+
 static int64_t dev_null_open(const char *name, int linux_flags, int mode) {
-    (void)name; (void)mode;
-    return open_host_dev("/dev/null", linux_flags);
+    (void)mode;
+    return open_host_dev("/dev/null", linux_flags, name);
 }
 static int64_t dev_zero_open(const char *name, int linux_flags, int mode) {
-    (void)name; (void)mode;
-    return open_host_dev("/dev/zero", linux_flags);
+    (void)mode;
+    return open_host_dev("/dev/zero", linux_flags, name);
 }
 static int64_t dev_urandom_open(const char *name, int linux_flags, int mode) {
-    (void)name; (void)mode;
-    return open_host_dev("/dev/urandom", linux_flags);
+    (void)mode;
+    return open_host_dev("/dev/urandom", linux_flags, name);
 }
 static int64_t dev_tty_open(const char *name, int linux_flags, int mode) {
-    (void)name; (void)mode;
-    return open_host_dev("/dev/tty", linux_flags);
+    (void)mode;
+    return open_host_dev("/dev/tty", linux_flags, name);
 }
 
 /* No .stat override: hl_device_stat() already fills mode and the device

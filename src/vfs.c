@@ -126,6 +126,51 @@ static void strip_trailing_slash(char *s) {
         s[--n] = '\0';
 }
 
+/* realpath() for a path whose tail may not exist yet.
+ *
+ * Plain realpath() fails outright on a missing component, and the caller
+ * then stored the mount root VERBATIM. On macOS that is usually a symlink
+ * (/tmp -> /private/tmp, mktemp's /var/... -> /private/var/...), so the
+ * containment check compared a canonical parent against a non-canonical
+ * root, never matched, and every access to that mount failed with EACCES —
+ * permanently, even once the directory was created. Resolve the deepest
+ * existing ancestor and re-attach the missing tail.
+ * Returns dst on success, NULL if nothing could be resolved. */
+static char *canonicalize_partial(const char *path, char *dst, size_t dstsz) {
+    if (!path || !dst || dstsz == 0) return NULL;
+    if (realpath(path, dst)) return dst;
+
+    char work[HL_VFS_PATH_MAX];
+    if ((size_t)snprintf(work, sizeof(work), "%s", path) >= sizeof(work))
+        return NULL;
+
+    /* Strip trailing components until one resolves, remembering the tail. */
+    char tail[HL_VFS_PATH_MAX];
+    size_t tail_len = 0;
+    tail[0] = '\0';
+    for (;;) {
+        char *slash = strrchr(work, '/');
+        if (!slash || slash == work) break;      /* reached "/" */
+        size_t seg_len = strlen(slash + 1);
+        if (seg_len == 0) { *slash = '\0'; continue; }   /* trailing '/' */
+        if (tail_len + seg_len + 2 >= sizeof(tail)) return NULL;
+        /* Prepend this segment to the accumulated tail. */
+        memmove(tail + seg_len + 1, tail, tail_len + 1);
+        memcpy(tail, slash + 1, seg_len);
+        tail[seg_len] = tail_len ? '/' : '\0';
+        tail_len += seg_len + (tail_len ? 1 : 0);
+        *slash = '\0';
+
+        char base[HL_VFS_PATH_MAX];
+        if (realpath(work, base)) {
+            int n = snprintf(dst, dstsz, "%s%s%s", base,
+                             (base[1] == '\0') ? "" : "/", tail);
+            return (n > 0 && (size_t)n < dstsz) ? dst : NULL;
+        }
+    }
+    return NULL;
+}
+
 int hl_vfs_add_bind(const char *guest_prefix, const char *host_path,
                     uint32_t flags) {
     hl_vfs_t *v = hl_vfs_get();
@@ -146,7 +191,8 @@ int hl_vfs_add_bind(const char *guest_prefix, const char *host_path,
          * stops a bind root from being mistaken for a symlink to re-map.
          * If the path does not exist yet, keep it verbatim. */
         char real[HL_VFS_PATH_MAX];
-        if (!(flags & HL_MOUNT_VIRTUAL) && realpath(host_path, real))
+        if (!(flags & HL_MOUNT_VIRTUAL) &&
+            canonicalize_partial(host_path, real, sizeof(real)))
             snprintf(m->host_path, sizeof(m->host_path), "%s", real);
         else
             snprintf(m->host_path, sizeof(m->host_path), "%s", host_path);
@@ -331,16 +377,77 @@ static int path_within_mount(const char *host_path, const char *host_parent,
     size_t rl = strlen(mount_root);
     while (rl > 1 && mount_root[rl - 1] == '/') rl--;
 
-    /* Prefer the full path: it covers the mount root itself, whose parent
-     * legitimately lies outside the mount. */
+    /* The mount root itself is inside the mount by definition, and its
+     * parent legitimately is not — check the full path first, but only to
+     * ACCEPT. */
     int r = real_within(host_path, mount_root, rl);
-    if (r >= 0) return r;
+    if (r == 1) return 1;
 
-    /* Leaf does not exist yet (a create). Its parent must still be inside;
-     * a parent that also does not resolve has not been subverted, so let
-     * the caller's own syscall produce the natural ENOENT. */
+    /* Otherwise judge by the parent directory alone.
+     *
+     * Using the full path to REJECT was too strict: it canonicalizes the
+     * final component too, so a symlink pointing outside the bind was
+     * refused with EACCES even for operations that never touch its target
+     * — readlink, lstat, unlink, rename, symlink, open(O_NOFOLLOW). Those
+     * are exactly what the resolver's own S_ISLNK branch below exists to
+     * serve, and it never got the chance. When the final symlink IS to be
+     * followed, that branch rewrites guest_abs to the target and re-enters
+     * this resolver, so the target is checked against the mount table on
+     * its own terms rather than escaping.
+     *
+     * A parent that does not resolve has not been subverted (the caller's
+     * own syscall will fail naturally), so that is allowed through. */
     r = real_within(host_parent, mount_root, rl);
     return (r < 0) ? 1 : r;
+}
+
+static int mount_ancestor(const hl_vfs_t *v, const char *guest_abs);
+
+/* List the immediate children of a synthetic ancestor directory — the
+ * distinct next path components of every mount below guest_abs. This is
+ * what makes `ls /` work in rooted mode: "/" and the interior directories
+ * of a mount path exist only in the mount table, so there is no host
+ * directory to read. Returns the number of names written. */
+int hl_vfs_is_synthetic_dir(const char *guest_abs) {
+    if (!guest_abs) return 0;
+    return mount_ancestor(hl_vfs_get(), guest_abs);
+}
+
+int hl_vfs_list_synthetic(const char *guest_abs, char (*names)[HL_VFS_NAME_MAX],
+                          int max) {
+    if (!guest_abs || !names || max <= 0) return 0;
+    hl_vfs_t *v = hl_vfs_get();
+    size_t plen = strlen(guest_abs);
+    int is_root = (plen == 1 && guest_abs[0] == '/');
+    if (!is_root) while (plen > 1 && guest_abs[plen - 1] == '/') plen--;
+
+    int n = 0;
+    for (int i = 0; i < v->nmounts && n < max; i++) {
+        const char *gp = v->mounts[i].guest_prefix;
+        if (!gp || gp[0] != '/') continue;
+        const char *rest;
+        if (is_root) {
+            rest = gp + 1;
+        } else {
+            if (strncmp(gp, guest_abs, plen) != 0 || gp[plen] != '/') continue;
+            rest = gp + plen + 1;
+        }
+        if (!*rest) continue;                    /* the mount itself */
+        const char *slash = strchr(rest, '/');
+        size_t clen = slash ? (size_t)(slash - rest) : strlen(rest);
+        if (clen == 0 || clen >= HL_VFS_NAME_MAX) continue;
+
+        int dup = 0;
+        for (int k = 0; k < n; k++)
+            if (strlen(names[k]) == clen && strncmp(names[k], rest, clen) == 0) {
+                dup = 1; break;
+            }
+        if (dup) continue;
+        memcpy(names[n], rest, clen);
+        names[n][clen] = '\0';
+        n++;
+    }
+    return n;
 }
 
 /* True when guest_abs is "/" or a proper ancestor directory of some mount
@@ -623,6 +730,16 @@ int hl_vfs_fchdir(int guest_fd) {
         if (fchdir(h) < 0) return linux_errno();
         return 0;
     }
+    /* Linux: fchdir on a non-directory is ENOTDIR. Rooted mode only moved
+     * the virtual CWD string, so fchdir(open("file")) "succeeded" and left
+     * the process with a CWD that is not a directory. */
+    int h = fd_to_host(guest_fd);
+    struct stat dst;
+    if (h >= 0 && fstat(h, &dst) == 0 && !S_ISDIR(dst.st_mode))
+        return -LINUX_ENOTDIR;
+    if (fd_table[guest_fd].type != FD_DIR && h < 0)
+        return -LINUX_ENOTDIR;
+
     char dirbase[HL_VFS_PATH_MAX];
     int drc = dirfd_guest_path(guest_fd, dirbase, sizeof(dirbase));
     if (drc < 0) return drc;

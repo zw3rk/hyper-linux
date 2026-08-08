@@ -1455,8 +1455,29 @@ int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
     return 0;
 }
 
+static int guest_map_va_range_impl(guest_t *g, uint64_t va_start, uint64_t va_end,
+                                   uint64_t gpa_start, int perms,
+                                   int *skipped_out);
+
+/* Variant that reports how many 2MB blocks were left alone because they
+ * were already mapped ("first mapping wins"). sys_mmap_high_va and the kbuf
+ * alias RELY on that reuse, but SysV shmat must not: silently skipping an
+ * occupied block made shmat(shmid, explicit_addr, 0) return success while
+ * the guest kept reading its own private RAM instead of the segment. */
+int guest_map_va_range_ex(guest_t *g, uint64_t va_start, uint64_t va_end,
+                          uint64_t gpa_start, int perms, int *skipped_out) {
+    if (skipped_out) *skipped_out = 0;
+    return guest_map_va_range_impl(g, va_start, va_end, gpa_start, perms,
+                                   skipped_out);
+}
+
 int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
                        uint64_t gpa_start, int perms) {
+    return guest_map_va_range_impl(g, va_start, va_end, gpa_start, perms, NULL);
+}
+
+static int guest_map_va_range_impl(guest_t *g, uint64_t va_start, uint64_t va_end,
+                       uint64_t gpa_start, int perms, int *skipped_out) {
     uint64_t base = g->ipa_base;
 
     /* Navigate to L0 table */
@@ -1521,6 +1542,8 @@ int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
         uint64_t output_ipa = base + gpa_cursor;
         if (!(l2[l2_idx] & PT_BLOCK)) {
             l2[l2_idx] = make_block_desc(output_ipa, perms);
+        } else if (skipped_out) {
+            (*skipped_out)++;
         }
     }
 

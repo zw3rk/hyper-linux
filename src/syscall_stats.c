@@ -393,6 +393,27 @@ static void stats_service_dump_request(void) {
         syscall_stats_reset();
 }
 
+/* Service point of last resort.
+ *
+ * stats_service_dump_request() is otherwise only reached from the syscall
+ * path, so a SIGUSR1 that arrives while the guest is making no syscalls —
+ * parked in an indefinite poll or futex, or busy in pure computation —
+ * latched a request that was never serviced. The dump appeared minutes
+ * later, when the guest happened to make a syscall, or not at all.
+ *
+ * A plain thread is the right context: the handler stays async-signal-safe
+ * (it only sets a flag) and the actual dump runs with locks and stdio
+ * available, exactly as it does on the syscall path. */
+static void *stats_service_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        stats_service_dump_request();
+    }
+    return NULL;
+}
+
 void syscall_stats_install_signal(void) {
     if (!stats_on) return;
     struct sigaction sa;
@@ -401,6 +422,10 @@ void syscall_stats_install_signal(void) {
     sa.sa_flags = SA_RESTART;   /* do not surface EINTR to in-flight I/O */
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, NULL);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, stats_service_thread, NULL) == 0)
+        pthread_detach(th);
 }
 
 static void atexit_dump(void) {

@@ -106,8 +106,13 @@ void syscall_init(void) {
     for (int i = 0; i < 3; i++) {
         int hfd = (i == 0) ? STDIN_FILENO :
                   (i == 1) ? STDOUT_FILENO : STDERR_FILENO;
+        /* Seed the guest-visible status flags from the real descriptor.
+         * Hard-coding 0 made stdout and stderr report O_RDONLY to anything
+         * reading status_flags. */
+        int hfl = fcntl(hfd, F_GETFL);
+        uint32_t sf = (hfl < 0) ? 0 : (uint32_t)mac_to_linux_status_flags(hfl);
         hl_open_file_t *of = hl_open_file_create(FD_STDIO, &hl_fd_ops_host_file,
-                                                 0, NULL);
+                                                 sf, NULL);
         hl_descriptor_t *d = of
             ? hl_descriptor_create(of, hfd, 0, FD_STDIO, NULL) : NULL;
         fd_table[i] = (fd_entry_t){
@@ -209,8 +214,8 @@ int fd_alloc_at(int fd, int type, int host_fd) {
         if (fd_table[fd].dir) {
             if (old_type == FD_DIR)
                 old_dir = (DIR *)fd_table[fd].dir;
-            else if (old_type == FD_EPOLL)
-                old_epoll = fd_table[fd].dir;
+            else if (old_type == FD_EPOLL || old_type == FD_VIRTUAL_DIR)
+                old_epoll = fd_table[fd].dir;   /* plain free() below */
         }
     }
     hl_descriptor_t *old_desc = fd_table[fd].desc;

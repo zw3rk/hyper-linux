@@ -32,7 +32,32 @@
  * simulate SIGCHLD delivery when all CLONE_THREAD workers exit —
  * wakes the main thread from blocking futex_wait without triggering
  * a full exit_group. */
-_Atomic int futex_interrupt_requested = 0;
+/* Interrupt broadcasts, as a monotonic epoch rather than a sticky flag.
+ *
+ * The old `futex_interrupt_requested` was set to 1 when the last
+ * CLONE_THREAD worker exits (simulating the SIGCHLD that interrupts
+ * futex_wait on real Linux) and cleared nowhere but execve. From the first
+ * worker exit onward, every indefinite futex_wait/poll/select/epoll_wait
+ * returned EINTR immediately; since correct callers retry on EINTR, that is
+ * a permanent 100%-CPU spin, not a visible hang.
+ *
+ * Consuming the flag with an exchange fixes the storm but breaks the
+ * broadcast: whichever thread looks first takes the nudge, and a directed
+ * signal aimed at a different thread is lost (test-tgkill-target).
+ *
+ * An epoch gives both properties. Each waiter samples it before blocking
+ * and compares after waking, so every parked waiter is interrupted exactly
+ * once per event, and a waiter that re-enters the wait starts from the
+ * current value and is not interrupted again. */
+_Atomic uint64_t futex_interrupt_gen = 0;
+
+void futex_interrupt_broadcast(void) {
+    atomic_fetch_add(&futex_interrupt_gen, 1);
+}
+
+uint64_t futex_interrupt_epoch(void) {
+    return atomic_load(&futex_interrupt_gen);
+}
 
 /* ---------- Futex operations (from Linux uapi) ---------- */
 #define FUTEX_WAIT            0
@@ -170,6 +195,10 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
     pthread_cond_init(&waiter.cond, NULL);
     b->head = &waiter;
 
+    /* Sample the interrupt epoch before parking: only a broadcast that
+     * happens while we are actually waiting should return EINTR. */
+    uint64_t irq_epoch = futex_interrupt_epoch();
+
     /* Wait until woken or timeout */
     int ret = 0;
 
@@ -211,7 +240,7 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
             pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
 
             if (atomic_load(&exit_group_requested) ||
-                atomic_load(&futex_interrupt_requested)) {
+                futex_interrupt_epoch() != irq_epoch) {
                 ret = -LINUX_EINTR;
                 break;
             }

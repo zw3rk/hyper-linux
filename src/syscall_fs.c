@@ -218,6 +218,56 @@ static int host_dirfd_for_resolved(void) {
     return AT_FDCWD;
 }
 
+/* Which host dirfd to pass alongside a path from resolve_path_for_op_ex().
+ *
+ * Rooted mode always yields an absolute host path, so AT_FDCWD is correct.
+ * Legacy mode does NOT: it only applies the --sysroot redirect to ABSOLUTE
+ * paths and hands relative ones back verbatim. Pairing those with AT_FDCWD
+ * reinterprets them against the process CWD instead of the caller's dirfd —
+ * so renameat2/linkat/fchmodat/fchownat/utimensat silently operated on a
+ * same-named file in the wrong directory and returned 0.
+ * Returns AT_FDCWD (-2 on macOS) or a valid fd on success, and exactly -1
+ * for a bad guest fd — so callers must test `== -1`, not `< 0`. */
+static int host_dirfd_for_op(int dirfd) {
+    if (hl_vfs_mode() == HL_FS_ROOTED || dirfd == LINUX_AT_FDCWD)
+        return AT_FDCWD;
+    int hfd = fd_to_host(dirfd);
+    return hfd < 0 ? -1 : hfd;
+}
+
+/* Synthetic directory: the immediate children of a mount-ancestor path,
+ * snapshotted at open() the way a real DIR* snapshots its stream. */
+typedef struct {
+    int  n;
+    int  pos;
+    char names[HL_VFS_SYNTH_MAX][HL_VFS_NAME_MAX];
+} hl_vdir_t;
+
+/* stat() for a synthetic directory: a read-only, execute-searchable dir
+ * with no host inode behind it. */
+static int64_t vdir_fill_stat(guest_t *g, uint64_t stat_gva) {
+    struct stat mac_st;
+    memset(&mac_st, 0, sizeof(mac_st));
+    mac_st.st_mode  = S_IFDIR | 0555;
+    mac_st.st_nlink = 2;
+    mac_st.st_uid   = getuid();
+    mac_st.st_gid   = getgid();
+    mac_st.st_size  = 512;
+    mac_st.st_ino   = 1;
+    linux_stat_t lin_st;
+    translate_stat(&mac_st, &lin_st);
+    if (guest_write(g, stat_gva, &lin_st, sizeof(lin_st)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
+static hl_vdir_t *vdir_create(const char *guest_abs) {
+    hl_vdir_t *vd = calloc(1, sizeof(*vd));
+    if (!vd) return NULL;
+    vd->n = hl_vfs_list_synthetic(guest_abs, vd->names, HL_VFS_SYNTH_MAX);
+    return vd;
+}
+
 /* ---------- open/close ---------- */
 
 int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
@@ -259,11 +309,18 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     const char *open_path = path;
     int host_dirfd;
 
+    /* O_CREAT|O_EXCL never follows a final symlink on Linux: the point of
+     * O_EXCL is that an existing name — symlink included — fails with
+     * EEXIST. Following it meant the host open acted on the TARGET, so a
+     * link to a name that does not exist yet made hl create the target
+     * instead, wherever that pointed. The classic symlink attack. */
+    int excl_create = (linux_flags & (LINUX_O_CREAT | LINUX_O_EXCL))
+                      == (LINUX_O_CREAT | LINUX_O_EXCL);
+    int follow_final = !(linux_flags & LINUX_O_NOFOLLOW) && !excl_create;
+
     if (hl_vfs_mode() == HL_FS_ROOTED) {
         hl_vfs_resolve_t r;
-        int rc = hl_vfs_resolve_at(dirfd, path,
-                                   !(linux_flags & LINUX_O_NOFOLLOW),
-                                   create_mode, &r);
+        int rc = hl_vfs_resolve_at(dirfd, path, follow_final, create_mode, &r);
         if (rc < 0) {
             /* Absolute nix-store / loader paths often fall outside binds.
              * Fall back to --sysroot basename resolution so dynamic
@@ -290,6 +347,24 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
                 return guest_fd;
             }
             if (intercepted == -1) return linux_errno();
+
+            /* A mount-ancestor directory — "/" itself, or an interior
+             * component of a mount path. These exist only in the mount
+             * table, so there is no host directory to open and every
+             * opendir("/") failed with ENOENT. Hand back a synthetic
+             * directory fd that getdents64 fills from the mount table. */
+            if (hl_vfs_is_synthetic_dir(r.guest_abs)) {
+                if (linux_flags & (LINUX_O_WRONLY | LINUX_O_RDWR |
+                                   LINUX_O_CREAT))
+                    return -LINUX_EISDIR;
+                hl_vdir_t *vd = vdir_create(r.guest_abs);
+                if (!vd) return -LINUX_ENOMEM;
+                int guest_fd = fd_alloc(FD_VIRTUAL_DIR, -1);
+                if (guest_fd < 0) { free(vd); return -LINUX_EMFILE; }
+                fd_table[guest_fd].dir = vd;
+                fd_table[guest_fd].linux_flags = linux_flags;
+                return guest_fd;
+            }
             return -LINUX_ENOENT;
         }
         if (r.mount && (r.mount->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)) &&
@@ -364,6 +439,22 @@ do_open:
     } /* do_open block */
 }
 
+/* Special-FD subsystems key their state on the GUEST fd number, so any path
+ * that retires a guest fd must tell them — not just close(). dup3() onto a
+ * live eventfd/signalfd/timerfd/inotify used to skip this, leaving the old
+ * state alive under a number the fd table had handed to something else: the
+ * next eventfd() to reuse that number inherited a stale entry and never
+ * became poll-ready, hanging the reader. */
+void fd_special_subsystem_close(int guest_fd, int type) {
+    switch (type) {
+    case FD_EVENTFD:  eventfd_close(guest_fd);  break;
+    case FD_SIGNALFD: signalfd_close(guest_fd); break;
+    case FD_TIMERFD:  timerfd_close(guest_fd);  break;
+    case FD_INOTIFY:  inotify_close(guest_fd);  break;
+    default: break;
+    }
+}
+
 int64_t sys_close(int fd) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
 
@@ -375,14 +466,7 @@ int64_t sys_close(int fd) {
         return -LINUX_EBADF;
 
     syscall_stats_clear_fd(fd);
-    /* Special FD subsystem cleanup (keyed by guest fd number). */
-    switch (snap.type) {
-    case FD_EVENTFD:  eventfd_close(fd);  break;
-    case FD_SIGNALFD: signalfd_close(fd); break;
-    case FD_TIMERFD:  timerfd_close(fd);  break;
-    case FD_INOTIFY:  inotify_close(fd);  break;
-    default: break;
-    }
+    fd_special_subsystem_close(fd, snap.type);
 
     if (snap.desc) {
         /* Descriptor release closes host alias, dir, and open-file. */
@@ -394,8 +478,8 @@ int64_t sys_close(int fd) {
     if (snap.dir) {
         if (snap.type == FD_DIR)
             closedir((DIR *)snap.dir);
-        else if (snap.type == FD_EPOLL)
-            free(snap.dir);  /* epoll_instance_t */
+        else if (snap.type == FD_EPOLL || snap.type == FD_VIRTUAL_DIR)
+            free(snap.dir);  /* epoll_instance_t / hl_vdir_t */
     }
     if (snap.of)
         hl_open_file_release(snap.of);
@@ -422,6 +506,11 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
         }
     }
 
+    /* Synthetic directories have no host fd; report a plain read-only
+     * directory so opendir()/fstatat(AT_EMPTY_PATH) work on them. */
+    if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_VIRTUAL_DIR)
+        return vdir_fill_stat(g, stat_gva);
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) {
         if (g->verbose) fprintf(stderr, "hl: fstat(%d): EBADF (no host fd)\n", fd);
@@ -433,6 +522,19 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
         if (g->verbose) fprintf(stderr, "hl: fstat(%d→%d): host fstat failed errno=%d\n",
                                 fd, host_fd, errno);
         return linux_errno();
+    }
+
+    /* A virtual /dev node is backed by the corresponding HOST device, so a
+     * bare fstat reported the macOS major/minor while stat() and statx() on
+     * the same path reported the Linux ones from the registry — /dev/null
+     * came back 1:3 by path and 3:2 by fd. Take the declared values. */
+    {
+        uint32_t dmode = 0;
+        uint64_t drdev = 0;
+        if (hl_device_fd_stat(fd, &dmode, &drdev) == 0) {
+            mac_st.st_mode = dmode;          /* registry mode is complete */
+            mac_st.st_rdev = (dev_t)drdev;
+        }
     }
 
     linux_stat_t lin_st;
@@ -561,9 +663,27 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
     /* AT_EMPTY_PATH with empty path: stat the fd itself (fstat).
      * macOS fstatat() doesn't support AT_EMPTY_PATH. */
     if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
+        /* Synthetic directories have no host fd at all. */
+        if (dirfd >= 0 && dirfd < FD_TABLE_SIZE &&
+            fd_table[dirfd].type == FD_VIRTUAL_DIR) {
+            memset(&mac_st, 0, sizeof(mac_st));
+            mac_st.st_mode = S_IFDIR | 0555;
+            mac_st.st_nlink = 2;
+            mac_st.st_size = 512;
+            mac_st.st_ino = 1;
+            goto statx_have_stat;
+        }
         if (host_dirfd < 0 || host_dirfd == AT_FDCWD) return -LINUX_EBADF;
         if (fstat(host_dirfd, &mac_st) < 0)
             return linux_errno();
+        /* ...and a device fd must report its registered numbers, exactly
+         * as the path-based branch below does. */
+        uint32_t emode = 0;
+        uint64_t erdev = 0;
+        if (hl_device_fd_stat(dirfd, &emode, &erdev) == 0) {
+            mac_st.st_mode = emode;
+            mac_st.st_rdev = (dev_t)erdev;
+        }
     } else {
         /* Same synthetic /dev and /proc interception sys_newfstatat does.
          * glibc >= 2.33 implements stat()/lstat()/fstatat() on top of
@@ -738,7 +858,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
      * state to the guest and left the guest's own O_NONBLOCK request
      * unseen by the OSS write path. */
     hl_open_file_t *of = fd_table[fd].of;
-    if (of && (cmd == 3 || cmd == 4)) {
+    /* ...but ONLY for those: a plain file or stdio also carries an open-file
+     * object, and its status_flags are never seeded from the host, so
+     * F_GETFL reported O_RDONLY for stdout and F_SETFL(O_NONBLOCK) never
+     * reached the fd it was meant to affect. Those fall through to the host
+     * path below and mirror the result back into status_flags. */
+    if (of && of->ops != &hl_fd_ops_host_file && (cmd == 3 || cmd == 4)) {
         const uint32_t accmode = 0003; /* Linux O_ACCMODE */
         if (cmd == 3)
             return (int64_t)atomic_load(&of->status_flags);
@@ -747,8 +872,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
                      (cur & accmode) | ((uint32_t)arg & ~accmode));
         return 0;
     }
-    if (of && (cmd == 0 || cmd == 1030))
-        return hl_fd_dup(fd);   /* shares the open-file description */
+    if (of && (cmd == 0 || cmd == 1030)) {
+        /* hl_fd_dup() takes the lowest free fd and always clears CLOEXEC —
+         * correct for dup(2), wrong for F_DUPFD, whose arg is the MINIMUM
+         * acceptable fd, and for F_DUPFD_CLOEXEC, which must set it. */
+        return hl_fd_dup_from(fd, (int)arg, cmd == 1030);
+    }
 
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
@@ -792,8 +921,17 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
         return mac_to_linux_status_flags(mac_fl);
     }
     case 4: /* F_SETFL */
-        return fcntl(host_fd, F_SETFL, linux_to_mac_status_flags((int)arg)) < 0
-               ? linux_errno() : 0;
+        if (fcntl(host_fd, F_SETFL, linux_to_mac_status_flags((int)arg)) < 0)
+            return linux_errno();
+        /* Keep the open-file view in step, so code reading status_flags
+         * (the OSS write path, fork export) does not disagree with the fd. */
+        if (of) {
+            const uint32_t accmode = 0003;
+            uint32_t cur = atomic_load(&of->status_flags);
+            atomic_store(&of->status_flags,
+                         (cur & accmode) | ((uint32_t)arg & ~accmode));
+        }
+        return 0;
     case 5:  /* F_GETLK */
     case 6:  /* F_SETLK */
     case 7: { /* F_SETLKW */
@@ -924,6 +1062,37 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
 int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     if (fd_table[fd].type == FD_CLOSED) return -LINUX_EBADF;
+
+    if (fd_table[fd].type == FD_VIRTUAL_DIR) {
+        hl_vdir_t *vd = (hl_vdir_t *)fd_table[fd].dir;
+        if (!vd) return -LINUX_ENOTDIR;
+        if (!guest_ptr(g, buf_gva)) return -LINUX_EFAULT;
+        size_t pos = 0;
+        uint8_t ent[280];
+        /* "." and ".." first, then one entry per child mount component. */
+        while (vd->pos < vd->n + 2) {
+            const char *name = (vd->pos == 0) ? "."
+                             : (vd->pos == 1) ? ".."
+                             : vd->names[vd->pos - 2];
+            size_t nl = strlen(name);
+            size_t reclen = (19 + nl + 1 + 7) & ~7ULL;
+            if (pos + reclen > count) break;
+            linux_dirent64_t lde;
+            lde.d_ino    = (uint64_t)(vd->pos + 1);
+            lde.d_off    = (int64_t)(vd->pos + 1);
+            lde.d_reclen = (uint16_t)reclen;
+            lde.d_type   = DT_DIR;
+            memcpy(ent, &lde, sizeof(lde));
+            memcpy(ent + 19, name, nl + 1);
+            if (19 + nl + 1 < reclen)
+                memset(ent + 19 + nl + 1, 0, reclen - (19 + nl + 1));
+            if (guest_write(g, buf_gva + pos, ent, reclen) < 0)
+                return pos > 0 ? (int64_t)pos : -LINUX_EFAULT;
+            pos += reclen;
+            vd->pos++;
+        }
+        return (int64_t)pos;
+    }
 
     DIR *dir = (DIR *)fd_table[fd].dir;
     if (!dir) return -LINUX_ENOTDIR;
@@ -1233,7 +1402,9 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
         if ((om && (om->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) || (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))))
             return -LINUX_EROFS;
-        host_olddir = host_newdir = host_dirfd_for_resolved();
+        host_olddir = host_dirfd_for_op(olddirfd);
+        host_newdir = host_dirfd_for_op(newdirfd);
+        if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
     }
 
     /* RENAME_NOREPLACE: fail if destination exists. macOS renamex_np
@@ -1354,7 +1525,9 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
         if (r2 < 0) return r2;
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
         if (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_olddir = host_newdir = host_dirfd_for_resolved();
+        host_olddir = host_dirfd_for_op(olddirfd);
+        host_newdir = host_dirfd_for_op(newdirfd);
+        if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
     }
 
     int mac_flags = translate_at_flags(flags);
@@ -1449,7 +1622,8 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_dirfd = host_dirfd_for_resolved();
+        host_dirfd = host_dirfd_for_op(dirfd);
+        if (host_dirfd == -1) return -LINUX_EBADF;
     }
 
     /* macOS fchmodat doesn't support AT_SYMLINK_NOFOLLOW */
@@ -1484,7 +1658,8 @@ int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
-        host_dirfd = host_dirfd_for_resolved();
+        host_dirfd = host_dirfd_for_op(dirfd);
+        if (host_dirfd == -1) return -LINUX_EBADF;
     }
 
     int mac_flags = translate_at_flags(flags);
@@ -1519,10 +1694,18 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
         /* Resolve in BOTH modes: the legacy branch passed the raw guest
          * path while open/stat/unlink applied the sysroot redirect. */
         {
-            int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf,
-                                         sizeof(hostbuf), &path_arg, NULL);
+            const hl_mount_t *mnt = NULL;
+            int rr = resolve_path_for_op_ex(dirfd, path, 0,
+                                            !(flags & LINUX_AT_SYMLINK_NOFOLLOW),
+                                            hostbuf, sizeof(hostbuf),
+                                            &path_arg, &mnt);
             if (rr < 0) return rr;
-            host_dirfd = host_dirfd_for_resolved();
+            /* utimensat writes metadata; it never asked for the mount, so a
+             * read-only bind could still have its timestamps rewritten. */
+            if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
+                return -LINUX_EROFS;
+            host_dirfd = host_dirfd_for_op(dirfd);
+            if (host_dirfd == -1) return -LINUX_EBADF;
         }
     }
 
@@ -1576,8 +1759,12 @@ int64_t sys_getxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *hpath = path;
-    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
-                                 sizeof(hostbuf), &hpath, NULL);
+    /* follow = !nofollow. Resolving through the final symlink handed the
+     * TARGET's host path to a call that then asked for XATTR_NOFOLLOW,
+     * so every l*xattr variant behaved exactly like its non-l form. */
+    int rr = resolve_path_for_op_ex(LINUX_AT_FDCWD, path, 0, !nofollow,
+                                    hostbuf, sizeof(hostbuf), &hpath,
+                                    NULL);
     if (rr < 0) return rr;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
@@ -1618,9 +1805,19 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *hpath = path;
-    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
-                                 sizeof(hostbuf), &hpath, NULL);
+    const hl_mount_t *mnt = NULL;
+    /* follow = !nofollow. Resolving through the final symlink handed the
+     * TARGET's host path to a call that then asked for XATTR_NOFOLLOW,
+     * so every l*xattr variant behaved exactly like its non-l form. */
+    int rr = resolve_path_for_op_ex(LINUX_AT_FDCWD, path, 0, !nofollow,
+                                    hostbuf, sizeof(hostbuf), &hpath,
+                                    &mnt);
     if (rr < 0) return rr;
+    /* setxattr writes; a read-only or virtual mount must refuse it. The
+     * mount was never even requested here, so every RO bind stayed
+     * writable through extended attributes. */
+    if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
+        return -LINUX_EROFS;
 
     /* Use host-side buffer to safely read from guest memory. */
     if (size > 65536) return -LINUX_E2BIG;
@@ -1652,8 +1849,12 @@ int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *hpath = path;
-    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
-                                 sizeof(hostbuf), &hpath, NULL);
+    /* follow = !nofollow. Resolving through the final symlink handed the
+     * TARGET's host path to a call that then asked for XATTR_NOFOLLOW,
+     * so every l*xattr variant behaved exactly like its non-l form. */
+    int rr = resolve_path_for_op_ex(LINUX_AT_FDCWD, path, 0, !nofollow,
+                                    hostbuf, sizeof(hostbuf), &hpath,
+                                    NULL);
     if (rr < 0) return rr;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
@@ -1686,9 +1887,19 @@ int64_t sys_removexattr(guest_t *g, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *hpath = path;
-    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
-                                 sizeof(hostbuf), &hpath, NULL);
+    const hl_mount_t *mnt = NULL;
+    /* follow = !nofollow. Resolving through the final symlink handed the
+     * TARGET's host path to a call that then asked for XATTR_NOFOLLOW,
+     * so every l*xattr variant behaved exactly like its non-l form. */
+    int rr = resolve_path_for_op_ex(LINUX_AT_FDCWD, path, 0, !nofollow,
+                                    hostbuf, sizeof(hostbuf), &hpath,
+                                    &mnt);
     if (rr < 0) return rr;
+    /* removexattr writes; a read-only or virtual mount must refuse it. The
+     * mount was never even requested here, so every RO bind stayed
+     * writable through extended attributes. */
+    if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
+        return -LINUX_EROFS;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
     int ret = removexattr(hpath, name, opts);

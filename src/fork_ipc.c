@@ -1140,8 +1140,7 @@ static void *thread_create_and_run(void *arg) {
         if (verbose)
             fprintf(stderr, "hl: last worker exited, interrupting "
                     "main thread futex_wait/poll\n");
-        extern _Atomic int futex_interrupt_requested;
-        atomic_store(&futex_interrupt_requested, 1);
+        futex_interrupt_broadcast();
         wakeup_pipe_signal();
         thread_interrupt_all();
     }

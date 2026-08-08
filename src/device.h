@@ -42,4 +42,8 @@ int hl_device_stat(const char *path, uint32_t *mode_out, uint64_t *rdev_out);
 int hl_device_readdir(int index, char *name_out, size_t name_sz,
                       uint8_t *dtype_out);
 
+/* Registry mode/rdev for a guest fd that was opened from a device node,
+ * so fstat() agrees with stat() on the same path. 0 = it is one. */
+int hl_device_fd_stat(int guest_fd, uint32_t *mode_out, uint64_t *rdev_out);
+
 #endif /* HL_DEVICE_H */

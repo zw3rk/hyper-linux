@@ -365,9 +365,7 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     /* Step 5a: Reset global process flags.  After exec, the new image
      * starts fresh — stale exit_group / futex_interrupt flags from a
      * previous multi-threaded state must not leak into the new program. */
-    extern _Atomic int futex_interrupt_requested;
     atomic_store(&exit_group_requested, 0);
-    atomic_store(&futex_interrupt_requested, 0);
 
     /* Step 5b: Reset signal state for exec (POSIX requirement).
      * Handlers set to SIG_DFL (except SIG_IGN stays SIG_IGN),

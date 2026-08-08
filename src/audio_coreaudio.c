@@ -203,7 +203,17 @@ static int ca_resume(hl_audio_stream_t *s) {
 
 static int ca_reset(hl_audio_stream_t *s) {
     ca_state_t *st = s->backend_state;
-    if (!st || !st->queue) return -1;
+    if (!st) return -1;
+    /* Discard the partial-frame carry and the per-buffer byte credits.
+     * RESET must drop buffered audio: stale carry bytes were being
+     * prepended to the next track (shifting every following sample), and
+     * stale buf_bytes were added to a freshly-zeroed `completed`, pushing
+     * it above `accepted` so GETOSPACE advertised space that did not exist.
+     * Cleared before the queue check so a not-yet-started stream is reset
+     * too. */
+    st->carry_len = 0;
+    for (int i = 0; i < AQ_BUFFERS; i++) st->buf_bytes[i] = 0;
+    if (!st->queue) return -1;
     st->generation = s->generation;
     AudioQueueReset(st->queue);
     return 0;

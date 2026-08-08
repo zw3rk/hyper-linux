@@ -308,7 +308,7 @@ void hl_fd_detached_finish(hl_fd_detached_t *d) {
     /* Legacy path without descriptor object */
     if (d->dir) {
         if (d->type == FD_DIR) closedir((DIR *)d->dir);
-        else if (d->type == FD_EPOLL) free(d->dir);
+        else if (d->type == FD_EPOLL || d->type == FD_VIRTUAL_DIR) free(d->dir);
         d->dir = NULL;
     }
     if (d->of) {
@@ -322,7 +322,15 @@ void hl_fd_detached_finish(hl_fd_detached_t *d) {
 }
 
 int hl_fd_dup(int oldfd) {
+    return hl_fd_dup_from(oldfd, 0, 0);
+}
+
+/* dup(2) is hl_fd_dup_from(fd, 0, 0). F_DUPFD needs a minimum fd number and
+ * F_DUPFD_CLOEXEC needs the flag set — routing both through hl_fd_dup()
+ * ignored `arg` entirely and always cleared CLOEXEC. */
+int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
     hl_fd_ref_t ref;
+    if (minfd < 0 || minfd >= FD_TABLE_SIZE) return -LINUX_EINVAL;
     if (hl_fd_get(oldfd, &ref) < 0) return -LINUX_EBADF;
 
     int new_host = -1;
@@ -340,15 +348,18 @@ int hl_fd_dup(int oldfd) {
     else {
         /* Pure legacy: allocate plain fd entry sharing... can't share offset
          * without of; fall back to independent host dup only. */
-        int gfd = fd_alloc(fd_table[oldfd].type, new_host);
+        int gfd = fd_alloc_from(minfd, fd_table[oldfd].type, new_host);
         if (gfd < 0) {
             if (new_host >= 0) close(new_host);
             hl_fd_put(&ref);
             return -LINUX_EMFILE;
         }
+        if (cloexec && new_host >= 0)
+            fcntl(new_host, F_SETFD, FD_CLOEXEC);
         pthread_mutex_lock(&fd_lock);
         fd_table[gfd].linux_flags =
-            fd_table[oldfd].linux_flags & ~LINUX_O_CLOEXEC;
+            (fd_table[oldfd].linux_flags & ~LINUX_O_CLOEXEC)
+            | (cloexec ? LINUX_O_CLOEXEC : 0);
         /* dir not shared for legacy DIR without of */
         pthread_mutex_unlock(&fd_lock);
         hl_fd_put(&ref);
@@ -358,8 +369,11 @@ int hl_fd_dup(int oldfd) {
     int kind = of->kind;
     uint32_t st = atomic_load(&of->status_flags);
     (void)st;
-    /* New descriptor: CLOEXEC cleared for dup() */
-    hl_descriptor_t *nd = hl_descriptor_create(of, new_host, 0, kind, NULL);
+    uint32_t new_fd_flags = cloexec ? LINUX_O_CLOEXEC : 0;
+    if (cloexec && new_host >= 0)
+        fcntl(new_host, F_SETFD, FD_CLOEXEC);
+    hl_descriptor_t *nd = hl_descriptor_create(of, new_host, new_fd_flags,
+                                               kind, NULL);
     if (!nd) {
         if (new_host >= 0) close(new_host);
         hl_open_file_release(of);
@@ -367,7 +381,7 @@ int hl_fd_dup(int oldfd) {
         return -LINUX_ENOMEM;
     }
 
-    int gfd = fd_alloc(kind, new_host);
+    int gfd = fd_alloc_from(minfd, kind, new_host);
     if (gfd < 0) {
         hl_descriptor_release(nd);
         hl_fd_put(&ref);
@@ -377,9 +391,10 @@ int hl_fd_dup(int oldfd) {
     fd_table[gfd].desc = nd;
     fd_table[gfd].of = of;
     hl_fd_sync_legacy(gfd);
-    /* dup clears CLOEXEC */
-    fd_table[gfd].linux_flags &= ~LINUX_O_CLOEXEC;
-    atomic_store(&nd->fd_flags, 0);
+    /* dup(2) clears CLOEXEC; F_DUPFD_CLOEXEC sets it. */
+    fd_table[gfd].linux_flags =
+        (fd_table[gfd].linux_flags & ~LINUX_O_CLOEXEC) | new_fd_flags;
+    atomic_store(&nd->fd_flags, new_fd_flags);
     pthread_mutex_unlock(&fd_lock);
 
     hl_fd_put(&ref);
@@ -425,10 +440,17 @@ int hl_fd_dup3(int oldfd, int newfd, int flags) {
         }
     }
 
-    /* Close target and install */
+    /* Close target and install. The special-FD subsystems key their state
+     * on the guest fd number, so they must be told too — otherwise the old
+     * eventfd/signalfd/timerfd/inotify state stayed alive under a number
+     * now owned by this dup, and the next creator to reuse that number
+     * inherited it (a recreated eventfd never became poll-ready). */
     hl_fd_detached_t old = {0};
     int had = (hl_fd_remove(newfd, &old) == 0);
-    if (had) hl_fd_detached_finish(&old);
+    if (had) {
+        fd_special_subsystem_close(newfd, old.type);
+        hl_fd_detached_finish(&old);
+    }
 
     if (fd_alloc_at(newfd, kind, new_host) < 0) {
         if (nd) hl_descriptor_release(nd);

@@ -224,6 +224,9 @@ void hl_audio_stream_destroy(hl_audio_stream_t *s) {
 int hl_audio_stream_configure(hl_audio_stream_t *s, const hl_audio_params_t *p) {
     if (!s || !p) return -1;
     pthread_mutex_lock(&s->lock);
+    int fmt_changed = (s->params.format   != p->format ||
+                       s->params.channels != p->channels ||
+                       s->params.rate     != p->rate);
     s->params = *p;
     /* Clamp BOTH ends. Only the SNDCTL_DSP_SETFRAGMENT ioctl path bounded
      * frag_size from above; the fork-import path replayed the guest's raw
@@ -250,6 +253,11 @@ int hl_audio_stream_configure(hl_audio_stream_t *s, const hl_audio_params_t *p) 
         setsockopt(s->cons_fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
     }
     s->configured = 1;
+    /* Force a backend restart so the new ASBD takes effect. Without this a
+     * SETFMT/SPEED/CHANNELS issued after the first write was silently
+     * ignored and the new PCM played through the old format. */
+    if (fmt_changed)
+        s->running = 0;
     pthread_mutex_unlock(&s->lock);
     if (hl_trace_on(HL_TRACE_AUDIO))
         hl_trace(HL_TRACE_AUDIO,
@@ -272,6 +280,12 @@ int hl_audio_stream_reset(hl_audio_stream_t *s) {
     atomic_store(&s->completed, 0);
     if (s->backend && s->backend->reset)
         s->backend->reset(s);
+    /* Allow the next write to re-post. `running` was set once and never
+     * cleared, so post() short-circuited forever: ca_reset() only empties
+     * the Audio Queue, and buffers are re-enqueued ONLY from the callback,
+     * which then never fires again. The guest's next write blocked in the
+     * space wait permanently — i.e. any XMMS stop/seek/track-change. */
+    s->running = 0;
     pthread_cond_broadcast(&s->space_cond);
     pthread_mutex_unlock(&s->lock);
     if (hl_trace_on(HL_TRACE_AUDIO))
@@ -287,7 +301,21 @@ int hl_audio_stream_drain(hl_audio_stream_t *s) {
      * It previously returned immediately, so apps ending a track lost the
      * tail. Bounded so a stalled device cannot wedge the guest: at 4kHz
      * mono (the slowest supported rate) a full ring is well under 5s. */
-    const int max_iters = 5000;          /* 5s at 1ms */
+    /* Bound = time to play a full ring at the negotiated rate, plus 50%
+     * slack, capped at 60s. The previous fixed 5000 iterations (~7s) was
+     * derived from arithmetic that was simply wrong: a 128KB ring at
+     * 4kHz mono U8 is 32.8 SECONDS, so SYNC returned success having
+     * dropped ~28s of audio. */
+    int bps  = (s->params.format == HL_AUDIO_FMT_S16_LE) ? 2 : 1;
+    int chan = s->params.channels ? s->params.channels : 2;
+    int rate = s->params.rate ? s->params.rate : 44100;
+    long bytes_per_sec = (long)rate * chan * bps;
+    long need_ms = bytes_per_sec > 0
+        ? ((long)s->capacity * 1000 / bytes_per_sec) * 3 / 2 + 100
+        : 5000;
+    if (need_ms < 1000)  need_ms = 1000;
+    if (need_ms > 60000) need_ms = 60000;
+    const int max_iters = (int)need_ms;   /* 1ms per iteration */
     for (int i = 0; i < max_iters; i++) {
         hl_audio_space_t sp;
         hl_audio_stream_get_space(s, &sp);
@@ -296,7 +324,12 @@ int hl_audio_stream_drain(hl_audio_stream_t *s) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };
         nanosleep(&ts, NULL);
     }
-    return 0;
+    /* Timed out with audio still queued: the device is stuck. Say so
+     * instead of reporting a completed drain. */
+    if (hl_trace_on(HL_TRACE_AUDIO))
+        hl_trace(HL_TRACE_AUDIO, "stream=%llu drain TIMEOUT after %ldms",
+                 (unsigned long long)s->id, need_ms);
+    return -1;
 }
 
 int hl_audio_stream_post(hl_audio_stream_t *s) {

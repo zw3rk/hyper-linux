@@ -776,6 +776,22 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
     if (strcmp(path, "/proc/self/exe") == 0) {
         const char *exe = proc_get_elf_path();
         if (!exe) { errno = ENOENT; return -1; }
+        /* Map back into the guest namespace, as /proc/self/cwd already
+         * does. The raw host path leaks the host layout and username, and
+         * the guest cannot open it — anything that re-execs itself through
+         * /proc/self/exe got ENOENT. Falls back to the host path when the
+         * binary lies outside every mount, which is the best available
+         * answer. */
+        char guest[LINUX_PATH_MAX];
+        if (hl_vfs_mode() == HL_FS_ROOTED) {
+            /* Canonicalize first: mount roots are stored resolved, and on
+             * macOS the path hl was invoked with usually is not
+             * (/var/... vs /private/var/...), so the reverse map missed. */
+            char realexe[LINUX_PATH_MAX];
+            const char *probe = realpath(exe, realexe) ? realexe : exe;
+            if (hl_vfs_host_to_guest(probe, guest, sizeof(guest)) == 0)
+                exe = guest;
+        }
         size_t len = strlen(exe);
         if (len > bufsiz) len = bufsiz;
         memcpy(buf, exe, len);

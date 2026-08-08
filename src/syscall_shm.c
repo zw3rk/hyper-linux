@@ -93,7 +93,16 @@ typedef struct {
     size_t map_size;   /* page-rounded size actually hv_vm_map'd */
     size_t ipa_span;   /* 2MB-rounded IPA reservation (for unmap/restore) */
     void *host_addr;   /* shmat in hl process */
-    uint64_t guest_va; /* guest attach address (2MB-aligned) */
+    uint64_t guest_va; /* most recent attach address (2MB-aligned) */
+    /* ALL live attach windows. A second shmat() of the same segment used to
+     * overwrite guest_va, orphaning the first window: va_range_busy() then
+     * reported it free, first-fit handed it to a different segment, and the
+     * still-valid L2 block made guest_map_va_range() a silent no-op — so
+     * the new segment's writes landed in the old segment's shared pages.
+     * shmdt() of the first view also returned EINVAL. */
+#define HL_SHM_MAX_ATTACH 8
+    uint64_t attach_va[HL_SHM_MAX_ATTACH];
+    int      nattach_va;
     uint64_t ipa;      /* HVF IPA of host_addr (2MB-aligned) */
     int nattach;
     int stage2_stolen; /* 1 if we replaced primary Stage-2 at ipa */
@@ -125,15 +134,22 @@ hl_shm_resolve(uint64_t gva, uint64_t *avail)
     pthread_mutex_lock(&shm_lock);
     for (i = 0; i < HL_SHM_MAX; i++) {
         hl_shm_seg_t *s = &segs[i];
-        if (!s->used || !s->host_addr || s->nattach <= 0 || s->guest_va == 0)
+        if (!s->used || !s->host_addr || s->nattach <= 0)
             continue;
-        /* Resolve within the logical SHM size (what the client may touch). */
-        if (gva >= s->guest_va && gva < s->guest_va + s->map_size) {
-            uint64_t off = gva - s->guest_va;
-            if (avail)
-                *avail = s->map_size - off;
-            pthread_mutex_unlock(&shm_lock);
-            return (uint8_t *)s->host_addr + off;
+        /* Resolve within the logical SHM size (what the client may touch).
+         * Every attach window resolves — a second shmat() used to leave the
+         * first window pointing at whatever primary RAM the stale PTE
+         * covered. */
+        for (int k = 0; k < s->nattach_va; k++) {
+            uint64_t va = s->attach_va[k];
+            if (!va) continue;
+            if (gva >= va && gva < va + s->map_size) {
+                uint64_t off = gva - va;
+                if (avail)
+                    *avail = s->map_size - off;
+                pthread_mutex_unlock(&shm_lock);
+                return (uint8_t *)s->host_addr + off;
+            }
         }
     }
     pthread_mutex_unlock(&shm_lock);
@@ -203,10 +219,25 @@ find_by_guest_va(uint64_t va)
 {
     int i;
     for (i = 0; i < HL_SHM_MAX; i++) {
-        if (segs[i].used && segs[i].nattach > 0 && segs[i].guest_va == va)
-            return &segs[i];
+        if (!segs[i].used || segs[i].nattach <= 0) continue;
+        for (int k = 0; k < segs[i].nattach_va; k++)
+            if (segs[i].attach_va[k] == va)
+                return &segs[i];
     }
     return NULL;
+}
+
+/* Drop one attach window from a segment's list (order irrelevant). */
+static void
+shm_forget_va(hl_shm_seg_t *s, uint64_t va)
+{
+    for (int k = 0; k < s->nattach_va; k++) {
+        if (s->attach_va[k] == va) {
+            s->attach_va[k] = s->attach_va[--s->nattach_va];
+            s->attach_va[s->nattach_va] = 0;
+            return;
+        }
+    }
 }
 
 /* True when [lo, lo+span) overlaps any live segment's IPA reservation. */
@@ -226,9 +257,11 @@ static int
 va_range_busy(uint64_t lo, size_t span)
 {
     for (int i = 0; i < HL_SHM_MAX; i++) {
-        if (!segs[i].used || !segs[i].guest_va) continue;
-        uint64_t a = segs[i].guest_va, b = a + segs[i].ipa_span;
-        if (lo < b && a < lo + span) return 1;
+        if (!segs[i].used) continue;
+        for (int k = 0; k < segs[i].nattach_va; k++) {
+            uint64_t a = segs[i].attach_va[k], b = a + segs[i].ipa_span;
+            if (a && lo < b && a < lo + span) return 1;
+        }
     }
     return 0;
 }
@@ -474,6 +507,13 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             SHMAT_FAIL(-LINUX_EINVAL);
         }
         guest_va = shmaddr;
+        if (va_range_busy(guest_va, ipa_span)) {
+            /* An explicit shmaddr onto an occupied window used to "succeed"
+             * and then quietly alias: guest_map_va_range leaves an already
+             * valid L2 block alone, so the guest kept reading the previous
+             * segment. Linux returns EINVAL without SHM_REMAP; so do we. */
+            SHMAT_FAIL(-LINUX_EINVAL);
+        }
     } else {
         guest_va = hl_shm_find_guest_va(g, ipa_span);
         if (guest_va == 0) {
@@ -488,16 +528,30 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
      * Map the full 2MB span so the L2 block is valid; Stage-2 only backs
      * map_size bytes — clients must not touch past the segment.
      */
-    if (guest_map_va_range(g, guest_va, guest_va + ipa_span, ipa,
-                           MEM_PERM_RW) != 0) {
+    if (s->nattach_va >= HL_SHM_MAX_ATTACH)
+        SHMAT_FAIL(-LINUX_ENOMEM);
+    int va_skipped = 0;
+    if (guest_map_va_range_ex(g, guest_va, guest_va + ipa_span, ipa,
+                              MEM_PERM_RW, &va_skipped) != 0) {
         fprintf(stderr, "hl: shmat map_va failed va=0x%llx ipa=0x%llx\n",
                 (unsigned long long)guest_va, (unsigned long long)ipa);
         SHMAT_FAIL(-LINUX_ENOMEM);
+    }
+    if (va_skipped) {
+        /* "First mapping wins" is right for mmap's high-VA reuse but is
+         * silent corruption here: the attach would report success while the
+         * guest still saw the old contents. Fail loudly instead. */
+        fprintf(stderr,
+                "hl: shmat: VA 0x%llx already mapped (%d blocks); refusing "
+                "to alias\n", (unsigned long long)guest_va, va_skipped);
+        guest_unmap_va_range(g, guest_va, guest_va + ipa_span);
+        SHMAT_FAIL(-LINUX_EINVAL);
     }
     guest_region_add(g, guest_va, guest_va + map_size, MEM_PERM_RW,
                      0 /* flags */, 0 /* offset */, "[sysvshm]");
 
     s->guest_va = guest_va;
+    s->attach_va[s->nattach_va++] = guest_va;
     s->nattach++;
     g->need_tlbi = 1;
     pthread_mutex_unlock(&shm_lock);
@@ -569,13 +623,17 @@ sys_shmdt(guest_t *g, uint64_t shmaddr)
     }
     if (s->nattach > 0)
         s->nattach--;
+    /* Invalidate the Stage-1 mapping for THIS window. Without this the 2MB
+     * window stayed valid and writable after detach and aliased primary
+     * guest RAM once the IPA slice was restored — Linux would SIGSEGV.
+     * Detaching one of several windows must not tear down the others. */
+    guest_unmap_va_range(g, shmaddr, shmaddr + s->ipa_span);
+    guest_region_remove(g, shmaddr, shmaddr + s->map_size);
+    shm_forget_va(s, shmaddr);
+    if (s->guest_va == shmaddr)
+        s->guest_va = s->nattach_va ? s->attach_va[0] : 0;
     if (s->nattach == 0) {
-        /* Invalidate the Stage-1 mapping. Without this the 2MB window
-         * stayed valid and writable after detach and aliased primary guest
-         * RAM once the IPA slice was restored — Linux would SIGSEGV. */
-        if (s->guest_va)
-            guest_unmap_va_range(g, s->guest_va, s->guest_va + s->ipa_span);
-        guest_region_remove(g, s->guest_va, s->guest_va + s->map_size);
+        s->nattach_va = 0;
         s->guest_va = 0;
         if (s->rmid_pending) {
             /* Marked destroyed earlier; last guest detach frees it now. */
@@ -726,11 +784,20 @@ hl_shm_fork_export(hl_shm_fork_rec_t *out, int max)
     if (!out || max <= 0) return 0;
     pthread_mutex_lock(&shm_lock);
     for (int i = 0; i < HL_SHM_MAX && n < max; i++) {
-        if (!segs[i].used || !segs[i].stage2_stolen) continue;
+        /* Export every segment hl knows about, not only the attached ones.
+         * shmget() in the parent followed by shmat() in the child is the
+         * normal X11/GTK pattern; the child used to reach the "adopt"
+         * path, where the shm_cpid == getpid() owner check can never hold
+         * (hl forks via posix_spawn, so the child has a different pid) and
+         * the attach failed with EACCES. */
+        if (!segs[i].used) continue;
         out[n].host_shmid   = segs[i].host_shmid;
         out[n].nattach      = segs[i].nattach;
         out[n].rmid_pending = segs[i].rmid_pending;
-        out[n].pad          = 0;
+        out[n].nattach_va   = segs[i].nattach_va;
+        for (int k = 0; k < HL_SHM_FORK_MAX_ATTACH; k++)
+            out[n].attach_va[k] = (k < segs[i].nattach_va)
+                                ? segs[i].attach_va[k] : 0;
         out[n].size         = segs[i].size;
         out[n].map_size     = segs[i].map_size;
         out[n].ipa_span     = segs[i].ipa_span;
@@ -753,6 +820,29 @@ hl_shm_fork_import(guest_t *g, const hl_shm_fork_rec_t *in, int n)
         hl_shm_seg_t *s = alloc_slot();
         if (!s) break;
 
+        s->host_shmid   = in[i].host_shmid;
+        s->nattach      = in[i].nattach;
+        s->rmid_pending = in[i].rmid_pending;
+        s->size         = (size_t)in[i].size;
+        s->map_size     = (size_t)in[i].map_size;
+        s->ipa_span     = (size_t)in[i].ipa_span;
+        s->nattach_va   = in[i].nattach_va;
+        if (s->nattach_va > HL_SHM_MAX_ATTACH)
+            s->nattach_va = HL_SHM_MAX_ATTACH;
+        for (int k = 0; k < s->nattach_va; k++)
+            s->attach_va[k] = in[i].attach_va[k];
+        s->guest_va     = in[i].guest_va;
+
+        /* Known but not attached in the parent: record the metadata only,
+         * so the child's own shmat() finds the segment instead of falling
+         * into the (correctly restrictive) adopt-a-foreign-shmid path. */
+        if (in[i].nattach <= 0 || s->nattach_va == 0) {
+            s->ipa = 0;
+            s->host_addr = NULL;
+            s->stage2_stolen = 0;
+            continue;
+        }
+
         /* SysV segments are kernel-global, so the child attaches the very
          * same shmid the parent did — that is what makes the memory
          * genuinely shared rather than copied. */
@@ -762,13 +852,6 @@ hl_shm_fork_import(guest_t *g, const hl_shm_fork_rec_t *in, int n)
             continue;
         }
 
-        s->host_shmid   = in[i].host_shmid;
-        s->nattach      = in[i].nattach;
-        s->rmid_pending = in[i].rmid_pending;
-        s->size         = (size_t)in[i].size;
-        s->map_size     = (size_t)in[i].map_size;
-        s->ipa_span     = (size_t)in[i].ipa_span;
-        s->guest_va     = in[i].guest_va;
         s->ipa          = in[i].ipa;
         s->host_addr    = host;
 

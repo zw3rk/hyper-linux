@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdlib.h>   /* getenv */
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -61,8 +62,51 @@ static int translate_af_to_linux(int mac_af) {
 
 /* Convert Linux sockaddr (from guest memory) to macOS sockaddr.
  * Returns the macOS sockaddr length, or -1 on error. */
-/* Directory backing the emulated Linux abstract AF_UNIX namespace. */
-#define HL_ABSTRACT_DIR "/tmp/.hl-abstract"
+/* Directory backing the emulated Linux abstract AF_UNIX namespace.
+ *
+ * This used to be the fixed path /tmp/.hl-abstract, which is wrong twice
+ * over. /tmp is world-writable and sticky, so any local user could create
+ * that directory (or a listening socket inside it) before hl starts:
+ * mkdir() then fails with EEXIST, hl carries on regardless, and the guest's
+ * bind/connect lands inside a directory the attacker controls — enough to
+ * intercept guest AF_UNIX traffic. And because the winner owns it 0700, it
+ * also worked for exactly one user per machine; everyone else got EACCES
+ * forever.
+ *
+ * Resolve it under the per-user TMPDIR instead (on macOS that is already a
+ * private 0700 directory in /var/folders), with the uid in the name as a
+ * fallback for a bare /tmp, and verify ownership and mode before use.
+ * Scoping the namespace to the invoking user is also closer to the Linux
+ * semantics being emulated: an abstract namespace belongs to a network
+ * namespace, not to the machine. */
+static const char *hl_abstract_dir(void) {
+    static char dir[256];
+    static int  checked;          /* 0 = unknown, 1 = usable, -1 = refused */
+    if (checked) return checked > 0 ? dir : NULL;
+
+    const char *base = getenv("TMPDIR");
+    if (!base || base[0] != '/') base = "/tmp";
+    size_t bl = strlen(base);
+    int n = snprintf(dir, sizeof(dir), "%s%shl-abstract-%u", base,
+                     (bl && base[bl - 1] == '/') ? "" : "/",
+                     (unsigned)geteuid());
+    if (n < 0 || (size_t)n >= sizeof(dir)) { checked = -1; return NULL; }
+
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) { checked = -1; return NULL; }
+
+    /* Never follow into something we do not own outright. */
+    struct stat st;
+    if (lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        fprintf(stderr, "hl: refusing abstract-socket dir %s "
+                        "(not a private directory owned by uid %u)\n",
+                dir, (unsigned)geteuid());
+        checked = -1;
+        return NULL;
+    }
+    checked = 1;
+    return dir;
+}
 
 /* Linux abstract sockets (sun_path[0] == '\0') have no macOS equivalent.
  * Copying them verbatim put a NUL at sun_path[0], so the kernel saw an
@@ -73,7 +117,9 @@ static int translate_af_to_linux(int mac_af) {
 static int abstract_to_path(const uint8_t *name, uint32_t name_len,
                             char *out, size_t out_sz) {
     size_t o = 0;
-    int n = snprintf(out, out_sz, "%s/", HL_ABSTRACT_DIR);
+    const char *dir = hl_abstract_dir();
+    if (!dir) return -1;
+    int n = snprintf(out, out_sz, "%s/", dir);
     if (n < 0 || (size_t)n >= out_sz) return -1;
     o = (size_t)n;
     for (uint32_t i = 0; i < name_len && o + 1 < out_sz; i++) {
@@ -86,8 +132,10 @@ static int abstract_to_path(const uint8_t *name, uint32_t name_len,
     return (int)o;
 }
 
-static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
-                                  struct sockaddr_storage *mac_sa) {
+static int linux_to_mac_sockaddr_ex(const void *linux_sa, uint32_t linux_len,
+                                    struct sockaddr_storage *mac_sa,
+                                    int *was_abstract) {
+    if (was_abstract) *was_abstract = 0;
     if (linux_len < 2) return -1;
 
     const uint8_t *src = linux_sa;
@@ -104,7 +152,7 @@ static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
         char path[sizeof(un->sun_path)];
         if (abstract_to_path(src + 3, linux_len - 3, path, sizeof(path)) < 0)
             return -1;
-        mkdir(HL_ABSTRACT_DIR, 0700);   /* best effort; may already exist */
+        if (was_abstract) *was_abstract = 1;
         un->sun_family = AF_UNIX;
         snprintf(un->sun_path, sizeof(un->sun_path), "%s", path);
         un->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) +
@@ -121,6 +169,11 @@ static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
     memcpy((uint8_t *)mac_sa + 2, src + 2, data_len);
 
     return (int)linux_len;
+}
+
+static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
+                                 struct sockaddr_storage *mac_sa) {
+    return linux_to_mac_sockaddr_ex(linux_sa, linux_len, mac_sa, NULL);
 }
 
 /* Convert macOS sockaddr to Linux sockaddr (to write into guest memory).
@@ -416,8 +469,21 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
     if (guest_read(g, addr_gva, linux_sa, addrlen) < 0) return -LINUX_EFAULT;
 
     struct sockaddr_storage mac_sa;
-    int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
+    int was_abstract = 0;
+    int mac_len = linux_to_mac_sockaddr_ex(linux_sa, addrlen, &mac_sa,
+                                           &was_abstract);
     if (mac_len < 0) return -LINUX_EINVAL;
+
+    /* Linux abstract names vanish with their last reference; the file that
+     * stands in for one here does not, so a previous run left a socket that
+     * failed every later bind with EADDRINUSE. Safe now that the directory
+     * is verified private: only unlink something that is actually a socket. */
+    if (was_abstract) {
+        const struct sockaddr_un *un = (const struct sockaddr_un *)&mac_sa;
+        struct stat st;
+        if (lstat(un->sun_path, &st) == 0 && S_ISSOCK(st.st_mode))
+            unlink(un->sun_path);
+    }
 
     if (bind(host_fd, (struct sockaddr *)&mac_sa, (socklen_t)mac_len) < 0)
         return linux_errno();

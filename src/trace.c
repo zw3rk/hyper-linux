@@ -74,6 +74,14 @@ int hl_trace_parse(const char *spec, uint32_t *out_mask,
 }
 
 int hl_trace_init_from_env(void) {
+    /* Read redaction BEFORE the HL_TRACE early-return. Categories can also
+     * be enabled with --trace=..., and this used to bail out first — so
+     * `HL_TRACE_REDACT=1 hl --trace=fs` traced with full host paths and the
+     * documented redaction was simply unreachable that way. */
+    const char *redact = getenv("HL_TRACE_REDACT");
+    if (redact && (*redact == '1' || *redact == 'y' || *redact == 'Y'))
+        hl_trace_redact_paths = 1;
+
     const char *env = getenv("HL_TRACE");
     if (!env || !*env) return 0;
     char err[256];
@@ -83,9 +91,6 @@ int hl_trace_init_from_env(void) {
         return -1;
     }
     hl_trace_mask |= mask;
-    const char *redact = getenv("HL_TRACE_REDACT");
-    if (redact && (*redact == '1' || *redact == 'y' || *redact == 'Y'))
-        hl_trace_redact_paths = 1;
     return 0;
 }
 

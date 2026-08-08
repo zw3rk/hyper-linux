@@ -91,6 +91,9 @@ int64_t linux_errno(void);
 
 /* Resolve dirfd: translate LINUX_AT_FDCWD and guest FDs. */
 int resolve_dirfd(int dirfd);
+/* Retire guest-fd-keyed state in the eventfd/signalfd/timerfd/inotify
+ * subsystems. Must be called by every path that frees a guest fd. */
+void fd_special_subsystem_close(int guest_fd, int type);
 
 /* Translate Linux AT_* flags to macOS equivalents.
  * For unlinkat, fstatat, linkat, fchmodat, fchownat, utimensat. */

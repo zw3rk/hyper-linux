@@ -107,6 +107,12 @@ int fd_snapshot_and_close(int fd, fd_entry_t *out) {
 }
 int64_t linux_errno(void) { return -1; }
 
+/* The eventfd/signalfd/timerfd/inotify subsystems are not linked into this
+ * lite harness; hl_fd_dup3() calls this to retire their fd-keyed state. */
+void fd_special_subsystem_close(int guest_fd, int type) {
+    (void)guest_fd; (void)type;
+}
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("FAIL %s\n", m); fails++; } \
     else printf("OK %s\n", m); } while (0)

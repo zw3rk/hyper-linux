@@ -168,6 +168,9 @@ void hl_fd_detached_finish(hl_fd_detached_t *d);
 
 /* Dup helpers: new descriptor sharing open-file; host dup of alias. */
 int hl_fd_dup(int oldfd);
+/* dup, but starting the search at minfd and optionally setting CLOEXEC —
+ * the semantics F_DUPFD / F_DUPFD_CLOEXEC need. */
+int hl_fd_dup_from(int oldfd, int minfd, int cloexec);
 int hl_fd_dup3(int oldfd, int newfd, int flags);
 
 /* Ensure legacy fd_entry fields mirror descriptor (after install). */

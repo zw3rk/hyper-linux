@@ -28,12 +28,20 @@
  * the PASS()/FAIL() macros would expand to `passes++`/`fails++` on the
  * POINTERS — incrementing the pointer, never the caller's counters — so the
  * summary would report 0 failures no matter what happened. */
+/* Any failure used to count as containment, so a typo'd path that failed
+ * with ENOENT for the wrong reason — or an EMFILE — passed just as happily
+ * as a real refusal. Require a containment errno. */
 #define MUST_NOT_OPEN(what, path)                                        \
     do {                                                                 \
         TEST(what);                                                      \
+        errno = 0;                                                       \
         int _fd = open((path), O_RDONLY);                                \
+        int _e = errno;                                                  \
         if (_fd >= 0) { close(_fd); FAILF("ESCAPED: opened %s", (path)); }\
-        else PASS();                                                     \
+        else if (_e == EACCES || _e == ENOENT || _e == EPERM ||          \
+                 _e == ELOOP || _e == ENOTDIR) PASS();                   \
+        else FAILF("failed with %s, not a containment refusal",          \
+                   strerror(_e));                                        \
     } while (0)
 
 int main(void) {
@@ -61,21 +69,33 @@ int main(void) {
         }
     }
 
-    /* Interior symlink to the host root. */
+    /* A failed symlink() used to print SKIP and count NOTHING, so the two
+     * checks that matter most could vanish and the suite still reported
+     * zero failures — which is exactly what happened while the containment
+     * check was over-blocking symlink creation itself. Creating a link
+     * inside a bind is legal; if it fails, that IS the bug. */
+    TEST("a symlink can be created inside the bind");
     unlink("esc");
-    if (symlink("/", "esc") == 0)
-        MUST_NOT_OPEN("interior symlink to /", "esc/etc/hosts");
-    else
-        printf("  %-30s SKIP (symlink: %s)\n", "interior symlink to /",
-               strerror(errno));
+    if (symlink("/", "esc") == 0) PASS();
+    else FAILF("symlink: %s", strerror(errno));
+    MUST_NOT_OPEN("interior symlink to /", "esc/etc/hosts");
 
-    /* Interior symlink straight at a host directory. */
     unlink("esc2");
-    if (symlink("/etc", "esc2") == 0)
-        MUST_NOT_OPEN("interior symlink to /etc", "esc2/hosts");
-    else
-        printf("  %-30s SKIP (symlink: %s)\n", "interior symlink to /etc",
-               strerror(errno));
+    TEST("a second symlink can be created");
+    if (symlink("/etc", "esc2") == 0) PASS();
+    else FAILF("symlink: %s", strerror(errno));
+    MUST_NOT_OPEN("interior symlink to /etc", "esc2/hosts");
+
+    /* The escape targets above are host paths that may or may not exist,
+     * so on their own they cannot distinguish "refused" from "absent".
+     * ../secret.txt is created by the harness immediately outside the bind
+     * root, so it definitely exists — and must still be unreachable. */
+    unlink("esc3");
+    TEST("a symlink to the bind's parent can be created");
+    if (symlink("..", "esc3") == 0) PASS();
+    else FAILF("symlink: %s", strerror(errno));
+    MUST_NOT_OPEN("symlink to the bind parent", "esc3/secret.txt");
+    MUST_NOT_OPEN("lexical .. to the bind parent", "../secret.txt");
 
     /* Lexical traversal must stay contained (this already worked —
      * normalize_guest runs before mount selection — so it guards against a
@@ -83,7 +103,8 @@ int main(void) {
     MUST_NOT_OPEN("lexical .. traversal", "../../../../etc/hosts");
     MUST_NOT_OPEN("absolute host path", "/etc/hosts");
 
-    unlink("esc"); unlink("esc2"); unlink("inside.txt");
+    unlink("esc"); unlink("esc2"); unlink("esc3");
+    unlink("inside.txt");
     SUMMARY("test-vfs-containment");
     return fails ? 1 : 0;
 }

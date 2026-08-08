@@ -306,11 +306,20 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-shm; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-dsp-presence; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-bare-name; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-stat; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigpipe-survival; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-open; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-tier1; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-fork; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vfs-chdir-relative-open; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-at-dirfd; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fcntl-dup; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-poll-wakeup; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-abstract-unix; \
+	absdir=$$(mktemp -d); mkdir -m 0777 "$$absdir/hl-abstract-$$(id -u)"; \
+	run_test env TMPDIR="$$absdir" $(BUILD_DIR)/hl $(HL_TEST_FLAGS) \
+		$(TEST_DIR)/test-abstract-unix unsafe; \
+	rm -rf "$$absdir"; \
 	tmpdir=$$(mktemp -d); \
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
 		--guest-cwd /home/user $(TEST_DIR)/test-vfs-rooted; \
@@ -323,9 +332,19 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
 		--guest-cwd /home/user $(TEST_DIR)/test-vfs-symlink; \
 	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); mkdir -p "$$tmpdir/bound"; \
+	echo SECRET > "$$tmpdir/secret.txt"; \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir/bound:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-containment; \
+	rm -rf "$$tmpdir"; \
 	tmpdir=$$(mktemp -d); \
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
-		--guest-cwd /home/user $(TEST_DIR)/test-vfs-containment; \
+		--bind "$$tmpdir/late:/data" --bind "$(TEST_DIR):/opt/tests" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-rootdir; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-fs-semantics; \
 	rm -rf "$$tmpdir"; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
@@ -343,19 +362,35 @@ test-host-units:
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-audio-stream \
 		test/host/test-audio-stream.c $(SRC_DIR)/audio.c $(SRC_DIR)/audio_coreaudio.c \
 		$(SRC_DIR)/trace.c -lpthread
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-audio-restart \
+		test/host/test-audio-restart.c $(SRC_DIR)/audio.c $(SRC_DIR)/audio_coreaudio.c \
+		$(SRC_DIR)/trace.c -lpthread
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-app-open \
 		test/host/test-app-open.c test/host/stubs.c \
 		$(SRC_DIR)/app_open.c $(SRC_DIR)/vfs.c $(SRC_DIR)/trace.c -lpthread
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-oss-abi \
 		test/host/test-oss-abi.c
+	@# The ONLY lane that compiles audio_coreaudio.c for real. Everywhere
+	@# else it is built without HL_HAVE_COREAUDIO and the whole file —
+	@# ca_callback included — becomes a stub, so the production audio path
+	@# had no coverage at all.
+	clang $(CFLAGS) -I$(SRC_DIR) -DHL_HAVE_COREAUDIO=1 \
+		-o $(BUILD_DIR)/test-audio-coreaudio \
+		test/host/test-audio-coreaudio.c $(SRC_DIR)/audio.c \
+		$(SRC_DIR)/audio_coreaudio.c $(SRC_DIR)/trace.c \
+		-framework AudioToolbox -framework CoreFoundation -lpthread
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-fd-object-lite \
 		test/host/test-fd-object-lite.c $(SRC_DIR)/fd_object.c $(SRC_DIR)/trace.c -lpthread
 	$(BUILD_DIR)/test-fd-object-lite
 	$(BUILD_DIR)/test-vfs-unit
 	$(BUILD_DIR)/test-audio-gain
 	$(BUILD_DIR)/test-audio-stream
+	$(BUILD_DIR)/test-audio-restart
 	$(BUILD_DIR)/test-app-open
 	$(BUILD_DIR)/test-oss-abi
+	$(BUILD_DIR)/test-audio-coreaudio
+	@# Operator-facing output: path redaction and the SIGUSR1 stats dump.
+	@HL=$(BUILD_DIR)/hl bash test/test-diagnostics.sh
 
 # ── Coreutils integration test ───────────────────────────────────
 

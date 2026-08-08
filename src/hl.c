@@ -504,10 +504,23 @@ int main(int argc, char **argv) {
             while (environ[env_count]) env_count++;
             char **new_environ = malloc((env_count + 1) * sizeof(char *));
             if (new_environ) {
-                for (int i = 0; i < env_count; i++)
+                /* A NULL from strdup would TERMINATE the copied environment
+                 * at that point, silently losing every later variable — so
+                 * keep the original on failure rather than half of it. */
+                int ok = 1;
+                for (int i = 0; i < env_count && ok; i++) {
                     new_environ[i] = strdup(environ[i]);
-                new_environ[env_count] = NULL;
-                environ = new_environ;
+                    if (!new_environ[i]) {
+                        for (int k = 0; k < i; k++) free(new_environ[k]);
+                        free(new_environ);
+                        new_environ = NULL;
+                        ok = 0;
+                    }
+                }
+                if (ok) {
+                    new_environ[env_count] = NULL;
+                    environ = new_environ;
+                }
             }
 
             /* Write title into the original argv area */
@@ -967,8 +980,8 @@ too_many_regions:
             snprintf(xauth_host, sizeof(xauth_host), "%s/.Xauthority",
                      host_home);
             if (access(xauth_host, R_OK) == 0) {
-                owned_env_vars[n_owned_env++] =
-                    strdup("XAUTHORITY=/home/user/.Xauthority");
+                char *e = strdup("XAUTHORITY=/home/user/.Xauthority");
+                if (e) owned_env_vars[n_owned_env++] = e;
             }
         }
     }
