@@ -13,3 +13,4 @@ dist/staging/
 !.dev.vars.example
 .env*
 !.env.example
+_split-seeds/

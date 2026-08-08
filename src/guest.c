@@ -626,7 +626,21 @@ static uint64_t guest_walk_pt(const guest_t *g, uint64_t va) {
  * at 128TB, or high-VA mmap regions used by rosetta's JIT).
  * Returns NULL if the address is not in any mapping. If avail is non-NULL,
  * stores the number of bytes available from gva to the end of its page/block. */
+static guest_extra_resolve_fn g_extra_resolve;
+
+void
+guest_set_extra_resolve(guest_extra_resolve_fn fn)
+{
+    g_extra_resolve = fn;
+}
+
 static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
+    /* SysV SHM / other external host mappings (before identity fast path). */
+    if (g_extra_resolve) {
+        void *ep = g_extra_resolve(gva, avail);
+        if (ep)
+            return ep;
+    }
     /* Fast path: primary region (identity-mapped at ipa_base) */
     if (gva >= g->ipa_base && gva < g->ipa_base + g->guest_size) {
         uint64_t off = gva - g->ipa_base;
@@ -1432,9 +1446,11 @@ int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
         uint64_t *l2 = pt_at(g, l2_ipa - base);
         unsigned l2_idx = (unsigned)((va % BLOCK_1GB) / BLOCK_2MB);
 
-        /* Block descriptor: output IPA points to GPA in primary buffer */
+        /* Block descriptor: output IPA may be non-identity (SysV SHM).
+         * Install when empty; overwrite existing L2 blocks so remaps work.
+         * Leave L3 tables alone (mixed-permission splits). */
         uint64_t output_ipa = base + gpa_cursor;
-        if (!(l2[l2_idx] & PT_BLOCK)) {
+        if (!(l2[l2_idx] & PT_VALID) || !(l2[l2_idx] & PT_TABLE)) {
             l2[l2_idx] = make_block_desc(output_ipa, perms);
         }
     }

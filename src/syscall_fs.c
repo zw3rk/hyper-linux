@@ -14,6 +14,10 @@
 #include "proc_emulation.h"
 #include "syscall_proc.h"   /* proc_get_sysroot */
 #include "guest.h"
+#include "fd_object.h"
+#include "vfs.h"
+#include "device.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,18 +97,96 @@ typedef struct {
  * if no sysroot is set or no match is found. */
 static const char *resolve_sysroot_path(const char *path, char *buf, size_t bufsz) {
     const char *sr = proc_get_sysroot();
-    if (!sr || path[0] != '/') return path;
+    if (!sr || !sr[0])
+        sr = hl_vfs_sysroot();
+    if (!sr || !sr[0] || !path || path[0] != '/') return path;
+
+    /* Never rewrite bare "/": sysroot+"/" is a directory and would match
+     * every root open via existence check. */
+    if (path[1] == '\0')
+        return path;
 
     snprintf(buf, bufsz, "%s%s", sr, path);
     if (access(buf, F_OK) == 0) return buf;
 
-    /* Fallback: sysroot/lib/basename — handles nix store lib paths */
+    /* Fallback: sysroot/lib/basename — handles nix store library paths
+     * (absolute RUNPATH entries outside rooted binds). */
     const char *base = strrchr(path, '/');
-    if (base) {
+    if (base && base[1] && strchr(base + 1, '/') == NULL) {
+        /* Only bare sonames / basenames, not multi-component leftovers. */
         snprintf(buf, bufsz, "%s/lib/%s", sr, base + 1);
         if (access(buf, F_OK) == 0) return buf;
     }
     return path;
+}
+
+/* Unified guest path → host path for ALL pathname syscalls.
+ * Rooted mode: one mount/CWD resolver (hl_vfs_resolve_at).
+ * Legacy mode: sysroot existence checks (prior behavior).
+ *
+ * On success: writes host path into out_buf, sets *out_path, returns 0.
+ * On error: returns negative Linux errno.
+ * create_mode=1 for O_CREAT/mkdir/rename-dest (final may not exist).
+ * out_mount may be NULL; when set, receives mount used (for EXDEV checks).
+ */
+static int resolve_path_for_op(int dirfd, const char *guest_path,
+                               int create_mode, char *out_buf, size_t out_sz,
+                               const char **out_path,
+                               const hl_mount_t **out_mount) {
+    if (out_mount) *out_mount = NULL;
+    if (!guest_path || !out_buf || !out_path) return -LINUX_EFAULT;
+
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        hl_vfs_resolve_t r;
+        int rc = hl_vfs_resolve_at(dirfd, guest_path, 1, create_mode, &r);
+        if (rc < 0) {
+            /* Dynamic linker probes absolute nix RPATHs outside binds.
+             * Fall back to --sysroot /lib/basename for library loads. */
+            if (guest_path[0] == '/' && !create_mode) {
+                char tmp[LINUX_PATH_MAX];
+                const char *sr = resolve_sysroot_path(guest_path, tmp,
+                                                      sizeof(tmp));
+                if (sr != guest_path) {
+                    snprintf(out_buf, out_sz, "%s", sr);
+                    *out_path = out_buf;
+                    if (hl_trace_on(HL_TRACE_FS))
+                        hl_trace(HL_TRACE_FS,
+                                 "pathop sysroot-fallback guest=%s host=%s",
+                                 guest_path, out_buf);
+                    return 0;
+                }
+            }
+            return rc;
+        }
+        if (r.is_virtual) {
+            /* Virtual mounts have no host path for mutation ops */
+            snprintf(out_buf, out_sz, "%s", r.guest_abs);
+            *out_path = out_buf;
+            if (out_mount) *out_mount = r.mount;
+            return 0;
+        }
+        if (r.mount && (r.mount->flags & HL_MOUNT_RO) && create_mode)
+            return -LINUX_EROFS;
+        snprintf(out_buf, out_sz, "%s", r.host_path);
+        *out_path = out_buf;
+        if (out_mount) *out_mount = r.mount;
+        if (hl_trace_on(HL_TRACE_FS))
+            hl_trace(HL_TRACE_FS, "pathop guest=%s host=%s create=%d",
+                     r.guest_abs, r.host_path, create_mode);
+        return 0;
+    }
+
+    /* Legacy */
+    const char *p = resolve_sysroot_path(guest_path, out_buf, out_sz);
+    if (p != out_buf)
+        snprintf(out_buf, out_sz, "%s", p);
+    *out_path = out_buf;
+    return 0;
+}
+
+/* After rooted resolve, use AT_FDCWD + absolute host path. */
+static int host_dirfd_for_resolved(void) {
+    return AT_FDCWD;
 }
 
 /* ---------- open/close ---------- */
@@ -115,7 +197,14 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    /* Intercept /proc and /dev paths before touching the host filesystem */
+    /* Virtual device registry (OSS /dev/dsp, migrated pseudo devices). */
+    {
+        int64_t dfd = hl_device_open(path, linux_flags, mode);
+        if (dfd != -2)
+            return dfd; /* success (>=0) or device error (<0, not -2) */
+    }
+
+    /* Intercept /proc and remaining /dev paths before host filesystem */
     int intercepted = proc_intercept_open(g, path, linux_flags, mode);
     if (intercepted >= 0) {
         /* Got a host fd from the intercept — allocate a guest fd for it.
@@ -135,20 +224,78 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     }
     /* intercepted == -2: not intercepted, fall through to real openat */
 
+    int create_mode = (linux_flags & LINUX_O_CREAT) != 0;
+    char open_path_buf[LINUX_PATH_MAX];
     char sysroot_buf[LINUX_PATH_MAX];
-    const char *open_path = resolve_sysroot_path(path, sysroot_buf,
-                                                  sizeof(sysroot_buf));
-
+    const char *open_path = path;
     int host_dirfd;
-    if (dirfd == LINUX_AT_FDCWD) {
-        host_dirfd = AT_FDCWD;
+
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        hl_vfs_resolve_t r;
+        int rc = hl_vfs_resolve_at(dirfd, path, 1, create_mode, &r);
+        if (rc < 0) {
+            /* Absolute nix-store / loader paths often fall outside binds.
+             * Fall back to --sysroot basename resolution so dynamic
+             * binaries (e.g. xmms) can open libgtk-1.2.so.0 etc. */
+            if (path[0] == '/' && !create_mode) {
+                const char *sr = resolve_sysroot_path(path, sysroot_buf,
+                                                      sizeof(sysroot_buf));
+                if (sr != path) {
+                    open_path = sr;
+                    host_dirfd = AT_FDCWD;
+                    goto do_open;
+                }
+            }
+            return rc;
+        }
+        if (r.is_virtual) {
+            int64_t dfd = hl_device_open(r.guest_abs, linux_flags, mode);
+            if (dfd != -2) return dfd;
+            intercepted = proc_intercept_open(g, r.guest_abs, linux_flags, mode);
+            if (intercepted >= 0) {
+                int guest_fd = fd_alloc_from(128, FD_REGULAR, intercepted);
+                if (guest_fd < 0) { close(intercepted); return -LINUX_ENOMEM; }
+                fd_table[guest_fd].linux_flags = linux_flags;
+                return guest_fd;
+            }
+            if (intercepted == -1) return linux_errno();
+            return -LINUX_ENOENT;
+        }
+        if (r.mount && (r.mount->flags & HL_MOUNT_RO) &&
+            (linux_flags & (LINUX_O_WRONLY | LINUX_O_RDWR | LINUX_O_CREAT)))
+            return -LINUX_EROFS;
+        snprintf(open_path_buf, sizeof(open_path_buf), "%s", r.host_path);
+        open_path = open_path_buf;
+        host_dirfd = AT_FDCWD; /* resolved absolute host path */
+        if (hl_trace_on(HL_TRACE_FS))
+            hl_trace(HL_TRACE_FS, "openat guest=%s host=%s flags=0x%x",
+                     r.guest_abs, open_path, linux_flags);
     } else {
-        host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
+        open_path = resolve_sysroot_path(path, sysroot_buf, sizeof(sysroot_buf));
+        if (dirfd == LINUX_AT_FDCWD) {
+            host_dirfd = AT_FDCWD;
+        } else {
+            host_dirfd = fd_to_host(dirfd);
+            if (host_dirfd < 0) return -LINUX_EBADF;
+        }
     }
 
+do_open:
+    ; /* C requires a statement after a label before declarations */
+    {
     int flags = translate_open_flags(linux_flags);
     int host_fd = openat(host_dirfd, open_path, flags, mode);
+    /* Rooted miss that looked like a host path: try sysroot basename. */
+    if (host_fd < 0 && path[0] == '/' && !create_mode) {
+        const char *sr = resolve_sysroot_path(path, sysroot_buf,
+                                              sizeof(sysroot_buf));
+        if (sr != path) {
+            if (hl_trace_on(HL_TRACE_FS))
+                hl_trace(HL_TRACE_FS, "openat sysroot-retry path=%s → %s",
+                         path, sr);
+            host_fd = openat(AT_FDCWD, sr, flags, mode);
+        }
+    }
     if (host_fd < 0) return linux_errno();
 
     int is_dir = (linux_flags & LINUX_O_DIRECTORY) != 0;
@@ -183,6 +330,7 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
     }
 
     return guest_fd;
+    } /* do_open block */
 }
 
 int64_t sys_close(int fd) {
@@ -195,16 +343,7 @@ int64_t sys_close(int fd) {
     if (!fd_snapshot_and_close(fd, &snap))
         return -LINUX_EBADF;
 
-    /* Now do cleanup on the snapshot — no lock needed since slot is
-     * already marked closed and no other thread will touch it. */
-    if (snap.dir) {
-        if (snap.type == FD_DIR)
-            closedir((DIR *)snap.dir);
-        else if (snap.type == FD_EPOLL)
-            free(snap.dir);  /* epoll_instance_t */
-    }
-
-    /* Clean up emulated I/O subsystem state (pipes, kqueues, counters) */
+    /* Special FD subsystem cleanup (keyed by guest fd number). */
     switch (snap.type) {
     case FD_EVENTFD:  eventfd_close(fd);  break;
     case FD_SIGNALFD: signalfd_close(fd); break;
@@ -213,8 +352,24 @@ int64_t sys_close(int fd) {
     default: break;
     }
 
+    if (snap.desc) {
+        /* Descriptor release closes host alias, dir, and open-file. */
+        hl_descriptor_release(snap.desc);
+        return 0;
+    }
+
+    /* Legacy path without descriptor object */
+    if (snap.dir) {
+        if (snap.type == FD_DIR)
+            closedir((DIR *)snap.dir);
+        else if (snap.type == FD_EPOLL)
+            free(snap.dir);  /* epoll_instance_t */
+    }
+    if (snap.of)
+        hl_open_file_release(snap.of);
+
     /* Don't actually close stdin/stdout/stderr on the host */
-    if (snap.type != FD_STDIO) {
+    if (snap.type != FD_STDIO && snap.host_fd >= 0) {
         close(snap.host_fd);
     }
     return 0;
@@ -223,6 +378,18 @@ int64_t sys_close(int fd) {
 /* ---------- stat family ---------- */
 
 int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva) {
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->fstat) {
+                int64_t r = ref.of->ops->fstat(ref.of, ref.host_fd, g, stat_gva);
+                hl_fd_put(&ref);
+                return r;
+            }
+            hl_fd_put(&ref);
+        }
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) {
         if (g->verbose) fprintf(stderr, "hl: fstat(%d): EBADF (no host fd)\n", fd);
@@ -268,17 +435,31 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
         if (fstat(host_dirfd, &mac_st) < 0)
             return linux_errno();
     } else {
-        /* Try /proc interception first (macOS has no /proc filesystem) */
-        int intercepted = proc_intercept_stat(path, &mac_st);
-        if (intercepted == -1) return linux_errno();
-        if (intercepted == -2) {
-            /* Not intercepted — fall through to real fstatat */
-            char sysroot_buf[LINUX_PATH_MAX];
-            const char *stat_path = resolve_sysroot_path(path, sysroot_buf,
-                                                          sizeof(sysroot_buf));
-            int mac_flags = translate_at_flags(flags);
-            if (fstatat(host_dirfd, stat_path, &mac_st, mac_flags) < 0)
-                return linux_errno();
+        /* Device/virtual synthetic first */
+        uint32_t mode = 0;
+        uint64_t rdev = 0;
+        int ds = hl_device_stat(path, &mode, &rdev);
+        if (ds == 0) {
+            memset(&mac_st, 0, sizeof(mac_st));
+            mac_st.st_mode = mode;
+            mac_st.st_rdev = (dev_t)rdev;
+            mac_st.st_nlink = 1;
+        } else {
+            /* Try /proc interception first (macOS has no /proc filesystem) */
+            int intercepted = proc_intercept_stat(path, &mac_st);
+            if (intercepted == -1) return linux_errno();
+            if (intercepted == -2) {
+                char hostbuf[LINUX_PATH_MAX];
+                const char *stat_path = NULL;
+                int rr = resolve_path_for_op(dirfd, path, 0, hostbuf,
+                                             sizeof(hostbuf), &stat_path, NULL);
+                if (rr < 0) return rr;
+                int use_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+                    ? host_dirfd_for_resolved() : host_dirfd;
+                int mac_flags = translate_at_flags(flags);
+                if (fstatat(use_dirfd, stat_path, &mac_st, mac_flags) < 0)
+                    return linux_errno();
+            }
         }
     }
 
@@ -296,10 +477,11 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    /* Apply sysroot redirect for absolute paths */
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *fs_path = resolve_sysroot_path(path, sysroot_buf,
-                                                sizeof(sysroot_buf));
+    char hostbuf[LINUX_PATH_MAX];
+    const char *fs_path = NULL;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &fs_path, NULL);
+    if (rr < 0) return rr;
     struct statfs mac_st;
     if (statfs(fs_path, &mac_st) < 0)
         return linux_errno();
@@ -338,7 +520,9 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
         return -LINUX_EFAULT;
 
     int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
+        && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
 
     struct stat mac_st;
 
@@ -349,9 +533,13 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
         if (fstat(host_dirfd, &mac_st) < 0)
             return linux_errno();
     } else {
-        char sysroot_buf[LINUX_PATH_MAX];
-        const char *statx_path = resolve_sysroot_path(path, sysroot_buf,
-                                                        sizeof(sysroot_buf));
+        char hostbuf[LINUX_PATH_MAX];
+        const char *statx_path = NULL;
+        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+                                     &statx_path, NULL);
+        if (rr < 0) return rr;
+        if (hl_vfs_mode() == HL_FS_ROOTED)
+            host_dirfd = host_dirfd_for_resolved();
         int mac_flags = translate_at_flags(flags);
         if (fstatat(host_dirfd, statx_path, &mac_st, mac_flags) < 0)
             return linux_errno();
@@ -676,19 +864,11 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva) {
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-
-    if (chdir(path) < 0)
-        return linux_errno();
-
-    return 0;
+    return hl_vfs_chdir(path);
 }
 
 int64_t sys_fchdir(int fd) {
-    int host_fd = fd_to_host(fd);
-    if (host_fd < 0) return -LINUX_EBADF;
-    if (fchdir(host_fd) < 0)
-        return linux_errno();
-    return 0;
+    return hl_vfs_fchdir(fd);
 }
 
 int64_t sys_chroot(guest_t *g, uint64_t path_gva) {
@@ -758,6 +938,34 @@ int64_t sys_lseek(int fd, int64_t offset, int whence) {
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
+    /* Directory FDs: getdents64 is backed by a host DIR* (fdopendir).
+     * Guest musl rewinddir() is just lseek(fd, 0, SEEK_SET) plus
+     * clearing its own buffer. lseek on the host fd does NOT reset
+     * the DIR* stream — readdir() would keep returning NULL after the
+     * first full scan. GTK 1.2 file selection (and similar) does a
+     * two-pass readdir (count, rewind, re-read); without this, the
+     * second pass is empty → open_dir fails → infinite tryagain on
+     * "/" → UI hang/freeze on "Add file". */
+    if (fd >= 0 && fd < FD_TABLE_SIZE &&
+        fd_table[fd].type == FD_DIR && fd_table[fd].dir) {
+        DIR *dir = (DIR *)fd_table[fd].dir;
+        if (whence == SEEK_SET && offset == 0) {
+            rewinddir(dir);
+            return 0;
+        }
+        if (whence == SEEK_CUR && offset == 0) {
+            /* telldir cookie — opaque; musl may probe position */
+            return (int64_t)telldir(dir);
+        }
+        if (whence == SEEK_SET) {
+            /* Opaque d_off from a prior getdents64 d_off field */
+            seekdir(dir, (long)offset);
+            return offset;
+        }
+        /* SEEK_END / SEEK_CUR nonzero: not meaningful for DIR* */
+        return -LINUX_EINVAL;
+    }
+
     off_t ret = lseek(host_fd, offset, whence);
     return ret < 0 ? linux_errno() : (int64_t)ret;
 }
@@ -785,18 +993,17 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
     }
     /* intercepted == -2: not intercepted, fall through */
 
-    int host_dirfd;
-    if (dirfd == LINUX_AT_FDCWD) {
-        host_dirfd = AT_FDCWD;
-    } else {
-        host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
-    }
+    char hostbuf[LINUX_PATH_MAX];
+    const char *read_path = NULL;
+    int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+                                 &read_path, NULL);
+    if (rr < 0) return rr;
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved()
+        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
 
-    /* Apply sysroot redirect for absolute paths */
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *read_path = resolve_sysroot_path(path, sysroot_buf,
-                                                  sizeof(sysroot_buf));
     ssize_t len = readlinkat(host_dirfd, read_path, link, sizeof(link) - 1);
     if (len < 0) return linux_errno();
 
@@ -812,16 +1019,23 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd;
-    if (dirfd == LINUX_AT_FDCWD) {
-        host_dirfd = AT_FDCWD;
-    } else {
-        host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
-    }
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_path = NULL;
+    const hl_mount_t *mnt = NULL;
+    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+                                 &host_path, &mnt);
+    if (rr < 0) return rr;
+    if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
+    if (mnt && (mnt->flags & HL_MOUNT_VIRTUAL)) return -LINUX_EPERM;
+
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved()
+        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
 
     int host_flags = translate_at_flags(flags);
-    if (unlinkat(host_dirfd, path, host_flags) < 0)
+    if (unlinkat(host_dirfd, host_path, host_flags) < 0)
         return linux_errno();
 
     return 0;
@@ -832,15 +1046,22 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd;
-    if (dirfd == LINUX_AT_FDCWD) {
-        host_dirfd = AT_FDCWD;
-    } else {
-        host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
-    }
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_path = NULL;
+    const hl_mount_t *mnt = NULL;
+    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+                                 &host_path, &mnt);
+    if (rr < 0) return rr;
+    if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
+    if (mnt && (mnt->flags & HL_MOUNT_VIRTUAL)) return -LINUX_EPERM;
 
-    if (mkdirat(host_dirfd, path, (mode_t)mode) < 0)
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved()
+        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
+
+    if (mkdirat(host_dirfd, host_path, (mode_t)mode) < 0)
         return linux_errno();
 
     return 0;
@@ -858,39 +1079,54 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
     if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
 
-    int host_olddir = (olddirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(olddirfd);
-    int host_newdir = (newdirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(newdirfd);
-    if (host_olddir < 0 && olddirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
-    if (host_newdir < 0 && newdirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char oldhost[LINUX_PATH_MAX], newhost[LINUX_PATH_MAX];
+    const char *oh = oldpath, *nh = newpath;
+    const hl_mount_t *om = NULL, *nm = NULL;
+    int host_olddir, host_newdir;
+
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        int r1 = resolve_path_for_op(olddirfd, oldpath, 0, oldhost,
+                                     sizeof(oldhost), &oh, &om);
+        if (r1 < 0) return r1;
+        int r2 = resolve_path_for_op(newdirfd, newpath, 1, newhost,
+                                     sizeof(newhost), &nh, &nm);
+        if (r2 < 0) return r2;
+        if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
+        if ((om && (om->flags & HL_MOUNT_RO)) || (nm && (nm->flags & HL_MOUNT_RO)))
+            return -LINUX_EROFS;
+        host_olddir = host_newdir = host_dirfd_for_resolved();
+    } else {
+        host_olddir = (olddirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(olddirfd);
+        host_newdir = (newdirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(newdirfd);
+        if (host_olddir < 0 && olddirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+        if (host_newdir < 0 && newdirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    }
 
     /* RENAME_NOREPLACE: fail if destination exists. macOS renamex_np
      * supports RENAME_EXCL for the same semantics. Only supported for
      * AT_FDCWD paths (renamex_np doesn't take dirfd arguments). */
     if (flags & LINUX_RENAME_NOREPLACE) {
-        if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
-            if (renamex_np(oldpath, newpath, RENAME_EXCL) < 0)
+        if (host_olddir == AT_FDCWD && host_newdir == AT_FDCWD) {
+            if (renamex_np(oh, nh, RENAME_EXCL) < 0)
                 return linux_errno();
             return 0;
         }
-        /* For non-CWD dirfds, emulate with link+unlink (not atomic, but
-         * link fails if dest exists, approximating RENAME_NOREPLACE) */
-        if (linkat(host_olddir, oldpath, host_newdir, newpath, 0) < 0)
+        if (linkat(host_olddir, oh, host_newdir, nh, 0) < 0)
             return linux_errno();
-        unlinkat(host_olddir, oldpath, 0);
+        unlinkat(host_olddir, oh, 0);
         return 0;
     }
 
-    /* RENAME_EXCHANGE: swap two paths. macOS renamex_np supports RENAME_SWAP. */
     if (flags & LINUX_RENAME_EXCHANGE) {
-        if (olddirfd == LINUX_AT_FDCWD && newdirfd == LINUX_AT_FDCWD) {
-            if (renamex_np(oldpath, newpath, RENAME_SWAP) < 0)
+        if (host_olddir == AT_FDCWD && host_newdir == AT_FDCWD) {
+            if (renamex_np(oh, nh, RENAME_SWAP) < 0)
                 return linux_errno();
             return 0;
         }
-        return -LINUX_EINVAL;  /* RENAME_EXCHANGE requires AT_FDCWD on macOS */
+        return -LINUX_EINVAL;
     }
 
-    if (renameat(host_olddir, oldpath, host_newdir, newpath) < 0)
+    if (renameat(host_olddir, oh, host_newdir, nh) < 0)
         return linux_errno();
 
     return 0;
@@ -903,19 +1139,28 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_path = NULL;
+    const hl_mount_t *mnt = NULL;
+    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+                                 &host_path, &mnt);
+    if (rr < 0) return rr;
+    if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
 
-    /* Only support FIFO creation; other node types need root */
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved() : resolve_dirfd(dirfd);
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
+
     if (S_ISFIFO(mode)) {
-        if (mkfifoat(host_dirfd, path, mode & 0777) < 0)
+        if (mkfifoat(host_dirfd, host_path, mode & 0777) < 0)
             return linux_errno();
         return 0;
     }
 
-    /* Regular files: create an empty file */
     if (S_ISREG(mode) || (mode & S_IFMT) == 0) {
-        int fd = openat(host_dirfd, path, O_CREAT | O_WRONLY | O_EXCL, mode & 0777);
+        int fd = openat(host_dirfd, host_path, O_CREAT | O_WRONLY | O_EXCL,
+                        mode & 0777);
         if (fd < 0) return linux_errno();
         close(fd);
         return 0;
@@ -932,10 +1177,21 @@ int64_t sys_symlinkat(guest_t *g, uint64_t target_gva,
     if (guest_read_str(g, linkpath_gva, linkpath, sizeof(linkpath)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_link = NULL;
+    const hl_mount_t *mnt = NULL;
+    int rr = resolve_path_for_op(dirfd, linkpath, 1, hostbuf, sizeof(hostbuf),
+                                 &host_link, &mnt);
+    if (rr < 0) return rr;
+    if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
 
-    if (symlinkat(target, host_dirfd, linkpath) < 0)
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved() : resolve_dirfd(dirfd);
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
+
+    /* target is stored as-is (guest path semantics for absolute symlinks) */
+    if (symlinkat(target, host_dirfd, host_link) < 0)
         return linux_errno();
 
     return 0;
@@ -949,13 +1205,30 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
     if (guest_read_str(g, newpath_gva, newpath, sizeof(newpath)) < 0)
         return -LINUX_EFAULT;
 
-    int host_olddir = resolve_dirfd(olddirfd);
-    int host_newdir = resolve_dirfd(newdirfd);
-    if (host_olddir < 0 && olddirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
-    if (host_newdir < 0 && newdirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char oldhost[LINUX_PATH_MAX], newhost[LINUX_PATH_MAX];
+    const char *oh = oldpath, *nh = newpath;
+    const hl_mount_t *om = NULL, *nm = NULL;
+    int host_olddir, host_newdir;
+
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        int r1 = resolve_path_for_op(olddirfd, oldpath, 0, oldhost,
+                                     sizeof(oldhost), &oh, &om);
+        if (r1 < 0) return r1;
+        int r2 = resolve_path_for_op(newdirfd, newpath, 1, newhost,
+                                     sizeof(newhost), &nh, &nm);
+        if (r2 < 0) return r2;
+        if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
+        if (nm && (nm->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
+        host_olddir = host_newdir = host_dirfd_for_resolved();
+    } else {
+        host_olddir = resolve_dirfd(olddirfd);
+        host_newdir = resolve_dirfd(newdirfd);
+        if (host_olddir < 0 && olddirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+        if (host_newdir < 0 && newdirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    }
 
     int mac_flags = translate_at_flags(flags);
-    if (linkat(host_olddir, oldpath, host_newdir, newpath, mac_flags) < 0)
+    if (linkat(host_olddir, oh, host_newdir, nh, mac_flags) < 0)
         return linux_errno();
 
     return 0;
@@ -967,25 +1240,24 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd;
-    if (dirfd == LINUX_AT_FDCWD) {
-        host_dirfd = AT_FDCWD;
-    } else {
-        host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
-    }
+    if (hl_device_lookup(path))
+        return 0;
 
-    /* Check /proc paths first — macOS has no /proc filesystem, so
-     * access("/proc/self/stat", R_OK) etc. must be intercepted.
-     * If proc_intercept_stat succeeds, the path is a known emulated
-     * entry and we report it as accessible. */
     struct stat dummy_st;
     if (proc_intercept_stat(path, &dummy_st) == 0)
         return 0;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *check_path = resolve_sysroot_path(path, sysroot_buf,
-                                                   sizeof(sysroot_buf));
+    char hostbuf[LINUX_PATH_MAX];
+    const char *check_path = NULL;
+    int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+                                 &check_path, NULL);
+    if (rr < 0) return rr;
+
+    int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+        ? host_dirfd_for_resolved()
+        : ((dirfd == LINUX_AT_FDCWD) ? AT_FDCWD : fd_to_host(dirfd));
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
 
     int mac_flags = translate_faccessat_flags(flags);
     if (faccessat(host_dirfd, check_path, mode, mac_flags) < 0)
@@ -1009,9 +1281,13 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length) {
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    char sysroot_buf[LINUX_PATH_MAX];
-    const char *trunc_path = resolve_sysroot_path(path, sysroot_buf,
-                                                   sizeof(sysroot_buf));
+    char hostbuf[LINUX_PATH_MAX];
+    const char *trunc_path = NULL;
+    const hl_mount_t *mnt = NULL;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &trunc_path, &mnt);
+    if (rr < 0) return rr;
+    if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
 
     if (truncate(trunc_path, length) < 0)
         return linux_errno();
@@ -1034,21 +1310,33 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_path = path;
+    const hl_mount_t *mnt = NULL;
+    int host_dirfd;
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+                                     &host_path, &mnt);
+        if (rr < 0) return rr;
+        if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
+        host_dirfd = host_dirfd_for_resolved();
+    } else {
+        host_dirfd = resolve_dirfd(dirfd);
+        if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    }
 
     /* macOS fchmodat doesn't support AT_SYMLINK_NOFOLLOW */
     int mac_flags = 0;
     if (flags & LINUX_AT_SYMLINK_NOFOLLOW) {
         /* Best effort: use lstat to check if it's a symlink */
         struct stat st;
-        if (fstatat(host_dirfd, path, &st, AT_SYMLINK_NOFOLLOW) == 0
+        if (fstatat(host_dirfd, host_path, &st, AT_SYMLINK_NOFOLLOW) == 0
             && S_ISLNK(st.st_mode)) {
             return -LINUX_EOPNOTSUPP;
         }
     }
 
-    if (fchmodat(host_dirfd, path, mode, mac_flags) < 0)
+    if (fchmodat(host_dirfd, host_path, mode, mac_flags) < 0)
         return linux_errno();
 
     return 0;
@@ -1060,11 +1348,23 @@ int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
-    int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    char hostbuf[LINUX_PATH_MAX];
+    const char *host_path = path;
+    const hl_mount_t *mnt = NULL;
+    int host_dirfd;
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+                                     &host_path, &mnt);
+        if (rr < 0) return rr;
+        if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
+        host_dirfd = host_dirfd_for_resolved();
+    } else {
+        host_dirfd = resolve_dirfd(dirfd);
+        if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    }
 
     int mac_flags = translate_at_flags(flags);
-    if (fchownat(host_dirfd, path, owner, group, mac_flags) < 0)
+    if (fchownat(host_dirfd, host_path, owner, group, mac_flags) < 0)
         return linux_errno();
 
     return 0;
@@ -1081,15 +1381,25 @@ int64_t sys_fchown(int fd, uint32_t owner, uint32_t group) {
 int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
                       uint64_t times_gva, int flags) {
     int host_dirfd = resolve_dirfd(dirfd);
-    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD) return -LINUX_EBADF;
+    if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
+        && hl_vfs_mode() != HL_FS_ROOTED)
+        return -LINUX_EBADF;
 
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;
     char path[LINUX_PATH_MAX];
+    char hostbuf[LINUX_PATH_MAX];
     if (path_gva != 0) {
         if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
             return -LINUX_EFAULT;
-        path_arg = path;
+        if (hl_vfs_mode() == HL_FS_ROOTED) {
+            int rr = resolve_path_for_op(dirfd, path, 0, hostbuf,
+                                         sizeof(hostbuf), &path_arg, NULL);
+            if (rr < 0) return rr;
+            host_dirfd = host_dirfd_for_resolved();
+        } else {
+            path_arg = path;
+        }
     }
 
     struct timespec ts[2];
@@ -1140,11 +1450,17 @@ int64_t sys_getxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
+    char hostbuf[LINUX_PATH_MAX];
+    const char *hpath = path;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &hpath, NULL);
+    if (rr < 0) return rr;
+
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
 
     if (size == 0) {
         /* Size query */
-        ssize_t ret = getxattr(path, name, NULL, 0, 0, opts);
+        ssize_t ret = getxattr(hpath, name, NULL, 0, 0, opts);
         return ret < 0 ? linux_errno() : ret;
     }
 
@@ -1154,7 +1470,7 @@ int64_t sys_getxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     void *buf = malloc(size);
     if (!buf) return -LINUX_ENOMEM;
 
-    ssize_t ret = getxattr(path, name, buf, size, 0, opts);
+    ssize_t ret = getxattr(hpath, name, buf, size, 0, opts);
     if (ret < 0) {
         free(buf);
         return linux_errno();
@@ -1176,6 +1492,12 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
+    char hostbuf[LINUX_PATH_MAX];
+    const char *hpath = path;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &hpath, NULL);
+    if (rr < 0) return rr;
+
     /* Use host-side buffer to safely read from guest memory. */
     if (size > 65536) return -LINUX_E2BIG;
     void *buf = NULL;
@@ -1193,7 +1515,7 @@ int64_t sys_setxattr(guest_t *g, uint64_t path_gva, uint64_t name_gva,
     if (flags & 1) opts |= XATTR_CREATE;
     if (flags & 2) opts |= XATTR_REPLACE;
 
-    int ret = setxattr(path, name, buf, size, 0, opts);
+    int ret = setxattr(hpath, name, buf, size, 0, opts);
     free(buf);
     return ret < 0 ? linux_errno() : 0;
 }
@@ -1204,10 +1526,16 @@ int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
 
+    char hostbuf[LINUX_PATH_MAX];
+    const char *hpath = path;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &hpath, NULL);
+    if (rr < 0) return rr;
+
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
 
     if (size == 0) {
-        ssize_t ret = listxattr(path, NULL, 0, opts);
+        ssize_t ret = listxattr(hpath, NULL, 0, opts);
         return ret < 0 ? linux_errno() : ret;
     }
 
@@ -1215,7 +1543,7 @@ int64_t sys_listxattr(guest_t *g, uint64_t path_gva,
     char *buf = malloc(size);
     if (!buf) return -LINUX_ENOMEM;
 
-    ssize_t ret = listxattr(path, buf, size, opts);
+    ssize_t ret = listxattr(hpath, buf, size, opts);
     if (ret >= 0 && guest_write(g, list_gva, buf, ret) < 0)
         ret = -LINUX_EFAULT;
     else if (ret < 0)
@@ -1232,8 +1560,14 @@ int64_t sys_removexattr(guest_t *g, uint64_t path_gva,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0)
         return -LINUX_EFAULT;
 
+    char hostbuf[LINUX_PATH_MAX];
+    const char *hpath = path;
+    int rr = resolve_path_for_op(LINUX_AT_FDCWD, path, 0, hostbuf,
+                                 sizeof(hostbuf), &hpath, NULL);
+    if (rr < 0) return rr;
+
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
-    int ret = removexattr(path, name, opts);
+    int ret = removexattr(hpath, name, opts);
     return ret < 0 ? linux_errno() : 0;
 }
 

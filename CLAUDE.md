@@ -6,26 +6,58 @@ Run static and dynamically-linked aarch64-linux and x86_64-linux ELF binaries on
 
 All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`).
 
-- **src/hl.c** — Main entry point. CLI (incl. --fork-child, --sysroot), VM setup, interpreter loading (~500 lines).
+- **src/hl.c** — Main entry point. CLI (incl. --fork-child, --sysroot, --fs-mode, --bind, --trace, --audio-backend), VM setup, interpreter loading.
 - **src/guest.c/h** — Guest memory management. Page tables, read/write, brk/mmap, reset, region tracking.
 - **src/elf.c/h** — ELF64 parser/loader. PT_LOAD segments, PT_INTERP parsing, ET_DYN load_base support.
 - **src/syscall.c/h** — Core infrastructure (FD table, errno/flag translation, brk/mmap) + dispatch switch (~900 lines).
 - **src/syscall_internal.h** — Shared declarations for syscall module helpers.
-- **src/syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions (~960 lines).
-- **src/syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select (~610 lines).
-- **src/syscall_inotify.c/h** — inotify emulation via kqueue EVFILT_VNODE (~350 lines).
-- **src/syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer (~190 lines).
-- **src/syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64 (~240 lines).
-- **src/syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL (~520 lines).
-- **src/syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation (~670 lines).
-- **src/syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop (~550 lines).
-- **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat (~380 lines).
-- **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart (~310 lines).
-- **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer (~740 lines).
-- **src/gdb_stub.c/h** — GDB Remote Serial Protocol stub for guest debugging (~1800 lines).
-- **src/crash_report.c/h** — Structured crash report for GitHub issue filing (~250 lines).
+- **src/fd_object.c/h** — Ref-counted open-file descriptions + per-descriptor ops (dup/close safety).
+- **src/vfs.c/h** — Rooted/legacy guest VFS: mounts, virtual CWD, path resolver, reverse map.
+- **src/device.c/h** — Virtual `/dev` registry (pseudo devices + OSS nodes).
+- **src/audio.c/h**, **src/audio_oss.c/h**, **src/audio_coreaudio.c**, **src/linux_oss_abi.h** — Audio stream/backends + OSS `/dev/dsp`/`mixer`.
+- **src/trace.c/h** — Category tracing (`HL_TRACE` / `--trace=fs,fd,dev,audio,proc,fork`).
+- **src/syscall_fs.c/h** — Filesystem: stat, open, close, directory, xattr, permissions.
+- **src/syscall_io.c/h** — I/O: read/write, ioctl, splice, sendfile, poll/select.
+- **src/syscall_inotify.c/h** — inotify emulation via kqueue EVFILT_VNODE.
+- **src/syscall_time.c/h** — Time: clock_gettime, nanosleep, gettimeofday, setitimer.
+- **src/syscall_sys.c/h** — System info: uname, getrandom, sysinfo, prlimit64.
+- **src/syscall_signal.c/h** — Signal delivery: rt_sigframe, rt_sigaction, delivery, ITIMER_REAL.
+- **src/syscall_net.c/h** — Socket networking: AF/sockaddr/sockopt translation.
+- **src/syscall_proc.c/h** — Process state, accessors, wait4/waitid, vCPU run loop.
+- **src/proc_emulation.c/h** — /proc and /dev path interception for openat/readlinkat.
+- **src/syscall_exec.c/h** — execve: ELF reload, interpreter loading, page table rebuild, vCPU restart.
+- **src/fork_ipc.c/h** — clone/fork via posix_spawn + IPC state transfer.
+- **src/gdb_stub.c/h** — GDB Remote Serial Protocol stub for guest debugging.
+- **src/crash_report.c/h** — Structured crash report for GitHub issue filing.
 - **src/stack.c/h** — Linux initial stack builder (argc/argv/envp/auxv).
 - **src/shim.S** — EL1 kernel shim. Exception vectors, SVC→HVC forwarding, MMU enable.
+
+## FD / audio lock order and callback rules
+
+Lock ordering (acquire ascending; see also `syscall_internal.h`):
+
+1. `mmap_lock` — mmap/brk + page tables  
+2. `pt_lock` — page table pool  
+3. `fd_lock` — FD table (alloc/close/dup); never hold while blocking on audio  
+4. `sig_lock` — signals  
+5. `thread_lock` / special-fd locks  
+6. `pid_lock`  
+7. futex buckets / inotify  
+
+**Audio stream mutex** (`hl_audio_stream_t.lock`) is a **leaf** lock: take it only
+after releasing `fd_lock`. Never call into FD table code while holding an audio
+lock.
+
+**Core Audio / Audio Queue callback MUST NOT:**
+
+- allocate (`malloc`/`calloc`/`realloc`)
+- access guest memory
+- log (`fprintf`, `hl_trace`, …)
+- take contended locks (including `fd_lock` or audio `lock` if writers may hold it)
+- perform blocking I/O beyond a non-blocking `read` on the stream consumer fd
+
+Use generation tokens so RESET drops stale callbacks. Software mixer only —
+never change the macOS system output volume.
 
 ## Key Constraints
 

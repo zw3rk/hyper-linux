@@ -71,46 +71,50 @@
         haskell-hello      = haskell.haskellHello;
       };
 
-      packages.${darwinSystem}.default = darwinPkgs.stdenv.mkDerivation {
-        pname = "hl";
-        version = "0.2.4";
-        src = ./.;
+      packages.${darwinSystem} =
+        {
+        # Display: zw3rk/hyper-linux-x11; demos: zw3rk/hyper-linux-examples
+        default = darwinPkgs.stdenv.mkDerivation {
+          pname = "hl";
+          version = "0.3.0-rc1";
+          src = ./.;
 
-        nativeBuildInputs = [
-          darwinPkgs.gnumake
-          darwinPkgs.binutils
-          darwinPkgs.xxd
-          darwinPkgs.darwin.sigtool  # codesign for nix sandbox
-        ] ++ darwinBuildInputs;
+          nativeBuildInputs = [
+            darwinPkgs.gnumake
+            darwinPkgs.binutils
+            darwinPkgs.xxd
+            darwinPkgs.darwin.sigtool  # codesign for nix sandbox
+          ] ++ darwinBuildInputs;
 
-        buildInputs = darwinBuildInputs;
+          buildInputs = darwinBuildInputs;
 
-        # GNU objcopy for Mach-O → raw binary (clang wrapper shadows with llvm-objcopy)
-        GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
+          # GNU objcopy for Mach-O → raw binary (clang wrapper shadows with llvm-objcopy)
+          GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
 
-        # Prevent nix from stripping the binary (removes codesign)
-        dontStrip = true;
+          # Prevent nix from stripping the binary (removes codesign)
+          dontStrip = true;
 
-        buildPhase = ''
-          make hl VERSION="$version+${self.shortRev or "unknown"}"
-        '';
+          buildPhase = ''
+            make hl VERSION="$version+${self.shortRev or "unknown"}"
+          '';
 
-        installPhase = ''
-          mkdir -p $out/bin $out/share/man/man1
-          cp _build/hl $out/bin/hl
-          cp hl.1 $out/share/man/man1/hl.1
-        '';
+          installPhase = ''
+            mkdir -p $out/bin $out/share/man/man1
+            cp _build/hl $out/bin/hl
+            cp hl.1 $out/share/man/man1/hl.1
+          '';
 
-        # Re-sign after install to ensure Hypervisor entitlement survives
-        postFixup = ''
-          codesign --entitlements entitlements.plist -f -s "-" $out/bin/hl
-        '';
+          # Re-sign after install to ensure Hypervisor entitlement survives
+          postFixup = ''
+            codesign --entitlements entitlements.plist -f -s "-" $out/bin/hl
+          '';
 
-        meta = with darwinPkgs.lib; {
-          description = "Run aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon";
-          mainProgram = "hl";
-          platforms = [ "aarch64-darwin" ];
-          license = licenses.asl20;
+          meta = with darwinPkgs.lib; {
+            description = "Run aarch64-linux and x86_64-linux ELF binaries on macOS Apple Silicon";
+            mainProgram = "hl";
+            platforms = [ "aarch64-darwin" ];
+            license = licenses.asl20;
+          };
         };
       };
 

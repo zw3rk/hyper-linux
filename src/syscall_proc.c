@@ -1457,18 +1457,43 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
                         si_addr = far_addr;
 
-                        if (verbose) {
+                        /* Always log guest faults — needed for XMMS/UI RCA. */
+                        {
                             const char *fault_type =
                                 (fault_ec == 0x20) ? "inst" : "data";
                             const char *code_name =
                                 (si_code == LINUX_SEGV_MAPERR) ? "MAPERR"
                                                                : "ACCERR";
+                            uint64_t x0 = 0, x1 = 0, x2 = 0, x3 = 0;
+                            uint64_t x29 = 0, x30 = 0, tpidr = 0, sp = 0;
+                            hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X29, &x29);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X30, &x30);
+                            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0,
+                                                &tpidr);
+                            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
                             fprintf(stderr, "%s: EL0 %s fault at 0x%llx "
-                                    "(ESR=0x%llx FSC=0x%x) → SIGSEGV/%s\n",
+                                    "ELR=0x%llx (ESR=0x%llx FSC=0x%x) "
+                                    "→ SIGSEGV/%s\n"
+                                    "%s:   X0=%llx X1=%llx X2=%llx X3=%llx "
+                                    "X29=%llx X30=%llx SP=%llx TPIDR=%llx\n",
                                     prefix, fault_type,
                                     (unsigned long long)far_addr,
+                                    (unsigned long long)elr_addr,
                                     (unsigned long long)esr,
-                                    fsc, code_name);
+                                    fsc, code_name,
+                                    prefix,
+                                    (unsigned long long)x0,
+                                    (unsigned long long)x1,
+                                    (unsigned long long)x2,
+                                    (unsigned long long)x3,
+                                    (unsigned long long)x29,
+                                    (unsigned long long)x30,
+                                    (unsigned long long)sp,
+                                    (unsigned long long)tpidr);
                         }
                     } else {
                         /* EC=0x00 (undefined instruction) or other unrecognized

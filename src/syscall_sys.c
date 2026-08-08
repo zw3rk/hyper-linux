@@ -11,6 +11,7 @@
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "guest.h"
+#include "vfs.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -66,8 +67,9 @@ int64_t sys_getrandom(guest_t *g, uint64_t buf_gva, uint64_t buflen,
 
 int64_t sys_getcwd(guest_t *g, uint64_t buf_gva, uint64_t size) {
     char cwd[LINUX_PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd)))
-        return linux_errno();
+    int rc = hl_vfs_getcwd(cwd, sizeof(cwd));
+    if (rc < 0)
+        return rc;
 
     size_t len = strlen(cwd) + 1;
     if (len > size)

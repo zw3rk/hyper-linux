@@ -1,5 +1,15 @@
 # hl — Run Linux ELF Binaries on macOS Apple Silicon
 
+`hl` core only. Sibling repos (split in progress):
+
+| Repo | Role |
+|------|------|
+| [zw3rk/hyper-linux](https://github.com/zw3rk/hyper-linux) | **This** — runtime |
+| [zw3rk/hyper-linux-x11](https://github.com/zw3rk/hyper-linux-x11) | AppKit-origin X |
+| [zw3rk/hyper-linux-examples](https://github.com/zw3rk/hyper-linux-examples) | XMMS demo |
+
+Freeze tag: `split-base-2026-07-30`. Plan: `docs/plan-repo-split-and-cleanup.md`.
+
 `hl` executes **aarch64-linux** and **x86_64-linux** ELF binaries on macOS Apple Silicon using Apple's Hypervisor.framework.
 No Docker, no full VM — just a lightweight per-process virtual machine that translates Linux syscalls to macOS equivalents.
 
@@ -20,8 +30,32 @@ Hello from Linux!
 - **Socket networking** — `AF_INET`/`AF_INET6` with sockaddr/sockopt translation
 - **inotify** — emulated via kqueue `EVFILT_VNODE`
 - **`/proc` emulation** — `/proc/self/exe`, `/proc/self/maps`, `/proc/self/stat`, `/proc/self/fd/`
+- **Rooted VFS** — `--fs-mode=rooted` with bind mounts, virtual CWD, reverse host→guest map
+- **OSS audio** — `/dev/dsp` + `/dev/mixer` bridged to Core Audio (null/WAV backends for CI)
 - **2MB + 4KB page tables** — automatic L3 splitting for mixed-permission regions (W^X)
 - **Demand-paged memory** — up to 1TB address space, only used pages consume RAM
+
+### Audio / VFS defaults
+
+By default `hl` runs with a product-oriented profile:
+
+- `--fs-mode=rooted`
+- bind `$HOME` → `/home/user`
+- `--guest-cwd /home/user`
+- `--audio-backend coreaudio`
+
+```bash
+# Same as the defaults (home media + Core Audio)
+hl ./my-linux-app
+
+# Hermetic / no auto home bind
+hl --isolated --bind /path/to/media:/media ./app
+
+# Deterministic tests (legacy paths + silent backend)
+hl --fs-mode=legacy --audio-backend null ./test-program
+
+# Category traces: HL_TRACE=fs,fd,dev,audio,proc,fork
+```
 
 ## Requirements
 

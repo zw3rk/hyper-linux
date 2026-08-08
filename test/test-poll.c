@@ -52,6 +52,116 @@ int main(void) {
         else FAIL("ppoll failed");
     }
 
+    /* Sub-millisecond positive timeout must wait, not busy as timeout=0.
+     * hl clamps each such wait to ≥1ms; 20 iterations should take ≥10ms. */
+    TEST("ppoll (sub-ms timeout)");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            struct pollfd fds[1];
+            fds[0].fd = pipefd[0]; /* read end — not ready */
+            fds[0].events = POLLIN;
+            fds[0].revents = 0;
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000 }; /* 0.5 ms */
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int ok = 1;
+            for (int i = 0; i < 20; i++) {
+                fds[0].revents = 0;
+                if (ppoll(fds, 1, &ts, NULL) < 0)
+                    ok = 0;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long long dt_ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                              (t1.tv_nsec - t0.tv_nsec);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            /* 20 × ~1ms clamp → expect ≥10ms wall */
+            if (ok && dt_ns >= 10000000LL) PASS();
+            else FAIL("sub-ms ppoll busy-spun or failed");
+        }
+    }
+
+    /* Closed nonnegative fd → POLLNVAL (timeout=0 path) */
+    TEST("ppoll (POLLNVAL on closed fd)");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            int bad = pipefd[0];
+            close(pipefd[0]);
+            close(pipefd[1]);
+            struct pollfd fds[1];
+            fds[0].fd = bad;
+            fds[0].events = POLLIN;
+            fds[0].revents = 0;
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
+            int ret = ppoll(fds, 1, &ts, NULL);
+            if (ret >= 1 && (fds[0].revents & POLLNVAL)) PASS();
+            else FAIL("expected POLLNVAL");
+        }
+    }
+
+    /* Closed fd + long positive timeout must return immediately with POLLNVAL
+     * (Linux does not wait — invalid fd is already "ready"). */
+    TEST("ppoll (POLLNVAL + 1s timeout, no hang)");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            int bad = pipefd[0];
+            close(pipefd[0]);
+            close(pipefd[1]);
+            struct pollfd fds[1];
+            fds[0].fd = bad;
+            fds[0].events = POLLIN;
+            fds[0].revents = 0;
+            struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int ret = ppoll(fds, 1, &ts, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long long dt_ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                              (t1.tv_nsec - t0.tv_nsec);
+            /* Must not consume the 1s timeout; allow a few ms of overhead. */
+            if (ret >= 1 && (fds[0].revents & POLLNVAL) && dt_ns < 200000000LL)
+                PASS();
+            else
+                FAIL("POLLNVAL waited or missing");
+        }
+    }
+
+    /* Closed fd + infinite timeout (NULL) must not hang. */
+    TEST("ppoll (POLLNVAL + infinite timeout, no hang)");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            int bad = pipefd[0];
+            close(pipefd[0]);
+            close(pipefd[1]);
+            struct pollfd fds[1];
+            fds[0].fd = bad;
+            fds[0].events = POLLIN;
+            fds[0].revents = 0;
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int ret = ppoll(fds, 1, NULL, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long long dt_ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                              (t1.tv_nsec - t0.tv_nsec);
+            if (ret >= 1 && (fds[0].revents & POLLNVAL) && dt_ns < 200000000LL)
+                PASS();
+            else
+                FAIL("infinite POLLNVAL hang or missing");
+        }
+    }
+
     /* Test pselect with timeout */
     TEST("pselect (timeout)");
     {
@@ -59,6 +169,34 @@ int main(void) {
         int ret = pselect(0, NULL, NULL, NULL, &ts, NULL);
         if (ret == 0) PASS();  /* No fds, immediate timeout */
         else FAIL("pselect failed");
+    }
+
+    /* Closed fd in pselect set → EBADF (Linux select semantics). */
+    TEST("pselect (EBADF on closed fd)");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            int bad = pipefd[0];
+            close(pipefd[0]);
+            close(pipefd[1]);
+            fd_set rset;
+            FD_ZERO(&rset);
+            FD_SET(bad, &rset);
+            struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+            struct timespec t0, t1;
+            errno = 0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int ret = pselect(bad + 1, &rset, NULL, NULL, &ts, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long long dt_ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                              (t1.tv_nsec - t0.tv_nsec);
+            if (ret < 0 && errno == EBADF && dt_ns < 200000000LL)
+                PASS();
+            else
+                FAIL("expected EBADF quickly");
+        }
     }
 
     /* Test kill(getpid(), 0) — process existence check */

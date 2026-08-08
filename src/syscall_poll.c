@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <sys/event.h>
 #include <poll.h>
 
@@ -47,6 +48,56 @@ void wakeup_pipe_signal(void) {
     }
 }
 
+/* Linux POLLNVAL (same numeric value on Darwin poll.h). */
+#ifndef POLLNVAL
+#define POLLNVAL 0x20
+#endif
+
+/* Spin diagnostic: rate-limited log when poll-family floods with no I/O. */
+static _Atomic uint64_t poll_spin_calls;
+static _Atomic uint64_t poll_spin_window_ns;
+static struct timespec poll_spin_t0;
+static int poll_spin_t0_set;
+static int poll_spin_logged;
+
+static void poll_spin_note(int productive) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!poll_spin_t0_set) {
+        poll_spin_t0 = now;
+        poll_spin_t0_set = 1;
+        atomic_store(&poll_spin_calls, 0);
+    }
+    if (productive) {
+        poll_spin_t0 = now;
+        atomic_store(&poll_spin_calls, 0);
+        poll_spin_logged = 0;
+        return;
+    }
+    uint64_t n = atomic_fetch_add(&poll_spin_calls, 1) + 1;
+    int64_t dt_ns = (int64_t)(now.tv_sec - poll_spin_t0.tv_sec) * 1000000000LL +
+                    (int64_t)(now.tv_nsec - poll_spin_t0.tv_nsec);
+    if (dt_ns < 250000000LL) /* 250 ms window */
+        return;
+    double rate = (double)n * 1e9 / (double)dt_ns;
+    if (rate >= 10000.0 && !poll_spin_logged) {
+        poll_spin_logged = 1;
+        fprintf(stderr,
+                "hl: poll-spin diagnostic: rate=%.0f/s calls=%llu window_ms=%.0f "
+                "(zero productive I/O). Check guest zero-timeout loops, "
+                "sub-ms truncation, POLLNVAL, or wake-pipe.\n",
+                rate, (unsigned long long)n, dt_ns / 1e6);
+        fflush(stderr);
+    }
+    /* Reset window to avoid permanent latch without progress */
+    if (dt_ns > 1000000000LL) {
+        poll_spin_t0 = now;
+        atomic_store(&poll_spin_calls, 0);
+        poll_spin_logged = 0;
+    }
+    (void)poll_spin_window_ns;
+}
+
 /* ---------- polling/select ---------- */
 
 int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
@@ -60,12 +111,28 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
             return -LINUX_EFAULT;
     }
 
-    /* Translate guest FDs to host FDs */
+    /* Translate guest FDs to host FDs.
+     * Linux: gfd < 0 is ignored; gfd >= 0 but not open → POLLNVAL. */
     struct pollfd host_fds[256];
+    int nval_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
-        host_fds[i].fd = fd_to_host(guest_fds[i].fd);
+        int gfd = guest_fds[i].fd;
         host_fds[i].events = guest_fds[i].events;
         host_fds[i].revents = 0;
+        guest_fds[i].revents = 0;
+        if (gfd < 0) {
+            host_fds[i].fd = -1; /* deliberately ignored */
+        } else if (gfd >= FD_TABLE_SIZE || fd_table[gfd].type == FD_CLOSED) {
+            host_fds[i].fd = -1;
+            guest_fds[i].revents = (uint16_t)POLLNVAL;
+            nval_count++;
+        } else {
+            host_fds[i].fd = fd_to_host(gfd);
+            if (host_fds[i].fd < 0) {
+                guest_fds[i].revents = (uint16_t)POLLNVAL;
+                nval_count++;
+            }
+        }
     }
 
     /* Log fd types for shutdown diagnostics (verbose only) */
@@ -89,7 +156,8 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         fprintf(stderr, "]\n");
     }
 
-    /* Convert timeout (compute in int64_t to avoid overflow, clamp to INT_MAX) */
+    /* Convert timeout (compute in int64_t to avoid overflow, clamp to INT_MAX).
+     * Sub-millisecond positive timeouts must not become 0 (busy poll). */
     int timeout_ms = -1;  /* Infinite by default */
     if (timeout_gva != 0) {
         linux_timespec_t lts;
@@ -101,9 +169,12 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         /* Guard against overflow: tv_sec * 1000 can exceed INT64_MAX */
         int64_t ms64;
         if (lts.tv_sec > INT64_MAX / 1000)
-            ms64 = INT64_MAX;
+            ms64 = INT_MAX;
         else
             ms64 = lts.tv_sec * (int64_t)1000 + lts.tv_nsec / 1000000;
+        /* 0 < timeout < 1ms → wait 1ms, not immediate return */
+        if (ms64 == 0 && (lts.tv_sec > 0 || lts.tv_nsec > 0))
+            ms64 = 1;
         timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int)ms64;
     }
 
@@ -120,9 +191,8 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
     }
 
     /* For indefinite polls, add the wakeup pipe so exit_group can
-     * interrupt threads blocked in host poll(). Without this, threads
-     * in poll(timeout=-1) can't be interrupted by hv_vcpus_exit()
-     * because they're not in hv_vcpu_run(). */
+     * interrupt threads blocked in host poll(). With a solid wake path,
+     * use true infinite host timeout (-1). */
     int added_wakeup = 0;
     if (timeout_ms < 0 && wakeup_pipe_rd >= 0 && nfds < 256) {
         host_fds[nfds].fd = wakeup_pipe_rd;
@@ -133,8 +203,18 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
 
     extern _Atomic int futex_interrupt_requested;
     int ret;
+    /* Linux: closed/invalid fds already have POLLNVAL ready → return
+     * without waiting. Sample valid host fds once (timeout 0). Never
+     * enter the infinite-retry path when nval_count > 0. */
+    int force_immediate = (nval_count > 0);
+    int host_timeout = timeout_ms;
+    if (force_immediate)
+        host_timeout = 0;
+    else if (timeout_ms < 0)
+        host_timeout = added_wakeup ? -1 : 200; /* fallback if no wake pipe */
+
     do {
-        ret = poll(host_fds, nfds + added_wakeup, timeout_ms < 0 ? 200 : timeout_ms);
+        ret = poll(host_fds, nfds + added_wakeup, host_timeout);
 
         /* Check for exit_group / futex_interrupt after waking */
         if (atomic_load(&exit_group_requested) ||
@@ -144,10 +224,8 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
             break;
         }
 
-        /* If we used a short timeout (200ms) on an infinite poll and
-         * nothing happened, loop back. If the caller had a real timeout,
-         * we only called poll once with that timeout, so break. */
-    } while (ret == 0 && timeout_ms < 0);
+        /* Only retry when we used a sliced infinite wait without wake pipe. */
+    } while (ret == 0 && timeout_ms < 0 && !added_wakeup && !force_immediate);
 
     int saved_errno = errno;
 
@@ -165,16 +243,31 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
 
     if (ret < 0) { errno = saved_errno; return linux_errno(); }
 
-    /* Write back revents to guest */
+    /* Write back revents: keep POLLNVAL pre-sets; copy host revents otherwise. */
+    int ready_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
-        guest_fds[i].revents = host_fds[i].revents;
+        if (guest_fds[i].revents & POLLNVAL) {
+            ready_count++;
+            continue;
+        }
+        uint16_t rev = host_fds[i].revents;
+        guest_fds[i].revents = rev;
+        if (rev != 0)
+            ready_count++;
     }
     if (nfds > 0) {
         if (guest_write(g, fds_gva, guest_fds, nfds * sizeof(linux_pollfd_t)) < 0)
             return -LINUX_EFAULT;
     }
 
-    return ret;
+    int64_t out = (int64_t)ready_count;
+    if (out == 0 && ret > 0)
+        out = (int64_t)ret + nval_count;
+    else if (nval_count > 0 && out < nval_count)
+        out = (int64_t)ready_count; /* already includes POLLNVAL */
+    /* Productive if any guest fd is ready (incl. POLLNVAL) or ret > 0 */
+    poll_spin_note(out > 0 || timeout_ms != 0);
+    return out;
 }
 
 int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
@@ -207,8 +300,19 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             return -LINUX_EFAULT;
 
         for (int i = 0; i < nfds; i++) {
+            int in_set = 0;
+            if (rbits[i / 64] & (1ULL << (i % 64))) in_set = 1;
+            if (wbits[i / 64] & (1ULL << (i % 64))) in_set = 1;
+            if (ebits[i / 64] & (1ULL << (i % 64))) in_set = 1;
+            if (!in_set) continue;
+
+            /* Linux: invalid fd in select set → EBADF */
+            if (i >= FD_TABLE_SIZE || fd_table[i].type == FD_CLOSED)
+                return -LINUX_EBADF;
+
             int host_fd = fd_to_host(i);
-            if (host_fd < 0) continue;
+            if (host_fd < 0)
+                return -LINUX_EBADF;
             /* Guard against host fds exceeding FD_SETSIZE (macOS stack
              * buffer overflow if the host fd number is >= FD_SETSIZE). */
             if (host_fd >= FD_SETSIZE) continue;
@@ -234,6 +338,9 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             return -LINUX_EINVAL;
         ts.tv_sec = lts.tv_sec;
         ts.tv_nsec = lts.tv_nsec;
+        /* Sub-ms positive timeout: ensure at least 1ms equivalent via nsec */
+        if (ts.tv_sec == 0 && ts.tv_nsec > 0 && ts.tv_nsec < 1000000L)
+            ts.tv_nsec = 1000000L;
     }
 
     /* Apply signal mask atomically around the select.
@@ -255,8 +362,8 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         }
     }
 
-    /* For indefinite selects, add the wakeup pipe and use a short
-     * timeout so exit_group can interrupt. */
+    /* For indefinite selects, add the wakeup pipe and wait forever on
+     * the host (interrupted by wake pipe / exit_group). */
     int added_wakeup = 0;
     if (!has_timeout && wakeup_pipe_rd >= 0) {
         FD_SET(wakeup_pipe_rd, &read_set);
@@ -265,13 +372,13 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
     }
 
     extern _Atomic int futex_interrupt_requested;
-    struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
+    /* Fallback 200ms only when infinite and no wake pipe available. */
+    struct timespec poll_ts = { .tv_sec = 0, .tv_nsec = 200000000L };
 
     /* Save fd_sets — pselect modifies them in-place to indicate ready fds.
-     * Without saving/restoring, the indefinite retry loop would operate on
-     * corrupted (zeroed) fd_sets after a 200ms timeout iteration. */
+     * Without saving/restoring, a sliced infinite retry would corrupt sets. */
     fd_set saved_read, saved_write, saved_except;
-    if (!has_timeout) {
+    if (!has_timeout && !added_wakeup) {
         saved_read   = read_set;
         saved_write  = write_set;
         saved_except = except_set;
@@ -279,17 +386,25 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     int ret;
     do {
-        if (!has_timeout) {
+        if (!has_timeout && !added_wakeup) {
             read_set   = saved_read;
             write_set  = saved_write;
             except_set = saved_except;
         }
 
+        const struct timespec *pts;
+        if (has_timeout)
+            pts = &ts;
+        else if (added_wakeup)
+            pts = NULL; /* infinite */
+        else
+            pts = &poll_ts;
+
         ret = pselect(max_host_fd + 1,
                       (readfds_gva || added_wakeup) ? &read_set : NULL,
                       writefds_gva ? &write_set : NULL,
                       exceptfds_gva ? &except_set : NULL,
-                      has_timeout ? &ts : &poll_ts, NULL);
+                      pts, NULL);
 
         if (atomic_load(&exit_group_requested) ||
             atomic_load(&futex_interrupt_requested)) {
@@ -297,7 +412,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             errno = EINTR;
             break;
         }
-    } while (ret == 0 && !has_timeout);
+    } while (ret == 0 && !has_timeout && !added_wakeup);
 
     int save_errno = errno;
 

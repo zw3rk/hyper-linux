@@ -15,6 +15,7 @@
 #include "syscall_signal.h"
 #include "syscall.h"        /* LINUX_E* errno constants */
 #include "syscall_fd.h"     /* signalfd_notify */
+#include "syscall_poll.h"   /* wakeup_pipe_signal */
 #include "syscall_proc.h"   /* proc_get_pid, SYSCALL_EXEC_HAPPENED */
 #include "thread.h"         /* current_thread, thread_entry_t */
 #include "vdso.h"           /* VDSO_BASE */
@@ -27,6 +28,18 @@
 
 /* ---------- Signal state (module-level, process-wide) ---------- */
 static signal_state_t sig_state;
+
+/* ---------- Thread-directed signal metadata ----------
+ * Indexed by signal number (1-based). Kept outside signal_state_t so the
+ * fork/exec IPC layout is unchanged; directed signals are transient and do
+ * not need to survive fork.
+ *
+ *   sig_target_tid[s]  guest TID that must run the handler (0 = any thread)
+ *   sig_si_code[s]     si_code to stamp into the delivered siginfo
+ *
+ * Both are guarded by sig_lock. */
+static int64_t sig_target_tid[LINUX_NSIG + 1];
+static int32_t sig_si_code[LINUX_NSIG + 1];
 
 /* ---------- Per-thread pending fault info ----------
  * When a synchronous fault (BRK, segfault, etc.) needs to deliver a signal,
@@ -174,8 +187,13 @@ void signal_reset_for_exec(void) {
 }
 
 void signal_queue(int signum) {
+    signal_queue_directed(signum, 0, LINUX_SI_USER);
+}
+
+void signal_queue_directed(int signum, int64_t target_tid, int si_code) {
     if (signum < 1 || signum > LINUX_NSIG) return;
     pthread_mutex_lock(&sig_lock);
+    int was_pending = (sig_state.pending & sig_bit(signum)) != 0;
     sig_state.pending |= sig_bit(signum);
     /* RT signals: increment queue count (multiple instances tracked) */
     if (signum >= LINUX_SIGRTMIN) {
@@ -183,6 +201,15 @@ void signal_queue(int signum) {
         if (sig_state.rt_queue[idx] < RT_SIGQUEUE_MAX)
             sig_state.rt_queue[idx]++;
     }
+    /* Target is tracked per signal number, not per queued instance. If an
+     * instance is already pending for a different thread, widen to
+     * process-directed so no instance can get stuck behind a thread that
+     * never reaches a delivery point. */
+    if (!was_pending)
+        sig_target_tid[signum] = target_tid;
+    else if (sig_target_tid[signum] != target_tid)
+        sig_target_tid[signum] = 0;
+    sig_si_code[signum] = si_code;
     pthread_mutex_unlock(&sig_lock);
 
     /* Notify any signalfd instances whose mask includes this signal.
@@ -194,6 +221,12 @@ void signal_queue(int signum) {
      * with no syscalls. Each vCPU's CANCELED handler will check
      * signal_pending() and call signal_deliver(). */
     thread_interrupt_all();
+
+    /* hv_vcpus_exit() only cancels hv_vcpu_run(); a thread parked in a host
+     * poll/select/kevent is unaffected. Nudge the wakeup pipe so a thread
+     * waiting indefinitely returns and reaches its delivery point. Without
+     * this a directed signal to such a thread is never observed. */
+    wakeup_pipe_signal();
 }
 
 void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr) {
@@ -219,9 +252,33 @@ void signal_consume(int signum) {
     pthread_mutex_unlock(&sig_lock);
 }
 
+/* Signals this thread may run a handler for: pending, not blocked here, and
+ * either process-directed or directed at us. A signal directed at a thread
+ * that has since exited is treated as process-directed so it cannot leak.
+ * Caller must hold sig_lock. */
+static uint64_t deliverable_here_locked(void) {
+    uint64_t mask = sig_state.pending & ~*thread_blocked_ptr();
+    int64_t me = current_thread ? current_thread->guest_tid : 0;
+    uint64_t rest = mask;
+
+    while (rest) {
+        int signum = __builtin_ctzll(rest) + 1;
+        rest &= rest - 1;
+        int64_t target = sig_target_tid[signum];
+        if (target == 0 || target == me)
+            continue;
+        if (!thread_tid_alive(target)) {
+            sig_target_tid[signum] = 0;   /* target gone — anyone may take it */
+            continue;
+        }
+        mask &= ~sig_bit(signum);
+    }
+    return mask;
+}
+
 int signal_pending(void) {
     pthread_mutex_lock(&sig_lock);
-    int result = (sig_state.pending & ~*thread_blocked_ptr()) != 0;
+    int result = deliverable_here_locked() != 0;
     pthread_mutex_unlock(&sig_lock);
     return result;
 }
@@ -704,7 +761,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     uint64_t *blocked = thread_blocked_ptr();
     uint64_t *saved_ptr = thread_saved_blocked_ptr();
     int *valid_ptr = thread_saved_valid_ptr();
-    uint64_t deliverable = sig_state.pending & ~*blocked;
+    uint64_t deliverable = deliverable_here_locked();
     if (deliverable == 0) {
         pthread_mutex_unlock(&sig_lock);
         return 0;
@@ -724,6 +781,13 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
             sig_state.pending &= ~sig_bit(signum);
     } else {
         sig_state.pending &= ~sig_bit(signum);
+    }
+    /* si_code travels with the pending instance; clear the routing state
+     * once the last instance is dequeued. */
+    int delivered_si_code = sig_si_code[signum];
+    if ((sig_state.pending & sig_bit(signum)) == 0) {
+        sig_target_tid[signum] = 0;
+        sig_si_code[signum] = LINUX_SI_USER;
     }
 
     int idx = signum - 1;
@@ -782,7 +846,11 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
          * int32_t fields. Write it via memcpy to avoid strict aliasing. */
         memcpy(&frame.info.si_pid, &pending_fault.addr, 8);
     } else {
-        frame.info.si_code = LINUX_SI_USER;
+        /* SI_USER for kill(2)/internal signals, SI_TKILL for tkill/tgkill.
+         * glibc's __nptl_setxid_sighandler and musl's cancellation handler
+         * both return early unless si_code matches, so getting this wrong
+         * deadlocks setuid()/pthread_cancel() in the caller. */
+        frame.info.si_code = delivered_si_code;
         frame.info.si_pid = (int32_t)proc_get_pid();
     }
 
@@ -872,19 +940,20 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t)signum);
 
     /* X30 (LR) = return address for signal handler.
-     * On aarch64-linux, the kernel always sets LR to the vDSO's
-     * __kernel_rt_sigreturn (mov x8,#139; svc #0; ret). The sa_restorer
-     * field is architecturally unused on aarch64 — the kernel ignores it.
-     * However, musl explicitly sets sa_restorer to its own __restore_rt
-     * trampoline. We honor sa_restorer if set (for musl compatibility),
-     * otherwise use the vDSO trampoline. The vDSO is built unconditionally
-     * in both native aarch64 and rosetta modes (hl.c + syscall_exec.c). */
-    uint64_t restorer = act->sa_restorer;
-    if (restorer == 0) {
-        /* vDSO __kernel_rt_sigreturn: first trampoline in text section */
-        restorer = VDSO_BASE + VDSO_OFF_TEXT;
+     *
+     * aarch64 Linux kernel ALWAYS sets LR to the vDSO __kernel_rt_sigreturn
+     * trampoline and IGNORES sa_restorer (arch/arm64/kernel/signal.c
+     * setup_return). Glibc still writes a non-zero sa_restorer (often a
+     * random ld.so address / non-restorer); honoring it makes the handler
+     * "return" into garbage and SEGV (seen with XMMS: FAR=0x380 / near-null
+     * after SIGSETXID tgkill, ELR in ld.so, X30=sa_restorer).
+     *
+     * Match the kernel: always use vDSO. Musl's __restore_rt is equivalent
+     * (mov x8,#139; svc #0); using vDSO is correct for both. */
+    {
+        uint64_t restorer = VDSO_BASE + VDSO_OFF_TEXT + VDSO_SYM_RT_SIGRETURN;
+        hv_vcpu_set_reg(vcpu, HV_REG_X30, restorer);
     }
-    hv_vcpu_set_reg(vcpu, HV_REG_X30, restorer);
 
     if (act->sa_flags & LINUX_SA_SIGINFO) {
         /* X1 = pointer to siginfo, X2 = pointer to ucontext */

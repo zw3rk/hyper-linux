@@ -19,6 +19,8 @@
 #include "rosetta.h"
 #include "guest.h"
 #include "thread.h"
+#include "fd_object.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -269,6 +272,19 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
     if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD)
         return eventfd_write(fd, g, buf_gva, count);
 
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->write) {
+                int64_t r = ref.of->ops->write(ref.of, ref.host_fd, g,
+                                               buf_gva, count);
+                hl_fd_put(&ref);
+                return r;
+            }
+            hl_fd_put(&ref);
+        }
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -304,6 +320,19 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
             return timerfd_read(fd, g, buf_gva, count);
         if (fd_table[fd].type == FD_INOTIFY)
             return inotify_read(fd, g, buf_gva, count);
+    }
+
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->read) {
+                int64_t r = ref.of->ops->read(ref.of, ref.host_fd, g,
+                                              buf_gva, count);
+                hl_fd_put(&ref);
+                return r;
+            }
+            hl_fd_put(&ref);
+        }
     }
 
     int host_fd = fd_to_host(fd);
@@ -993,6 +1022,21 @@ int rosettad_is_socket(int host_fd) {
 /* VZ ioctl constants: centralized in rosetta.h */
 
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
+    /* Typed open-file ops before generic Darwin ioctl translation.
+     * Synthetic devices (OSS) must not see Linux request codes on host. */
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->ioctl) {
+                int64_t r = ref.of->ops->ioctl(ref.of, ref.host_fd, g,
+                                               request, arg);
+                hl_fd_put(&ref);
+                return r;
+            }
+            hl_fd_put(&ref);
+        }
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 

@@ -108,7 +108,9 @@ typedef struct {
 /* si_code values */
 #define LINUX_SI_USER    0
 #define LINUX_SI_KERNEL  128
+#define LINUX_SI_QUEUE   (-1)
 #define LINUX_SI_TIMER   (-2)
+#define LINUX_SI_TKILL   (-6)   /* tkill(2) / tgkill(2) — libcs check for this */
 
 /* si_code values for SIGTRAP (from include/uapi/asm-generic/siginfo.h) */
 #define LINUX_TRAP_BRKPT  1   /* Process breakpoint (BRK instruction) */
@@ -200,8 +202,23 @@ void signal_init(void);
  * Pending signals and signal mask are preserved. */
 void signal_reset_for_exec(void);
 
-/* Queue a signal for delivery. */
+/* Queue a process-directed signal (kill(2), internal SIGPIPE/SIGALRM, …).
+ * Any thread that does not block the signal may run the handler. */
 void signal_queue(int signum);
+
+/* Queue a thread-directed signal (tkill(2) / tgkill(2)).
+ *
+ * target_tid names the guest thread that MUST run the handler; the signal
+ * stays pending until that thread reaches a delivery point (0 falls back to
+ * process-directed). si_code is stamped into the delivered siginfo — Linux
+ * uses SI_TKILL for tkill/tgkill and libcs rely on it: glibc's
+ * __nptl_setxid_sighandler (setuid/setgid/…) and musl's cancellation
+ * handlers return without acknowledging when si_code says otherwise, which
+ * deadlocks the caller.
+ *
+ * Threads parked in a host blocking syscall are woken so the signal is
+ * delivered promptly rather than at the next unrelated wakeup. */
+void signal_queue_directed(int signum, int64_t target_tid, int si_code);
 
 /* Set fault info for the next signal delivery. When set, signal_deliver()
  * populates si_code, si_addr, fault_address, and ESR context from these

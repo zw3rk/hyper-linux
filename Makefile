@@ -76,10 +76,12 @@ SRC_DIR := src
 HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
            syscall_fs.c syscall_io.c syscall_poll.c syscall_fd.c \
            syscall_inotify.c syscall_time.c syscall_sys.c \
+           syscall_shm.c \
            syscall_proc.c proc_emulation.c syscall_exec.c \
            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
            thread.c futex.c vdso.c crash_report.c rosetta.c \
-           gdb_stub.c)
+           gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
+           audio.c audio_oss.c audio_coreaudio.c app_open.c)
 HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_internal.h syscall_fs.h syscall_io.h \
            syscall_poll.h syscall_fd.h syscall_inotify.h \
@@ -87,7 +89,8 @@ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            proc_emulation.h syscall_exec.h fork_ipc.h \
            syscall_signal.h syscall_net.h stack.h hv_util.h \
            thread.h futex.h vdso.h crash_report.h rosetta.h \
-           gdb_stub.h)
+           gdb_stub.h trace.h syscall_stats.h fd_object.h vfs.h device.h \
+           audio.h audio_oss.h linux_oss_abi.h app_open.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -133,12 +136,22 @@ $(BUILD_DIR)/shim_blob.h: $(BUILD_DIR)/shim.bin
 hl: $(BUILD_DIR)/hl
 	@printf "$(GREEN)✓ hl built successfully$(RESET)\n"
 
-$(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h | $(BUILD_DIR)
+# Guest vDSO text (real gettimeofday/clock_gettime) — host-assembled aarch64 blob
+$(BUILD_DIR)/vdso_guest_bin.h: src/vdso_guest.S | $(BUILD_DIR)
+	@printf "$(GREEN)▸ Assembling$(RESET) guest vDSO text\n"
+	clang -arch arm64 -c -o $(BUILD_DIR)/vdso_guest.o src/vdso_guest.S
+	$(if $(GNU_OBJCOPY),$(GNU_OBJCOPY),objcopy) -O binary -j .text \
+		$(BUILD_DIR)/vdso_guest.o $(BUILD_DIR)/vdso_guest.bin
+	cd $(BUILD_DIR) && xxd -i vdso_guest.bin > vdso_guest_bin.h
+
+$(BUILD_DIR)/hl: $(HL_SRCS) $(HL_HDRS) $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h \
+		$(BUILD_DIR)/vdso_guest_bin.h | $(BUILD_DIR)
 	@printf "$(GREEN)▸ Compiling$(RESET) hl\n"
-	clang $(CFLAGS) \
+	clang $(CFLAGS) -DHL_HAVE_COREAUDIO=1 \
 		-I$(BUILD_DIR) -I$(SRC_DIR) \
 		-o $@ $(HL_SRCS) \
-		-framework Hypervisor -arch arm64
+		-framework Hypervisor -framework AudioToolbox -framework CoreAudio \
+		-arch arm64
 	@printf "$(GREEN)▸ Signing$(RESET) hl\n"
 	codesign --entitlements $(ENTITLEMENTS) -f -s "$(SIGN_IDENTITY)" $@
 
@@ -171,12 +184,22 @@ test-hello: $(BUILD_DIR)/hl $(TEST_DEPS)
 	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
 	$(BUILD_DIR)/hl $(TEST_DIR)/test-hello
 
+# Deterministic suite flags: host-path tests need legacy VFS; audio needs null.
+HL_TEST_FLAGS ?= --fs-mode=legacy --audio-backend null
+
 ## Run all tests
 test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	@printf "\n$(BLUE)━━━ Running test suite ━━━$(RESET)\n\n"
 	@pass=0; fail=0; \
 	run_test() { \
-		name=$$(basename "$$2"); \
+		name=""; \
+		for a in "$$@"; do \
+			case "$$a" in \
+				--*|-*|"") ;; \
+				*) name=$$(basename "$$a");; \
+			esac; \
+		done; \
+		[ -n "$$name" ] || name="test"; \
 		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
 		if output=$$(timeout 60 $$@ 2>&1); then \
 			printf "$(GREEN)✓ PASS$(RESET)\n"; \
@@ -197,70 +220,109 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 		fi; \
 	}; \
 	printf "$(BLUE)── Assembly tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-hello; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-hello; \
 	printf "\n$(BLUE)── C tests (musl static) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/hello-musl; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/hello-write; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/echo-test hello world; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-argc a b c; \
-	expected_rc=42 run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-complex; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fileio CLAUDE.md; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-string; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-malloc; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cat test/hello.S; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-ls test/; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-roundtrip; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-comprehensive; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/hello-musl; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/hello-write; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/echo-test hello world; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-argc a b c; \
+	expected_rc=42 run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-complex; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vdso-time; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fileio CLAUDE.md; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-string; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-cat test/hello.S; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-ls test/; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-roundtrip; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-comprehensive; \
 	printf "\n$(BLUE)── Process tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-exec $(TEST_DIR)/echo-test exec-works; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fork; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-exec $(TEST_DIR)/echo-test exec-works; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fork; \
 	printf "\n$(BLUE)── Signal tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signal; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-signal; \
 	printf "\n$(BLUE)── Socket tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-socket; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-file-ops; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-sysinfo; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-io-opt; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-poll; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-file-ops; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sysinfo; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-io-opt; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-poll; \
 	printf "\n$(BLUE)── I/O subsystem tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-eventfd; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signalfd; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-epoll; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-timerfd; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-eventfd; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-signalfd; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-epoll; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-timerfd; \
 	printf "\n$(BLUE)── /proc and /dev emulation tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-proc; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-proc; \
 	printf "\n$(BLUE)── Network tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-net; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-thread; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-pthread; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-thread; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)── Stress tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-stress; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-stress; \
 	printf "\n$(BLUE)── Negative / error-path tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-negative; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-negative; \
 	printf "\n$(BLUE)── Signal + thread tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-signal-thread; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-signal-thread; \
 	printf "\n$(BLUE)── Fork edge cases ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-fork-exec $(TEST_DIR)/echo-test; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fork-exec $(TEST_DIR)/echo-test; \
 	printf "\n$(BLUE)── COW fork isolation tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cow-fork; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── O_CLOEXEC tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-cloexec; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-cloexec; \
 	printf "\n$(BLUE)── Guard page / mmap edge cases ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-guard-page; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-guard-page; \
 	printf "\n$(BLUE)── Scatter-gather I/O tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-readv-writev; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-readv-writev; \
 	printf "\n$(BLUE)── inotify emulation tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-inotify; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-inotify; \
 	printf "\n$(BLUE)── PI futex + EINTR regression tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-futex-pi; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-futex-pi; \
+	printf "\n$(BLUE)── Directed signal (tkill/tgkill) tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-sigill; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigill; \
 	printf "\n$(BLUE)── X11 raw protocol tests ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(TEST_DIR)/test-x11; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-x11; \
+	printf "\n$(BLUE)── VFS / OSS / device tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-dsp-presence; \
+	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-open; \
+	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-tier1; \
+	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-fork; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vfs-chdir-relative-open; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-rooted; \
+	rm -rf "$$tmpdir"; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
+
+## Host-side unit tests (no guest VM): VFS resolver + audio gain
+test-host-units:
+	@printf "$(BLUE)▸ Host unit tests$(RESET)\n"
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-vfs-unit \
+		test/host/test-vfs-unit.c test/host/stubs.c \
+		$(SRC_DIR)/vfs.c $(SRC_DIR)/trace.c -lpthread
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-audio-gain \
+		test/host/test-audio-gain.c $(SRC_DIR)/audio.c $(SRC_DIR)/audio_coreaudio.c \
+		$(SRC_DIR)/trace.c -lpthread
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-audio-stream \
+		test/host/test-audio-stream.c $(SRC_DIR)/audio.c $(SRC_DIR)/audio_coreaudio.c \
+		$(SRC_DIR)/trace.c -lpthread
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-app-open \
+		test/host/test-app-open.c test/host/stubs.c \
+		$(SRC_DIR)/app_open.c $(SRC_DIR)/vfs.c $(SRC_DIR)/trace.c -lpthread
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-oss-abi \
+		test/host/test-oss-abi.c
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-fd-object-lite \
+		test/host/test-fd-object-lite.c $(SRC_DIR)/fd_object.c $(SRC_DIR)/trace.c -lpthread
+	$(BUILD_DIR)/test-fd-object-lite
+	$(BUILD_DIR)/test-vfs-unit
+	$(BUILD_DIR)/test-audio-gain
+	$(BUILD_DIR)/test-audio-stream
+	$(BUILD_DIR)/test-app-open
+	$(BUILD_DIR)/test-oss-abi
 
 # ── Coreutils integration test ───────────────────────────────────
 
@@ -416,7 +478,14 @@ test-x64-all: $(BUILD_DIR)/hl
 	@printf "\n$(BLUE)━━━ Running x86_64 test suite (via rosetta) ━━━$(RESET)\n\n"
 	@pass=0; fail=0; xfail=0; \
 	run_test() { \
-		name=$$(basename "$$2"); \
+		name=""; \
+		for a in "$$@"; do \
+			case "$$a" in \
+				--*|-*|"") ;; \
+				*) name=$$(basename "$$a");; \
+			esac; \
+		done; \
+		[ -n "$$name" ] || name="test"; \
 		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
 		if output=$$(timeout 60 $$@ 2>&1); then \
 			printf "$(GREEN)✓ PASS$(RESET)\n"; \
@@ -499,6 +568,8 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── PI futex + EINTR regression tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-futex-pi "rosetta: raw clone(CLONE_THREAD) in dead-owner test hangs"; \
+	printf "\n$(BLUE)── Directed signal (tkill/tgkill) tests (x86_64) ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests (x86_64) ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sigill; \
 	printf "\n$(BLUE)── X11 raw protocol tests (x86_64) ──$(RESET)\n"; \
@@ -713,6 +784,9 @@ $(BUILD_DIR)/test-rwx: test/test-rwx.c $(BUILD_DIR)/shim_blob.h | $(BUILD_DIR)
 test-rwx: $(BUILD_DIR)/test-rwx
 	$(BUILD_DIR)/test-rwx
 
+# AppKit/XMMS targets: zw3rk/hyper-linux-x11 and hyper-linux-examples.
+
+# ── Static analysis
 # ── Static analysis ────────────────────────────────────────────────
 
 .PHONY: lint analyze format shellcheck
@@ -808,6 +882,7 @@ site-serve:
 	@printf "$(GREEN)▸ Serving$(RESET) site/ at http://localhost:8080\n"
 	@cd site && python3 -m http.server 8080
 
+# ── Help
 # ── Help ───────────────────────────────────────────────────────────
 
 ## Display this help message

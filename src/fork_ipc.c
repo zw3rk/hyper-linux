@@ -17,6 +17,10 @@
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
 #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
 #include "futex.h"           /* futex_wake_one */
+#include "fd_object.h"
+#include "audio_oss.h"
+#include "vfs.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +43,8 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
-#define IPC_VERSION       4            /* v4: COW fork + stack_base/stack_top */
+#define IPC_VERSION       5            /* v5: OSS open-file recreate-empty object graph */
+#define IPC_FD_HAS_OBJECT 1            /* ipc_fd_entry_t.pad: synthetic open-file follows */
 
 /* IPC header: sent first over socketpair */
 typedef struct {
@@ -404,7 +409,9 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         /* Populate fd_table.  Parent sends fd_entries and host_fds in
          * 1:1 correspondence — each entry at index i has its host FD
          * at host_fds[i] (STDIO entries include their FD too, but we
-         * use the child's existing stdio instead). */
+         * use the child's existing stdio instead).
+         * pad & IPC_FD_HAS_OBJECT: host_fd is a placeholder; real open-file
+         * is recreated from object records after SCM_RIGHTS (IPC v5). */
         for (uint32_t i = 0; i < num_fds; i++) {
             int gfd = fd_entries[i].guest_fd;
             if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
@@ -417,30 +424,39 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                     close(host_fds[i]);
                 fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             } else if ((int)i < received_count) {
-                /* Use fd_alloc_at to properly update the bitmap.
-                 * Without this, fd_alloc() would see these slots as
-                 * free and overwrite them on the first allocation. */
-                fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
-                fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+                if (fd_entries[i].pad & IPC_FD_HAS_OBJECT) {
+                    /* Placeholder only — close; object import fills slot. */
+                    close(host_fds[i]);
+                    /* Temporarily mark slot used so bitmap stays consistent;
+                     * import will fd_alloc_at again. */
+                    fd_alloc_at(gfd, fd_entries[i].type, -1);
+                    fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+                } else {
+                    /* Use fd_alloc_at to properly update the bitmap.
+                     * Without this, fd_alloc() would see these slots as
+                     * free and overwrite them on the first allocation. */
+                    fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
+                    fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
 
-                /* Reconstruct DIR* for directory FDs. The parent's DIR*
-                 * pointer is meaningless in the child's address space.
-                 * fdopendir() takes ownership of the fd, so dup() first
-                 * to keep the original host_fd usable for other ops. */
-                if (fd_entries[i].type == FD_DIR) {
-                    int dir_fd = dup(host_fds[i]);
-                    if (dir_fd >= 0) {
-                        DIR *dir = fdopendir(dir_fd);
-                        if (dir) {
-                            fd_table[gfd].dir = dir;
+                    /* Reconstruct DIR* for directory FDs. The parent's DIR*
+                     * pointer is meaningless in the child's address space.
+                     * fdopendir() takes ownership of the fd, so dup() first
+                     * to keep the original host_fd usable for other ops. */
+                    if (fd_entries[i].type == FD_DIR) {
+                        int dir_fd = dup(host_fds[i]);
+                        if (dir_fd >= 0) {
+                            DIR *dir = fdopendir(dir_fd);
+                            if (dir) {
+                                fd_table[gfd].dir = dir;
+                            } else {
+                                close(dir_fd);
+                                fprintf(stderr, "hl: fork-child: fdopendir "
+                                        "failed for gfd %d\n", gfd);
+                            }
                         } else {
-                            close(dir_fd);
-                            fprintf(stderr, "hl: fork-child: fdopendir "
-                                    "failed for gfd %d\n", gfd);
+                            fprintf(stderr, "hl: fork-child: dup failed for "
+                                    "DIR gfd %d: %s\n", gfd, strerror(errno));
                         }
-                    } else {
-                        fprintf(stderr, "hl: fork-child: dup failed for "
-                                "DIR gfd %d: %s\n", gfd, strerror(errno));
                     }
                 }
             }
@@ -448,6 +464,65 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
 
         free(host_fds);
         free(fd_entries);
+    }
+
+    /* IPC v5: open-file object records (OSS recreate-empty). Always present. */
+    {
+        uint32_t num_objects = 0;
+        if (ipc_read_all(ipc_fd, &num_objects, sizeof(num_objects)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read object count\n");
+            guest_destroy(&g);
+            return 1;
+        }
+        for (uint32_t oi = 0; oi < num_objects; oi++) {
+            int32_t gfd = -1;
+            hl_fork_object_record_t rec;
+            if (ipc_read_all(ipc_fd, &gfd, sizeof(gfd)) < 0 ||
+                ipc_read_all(ipc_fd, &rec, sizeof(rec)) < 0) {
+                fprintf(stderr, "hl: fork-child: failed to read object %u\n", oi);
+                guest_destroy(&g);
+                return 1;
+            }
+            if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
+
+            hl_open_file_t *of = NULL;
+            if (hl_oss_fd_needs_recreate((int)rec.kind))
+                of = hl_oss_fork_import(&rec);
+            if (!of) {
+                fprintf(stderr, "hl: fork-child: fork_import failed gfd=%d kind=%u\n",
+                        gfd, rec.kind);
+                continue;
+            }
+            int host_alias = -1;
+            if (of->ops && of->ops->poll_host_fd) {
+                int pfd = of->ops->poll_host_fd(of, -1);
+                if (pfd >= 0) host_alias = dup(pfd);
+            }
+
+            uint32_t fdflags = 0;
+            if (fd_table[gfd].linux_flags & LINUX_O_CLOEXEC)
+                fdflags = LINUX_O_CLOEXEC;
+            hl_descriptor_t *d = hl_descriptor_create(of, host_alias, fdflags,
+                                                      of->kind, NULL);
+            if (!d) {
+                hl_open_file_release(of);
+                if (host_alias >= 0) close(host_alias);
+                continue;
+            }
+            pthread_mutex_lock(&fd_lock);
+            fd_table[gfd].desc = d;
+            fd_table[gfd].of = of;
+            fd_table[gfd].type = of->kind;
+            fd_table[gfd].host_fd = host_alias;
+            fd_table[gfd].linux_flags = (int)(fdflags |
+                (int)atomic_load(&of->status_flags));
+            pthread_mutex_unlock(&fd_lock);
+
+            if (hl_trace_on(HL_TRACE_FORK))
+                hl_trace(HL_TRACE_FORK,
+                         "import gfd=%d kind=%d policy=recreate-empty of=%llu",
+                         gfd, of->kind, (unsigned long long)of->object_id);
+        }
     }
 
     /* Step 6: Read process info (cwd + umask) */
@@ -460,7 +535,24 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         return 1;
     }
 
-    if (cwd[0] != '\0') chdir(cwd);
+    /* VFS config reconstruction */
+    {
+        hl_vfs_t vfs_snap;
+        if (ipc_read_all(ipc_fd, &vfs_snap, sizeof(vfs_snap)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read VFS config\n");
+            guest_destroy(&g);
+            return 1;
+        }
+        hl_vfs_fork_import(&vfs_snap);
+    }
+
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        if (cwd[0] != '\0')
+            hl_vfs_set_cwd(cwd);
+        /* never host chdir in rooted mode */
+    } else if (cwd[0] != '\0') {
+        chdir(cwd);
+    }
     umask((mode_t)umask_val);
 
     /* Step 6a: Read sysroot path */
@@ -862,10 +954,16 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
 
     /* Create the host pthread (joinable — exit_group joins all workers
      * via thread_join_workers_cb before process exit). Threads clean up
-     * their TID address via CLONE_CHILD_CLEARTID + futex wake. */
+     * their TID address via CLONE_CHILD_CLEARTID + futex wake.
+     *
+     * macOS default secondary-thread stack is only 512KB. Several syscall
+     * handlers still use large on-stack buffers (e.g. 64KB I/O), and the
+     * main thread's 8MB RLIMIT_STACK does not apply here — give workers
+     * 2MB so they match typical Linux pthread defaults. */
     pthread_t host_thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+    (void)pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
 
     int err = pthread_create(&host_thread, &attr, thread_create_and_run, tca);
     pthread_attr_destroy(&attr);
@@ -1110,11 +1208,12 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
         }
     }
 
-    /* Create the host pthread */
+    /* Create the host pthread (2MB stack — see sys_clone_thread comment) */
     pthread_t host_thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    (void)pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
 
     int err = pthread_create(&host_thread, &attr, vm_clone_thread_run, tca);
     pthread_attr_destroy(&attr);
@@ -1251,23 +1350,17 @@ static void *vm_clone_thread_run(void *arg) {
     return NULL;
 }
 
-int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
-                  uint64_t child_stack, uint64_t ptid_gva,
-                  uint64_t tls, uint64_t ctid_gva, int verbose) {
-    /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
-    if (flags & LINUX_CLONE_THREAD) {
-        return sys_clone_thread(vcpu, g, flags, child_stack,
-                                ptid_gva, tls, ctid_gva, verbose);
-    }
-
-    /* CLONE_VM without CLONE_THREAD: create an in-process VM-clone child.
-     * Used by Rosetta's two-process JIT: the inferior shares guest memory
-     * but has a separate TID and is waitable via wait4/ptrace. */
-    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD)) {
-        return sys_clone_vm(vcpu, g, flags, child_stack,
-                            ptid_gva, tls, ctid_gva, verbose);
-    }
-
+/* posix_spawn + IPC path for true process clone (not CLONE_THREAD/CLONE_VM).
+ *
+ * Kept as a separate noinline function so its locals (path buffers, register
+ * snapshots) are NOT allocated on every pthread_create-backed CLONE_THREAD
+ * call. Worker vCPU threads only get the macOS default ~512KB stack; the
+ * pre-fix combined frame for this path was ~900KB (FD table + VFS mount
+ * arrays on stack) and host-SIGBUS'd (___chkstk_darwin) when mpg123 cloned
+ * a decode thread from a worker. Large arrays are heap-allocated below. */
+__attribute__((noinline))
+static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+                              int verbose) {
     /* We only support fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD) */
     int is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
@@ -1494,15 +1587,28 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
      * Note: CLOEXEC FDs are inherited across fork (POSIX semantics).
      * CLOEXEC only takes effect at exec (handled in syscall_exec.c).
      *
-     * Both arrays (fd_entries and host_fds_to_send) are kept in 1:1
-     * correspondence: each fd_entry has a matching host fd at the same
-     * index. If dup() fails for a non-STDIO fd, the entry is skipped
-     * entirely so the arrays never get out of sync. */
-    ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
-    int host_fds_to_send[FD_TABLE_SIZE];
+     * Heap-allocate the FD_TABLE_SIZE snapshots: on-stack they alone are
+     * hundreds of KB and would blow the 512KB default pthread stack if this
+     * path were ever reached from a worker vCPU thread. */
+    ipc_fd_entry_t *fd_entries = calloc(FD_TABLE_SIZE, sizeof(*fd_entries));
+    int *host_fds_to_send = calloc(FD_TABLE_SIZE, sizeof(*host_fds_to_send));
     /* Track which host_fds were duped (need close) vs passed as-is (STDIO) */
-    int host_fds_duped[FD_TABLE_SIZE];
+    int *host_fds_duped = calloc(FD_TABLE_SIZE, sizeof(*host_fds_duped));
+    hl_fork_object_record_t *obj_records =
+        calloc(FD_TABLE_SIZE, sizeof(*obj_records));
+    int32_t *obj_gfds = calloc(FD_TABLE_SIZE, sizeof(*obj_gfds));
+    if (!fd_entries || !host_fds_to_send || !host_fds_duped ||
+        !obj_records || !obj_gfds) {
+        free(fd_entries);
+        free(host_fds_to_send);
+        free(host_fds_duped);
+        free(obj_records);
+        free(obj_gfds);
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
     uint32_t num_fds = 0;
+    uint32_t num_objects = 0;
 
     /* Hold fd_lock while scanning the FD table to prevent concurrent
      * close/open from another thread corrupting the snapshot.
@@ -1513,8 +1619,26 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
 
         int host_fd;
         int was_duped = 0;
-        if (fd_table[i].type != FD_STDIO) {
+        int has_object = 0;
+
+        /* OSS / synthetic: export open-file config; do NOT share stream FDs */
+        if (fd_table[i].of && hl_oss_fd_needs_recreate(fd_table[i].type)) {
+            hl_fork_object_record_t rec;
+            if (hl_oss_fork_export(fd_table[i].of, &rec) == 0) {
+                has_object = 1;
+                obj_gfds[num_objects] = i;
+                obj_records[num_objects] = rec;
+                num_objects++;
+                /* Placeholder fd so SCM_RIGHTS 1:1 stays aligned; child closes */
+                host_fd = open("/dev/null", O_RDWR);
+                if (host_fd < 0) continue;
+                was_duped = 1;
+            } else {
+                continue;
+            }
+        } else if (fd_table[i].type != FD_STDIO) {
             /* Dup the fd so child gets its own copy */
+            if (fd_table[i].host_fd < 0) continue;
             int duped = dup(fd_table[i].host_fd);
             if (duped < 0) continue; /* Skip entry if dup fails */
             host_fd = duped;
@@ -1527,7 +1651,7 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = fd_table[i].type;
         fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
-        fd_entries[num_fds].pad = 0;
+        fd_entries[num_fds].pad = has_object ? IPC_FD_HAS_OBJECT : 0;
         host_fds_to_send[num_fds] = host_fd;
         host_fds_duped[num_fds] = was_duped;
         num_fds++;
@@ -1538,6 +1662,11 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {
         for (uint32_t fi = 0; fi < num_fds; fi++)
             if (host_fds_duped[fi]) close(host_fds_to_send[fi]);
+        free(fd_entries);
+        free(host_fds_to_send);
+        free(host_fds_duped);
+        free(obj_records);
+        free(obj_gfds);
         close(ipc_sock);
         return -LINUX_ENOMEM;
     }
@@ -1546,6 +1675,11 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         if (ipc_write_all(ipc_sock, fd_entries, num_fds * sizeof(ipc_fd_entry_t)) < 0) {
             for (uint32_t fi = 0; fi < num_fds; fi++)
                 if (host_fds_duped[fi]) close(host_fds_to_send[fi]);
+            free(fd_entries);
+            free(host_fds_to_send);
+            free(host_fds_duped);
+            free(obj_records);
+            free(obj_gfds);
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }
@@ -1557,6 +1691,11 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
                 if (host_fds_duped[fi])
                     close(host_fds_to_send[fi]);
             }
+            free(fd_entries);
+            free(host_fds_to_send);
+            free(host_fds_duped);
+            free(obj_records);
+            free(obj_gfds);
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }
@@ -1569,9 +1708,50 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         }
     }
 
-    /* Process info: cwd + umask */
+    /* IPC v5 object graph after SCM_RIGHTS (even if num_fds==0 send count). */
+    if (ipc_write_all(ipc_sock, &num_objects, sizeof(num_objects)) < 0) {
+        free(fd_entries);
+        free(host_fds_to_send);
+        free(host_fds_duped);
+        free(obj_records);
+        free(obj_gfds);
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
+    }
+    for (uint32_t oi = 0; oi < num_objects; oi++) {
+        if (ipc_write_all(ipc_sock, &obj_gfds[oi], sizeof(obj_gfds[oi])) < 0 ||
+            ipc_write_all(ipc_sock, &obj_records[oi], sizeof(obj_records[oi])) < 0) {
+            free(fd_entries);
+            free(host_fds_to_send);
+            free(host_fds_duped);
+            free(obj_records);
+            free(obj_gfds);
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+        if (hl_trace_on(HL_TRACE_FORK))
+            hl_trace(HL_TRACE_FORK, "export gfd=%d kind=%u policy=recreate-empty",
+                     (int)obj_gfds[oi], obj_records[oi].kind);
+    }
+    free(fd_entries);
+    free(host_fds_to_send);
+    free(host_fds_duped);
+    free(obj_records);
+    free(obj_gfds);
+    fd_entries = NULL;
+    host_fds_to_send = NULL;
+    host_fds_duped = NULL;
+    obj_records = NULL;
+    obj_gfds = NULL;
+
+    /* Process info: cwd + umask (+ VFS config for rooted mode) */
     char cwd[LINUX_PATH_MAX] = {0};
-    getcwd(cwd, sizeof(cwd));
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        const char *gcwd = hl_vfs_cwd();
+        if (gcwd) snprintf(cwd, sizeof(cwd), "%s", gcwd);
+    } else {
+        getcwd(cwd, sizeof(cwd));
+    }
     mode_t cur_umask = umask(0);
     umask(cur_umask);
     uint32_t umask_val = (uint32_t)cur_umask;
@@ -1580,6 +1760,23 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         ipc_write_all(ipc_sock, &umask_val, sizeof(umask_val)) < 0) {
         close(ipc_sock);
         return -LINUX_ENOMEM;
+    }
+
+    /* VFS config reconstruction (mounts + mode + cwd). Heap-allocate:
+     * hl_vfs_t is ~0.5MB (64 mounts × path pairs) — too big for worker stacks. */
+    {
+        hl_vfs_t *vfs_snap = calloc(1, sizeof(*vfs_snap));
+        if (!vfs_snap) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+        hl_vfs_fork_export(vfs_snap);
+        int werr = ipc_write_all(ipc_sock, vfs_snap, sizeof(*vfs_snap));
+        free(vfs_snap);
+        if (werr < 0) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
     }
 
     /* Sysroot path (for dynamic linker library resolution) */
@@ -1716,4 +1913,25 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
                 (long long)child_guest_pid, child_host_pid);
 
     return child_guest_pid;
+}
+
+int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+                  uint64_t child_stack, uint64_t ptid_gva,
+                  uint64_t tls, uint64_t ctid_gva, int verbose) {
+    /* CLONE_THREAD: create a new thread in the same VM (not a new process).
+     * Must stay a thin dispatcher — see sys_clone_fork comment about stack. */
+    if (flags & LINUX_CLONE_THREAD) {
+        return sys_clone_thread(vcpu, g, flags, child_stack,
+                                ptid_gva, tls, ctid_gva, verbose);
+    }
+
+    /* CLONE_VM without CLONE_THREAD: create an in-process VM-clone child.
+     * Used by Rosetta's two-process JIT: the inferior shares guest memory
+     * but has a separate TID and is waitable via wait4/ptrace. */
+    if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD)) {
+        return sys_clone_vm(vcpu, g, flags, child_stack,
+                            ptid_gva, tls, ctid_gva, verbose);
+    }
+
+    return sys_clone_fork(vcpu, g, flags, verbose);
 }

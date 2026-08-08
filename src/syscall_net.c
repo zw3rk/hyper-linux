@@ -15,6 +15,8 @@
 #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
 #include "syscall_io.h"      /* rosettad_is_socket */
 #include "guest.h"           /* guest_ptr_avail */
+#include "syscall_stats.h"
+#include "trace.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -181,6 +183,65 @@ static int mac_to_linux_msg_flags(int mac_flags) {
     if (mac_flags & MSG_EOR)       linux_flags |= 0x80;     /* 0x08 → 0x80 */
     if (mac_flags & MSG_WAITALL)   linux_flags |= 0x100;    /* 0x40 → 0x100 */
     return linux_flags;
+}
+
+/*
+ * AF_UNIX / X11 stream fast path.
+ *
+ * Xlib/GTK (and most SOCK_STREAM users) call recvmsg/sendmsg with
+ * msg_name=NULL and msg_control=NULL. Full sendmsg/recvmsg still pays for
+ * sockaddr/cmsg setup and Linux↔macOS cmsg translation — hot under HVF at
+ * ~80–100 EAGAIN recvmsg/s idle and higher during drag.
+ *
+ * When there is no name and no ancillary data, and flags are only
+ * DONTWAIT / NOSIGNAL / CMSG_CLOEXEC (no PEEK/OOB/WAITALL), use
+ * readv/writev (or single-buffer recv/send) and skip cmsg translation.
+ * Paths with SCM_RIGHTS (rosettad) keep the full implementation.
+ *
+ * Linux flags allowed on fast path (masked):
+ *   MSG_DONTWAIT     0x40
+ *   MSG_NOSIGNAL     0x4000
+ *   MSG_CMSG_CLOEXEC 0x40000000  (no-op without control)
+ */
+#define MSG_FP_LINUX_OK  (0x40 | 0x4000 | 0x40000000)
+
+static int msghdr_simple_stream(const linux_msghdr_t *m) {
+    if (m->msg_name && m->msg_namelen > 0) return 0;
+    if (m->msg_control && m->msg_controllen > 0) return 0;
+    return 1;
+}
+
+/* Build host iovec[0..iovlen) from guest msg_iov; iovlen capped at 64. */
+static int64_t msg_build_host_iov(guest_t *g, const linux_msghdr_t *lmsg,
+                                  struct iovec *host_iov, int max_iov,
+                                  int *out_iovlen) {
+    if (lmsg->msg_iovlen > (uint64_t)max_iov) return -LINUX_EINVAL;
+    int n = (int)lmsg->msg_iovlen;
+    *out_iovlen = n;
+    if (n <= 0) return 0;
+
+    struct {
+        uint64_t iov_base;
+        uint64_t iov_len;
+    } guest_iov[64];
+    if (guest_read(g, lmsg->msg_iov, guest_iov, (size_t)n * 16) < 0)
+        return -LINUX_EFAULT;
+
+    for (int i = 0; i < n; i++) {
+        if (guest_iov[i].iov_len == 0) {
+            host_iov[i].iov_base = NULL;
+            host_iov[i].iov_len = 0;
+            continue;
+        }
+        uint64_t avail = 0;
+        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
+        if (!base) return -LINUX_EFAULT;
+        uint64_t len = guest_iov[i].iov_len;
+        if (len > avail) len = avail;
+        host_iov[i].iov_base = base;
+        host_iov[i].iov_len = (size_t)len;
+    }
+    return 0;
 }
 
 /* ---------- Syscall implementations ---------- */
@@ -419,11 +480,36 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
 
     if (connect(host_fd, (struct sockaddr *)&mac_sa, (socklen_t)mac_len) < 0)
         return linux_errno();
+
+    /* Tag X11 display sockets for syscall_stats.
+     * Linux sockaddr_un: family@0 (u16), path@2 (possibly abstract: path[0]==0).
+     * Guests often pass addrlen == sizeof(sockaddr_un) (110) so path_len == 108;
+     * accept path_len up to 108 (not strictly < 108). */
+    if (addrlen >= 4 && syscall_stats_enabled()) {
+        uint16_t family = 0;
+        memcpy(&family, linux_sa, sizeof(family));
+        if (family == LINUX_AF_UNIX) {
+            size_t path_off = 2;
+            size_t path_len = addrlen > path_off ? addrlen - path_off : 0;
+            if (path_len > 0 && path_len <= 108) {
+                char path[109];
+                memset(path, 0, sizeof(path));
+                size_t copy = path_len < sizeof(path) ? path_len : sizeof(path) - 1;
+                memcpy(path, linux_sa + path_off, copy);
+                path[copy] = '\0';
+                const char *p = path;
+                if (path[0] == '\0' && path_len > 1)
+                    p = path + 1; /* abstract namespace */
+                /* Match common X11 socket paths (filesystem + abstract). */
+            }
+        }
+    }
     return 0;
 }
 
 int64_t sys_getsockname(guest_t *g, int fd, uint64_t addr_gva,
                         uint64_t addrlen_gva) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -457,6 +543,7 @@ int64_t sys_getsockname(guest_t *g, int fd, uint64_t addr_gva,
 
 int64_t sys_getpeername(guest_t *g, int fd, uint64_t addr_gva,
                         uint64_t addrlen_gva) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -490,6 +577,7 @@ int64_t sys_getpeername(guest_t *g, int fd, uint64_t addr_gva,
 
 int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
                    int linux_flags, uint64_t dest_gva, uint32_t addrlen) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -534,6 +622,7 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
 
 int64_t sys_recvfrom(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
                      int flags, uint64_t src_gva, uint64_t addrlen_gva) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -583,6 +672,8 @@ int64_t sys_recvfrom(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
 
 int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
                        uint64_t optval_gva, uint32_t optlen) {
+    /* Synthetic X PV channel: accept common Xlib socket opts as no-ops. */
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -634,6 +725,7 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
 
 int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
                        uint64_t optval_gva, uint64_t optlen_gva) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -734,6 +826,7 @@ int64_t sys_shutdown(int fd, int how) {
 }
 
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -743,6 +836,40 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
 
     int mac_flags = translate_msg_flags(linux_flags);
     int suppress_sigpipe = (linux_flags & 0x4000);
+
+    /*
+     * Fast path: no destination name, no ancillary data, simple flags.
+     * X11 display write path and ordinary AF_UNIX SOCK_STREAM traffic.
+     * Does not handle SCM_RIGHTS (falls through to full path).
+     */
+    if (msghdr_simple_stream(&lmsg) &&
+        (linux_flags & ~MSG_FP_LINUX_OK) == 0) {
+        struct iovec host_iov[64];
+        int iovlen = 0;
+        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
+        if (err < 0) return err;
+
+        ssize_t ret;
+        if (iovlen == 1 && host_iov[0].iov_len > 0) {
+            /* Prefer send() so MSG_DONTWAIT is honored on blocking sockets. */
+            ret = send(host_fd, host_iov[0].iov_base, host_iov[0].iov_len,
+                       mac_flags);
+        } else if (mac_flags == 0) {
+            ret = writev(host_fd, host_iov, iovlen);
+        } else {
+            struct msghdr msg = {
+                .msg_iov = host_iov,
+                .msg_iovlen = iovlen,
+            };
+            ret = sendmsg(host_fd, &msg, mac_flags);
+        }
+        if (ret < 0) {
+            if (errno == EPIPE && !suppress_sigpipe)
+                signal_queue(LINUX_SIGPIPE);
+            return linux_errno();
+        }
+        return ret;
+    }
 
     /* Translate destination address */
     struct sockaddr_storage mac_sa;
@@ -760,33 +887,11 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
     }
 
     /* Build host iovec from guest iovec */
-    if (lmsg.msg_iovlen > 64) return -LINUX_EINVAL;
-
-    struct {
-        uint64_t iov_base;
-        uint64_t iov_len;
-    } guest_iov[64];
-
-    if (lmsg.msg_iovlen > 0) {
-        if (guest_read(g, lmsg.msg_iov, guest_iov,
-                       lmsg.msg_iovlen * 16) < 0)
-            return -LINUX_EFAULT;
-    }
-
     struct iovec host_iov[64];
-    for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        if (guest_iov[i].iov_len == 0) {
-            host_iov[i].iov_base = NULL;
-            host_iov[i].iov_len = 0;
-            continue;
-        }
-        uint64_t avail = 0;
-        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
-        if (!base) return -LINUX_EFAULT;
-        uint64_t len = guest_iov[i].iov_len;
-        if (len > avail) len = avail;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = len;
+    int iovlen = 0;
+    {
+        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
+        if (err < 0) return err;
     }
 
     /* Translate control messages from Linux to macOS format.
@@ -881,7 +986,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
         .msg_name = dest_sa,
         .msg_namelen = dest_len,
         .msg_iov = host_iov,
-        .msg_iovlen = (int)lmsg.msg_iovlen,
+        .msg_iovlen = iovlen,
         .msg_control = ctrl_ptr,
         .msg_controllen = ctrl_len,
         .msg_flags = 0,
@@ -897,6 +1002,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
 }
 
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -906,34 +1012,49 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
 
     int mac_flags = translate_msg_flags(flags);
 
-    /* Build host iovec from guest iovec */
-    if (lmsg.msg_iovlen > 64) return -LINUX_EINVAL;
+    /*
+     * Fast path: connected stream, no name, no control, simple flags.
+     * Dominant path for X11 display sockets under GTK (idle EAGAIN storm
+     * and event reads). SCM_RIGHTS / PEEK / OOB take the full path below.
+     */
+    if (msghdr_simple_stream(&lmsg) &&
+        (flags & ~MSG_FP_LINUX_OK) == 0) {
+        struct iovec host_iov[64];
+        int iovlen = 0;
+        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
+        if (err < 0) return err;
 
-    struct {
-        uint64_t iov_base;
-        uint64_t iov_len;
-    } guest_iov[64];
+        ssize_t ret;
+        if (iovlen == 1 && host_iov[0].iov_len > 0) {
+            ret = recv(host_fd, host_iov[0].iov_base, host_iov[0].iov_len,
+                       mac_flags);
+        } else if (mac_flags == 0) {
+            ret = readv(host_fd, host_iov, iovlen);
+        } else {
+            struct msghdr msg = {
+                .msg_iov = host_iov,
+                .msg_iovlen = iovlen,
+            };
+            ret = recvmsg(host_fd, &msg, mac_flags);
+        }
+        if (ret < 0) return linux_errno();
 
-    if (lmsg.msg_iovlen > 0) {
-        if (guest_read(g, lmsg.msg_iov, guest_iov,
-                       lmsg.msg_iovlen * 16) < 0)
+        /* Guest CMSG_FIRSTHDR must see controllen=0; msg_flags clear. */
+        uint64_t zero64 = 0;
+        int32_t mflags = 0;
+        if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
             return -LINUX_EFAULT;
+        if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
+            return -LINUX_EFAULT;
+        return ret;
     }
 
+    /* Build host iovec from guest iovec */
     struct iovec host_iov[64];
-    for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        if (guest_iov[i].iov_len == 0) {
-            host_iov[i].iov_base = NULL;
-            host_iov[i].iov_len = 0;
-            continue;
-        }
-        uint64_t avail = 0;
-        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
-        if (!base) return -LINUX_EFAULT;
-        uint64_t len = guest_iov[i].iov_len;
-        if (len > avail) len = avail;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = len;
+    int iovlen = 0;
+    {
+        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
+        if (err < 0) return err;
     }
 
     /* Source address buffer */
@@ -958,7 +1079,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         .msg_name = lmsg.msg_name ? &mac_sa : NULL,
         .msg_namelen = lmsg.msg_name ? sa_len : 0,
         .msg_iov = host_iov,
-        .msg_iovlen = (int)lmsg.msg_iovlen,
+        .msg_iovlen = iovlen,
         .msg_control = ctrl_alloc > 0 ? mac_ctrl : NULL,
         .msg_controllen = ctrl_alloc,
         .msg_flags = 0,

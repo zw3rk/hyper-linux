@@ -18,6 +18,7 @@
  */
 #include "syscall.h"
 #include "syscall_internal.h"
+#include "syscall_shm.h"
 #include "syscall_fs.h"
 #include "syscall_io.h"
 #include "syscall_poll.h"
@@ -32,6 +33,12 @@
 #include "syscall_inotify.h"
 #include "futex.h"
 #include "thread.h"
+#include "fd_object.h"
+#include "trace.h"
+#include "vfs.h"
+#include "device.h"
+#include "audio.h"
+#include "syscall_stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +53,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 /* ---------- Thread-safety locks ---------- */
 
@@ -94,13 +102,28 @@ void syscall_init(void) {
     /* Mark all FDs as free in bitmap */
     memset(fd_free_bitmap, 0xFF, sizeof(fd_free_bitmap));
 
-    /* Pre-open stdin/stdout/stderr */
-    fd_table[0] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDIN_FILENO };
-    fd_table[1] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDOUT_FILENO };
-    fd_table[2] = (fd_entry_t){ .type = FD_STDIO, .host_fd = STDERR_FILENO };
-    fd_bitmap_set_used(0);
-    fd_bitmap_set_used(1);
-    fd_bitmap_set_used(2);
+    /* Pre-open stdin/stdout/stderr with open-file objects for dup/fork safety. */
+    for (int i = 0; i < 3; i++) {
+        int hfd = (i == 0) ? STDIN_FILENO :
+                  (i == 1) ? STDOUT_FILENO : STDERR_FILENO;
+        hl_open_file_t *of = hl_open_file_create(FD_STDIO, &hl_fd_ops_host_file,
+                                                 0, NULL);
+        hl_descriptor_t *d = of
+            ? hl_descriptor_create(of, hfd, 0, FD_STDIO, NULL) : NULL;
+        fd_table[i] = (fd_entry_t){
+            .type = FD_STDIO,
+            .host_fd = hfd,
+            .linux_flags = 0,
+            .dir = NULL,
+            .of = of,
+            .desc = d,
+        };
+        fd_bitmap_set_used(i);
+    }
+
+    hl_vfs_init_defaults();
+    hl_audio_init();
+    hl_device_init();
 }
 
 /* ---------- FD helpers ---------- */
@@ -141,6 +164,8 @@ int fd_alloc(int type, int host_fd) {
         fd_table[fd].host_fd = host_fd;
         fd_table[fd].linux_flags = 0;
         fd_table[fd].dir = NULL;
+        fd_table[fd].of = NULL;
+        fd_table[fd].desc = NULL;
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -156,6 +181,8 @@ int fd_alloc_from(int minfd, int type, int host_fd) {
         fd_table[fd].host_fd = host_fd;
         fd_table[fd].linux_flags = 0;
         fd_table[fd].dir = NULL;
+        fd_table[fd].of = NULL;
+        fd_table[fd].desc = NULL;
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -186,17 +213,27 @@ int fd_alloc_at(int fd, int type, int host_fd) {
                 old_epoll = fd_table[fd].dir;
         }
     }
+    hl_descriptor_t *old_desc = fd_table[fd].desc;
+    hl_open_file_t *old_of = fd_table[fd].of;
+    if (old_desc)
+        atomic_store(&old_desc->removed, true);
+
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
     fd_table[fd].linux_flags = 0;
     fd_table[fd].dir = NULL;
+    fd_table[fd].of = NULL;
+    fd_table[fd].desc = NULL;
     fd_bitmap_set_used(fd);
     pthread_mutex_unlock(&fd_lock);
 
     /* Clean up old resources outside fd_lock */
-    if (old_type != FD_CLOSED) {
+    if (old_desc) {
+        hl_descriptor_release(old_desc);
+    } else if (old_type != FD_CLOSED) {
         if (old_dir)   closedir(old_dir);
         if (old_epoll) free(old_epoll);
+        if (old_of) hl_open_file_release(old_of);
         switch (old_type) {
         case FD_EVENTFD:  eventfd_close(fd);  break;
         case FD_SIGNALFD: signalfd_close(fd); break;
@@ -224,6 +261,8 @@ void fd_mark_closed_unlocked(int fd) {
     fd_table[fd].host_fd = -1;
     fd_table[fd].dir = NULL;
     fd_table[fd].linux_flags = 0;
+    fd_table[fd].of = NULL;
+    fd_table[fd].desc = NULL;
     fd_bitmap_set_free(fd);
 }
 
@@ -245,10 +284,15 @@ int fd_snapshot_and_close(int fd, fd_entry_t *out) {
         return 0;
     }
     *out = fd_table[fd];
+    if (out->desc)
+        atomic_store(&out->desc->removed, true);
+    /* Detach from table; caller owns snapshot (desc/of/dir/host_fd). */
     fd_table[fd].type = FD_CLOSED;
     fd_table[fd].host_fd = -1;
     fd_table[fd].dir = NULL;
     fd_table[fd].linux_flags = 0;
+    fd_table[fd].of = NULL;
+    fd_table[fd].desc = NULL;
     fd_bitmap_set_free(fd);
     pthread_mutex_unlock(&fd_lock);
     return 1;
@@ -1125,6 +1169,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 (unsigned long long)x4, (unsigned long long)x5);
     }
 
+    struct timespec stats_t0;
+    int stats_time = syscall_stats_time_handlers();
+    if (stats_time)
+        clock_gettime(CLOCK_MONOTONIC, &stats_t0);
+
     int64_t result = 0;
     int should_exit = 0;
 
@@ -1795,14 +1844,20 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         }
         break;
     }
+    case SYS_tkill:
     case SYS_tgkill: {
-        int sig = (int)x2;
-        int tid = (int)x1;
+        /* tkill(tid, sig); tgkill(tgid, tid, sig). Both deliver to one
+         * specific thread with si_code = SI_TKILL — libcs depend on both
+         * properties (glibc __nptl_setxid_sighandler for setuid/setgid,
+         * musl __synccall, pthread_cancel). Queueing process-wide or with
+         * SI_USER makes those handshakes hang forever. */
+        int is_tkill = ((int)x8 == SYS_tkill);
+        int tid = is_tkill ? (int)x0 : (int)x1;
+        int sig = is_tkill ? (int)x1 : (int)x2;
         if (sig < 0 || sig > LINUX_NSIG) {
             result = -LINUX_EINVAL;
             break;
         }
-        /* Accept tgkill targeting any active thread in our process */
         thread_entry_t *target = thread_find((int64_t)tid);
         if (!target) {
             /* Fall back to checking main PID for compatibility */
@@ -1810,7 +1865,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
             if (tid == (int)our_pid) target = current_thread;
         }
         if (target) {
-            if (sig > 0) signal_queue(sig);
+            if (sig > 0)
+                signal_queue_directed(sig, target->guest_tid, LINUX_SI_TKILL);
             result = 0;
         } else {
             result = -LINUX_ESRCH;
@@ -2234,6 +2290,20 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         result = -LINUX_ENOSYS;
         break;
 
+    /* ---- SysV SHM (MIT-SHM / X11 image path) ---- */
+    case SYS_shmget:
+        result = sys_shmget(g, (int64_t)x0, x1, (int)x2);
+        break;
+    case SYS_shmctl:
+        result = sys_shmctl(g, (int)x0, (int)x1, x2);
+        break;
+    case SYS_shmat:
+        result = sys_shmat(g, (int)x0, x1, (int)x2);
+        break;
+    case SYS_shmdt:
+        result = sys_shmdt(g, x0);
+        break;
+
     default:
         if (verbose) {
             fprintf(stderr, "hl: unimplemented syscall %llu "
@@ -2246,6 +2316,22 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         }
         result = -LINUX_ENOSYS;
         break;
+    }
+
+    if (syscall_stats_enabled()) {
+        if ((int)x8 == SYS_close && (int)x0 >= 0)
+            syscall_stats_clear_fd((int)x0);
+        syscall_stats_note((unsigned)x8, result, x0, x1, x2);
+        if (stats_time) {
+            struct timespec stats_t1;
+            clock_gettime(CLOCK_MONOTONIC, &stats_t1);
+            unsigned long long ns =
+                (unsigned long long)(stats_t1.tv_sec - stats_t0.tv_sec) * 1000000000ULL +
+                (unsigned long long)(stats_t1.tv_nsec - stats_t0.tv_nsec);
+            syscall_stats_note_time_ns(ns);
+        }
+        if ((int)x8 == SYS_exit_group || (int)x8 == SYS_exit)
+            syscall_stats_dump("exit");
     }
 
     if (!should_exit) {

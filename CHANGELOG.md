@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] — 0.3.0-rc (hl core only)
+
+### Added
+- Ref-counted open-file FD core (`src/fd_object.*`) with per-descriptor ops
+- Rooted VFS mode: `--fs-mode`, `--bind`, `--guest-home`, `--guest-cwd`, `--app-profile`
+- Virtual device registry; OSS `/dev/dsp`, `/dev/dsp0`, `/dev/audio`, `/dev/mixer`
+- Audio stream manager with null / null-realtime / WAV / Core Audio backends
+- Software mixer gain (never changes macOS system volume); live mixer → open DSP streams
+- Category tracing: `HL_TRACE` / `--trace=fs,fd,dev,audio,proc,fork`
+- Guest DISPLAY / X11 socket bridging; SysV SHM (MIT-SHM); guest vDSO text
+- Guest tests: OSS/VFS/vdso/tgkill; host unit tests for VFS/FD/audio
+
+### Removed
+- Paravirtual X11 ring (`HL_X11_PV`, `libhl_x11_pv.so`, `packages.*.hl-x11-pv`) —
+  high complexity, no product win; stock AF_UNIX X path is sufficient
+
+### Notes
+- CLI defaults: `--fs-mode=rooted`, bind `$HOME:/home/user`, `--guest-cwd /home/user`,
+  `--audio-backend coreaudio`; `--isolated` skips auto home bind
+- OSS fork policy v1: recreate-empty independent streams (no AQ pointer IPC)
+- AppKit X and XMMS live in sibling repos (see `docs/SIBLING-REPOS.md`)
+
 ## [0.2.4] - 2026-03-15
 
 ### Added

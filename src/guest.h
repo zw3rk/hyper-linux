@@ -191,7 +191,7 @@ typedef struct {
 } guest_region_t;
 
 /* ---------- Guest state ---------- */
-typedef struct {
+typedef struct guest {
     void       *host_base;    /* Host pointer to allocated guest memory */
     int         shm_fd;       /* File fd backing host_base for COW fork (-1 if MAP_ANON) */
     uint64_t    guest_size;   /* Total size (determined by IPA capacity) */
@@ -288,6 +288,12 @@ void *guest_ptr(const guest_t *g, uint64_t gva);
  * the current memory region. Use this when passing guest buffers directly
  * to host syscalls (read/write) to prevent accessing past the region. */
 void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail);
+
+/* Optional VA→host resolver consulted before the primary/overflow paths.
+ * Used by SysV SHM so shared host pages are reachable even when IPA sits
+ * inside the primary IPA span (40-bit full-size primary). */
+typedef void *(*guest_extra_resolve_fn)(uint64_t gva, uint64_t *avail);
+void guest_set_extra_resolve(guest_extra_resolve_fn fn);
 
 /* Bounds-checked copy from guest memory to host buffer.
  * Returns 0 on success, -1 if out of bounds. */

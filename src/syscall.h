@@ -87,6 +87,7 @@
 #define SYS_sched_getaffinity 123
 #define SYS_sched_yield     124
 #define SYS_kill            129
+#define SYS_tkill           130
 #define SYS_tgkill          131
 #define SYS_sigaltstack     132
 #define SYS_rt_sigsuspend   133
@@ -192,6 +193,11 @@
 #define SYS_clone3          435
 #define SYS_close_range     436
 #define SYS_ptrace          117
+/* SysV shared memory (MIT-SHM for X11) — aarch64 Linux */
+#define SYS_shmget          194
+#define SYS_shmctl          195
+#define SYS_shmat           196
+#define SYS_shmdt           197
 
 /* ---------- Linux ptrace constants ---------- */
 #define LINUX_PTRACE_CONT       7
@@ -584,12 +590,22 @@ typedef struct {
 #define FD_EVENTFD  8
 #define FD_SIGNALFD 9
 #define FD_INOTIFY  10
+#define FD_VIRTUAL_DIR 11
+#define FD_OSS_DSP     12
+#define FD_OSS_MIXER   13
+#define FD_DEVICE      14
+
+/* Forward decls for open-file core (see fd_object.h). */
+struct hl_open_file;
+struct hl_descriptor;
 
 typedef struct {
-    int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
-    int   host_fd;     /* Underlying macOS file descriptor */
-    int   linux_flags; /* Linux open flags (for CLOEXEC tracking) */
-    void *dir;         /* DIR* for FD_DIR entries (NULL otherwise) */
+    int   type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR, ... */
+    int   host_fd;     /* Underlying macOS file descriptor / poll alias */
+    int   linux_flags; /* Linux flags: CLOEXEC on descriptor; status bits */
+    void *dir;         /* DIR* for FD_DIR / epoll instance (legacy) */
+    struct hl_open_file  *of;   /* Shared open-file description (may be NULL) */
+    struct hl_descriptor *desc; /* Per-descriptor object (may be NULL) */
 } fd_entry_t;
 
 /* ---------- API ---------- */

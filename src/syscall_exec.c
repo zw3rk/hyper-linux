@@ -591,6 +591,8 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     } else {
         /* Build vDSO for signal restorer fallback (sa_restorer == 0) */
         uint64_t exec_vdso = vdso_build(g);
+        if (exec_vdso)
+            vdso_publisher_start(g);
 
         sp = build_linux_stack(g, g->stack_top, argc, argv_const,
                                envp_const, &elf_info,

@@ -12,6 +12,14 @@
 .Op Fl t Ar seconds
 .Op Fl -timeout Ar seconds
 .Op Fl -sysroot Ar path
+.Op Fl -fs-mode Ar legacy|rooted
+.Op Fl -bind Ar host:guest
+.Op Fl -guest-home Ar path
+.Op Fl -guest-cwd Ar path
+.Op Fl -isolated
+.Op Fl -app-profile
+.Op Fl -trace Ar categories
+.Op Fl -audio-backend Ar name
 .Op Fl -verbose
 .Op Fl -gdb Ar port
 .Op Fl -gdb-stop-on-entry
@@ -76,6 +84,67 @@ or
 .Pa ld-linux-aarch64.so.1 )
 from this sysroot and transparently redirects absolute path opens
 through it.
+.It Fl -fs-mode Ar legacy|rooted
+Filesystem namespace mode.
+Default:
+.Ar rooted
+(deterministic mount table, virtual guest CWD, no host
+.Xr chdir 2 ).
+.Ar legacy
+preserves prior sysroot/host path behavior for tools and tests.
+.It Fl -bind Ar host:guest
+Add a bind mount from host path to guest path.
+Also accepts
+.Ar guest=host .
+Longest guest prefix wins.
+By default (unless
+.Fl -isolated ),
+.Nm
+binds
+.Pa $HOME
+to
+.Pa /home/user .
+.It Fl -guest-home Ar path
+Set the guest home directory path used by profiles.
+.It Fl -guest-cwd Ar path
+Set the initial virtual guest working directory
+.Pq rooted mode .
+Default:
+.Pa /home/user
+when the home bind is active.
+.It Fl -isolated
+Do not auto-bind
+.Pa $HOME
+to
+.Pa /home/user
+and do not set the default guest CWD.
+Useful for hermetic runs or explicit
+.Fl -bind
+profiles only.
+.It Fl -app-profile
+Install the fuller rooted app profile (home, Music, Desktop,
+Documents, Downloads, /Volumes, virtual /dev and /proc).
+.It Fl -trace Ar categories
+Enable category tracing.
+Categories:
+.Ar fs,fd,dev,audio,proc,fork
+(or
+.Ar all ).
+Also set via
+.Ev HL_TRACE .
+Unknown categories are an error.
+Off by default.
+.It Fl -audio-backend Ar name
+Select PCM backend:
+.Ar null ,
+.Ar null-realtime ,
+.Ar wav ,
+or
+.Ar coreaudio
+(default).
+Override with this flag or
+.Ev HL_AUDIO_BACKEND .
+Deterministic tests use null/wav.
 .It Fl -gdb Ar port
 Start a GDB Remote Serial Protocol stub listening on TCP
 .Ar port .
