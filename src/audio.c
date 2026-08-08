@@ -236,6 +236,19 @@ int hl_audio_stream_configure(hl_audio_stream_t *s, const hl_audio_params_t *p) 
     if (s->params.frag_count < 2) s->params.frag_count = 2;
     if (s->params.frag_count > 128) s->params.frag_count = 128;
     s->capacity = s->params.frag_size * s->params.frag_count;
+    /* Resize the transport to match. SO_SNDBUF was set once at create from
+     * the pre-configure capacity and never updated, so after SETFRAGMENT
+     * poll() readiness (socket space) and write() acceptance (capacity -
+     * pending) disagreed: a non-blocking OSS client could spin
+     * poll-ready / write-EAGAIN. */
+    if (s->prod_fd >= 0) {
+        int bufsz = s->capacity;
+        setsockopt(s->prod_fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+    }
+    if (s->cons_fd >= 0) {
+        int bufsz = s->capacity;
+        setsockopt(s->cons_fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+    }
     s->configured = 1;
     pthread_mutex_unlock(&s->lock);
     if (hl_trace_on(HL_TRACE_AUDIO))
@@ -264,6 +277,25 @@ int hl_audio_stream_reset(hl_audio_stream_t *s) {
     if (hl_trace_on(HL_TRACE_AUDIO))
         hl_trace(HL_TRACE_AUDIO, "stream=%llu reset gen=%llu",
                  (unsigned long long)s->id, (unsigned long long)s->generation);
+    return 0;
+}
+
+int hl_audio_stream_drain(hl_audio_stream_t *s) {
+    if (!s) return -1;
+    if (!s->running || s->failed) return 0;
+    /* SNDCTL_DSP_SYNC must block until everything queued has been played.
+     * It previously returned immediately, so apps ending a track lost the
+     * tail. Bounded so a stalled device cannot wedge the guest: at 4kHz
+     * mono (the slowest supported rate) a full ring is well under 5s. */
+    const int max_iters = 5000;          /* 5s at 1ms */
+    for (int i = 0; i < max_iters; i++) {
+        hl_audio_space_t sp;
+        hl_audio_stream_get_space(s, &sp);
+        if (sp.pending == 0) return 0;
+        if (s->stop_worker || s->failed) return 0;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };
+        nanosleep(&ts, NULL);
+    }
     return 0;
 }
 

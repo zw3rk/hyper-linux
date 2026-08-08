@@ -28,6 +28,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
+#include <stddef.h>
 
 /* ---------- Address family translation ---------- */
 
@@ -59,6 +61,31 @@ static int translate_af_to_linux(int mac_af) {
 
 /* Convert Linux sockaddr (from guest memory) to macOS sockaddr.
  * Returns the macOS sockaddr length, or -1 on error. */
+/* Directory backing the emulated Linux abstract AF_UNIX namespace. */
+#define HL_ABSTRACT_DIR "/tmp/.hl-abstract"
+
+/* Linux abstract sockets (sun_path[0] == '\0') have no macOS equivalent.
+ * Copying them verbatim put a NUL at sun_path[0], so the kernel saw an
+ * empty path and bind/connect failed with ENOENT — X11 clients try the
+ * abstract name "\0/tmp/.X11-unix/X0" first. Map the abstract name onto a
+ * deterministic filesystem path instead, so guest processes binding and
+ * connecting to the same abstract name still find each other. */
+static int abstract_to_path(const uint8_t *name, uint32_t name_len,
+                            char *out, size_t out_sz) {
+    size_t o = 0;
+    int n = snprintf(out, out_sz, "%s/", HL_ABSTRACT_DIR);
+    if (n < 0 || (size_t)n >= out_sz) return -1;
+    o = (size_t)n;
+    for (uint32_t i = 0; i < name_len && o + 1 < out_sz; i++) {
+        unsigned char c = name[i];
+        if (c == '\0') break;
+        out[o++] = (c == '/') ? '_' : (char)c;
+    }
+    if (o + 1 >= out_sz) return -1;
+    out[o] = '\0';
+    return (int)o;
+}
+
 static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
                                   struct sockaddr_storage *mac_sa) {
     if (linux_len < 2) return -1;
@@ -70,6 +97,21 @@ static int linux_to_mac_sockaddr(const void *linux_sa, uint32_t linux_len,
     int mac_family = translate_af_to_mac((int)linux_family);
 
     memset(mac_sa, 0, sizeof(*mac_sa));
+
+    /* Abstract AF_UNIX: rewrite to a filesystem path. */
+    if (mac_family == AF_UNIX && linux_len > 3 && src[2] == '\0') {
+        struct sockaddr_un *un = (struct sockaddr_un *)mac_sa;
+        char path[sizeof(un->sun_path)];
+        if (abstract_to_path(src + 3, linux_len - 3, path, sizeof(path)) < 0)
+            return -1;
+        mkdir(HL_ABSTRACT_DIR, 0700);   /* best effort; may already exist */
+        un->sun_family = AF_UNIX;
+        snprintf(un->sun_path, sizeof(un->sun_path), "%s", path);
+        un->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) +
+                                strlen(un->sun_path) + 1);
+        return (int)un->sun_len;
+    }
+
     mac_sa->ss_len = (uint8_t)linux_len;
     mac_sa->ss_family = (uint8_t)mac_family;
 
@@ -1136,8 +1178,21 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
             /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */
             size_t lcmsg_space = (size_t)((lcmsg_len + 7) & ~7ULL);
 
-            if (lpos + lcmsg_space > sizeof(linux_ctrl)) break;
-            if (lpos + lcmsg_space > lmsg.msg_controllen) break;
+            /* No room in the guest's control buffer. Linux reports
+             * MSG_CTRUNC; and any SCM_RIGHTS fds in the part we drop must
+             * be closed or they leak in hl forever. */
+            if (lpos + lcmsg_space > sizeof(linux_ctrl) ||
+                lpos + lcmsg_space > lmsg.msg_controllen) {
+                if (cmsg->cmsg_level == SOL_SOCKET &&
+                    cmsg->cmsg_type == SCM_RIGHTS) {
+                    int *rawfds = (int *)CMSG_DATA(cmsg);
+                    size_t rawn = data_len / sizeof(int);
+                    for (size_t i = 0; i < rawn; i++)
+                        if (rawfds[i] >= 0) close(rawfds[i]);
+                }
+                lmsg.msg_flags |= LINUX_MSG_CTRUNC;
+                break;
+            }
 
             /* Translate SOL_SOCKET (macOS=0xFFFF → Linux=1) */
             int32_t llevel = (cmsg->cmsg_level == SOL_SOCKET) ? 1
@@ -1145,8 +1200,25 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
             int32_t ltype = cmsg->cmsg_type;
 
             /* For SCM_RIGHTS: translate host fds → guest fds */
-            uint8_t data_copy[128];
+            /* Room for every fd macOS can hand us in one cmsg. The old
+             * 128-byte buffer capped translation at 32 fds; a larger
+             * SCM_RIGHTS array fell through UNTRANSLATED, so the guest was
+             * handed raw HOST fd numbers (aliasing unrelated entries in its
+             * own table) and those host fds leaked permanently. mac_ctrl is
+             * 256 bytes, so 61 fds is the ceiling — size for that. */
+            uint8_t data_copy[256];
             uint8_t *data_src = CMSG_DATA(cmsg);
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS && data_len > sizeof(data_copy)) {
+                /* Cannot translate: close them rather than leaking host fds
+                 * into the guest. */
+                int *rawfds = (int *)CMSG_DATA(cmsg);
+                size_t rawn = data_len / sizeof(int);
+                for (size_t i = 0; i < rawn; i++)
+                    if (rawfds[i] >= 0) close(rawfds[i]);
+                lmsg.msg_flags |= LINUX_MSG_CTRUNC;
+                continue;
+            }
             if (cmsg->cmsg_level == SOL_SOCKET &&
                 cmsg->cmsg_type == SCM_RIGHTS && data_len <= sizeof(data_copy)) {
                 memcpy(data_copy, data_src, data_len);
@@ -1205,7 +1277,10 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
 
     /* Update msg_flags in guest (offset 48 in linux_msghdr_t).
      * macOS msg_flags use macOS values — translate to Linux. */
-    int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
+    /* Preserve any CTRUNC raised while translating the control buffer;
+     * it is not reflected in the host msg_flags. */
+    int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags) |
+                     (lmsg.msg_flags & LINUX_MSG_CTRUNC);
     if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
         return -LINUX_EFAULT;
 

@@ -146,8 +146,11 @@ static int is_x11_fd(int gfd) {
     return atomic_load(&x11_fd[gfd]) != 0;
 }
 
+static void stats_service_dump_request(void);
+
 void syscall_stats_note(unsigned nr, int64_t result,
                         uint64_t a0, uint64_t a1, uint64_t a2) {
+    stats_service_dump_request();
     if (!stats_on) return;
 
     if (nr < HL_SYS_STATS_MAX_NR)
@@ -369,8 +372,21 @@ void syscall_stats_dump(const char *label) {
     syscall_stats_dump_fp(stderr, label);
 }
 
+static _Atomic int stats_dump_requested;
+
+/* Async-signal-safe: just latch a request. The previous handler called
+ * pthread_mutex_lock, fprintf, qsort and getenv directly — none of which is
+ * async-signal-safe — and would self-deadlock on dump_lock if the signal
+ * landed on the thread already holding it (e.g. during the atexit dump). */
 static void on_sigusr1(int sig) {
     (void)sig;
+    atomic_store(&stats_dump_requested, 1);
+}
+
+/* Called from the syscall path, outside signal context. */
+static void stats_service_dump_request(void) {
+    if (!atomic_load(&stats_dump_requested)) return;
+    atomic_store(&stats_dump_requested, 0);
     syscall_stats_dump("SIGUSR1");
     const char *r = getenv("HL_SYSCALL_STATS_RESET");
     if (r && (*r == '1' || *r == 'y' || *r == 'Y'))
@@ -382,6 +398,7 @@ void syscall_stats_install_signal(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigusr1;
+    sa.sa_flags = SA_RESTART;   /* do not surface EINTR to in-flight I/O */
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, NULL);
 }

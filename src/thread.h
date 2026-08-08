@@ -110,6 +110,9 @@ void thread_deactivate(thread_entry_t *t);
 
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);
+/* Lock-safe tid lookup: returns tid if live, else 0. Prefer this when only
+ * the tid is needed — thread_find()'s pointer escapes the lock. */
+int64_t thread_find_live_tid(int64_t tid);
 
 /* Lock-free check: is there an active thread with this TID?
  * Returns 1 if found, 0 if not. Safe to call without holding

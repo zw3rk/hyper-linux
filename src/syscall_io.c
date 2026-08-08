@@ -422,6 +422,32 @@ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
 }
 
 int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->read) {
+                int64_t total = 0;
+                for (int i = 0; i < iovcnt; i++) {
+                    linux_iovec_t giov;
+                    if (guest_read(g, iov_gva + (uint64_t)i * sizeof(giov),
+                                   &giov, sizeof(giov)) < 0) {
+                        hl_fd_put(&ref);
+                        return total ? total : -LINUX_EFAULT;
+                    }
+                    if (giov.iov_len == 0) continue;
+                    int64_t r = ref.of->ops->read(ref.of, ref.host_fd, g,
+                                                  giov.iov_base, giov.iov_len);
+                    if (r < 0) { hl_fd_put(&ref); return total ? total : r; }
+                    total += r;
+                    if ((uint64_t)r < giov.iov_len) break;   /* short read */
+                }
+                hl_fd_put(&ref);
+                return total;
+            }
+            hl_fd_put(&ref);
+        }
+    }
     /* Special FD types need their custom read handlers — glibc may use
      * readv() instead of read() for the same logical operation. Delegate
      * to the first iov entry's buffer.  Use the first iov's length (not
@@ -466,9 +492,46 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
         return eventfd_write(fd, g, giov.iov_base, giov.iov_len);
     }
 
+    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+
+    /* Descriptor-backed fds must go through their write op, exactly as
+     * sys_write does. writev() previously fell through to the host fd,
+     * which for /dev/dsp is a dup() of the audio producer socketpair — so
+     * a vectored write injected raw PCM past the software gain and past
+     * the `accepted` accounting, permanently desyncing GETOSPACE and
+     * GETODELAY for the rest of the stream's life. */
+    {
+        hl_fd_ref_t ref;
+        if (hl_fd_get(fd, &ref) == 0) {
+            if (ref.of && ref.of->ops && ref.of->ops->write) {
+                int64_t total = 0;
+                for (int i = 0; i < iovcnt; i++) {
+                    linux_iovec_t giov;
+                    if (guest_read(g, iov_gva + (uint64_t)i * sizeof(giov),
+                                   &giov, sizeof(giov)) < 0) {
+                        hl_fd_put(&ref);
+                        return total ? total : -LINUX_EFAULT;
+                    }
+                    if (giov.iov_len == 0) continue;
+                    int64_t r = ref.of->ops->write(ref.of, ref.host_fd, g,
+                                                   giov.iov_base,
+                                                   giov.iov_len);
+                    if (r < 0) {
+                        hl_fd_put(&ref);
+                        return total ? total : r;
+                    }
+                    total += r;
+                    if ((uint64_t)r < giov.iov_len) break;  /* short write */
+                }
+                hl_fd_put(&ref);
+                return total;
+            }
+            hl_fd_put(&ref);
+        }
+    }
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
-    if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
 
     struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
     int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);

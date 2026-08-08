@@ -54,17 +54,13 @@ static int64_t dev_tty_open(const char *name, int linux_flags, int mode) {
     return open_host_dev("/dev/tty", linux_flags);
 }
 
-static int dev_chr_stat(const char *name, uint32_t *mode_out, uint64_t *rdev_out) {
-    (void)name;
-    if (mode_out) *mode_out = S_IFCHR | 0666;
-    if (rdev_out) *rdev_out = 0;
-    return 0;
-}
-
-static const hl_device_ops_t ops_null = { .open = dev_null_open, .stat = dev_chr_stat };
-static const hl_device_ops_t ops_zero = { .open = dev_zero_open, .stat = dev_chr_stat };
-static const hl_device_ops_t ops_urandom = { .open = dev_urandom_open, .stat = dev_chr_stat };
-static const hl_device_ops_t ops_tty = { .open = dev_tty_open, .stat = dev_chr_stat };
+/* No .stat override: hl_device_stat() already fills mode and the device
+ * numbers from the registry entry. The old dev_chr_stat() zeroed rdev,
+ * throwing away the major/minor each node declares. */
+static const hl_device_ops_t ops_null = { .open = dev_null_open };
+static const hl_device_ops_t ops_zero = { .open = dev_zero_open };
+static const hl_device_ops_t ops_urandom = { .open = dev_urandom_open };
+static const hl_device_ops_t ops_tty = { .open = dev_tty_open };
 
 void hl_device_init(void) {
     pthread_mutex_lock(&dev_lock);
@@ -151,9 +147,12 @@ int hl_device_stat(const char *path, uint32_t *mode_out, uint64_t *rdev_out) {
     if (!n) return -2;
     if (mode_out) *mode_out = n->mode ? n->mode : (S_IFCHR | 0666);
     if (rdev_out) {
-        /* Linux new_encode_dev style rough */
-        unsigned maj = n->major, min = n->minor;
-        *rdev_out = (uint64_t)((min & 0xff) | (maj << 8) | ((min & ~0xffu) << 12));
+        /* HOST (macOS) encoding: callers stuff this into a struct stat that
+         * then goes through translate_stat(), which applies the Linux
+         * new_encode_dev() itself. Emitting a Linux-encoded value here meant
+         * it was encoded twice — stat("/dev/dsp") reported major 0 minor
+         * 1027 while fstat() on the same fd reported something else again. */
+        *rdev_out = (uint64_t)makedev(n->major, n->minor);
     }
     if (n->ops && n->ops->stat)
         return n->ops->stat(n->name, mode_out, rdev_out);

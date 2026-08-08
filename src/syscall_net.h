@@ -16,6 +16,9 @@
 
 /* ---------- Linux address families ---------- */
 #define LINUX_AF_UNSPEC   0
+/* Linux MSG_CTRUNC (macOS uses 0x20 for the same meaning). */
+#define LINUX_MSG_CTRUNC 0x08
+
 #define LINUX_AF_UNIX     1
 #define LINUX_AF_INET     2
 #define LINUX_AF_INET6   10

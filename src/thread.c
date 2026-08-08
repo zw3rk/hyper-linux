@@ -136,6 +136,24 @@ void thread_deactivate(thread_entry_t *t) {
     pthread_mutex_unlock(&thread_lock);
 }
 
+/* Resolve a guest tid to itself if (and only if) it is live, entirely under
+ * thread_lock. thread_find() returns a table pointer after dropping the
+ * lock, so a caller that dereferences it can race thread_alloc() recycling
+ * that slot and end up naming an unrelated thread. Callers that only need
+ * the tid should use this instead. Returns 0 when not found. */
+int64_t thread_find_live_tid(int64_t tid) {
+    int64_t found = 0;
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_table[i].active && thread_table[i].guest_tid == tid) {
+            found = thread_table[i].guest_tid;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_lock);
+    return found;
+}
+
 thread_entry_t *thread_find(int64_t tid) {
     thread_entry_t *result = NULL;
 

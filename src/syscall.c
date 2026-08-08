@@ -1851,21 +1851,37 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          * musl __synccall, pthread_cancel). Queueing process-wide or with
          * SI_USER makes those handshakes hang forever. */
         int is_tkill = ((int)x8 == SYS_tkill);
+        int tgid = is_tkill ? 0 : (int)x0;
         int tid = is_tkill ? (int)x0 : (int)x1;
         int sig = is_tkill ? (int)x1 : (int)x2;
         if (sig < 0 || sig > LINUX_NSIG) {
             result = -LINUX_EINVAL;
             break;
         }
-        thread_entry_t *target = thread_find((int64_t)tid);
-        if (!target) {
-            /* Fall back to checking main PID for compatibility */
-            int64_t our_pid = proc_get_pid();
-            if (tid == (int)our_pid) target = current_thread;
+        /* Linux: EINVAL for a non-positive tid, and for tgkill also for a
+         * non-positive tgid. The tgid was ignored entirely, so
+         * tgkill(-1, tid, sig) silently delivered instead of failing. */
+        if (tid <= 0 || (!is_tkill && tgid <= 0)) {
+            result = -LINUX_EINVAL;
+            break;
         }
-        if (target) {
+        /* Single guest process: the only valid thread group is our own. */
+        if (!is_tkill && (int64_t)tgid != proc_get_pid()) {
+            result = -LINUX_ESRCH;
+            break;
+        }
+        /* Resolve to a tid under thread_lock rather than holding a table
+         * pointer across the unlock, where slot recycling could redirect
+         * the signal at an unrelated thread. */
+        int64_t target_tid = thread_find_live_tid((int64_t)tid);
+        if (target_tid == 0) {
+            int64_t our_pid = proc_get_pid();
+            if (tid == (int)our_pid && current_thread)
+                target_tid = current_thread->guest_tid;
+        }
+        if (target_tid != 0) {
             if (sig > 0)
-                signal_queue_directed(sig, target->guest_tid, LINUX_SI_TKILL);
+                signal_queue_directed(sig, target_tid, LINUX_SI_TKILL);
             result = 0;
         } else {
             result = -LINUX_ESRCH;

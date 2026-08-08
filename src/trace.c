@@ -153,11 +153,42 @@ void hl_tracev(uint32_t cat, const char *fmt, va_list ap) {
     char body[1024];
     vsnprintf(body, sizeof(body), fmt, ap);
 
+    /* Sanitize the finished line rather than each call site. Trace strings
+     * carry guest-controlled path bytes, which reached the operator's
+     * terminal raw — control characters and ANSI/OSC escapes included.
+     * Applying it here also makes HL_TRACE_REDACT effective: hl_trace_path()
+     * and hl_trace_escape() existed but had no callers at all, so the
+     * documented redaction silently did nothing. */
+    char safe[sizeof(body) * 4];
+    if (hl_trace_redact_paths) {
+        char red[sizeof(body)];
+        const char *home = getenv("HOME");
+        size_t hl = home ? strlen(home) : 0;
+        if (hl > 0) {
+            /* Replace every occurrence of $HOME with "~". */
+            size_t o = 0;
+            for (size_t i = 0; body[i] && o + 1 < sizeof(red); ) {
+                if (strncmp(body + i, home, hl) == 0) {
+                    red[o++] = '~';
+                    i += hl;
+                } else {
+                    red[o++] = body[i++];
+                }
+            }
+            red[o] = '\0';
+            hl_trace_escape(safe, sizeof(safe), red);
+        } else {
+            hl_trace_escape(safe, sizeof(safe), body);
+        }
+    } else {
+        hl_trace_escape(safe, sizeof(safe), body);
+    }
+
     pthread_mutex_lock(&trace_lock);
     fprintf(stderr, "hl[pid=%d tid=%lu] %s %s\n",
             (int)getpid(),
             (unsigned long)(uintptr_t)pthread_self(),
-            cname, body);
+            cname, safe);
     fflush(stderr);
     pthread_mutex_unlock(&trace_lock);
 }

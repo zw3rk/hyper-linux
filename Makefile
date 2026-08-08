@@ -65,7 +65,7 @@ RED    := \033[0;31m
 RESET  := \033[0m
 
 # ── Compiler flags ────────────────────────────────────────────────
-CFLAGS := -O2 -Wall -Wextra -Wpedantic \
+CFLAGS := -O2 -std=c11 -Werror=vla -Wall -Wextra -Wpedantic \
           -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
           -Wformat=2 -Wimplicit-fallthrough -Wundef \
           -Wnull-dereference -Wno-unused-parameter
@@ -303,6 +303,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	printf "\n$(BLUE)── X11 raw protocol tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)── VFS / OSS / device tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-shm; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-dsp-presence; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-bare-name; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigpipe-survival; \
@@ -328,6 +329,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	rm -rf "$$tmpdir"; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
+	@$(MAKE) --no-print-directory test-host-units
 
 ## Host-side unit tests (no guest VM): VFS resolver + audio gain
 test-host-units:

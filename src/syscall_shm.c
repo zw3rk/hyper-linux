@@ -49,7 +49,22 @@
 #define LINUX_SHM_STAT   13
 #define LINUX_SHM_RDONLY 010000
 #define LINUX_SHM_REMAP  040000
+#define LINUX_SHM_LOCK   11
+#define LINUX_SHM_UNLOCK 12
 #endif
+
+/* Linux struct shminfo / shm_info (asm-generic, 64-bit). */
+typedef struct {
+    uint64_t shmmax, shmmin, shmmni, shmseg, shmall;
+    uint64_t unused[4];
+} linux_shminfo_t;
+
+typedef struct {
+    int32_t  used_ids;
+    int32_t  pad;
+    uint64_t shm_tot, shm_rss, shm_swp;
+    uint64_t swap_attempts, swap_successes;
+} linux_shm_info_t;
 
 #define LINUX_IPC_PRIVATE 0
 
@@ -89,7 +104,6 @@ static hl_shm_seg_t segs[HL_SHM_MAX];
 static uint64_t hl_shm_find_guest_va(guest_t *g, size_t ipa_span);
 static pthread_mutex_t shm_lock = PTHREAD_MUTEX_INITIALIZER;
 static int resolve_hooked;
-static uint64_t steal_cursor; /* next IPA to steal inside primary */
 
 static size_t
 align_host_page(size_t n)
@@ -195,6 +209,30 @@ find_by_guest_va(uint64_t va)
     return NULL;
 }
 
+/* True when [lo, lo+span) overlaps any live segment's IPA reservation. */
+static int
+ipa_range_busy(uint64_t lo, size_t span)
+{
+    for (int i = 0; i < HL_SHM_MAX; i++) {
+        if (!segs[i].used || !segs[i].stage2_stolen || !segs[i].ipa) continue;
+        uint64_t a = segs[i].ipa, b = a + segs[i].ipa_span;
+        if (lo < b && a < lo + span) return 1;
+    }
+    return 0;
+}
+
+/* True when [lo, lo+span) overlaps any live segment's guest VA window. */
+static int
+va_range_busy(uint64_t lo, size_t span)
+{
+    for (int i = 0; i < HL_SHM_MAX; i++) {
+        if (!segs[i].used || !segs[i].guest_va) continue;
+        uint64_t a = segs[i].guest_va, b = a + segs[i].ipa_span;
+        if (lo < b && a < lo + span) return 1;
+    }
+    return 0;
+}
+
 static hl_shm_seg_t *
 alloc_slot(void)
 {
@@ -271,24 +309,41 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
         return -LINUX_EINVAL;
 
     pthread_mutex_lock(&shm_lock);
+    int slot_is_new = 0;
     s = find_by_shmid(shmid);
     if (!s) {
-        /* Segment created outside our table — adopt it */
+        /* Adopt a segment we created but no longer track — but ONLY our
+         * own. Adopting any shmid the guest names let it enumerate and map
+         * the SysV segments of unrelated same-uid host processes straight
+         * into its address space. */
+        if (shmctl(shmid, IPC_STAT, &ds) != 0) {
+            pthread_mutex_unlock(&shm_lock);
+            return -LINUX_EINVAL;
+        }
+        if (ds.shm_cpid != getpid()) {
+            pthread_mutex_unlock(&shm_lock);
+            return -LINUX_EACCES;
+        }
         s = alloc_slot();
         if (s) {
+            slot_is_new = 1;
             s->host_shmid = shmid;
-            if (shmctl(shmid, IPC_STAT, &ds) == 0)
-                s->size = ds.shm_segsz;
-            else
-                s->size = (size_t)HL_SHM_2MB;
+            s->size = ds.shm_segsz ? (size_t)ds.shm_segsz : (size_t)HL_SHM_2MB;
             s->map_size = align_host_page(s->size);
             s->ipa_span = align_2mb(s->map_size);
         }
     }
     if (!s) {
         pthread_mutex_unlock(&shm_lock);
-        return -LINUX_EINVAL;
+        return -LINUX_ENOSPC;
     }
+    /* Free the slot again on any error below, or 64 failed attaches would
+     * exhaust the table and disable SysV SHM for the whole process. */
+    #define SHMAT_FAIL(rc) do {                       \
+        if (slot_is_new) memset(s, 0, sizeof(*s));    \
+        pthread_mutex_unlock(&shm_lock);              \
+        return (rc);                                  \
+    } while (0)
 
     /* Refresh size from kernel (actual rounded size). */
     if (shmctl(shmid, IPC_STAT, &ds) == 0 && ds.shm_segsz > 0) {
@@ -306,9 +361,9 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             int e = errno;
             fprintf(stderr, "hl: host shmat(%d) failed: %s (flg=0%o)\n",
                     shmid, strerror(e), host_flg);
-            pthread_mutex_unlock(&shm_lock);
             errno = e;
-            return linux_errno();
+            int lrc = (int)linux_errno();
+            SHMAT_FAIL(lrc);
         }
         s->host_addr = host;
 
@@ -351,23 +406,27 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             }
             zone_lo = (zone_lo + HL_SHM_2MB - 1) & ~(HL_SHM_2MB - 1);
 
-            if (steal_cursor == 0 || steal_cursor < zone_lo)
-                steal_cursor = zone_lo;
-
-            if (steal_cursor + ipa_span > zone_hi) {
+            /* First fit over the band. This used to be a monotonic bump
+             * cursor that release never rewound, so ~1024 attach/detach
+             * cycles exhausted the 2GB zone even though every segment had
+             * been freed — a GTK client recreating its XShmImage on each
+             * resize hit that. */
+            ipa = 0;
+            for (uint64_t cand = zone_lo; cand + ipa_span <= zone_hi;
+                 cand += HL_SHM_2MB) {
+                if (!ipa_range_busy(cand, ipa_span)) { ipa = cand; break; }
+            }
+            if (ipa == 0) {
                 fprintf(stderr,
                         "hl: shmat: no room to steal IPA "
-                        "(cursor=0x%llx span=0x%zx zone=[0x%llx,0x%llx))\n",
-                        (unsigned long long)steal_cursor, ipa_span,
+                        "(span=0x%zx zone=[0x%llx,0x%llx))\n",
+                        ipa_span,
                         (unsigned long long)zone_lo,
                         (unsigned long long)zone_hi);
                 shmdt(host);
                 s->host_addr = NULL;
-                pthread_mutex_unlock(&shm_lock);
-                return -LINUX_ENOMEM;
+                SHMAT_FAIL(-LINUX_ENOMEM);
             }
-            ipa = steal_cursor;
-            steal_cursor += ipa_span;
         }
 
         /* Drop primary Stage-2 for the reservation, then map SHM pages. */
@@ -389,8 +448,7 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             hl_shm_restore_stage2(g, ipa, ipa_span);
             shmdt(host);
             s->host_addr = NULL;
-            pthread_mutex_unlock(&shm_lock);
-            return -LINUX_ENOMEM;
+            SHMAT_FAIL(-LINUX_ENOMEM);
         }
 
         s->ipa = ipa;
@@ -413,16 +471,14 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             fprintf(stderr,
                     "hl: shmat: shmaddr 0x%llx not 2MB-aligned\n",
                     (unsigned long long)shmaddr);
-            pthread_mutex_unlock(&shm_lock);
-            return -LINUX_EINVAL;
+            SHMAT_FAIL(-LINUX_EINVAL);
         }
         guest_va = shmaddr;
     } else {
         guest_va = hl_shm_find_guest_va(g, ipa_span);
         if (guest_va == 0) {
             fprintf(stderr, "hl: shmat: no guest VA\n");
-            pthread_mutex_unlock(&shm_lock);
-            return -LINUX_ENOMEM;
+            SHMAT_FAIL(-LINUX_ENOMEM);
         }
     }
 
@@ -436,8 +492,7 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
                            MEM_PERM_RW) != 0) {
         fprintf(stderr, "hl: shmat map_va failed va=0x%llx ipa=0x%llx\n",
                 (unsigned long long)guest_va, (unsigned long long)ipa);
-        pthread_mutex_unlock(&shm_lock);
-        return -LINUX_ENOMEM;
+        SHMAT_FAIL(-LINUX_ENOMEM);
     }
     guest_region_add(g, guest_va, guest_va + map_size, MEM_PERM_RW,
                      0 /* flags */, 0 /* offset */, "[sysvshm]");
@@ -459,7 +514,6 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
 static uint64_t
 hl_shm_find_guest_va(guest_t *g, size_t ipa_span)
 {
-    static uint64_t next_va;
     uint64_t va;
     size_t span = ipa_span ? ipa_span : (size_t)HL_SHM_2MB;
     /* Guest VA in the lower half of the reserved band; IPA steals the upper
@@ -475,13 +529,13 @@ hl_shm_find_guest_va(guest_t *g, size_t ipa_span)
     }
     va_lo = (va_lo + HL_SHM_2MB - 1) & ~(HL_SHM_2MB - 1);
 
-    if (next_va == 0 || next_va < va_lo)
-        next_va = va_lo;
-    va = next_va;
-    next_va += span;
-    if (va + span > va_hi)
-        return 0;
-    return va;
+    /* First fit over the band, so a detached window is reusable. The old
+     * monotonic `next_va` was never rewound on release. */
+    for (va = va_lo; va + span <= va_hi; va += HL_SHM_2MB) {
+        if (!va_range_busy(va, span))
+            return va;
+    }
+    return 0;
 }
 
 /*
@@ -516,6 +570,11 @@ sys_shmdt(guest_t *g, uint64_t shmaddr)
     if (s->nattach > 0)
         s->nattach--;
     if (s->nattach == 0) {
+        /* Invalidate the Stage-1 mapping. Without this the 2MB window
+         * stayed valid and writable after detach and aliased primary guest
+         * RAM once the IPA slice was restored — Linux would SIGSEGV. */
+        if (s->guest_va)
+            guest_unmap_va_range(g, s->guest_va, s->guest_va + s->ipa_span);
         guest_region_remove(g, s->guest_va, s->guest_va + s->map_size);
         s->guest_va = 0;
         if (s->rmid_pending) {
@@ -551,7 +610,15 @@ sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva)
          * so the X server read a zero-filled segment — every XMMS skin
          * pixmap came out black, on both the AppKit and Xplugin paths.
          */
-        shmctl(shmid, IPC_RMID, NULL);
+        int rmid_rc = shmctl(shmid, IPC_RMID, NULL);
+        if (rmid_rc < 0 && !s) {
+            /* Propagate the real error (EINVAL/EPERM) instead of always
+             * reporting success. */
+            int e = errno;
+            pthread_mutex_unlock(&shm_lock);
+            errno = e;
+            return linux_errno();
+        }
         if (s) {
             if (s->nattach > 0)
                 s->rmid_pending = 1; /* freed by the last sys_shmdt */
@@ -565,18 +632,164 @@ sys_shmctl(guest_t *g, int shmid, int cmd, uint64_t buf_gva)
     if (cmd == LINUX_IPC_STAT || cmd == LINUX_SHM_STAT) {
         if (buf_gva == 0)
             return -LINUX_EFAULT;
-        if (shmctl(shmid, IPC_STAT, &ds) < 0)
+        int target = shmid;
+        int ret_id = 0;
+        if (cmd == LINUX_SHM_STAT) {
+            /* SHM_STAT's argument is an INDEX into the kernel's table and
+             * the call returns the segment id — it was being treated as a
+             * shmid, so it always reported 0. */
+            if (shmid < 0 || shmid >= HL_SHM_MAX) return -LINUX_EINVAL;
+            pthread_mutex_lock(&shm_lock);
+            if (!segs[shmid].used) {
+                pthread_mutex_unlock(&shm_lock);
+                return -LINUX_EINVAL;
+            }
+            target = segs[shmid].host_shmid;
+            pthread_mutex_unlock(&shm_lock);
+            ret_id = target;
+        }
+        if (shmctl(target, IPC_STAT, &ds) < 0)
             return linux_errno();
         memset(&lds, 0, sizeof(lds));
         lds.shm_segsz = ds.shm_segsz;
         lds.shm_nattch = (uint64_t)ds.shm_nattch;
         if (guest_write(g, buf_gva, &lds, sizeof(lds)) < 0)
             return -LINUX_EFAULT;
+        return ret_id;
+    }
+
+    if (cmd == LINUX_IPC_INFO) {
+        /* Previously returned 0 without writing anything, so `ipcs -l`
+         * read its own uninitialized stack as the limits. */
+        if (buf_gva == 0) return -LINUX_EFAULT;
+        linux_shminfo_t si;
+        memset(&si, 0, sizeof(si));
+        si.shmmax = (uint64_t)HL_SHM_2MB * 512;   /* 1GB */
+        si.shmmin = 1;
+        si.shmmni = HL_SHM_MAX;
+        si.shmseg = HL_SHM_MAX;
+        si.shmall = si.shmmax / 4096;
+        if (guest_write(g, buf_gva, &si, sizeof(si)) < 0)
+            return -LINUX_EFAULT;
+        /* Linux returns the highest used index. */
+        int high = 0;
+        pthread_mutex_lock(&shm_lock);
+        for (int i = 0; i < HL_SHM_MAX; i++) if (segs[i].used) high = i;
+        pthread_mutex_unlock(&shm_lock);
+        return high;
+    }
+
+    if (cmd == LINUX_SHM_INFO) {
+        if (buf_gva == 0) return -LINUX_EFAULT;
+        linux_shm_info_t inf;
+        memset(&inf, 0, sizeof(inf));
+        int high = 0;
+        pthread_mutex_lock(&shm_lock);
+        for (int i = 0; i < HL_SHM_MAX; i++) {
+            if (!segs[i].used) continue;
+            inf.used_ids++;
+            inf.shm_tot += segs[i].size / 4096;
+            high = i;
+        }
+        pthread_mutex_unlock(&shm_lock);
+        inf.shm_rss = inf.shm_tot;
+        if (guest_write(g, buf_gva, &inf, sizeof(inf)) < 0)
+            return -LINUX_EFAULT;
+        return high;
+    }
+
+    if (cmd == LINUX_IPC_SET) {
+        /* Permissions are not emulated (single-uid guest), but the call
+         * must not fail: it returned EINVAL on a segment the caller owns. */
+        if (buf_gva == 0) return -LINUX_EFAULT;
+        if (shmctl(shmid, IPC_STAT, &ds) < 0) return linux_errno();
         return 0;
     }
 
-    if (cmd == LINUX_IPC_INFO || cmd == LINUX_SHM_INFO)
+    if (cmd == LINUX_SHM_LOCK || cmd == LINUX_SHM_UNLOCK) {
+        /* No swap to lock against; Linux returns 0 for a permitted caller. */
+        if (shmctl(shmid, IPC_STAT, &ds) < 0) return linux_errno();
         return 0;
+    }
 
     return -LINUX_EINVAL;
+}
+
+/* ---------- fork support ---------- */
+
+int hl_shm_fork_max(void) { return HL_SHM_MAX; }
+
+int
+hl_shm_fork_export(hl_shm_fork_rec_t *out, int max)
+{
+    int n = 0;
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&shm_lock);
+    for (int i = 0; i < HL_SHM_MAX && n < max; i++) {
+        if (!segs[i].used || !segs[i].stage2_stolen) continue;
+        out[n].host_shmid   = segs[i].host_shmid;
+        out[n].nattach      = segs[i].nattach;
+        out[n].rmid_pending = segs[i].rmid_pending;
+        out[n].pad          = 0;
+        out[n].size         = segs[i].size;
+        out[n].map_size     = segs[i].map_size;
+        out[n].ipa_span     = segs[i].ipa_span;
+        out[n].guest_va     = segs[i].guest_va;
+        out[n].ipa          = segs[i].ipa;
+        n++;
+    }
+    pthread_mutex_unlock(&shm_lock);
+    return n;
+}
+
+int
+hl_shm_fork_import(guest_t *g, const hl_shm_fork_rec_t *in, int n)
+{
+    if (!in || n <= 0) return 0;
+    if (n > HL_SHM_MAX) n = HL_SHM_MAX;
+
+    pthread_mutex_lock(&shm_lock);
+    for (int i = 0; i < n; i++) {
+        hl_shm_seg_t *s = alloc_slot();
+        if (!s) break;
+
+        /* SysV segments are kernel-global, so the child attaches the very
+         * same shmid the parent did — that is what makes the memory
+         * genuinely shared rather than copied. */
+        void *host = shmat(in[i].host_shmid, NULL, 0);
+        if (host == (void *)(intptr_t)-1) {
+            memset(s, 0, sizeof(*s));
+            continue;
+        }
+
+        s->host_shmid   = in[i].host_shmid;
+        s->nattach      = in[i].nattach;
+        s->rmid_pending = in[i].rmid_pending;
+        s->size         = (size_t)in[i].size;
+        s->map_size     = (size_t)in[i].map_size;
+        s->ipa_span     = (size_t)in[i].ipa_span;
+        s->guest_va     = in[i].guest_va;
+        s->ipa          = in[i].ipa;
+        s->host_addr    = host;
+
+        /* Re-establish the Stage-2 override at the same IPA. The guest page
+         * tables came across with the memory image and already point here. */
+        hv_vm_unmap(s->ipa, s->ipa_span);
+        hv_return_t hv = hv_vm_map(host, s->ipa, s->map_size,
+                                   HV_MEMORY_READ | HV_MEMORY_WRITE);
+        if (hv != HV_SUCCESS) {
+            fprintf(stderr,
+                    "hl: shm fork import: hv_vm_map ipa=0x%llx sz=0x%zx → %d\n",
+                    (unsigned long long)s->ipa, s->map_size, (int)hv);
+            hl_shm_restore_stage2(g, s->ipa, s->ipa_span);
+            shmdt(host);
+            memset(s, 0, sizeof(*s));
+            continue;
+        }
+        s->stage2_stolen = 1;
+    }
+    pthread_mutex_unlock(&shm_lock);
+    hl_shm_ensure_hook();   /* gva_resolve must consult the segment table */
+    g->need_tlbi = 1;
+    return 0;
 }

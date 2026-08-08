@@ -104,6 +104,8 @@ void hl_audio_stream_destroy(hl_audio_stream_t *s);
 int hl_audio_stream_configure(hl_audio_stream_t *s, const hl_audio_params_t *p);
 int hl_audio_stream_reset(hl_audio_stream_t *s);
 int hl_audio_stream_post(hl_audio_stream_t *s);
+/* Block until queued audio has played (bounded). Used by SNDCTL_DSP_SYNC. */
+int hl_audio_stream_drain(hl_audio_stream_t *s);
 
 int64_t hl_audio_stream_write(hl_audio_stream_t *s, const void *buf, size_t n);
 

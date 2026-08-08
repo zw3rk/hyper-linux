@@ -17,6 +17,7 @@
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
 #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
 #include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
+#include "syscall_shm.h"     /* hl_shm_fork_export/import */
 #include "futex.h"           /* futex_wake_one */
 #include "fd_object.h"
 #include "audio_oss.h"
@@ -45,7 +46,7 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
-#define IPC_VERSION       5            /* v5: OSS open-file recreate-empty object graph */
+#define IPC_VERSION       6            /* v6: + SysV SHM segment records */
 #define IPC_FD_HAS_OBJECT 1            /* ipc_fd_entry_t.pad: synthetic open-file follows */
 
 /* IPC header: sent first over socketpair */
@@ -546,6 +547,36 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             return 1;
         }
         hl_vfs_fork_import(&vfs_snap);
+    }
+
+    /* SysV SHM segments: re-attach the same shmids and restore the Stage-2
+     * override so the inherited guest page tables resolve to shared memory. */
+    {
+        int32_t nshm = 0;
+        if (ipc_read_all(ipc_fd, &nshm, sizeof(nshm)) < 0) {
+            fprintf(stderr, "hl: fork-child: failed to read SHM count\n");
+            guest_destroy(&g);
+            return 1;
+        }
+        if (nshm < 0 || nshm > hl_shm_fork_max()) {
+            fprintf(stderr, "hl: fork-child: bad SHM count %d\n", nshm);
+            guest_destroy(&g);
+            return 1;
+        }
+        if (nshm > 0) {
+            hl_shm_fork_rec_t *recs =
+                calloc((size_t)nshm, sizeof(*recs));
+            if (!recs) { guest_destroy(&g); return 1; }
+            if (ipc_read_all(ipc_fd, recs,
+                             (size_t)nshm * sizeof(*recs)) < 0) {
+                fprintf(stderr, "hl: fork-child: failed to read SHM recs\n");
+                free(recs);
+                guest_destroy(&g);
+                return 1;
+            }
+            hl_shm_fork_import(&g, recs, nshm);
+            free(recs);
+        }
     }
 
     if (hl_vfs_mode() == HL_FS_ROOTED) {
@@ -1844,6 +1875,29 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
             close(ipc_sock);
             return -LINUX_ENOMEM;
         }
+    }
+
+    /* Attached SysV SHM segments. They must stay SHARED across fork, but the
+     * Stage-2 override lives in the parent's VM only and the segment table is
+     * process-local, so without this the child silently resolved SHM guest
+     * VAs to its own COW copy of primary RAM. */
+    {
+        int shm_max = hl_shm_fork_max();
+        hl_shm_fork_rec_t *shm_recs =
+            calloc((size_t)shm_max, sizeof(*shm_recs));
+        if (!shm_recs) {
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+        int32_t nshm = (int32_t)hl_shm_fork_export(shm_recs, shm_max);
+        if (ipc_write_all(ipc_sock, &nshm, sizeof(nshm)) < 0 ||
+            (nshm > 0 && ipc_write_all(ipc_sock, shm_recs,
+                                       (size_t)nshm * sizeof(*shm_recs)) < 0)) {
+            free(shm_recs);
+            close(ipc_sock);
+            return -LINUX_ENOMEM;
+        }
+        free(shm_recs);
     }
 
     /* Sysroot path (for dynamic linker library resolution) */

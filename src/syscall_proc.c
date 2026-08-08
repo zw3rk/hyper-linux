@@ -1457,8 +1457,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                             ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
                         si_addr = far_addr;
 
-                        /* Always log guest faults — needed for XMMS/UI RCA. */
-                        {
+                        /* Log guest faults — needed for XMMS/UI RCA — but
+                         * rate-limited. Guests that use SIGSEGV as a control
+                         * mechanism (GC write barriers, JIT guard pages)
+                         * otherwise flood stderr and pay 8 extra
+                         * hv_vcpu_get_* calls per fault on a hot path. */
+                        static _Atomic unsigned el0_fault_logs;
+                        unsigned el0_seen =
+                            atomic_fetch_add(&el0_fault_logs, 1);
+                        if (hl_verbose || el0_seen < 16) {
                             const char *fault_type =
                                 (fault_ec == 0x20) ? "inst" : "data";
                             const char *code_name =

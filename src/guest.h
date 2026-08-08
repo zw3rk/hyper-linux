@@ -365,6 +365,7 @@ int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * L0/L1/L2 indices are derived from va_start; block descriptor output IPAs
  * come from gpa_start. Both va_start and gpa_start must be 2MB-aligned.
  * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
+int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end);
 int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
                        uint64_t gpa_start, int perms);
 

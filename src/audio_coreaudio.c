@@ -33,6 +33,16 @@ typedef struct ca_state {
      * DC, i.e. a loud click on every start and every underrun. Computed
      * at setup so the real-time callback only reads it. */
     uint8_t silence;
+    /* Bytes per frame for the current format; used to keep submitted
+     * buffers frame-aligned. */
+    uint32_t bpf;
+    /* Carry for a partial frame left over from the previous callback. */
+    uint8_t  carry[8];
+    uint32_t carry_len;
+    /* Guest bytes contained in each in-flight buffer, so `completed` can be
+     * advanced when a buffer finishes PLAYING rather than when it is filled.
+     * Silence padding is excluded so it never inflates the counter. */
+    uint32_t buf_bytes[AQ_BUFFERS];
 } ca_state_t;
 
 /* Callback: only copy from stream's cons_fd via pre-known state; no log/malloc. */
@@ -51,18 +61,53 @@ static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b) {
         AudioQueueEnqueueBuffer(q, b, 0, NULL);
         return;
     }
-    int n = (int)b->mAudioDataBytesCapacity;
-    ssize_t got = read(s->cons_fd, b->mAudioData, (size_t)n);
-    if (got < 0) got = 0;
-    if (got < n)
-        memset((uint8_t *)b->mAudioData + got, st->silence,
-               (size_t)(n - got));
-    b->mAudioDataByteSize = (UInt32)n;
-    /* Counters: no lock (callback restriction). Worker is not started for CA. */
-    if (got > 0) {
-        atomic_fetch_add(&s->completed, (uint64_t)got);
-        atomic_fetch_add(&s->submitted, (uint64_t)got);
+    /* This buffer has finished playing. Retire its guest bytes now, so
+     * `completed` tracks what the device actually played rather than what
+     * was handed to the queue — SNDCTL_DSP_GETODELAY previously
+     * under-reported by the whole queue depth (~93ms). */
+    int slot = -1;
+    for (int i = 0; i < AQ_BUFFERS; i++)
+        if (st->bufs[i] == b) { slot = i; break; }
+    if (slot >= 0 && st->buf_bytes[slot]) {
+        atomic_fetch_add(&s->completed, (uint64_t)st->buf_bytes[slot]);
+        st->buf_bytes[slot] = 0;
     }
+
+    int n = (int)b->mAudioDataBytesCapacity;
+    uint8_t *dst = (uint8_t *)b->mAudioData;
+
+    /* Re-emit any partial frame held back last time, so the frame phase is
+     * preserved. Without this a single guest write that is not a whole
+     * number of frames shifted every following sample by a byte for the
+     * rest of the stream (L/R swap / broadband noise). */
+    uint32_t pre = st->carry_len;
+    if (pre) {
+        memcpy(dst, st->carry, pre);
+        st->carry_len = 0;
+    }
+
+    ssize_t got = read(s->cons_fd, dst + pre, (size_t)n - pre);
+    if (got < 0) got = 0;
+    uint32_t have = pre + (uint32_t)got;
+
+    /* Submit only whole frames; stash the tail for the next callback. */
+    uint32_t bpf = st->bpf ? st->bpf : 1;
+    uint32_t keep = have % bpf;
+    if (keep && keep <= sizeof(st->carry)) {
+        memcpy(st->carry, dst + (have - keep), keep);
+        st->carry_len = keep;
+        have -= keep;
+    }
+
+    if (have < (uint32_t)n)
+        memset(dst + have, st->silence, (size_t)n - have);
+    b->mAudioDataByteSize = (UInt32)n;
+
+    /* Counters: no lock (callback restriction). Worker is not started for CA. */
+    if (got > 0)
+        atomic_fetch_add(&s->submitted, (uint64_t)got);
+    if (slot >= 0)
+        st->buf_bytes[slot] = have;   /* retired when this buffer completes */
     AudioQueueEnqueueBuffer(q, b, 0, NULL);
 }
 
@@ -93,6 +138,9 @@ static int ca_setup_queue(hl_audio_stream_t *s, ca_state_t *st) {
 
     /* S16 silence is 0x00; unsigned 8-bit PCM is centered on 0x80. */
     st->silence = (s->params.format == HL_AUDIO_FMT_S16_LE) ? 0x00 : 0x80;
+    st->bpf = asbd.mBytesPerFrame ? asbd.mBytesPerFrame : 1;
+    st->carry_len = 0;
+    for (int i = 0; i < AQ_BUFFERS; i++) st->buf_bytes[i] = 0;
 
     OSStatus err = AudioQueueNewOutput(&asbd, ca_callback, st, NULL, NULL, 0,
                                        &st->queue);

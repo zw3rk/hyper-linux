@@ -398,8 +398,17 @@ int main(int argc, char **argv) {
     }
     int guest_argc = argc - arg_start;
     const char **guest_argv = malloc(guest_argc * sizeof(char *));
-    for (int i = 0; i < guest_argc; i++)
+    if (!guest_argv) {
+        fprintf(stderr, "hl: out of memory building guest argv\n");
+        return 1;
+    }
+    for (int i = 0; i < guest_argc; i++) {
         guest_argv[i] = strdup(argv[arg_start + i]);
+        if (!guest_argv[i]) {
+            fprintf(stderr, "hl: out of memory building guest argv\n");
+            return 1;
+        }
+    }
 
     /* ---- Step 1: Load and parse ELF ---- */
     elf_info_t elf_info;
@@ -950,7 +959,8 @@ too_many_regions:
     /* HOME / XAUTHORITY: host $HOME is /Users/... but default bind maps
      * it to /home/user. Point guest HOME (and X auth cookie file) there. */
     if (!isolated && home_bind_set && n_owned_env < 16) {
-        owned_env_vars[n_owned_env++] = strdup("HOME=/home/user");
+        { char *e = strdup("HOME=/home/user");
+          if (e) owned_env_vars[n_owned_env++] = e; }
         const char *host_home = getenv("HOME");
         if (host_home && host_home[0] && n_owned_env < 16) {
             char xauth_host[LINUX_PATH_MAX];
@@ -985,9 +995,11 @@ too_many_regions:
      * /var/folders and is not visible in the guest. XMMS puts its
      * control socket at $TMPDIR/xmms_user.0. */
     if (tmp_bound && n_owned_env < 16) {
-        owned_env_vars[n_owned_env++] = strdup("TMPDIR=/tmp");
+        { char *e = strdup("TMPDIR=/tmp");
+          if (e) owned_env_vars[n_owned_env++] = e; }
         if (n_owned_env < 16)
-            owned_env_vars[n_owned_env++] = strdup("TMP=/tmp");
+            { char *e = strdup("TMP=/tmp");
+              if (e) owned_env_vars[n_owned_env++] = e; }
     }
 
     /*

@@ -31,6 +31,7 @@ typedef struct oss_dsp_state {
     int channels;
     int speed;
     int frag_arg;  /* SETFRAGMENT packed */
+    uint32_t rdev; /* Linux-encoded dev of the node this fd was opened from */
 } oss_dsp_state_t;
 
 typedef struct oss_mixer_state {
@@ -165,8 +166,15 @@ static int64_t oss_ioctl(hl_open_file_t *of, int host_fd,
         hl_audio_stream_reset(s);
         return 0;
     }
-    if (req == SNDCTL_DSP_POST || req == SNDCTL_DSP_SYNC) {
+    if (req == SNDCTL_DSP_POST) {
         hl_audio_stream_post(s);
+        return 0;
+    }
+    if (req == SNDCTL_DSP_SYNC) {
+        /* OSS contract: SYNC drains, RESET drops. Both used to alias POST,
+         * so SYNC returned without waiting for playback to finish. */
+        hl_audio_stream_post(s);
+        hl_audio_stream_drain(s);
         return 0;
     }
     if (req == SNDCTL_DSP_NONBLOCK) {
@@ -324,13 +332,17 @@ static int64_t oss_ioctl(hl_open_file_t *of, int host_fd,
 
 static int64_t oss_fstat(hl_open_file_t *of, int host_fd,
                          guest_t *g, uint64_t stat_gva) {
-    (void)of; (void)host_fd;
+    (void)host_fd;
     linux_stat_t st;
     memset(&st, 0, sizeof(st));
-    st.st_mode = 020666; /* S_IFCHR | 0666 — use numeric for portability */
-    /* Linux S_IFCHR is 0020000 */
-    st.st_mode = 0020000 | 0666;
-    st.st_rdev = (4 << 8) | 3; /* major 4 minor 3 typical dsp */
+    st.st_mode = 0020000 | 0666;   /* Linux S_IFCHR | 0666 */
+    /* Report the same dev the registry (and therefore stat()) uses. This
+     * was hardcoded to major 4 minor 3, so stat() and fstat() on the same
+     * open fd disagreed and neither matched the OSS major of 14. */
+    {
+        oss_dsp_state_t *dst = of ? of->state : NULL;
+        st.st_rdev = (dst && dst->rdev) ? dst->rdev : (uint32_t)((14 << 8) | 3);
+    }
     st.st_blksize = 4096;
     st.st_nlink = 1;
     if (guest_write(g, stat_gva, &st, sizeof(st)) < 0) return -LINUX_EFAULT;
@@ -439,7 +451,7 @@ static const hl_fd_ops_t oss_dsp_ops = {
 };
 
 static int64_t dsp_open(const char *name, int linux_flags, int mode) {
-    (void)name; (void)mode;
+    (void)mode;
     /* Capture (O_RDONLY without write) not supported */
     int acc = linux_flags & O_ACCMODE;
     /* Linux O_ACCMODE uses same 0x3 */
@@ -455,6 +467,17 @@ static int64_t dsp_open(const char *name, int linux_flags, int mode) {
         return -LINUX_ENOMEM;
     }
     st->format = AFMT_S16_LE;
+    /* Remember which node this fd was opened from so fstat() reports the
+     * same device numbers stat() gets from the registry. */
+    {
+        char devpath[64];
+        snprintf(devpath, sizeof(devpath), "/dev/%s", name ? name : "dsp");
+        const hl_device_node_t *n = hl_device_lookup(devpath);
+        st->rdev = n ? (uint32_t)(((unsigned)n->minor & 0xffu) |
+                                  ((unsigned)n->major << 8) |
+                                  (((unsigned)n->minor & ~0xffu) << 12))
+                     : (uint32_t)((14u << 8) | 3u);
+    }
     st->channels = 2;
     st->speed = 44100;
     {
@@ -596,15 +619,8 @@ static int64_t mixer_open(const char *name, int linux_flags, int mode) {
     return gfd;
 }
 
-static int dsp_stat(const char *name, uint32_t *mode_out, uint64_t *rdev_out) {
-    (void)name;
-    if (mode_out) *mode_out = 0020000 | 0666;
-    if (rdev_out) *rdev_out = (4u << 8) | 3u;
-    return 0;
-}
-
-static const hl_device_ops_t ops_dsp = { .open = dsp_open, .stat = dsp_stat };
-static const hl_device_ops_t ops_mixer = { .open = mixer_open, .stat = dsp_stat };
+static const hl_device_ops_t ops_dsp = { .open = dsp_open };
+static const hl_device_ops_t ops_mixer = { .open = mixer_open };
 
 void hl_audio_oss_register_devices(void) {
     static const hl_device_node_t nodes[] = {

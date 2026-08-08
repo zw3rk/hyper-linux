@@ -1422,6 +1422,39 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
 
 /* ---------- Non-identity page table mapping ---------- */
 
+/* Invalidate the L2 block descriptors for [va_start, va_end).
+ *
+ * Counterpart to guest_map_va_range(): SysV detach needs the window to stop
+ * translating, otherwise the guest keeps a live RW mapping that aliases
+ * whatever the IPA is restored to. Only whole 2MB blocks are cleared; L3
+ * tables (mixed-permission splits) are left alone, since nothing that uses
+ * this helper ever splits a block. */
+int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
+{
+    uint64_t base = g->ipa_base;
+    int cleared = 0;
+    for (uint64_t va = va_start; va < va_end; va += BLOCK_2MB) {
+        uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+        unsigned l0_idx = (unsigned)(va / (512ULL * BLOCK_1GB));
+        if (!(l0[l0_idx] & PT_VALID)) continue;
+        uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t *l1 = pt_at(g, l1_ipa - base);
+        unsigned l1_idx = (unsigned)((va / BLOCK_1GB) % 512);
+        if (!(l1[l1_idx] & PT_VALID)) continue;
+        uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+        uint64_t *l2 = pt_at(g, l2_ipa - base);
+        unsigned l2_idx = (unsigned)((va % BLOCK_1GB) / BLOCK_2MB);
+        /* Leave L3 table descriptors intact. */
+        if ((l2[l2_idx] & PT_VALID) && !(l2[l2_idx] & PT_TABLE)) {
+            l2[l2_idx] = 0;
+            cleared = 1;
+        }
+    }
+    if (cleared)
+        g->need_tlbi = 1;
+    return 0;
+}
+
 int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
                        uint64_t gpa_start, int perms) {
     uint64_t base = g->ipa_base;

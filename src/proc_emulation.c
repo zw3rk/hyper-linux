@@ -16,6 +16,7 @@
  * Matches observed Linux kernel formatting (verified via strace). */
 #define MAPS_NAME_COLUMN    73
 #include "proc_emulation.h"
+#include "vfs.h"           /* hl_vfs_mode, cwd/reverse map */
 #include "syscall_proc.h"    /* proc_get_pid, proc_get_ppid, proc_get_cmdline, proc_get_elf_path */
 #include "syscall_internal.h" /* fd_to_host, FD_TABLE_SIZE */
 #include "syscall.h"         /* linux_utmpx_t, FD_CLOSED, FD_STDIO, FD_REGULAR */
@@ -781,10 +782,19 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
         return (int)len;
     }
 
-    /* /proc/self/cwd -> getcwd() */
+    /* /proc/self/cwd -> the GUEST cwd.
+     *
+     * Rooted mode never host-chdir()s, so getcwd() returned hl's own startup
+     * directory — a host path the guest cannot open, disagreeing with
+     * getcwd(2) (which correctly uses the virtual cwd) and leaking the host
+     * layout and username. */
     if (strcmp(path, "/proc/self/cwd") == 0) {
         char cwd[LINUX_PATH_MAX];
-        if (!getcwd(cwd, sizeof(cwd))) return -1;
+        if (hl_vfs_mode() == HL_FS_ROOTED) {
+            hl_vfs_cwd_copy(cwd, sizeof(cwd));
+        } else if (!getcwd(cwd, sizeof(cwd))) {
+            return -1;
+        }
         size_t len = strlen(cwd);
         if (len > bufsiz) len = bufsiz;
         memcpy(buf, cwd, len);
@@ -802,6 +812,14 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz) {
 
         char fdpath[MAXPATHLEN];
         if (fcntl(host_fd, F_GETPATH, fdpath) < 0) { errno = ENOENT; return -1; }
+        /* Map back into the guest namespace. musl's realpath() reads this,
+         * so returning a host path handed the guest e.g. /Users/<name>/...
+         * which then failed to reopen — and disclosed the host layout. */
+        if (hl_vfs_mode() == HL_FS_ROOTED) {
+            char guestpath[LINUX_PATH_MAX];
+            if (hl_vfs_host_to_guest(fdpath, guestpath, sizeof(guestpath)) == 0)
+                snprintf(fdpath, sizeof(fdpath), "%s", guestpath);
+        }
         size_t len = strlen(fdpath);
         if (len > bufsiz) len = bufsiz;
         memcpy(buf, fdpath, len);
