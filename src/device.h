@@ -46,4 +46,9 @@ int hl_device_readdir(int index, char *name_out, size_t name_sz,
  * so fstat() agrees with stat() on the same path. 0 = it is one. */
 int hl_device_fd_stat(int guest_fd, uint32_t *mode_out, uint64_t *rdev_out);
 
+/* Registry-node index <-> pointer, for carrying FD_DEVICE identity across
+ * fork (g_nodes[] is deterministic per process). */
+int hl_device_node_index(const void *node_ptr);
+const void *hl_device_node_by_index(int idx);
+
 #endif /* HL_DEVICE_H */

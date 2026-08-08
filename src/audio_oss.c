@@ -5,6 +5,7 @@
  */
 #include "audio_oss.h"
 #include "audio.h"
+#include <sys/types.h>
 #include "linux_oss_abi.h"
 #include "device.h"
 #include "fd_object.h"
@@ -172,9 +173,11 @@ static int64_t oss_ioctl(hl_open_file_t *of, int host_fd,
     }
     if (req == SNDCTL_DSP_SYNC) {
         /* OSS contract: SYNC drains, RESET drops. Both used to alias POST,
-         * so SYNC returned without waiting for playback to finish. */
+         * so SYNC returned without waiting for playback to finish. Report a
+         * drain timeout to the guest (EIO) instead of swallowing it (V9). */
         hl_audio_stream_post(s);
-        hl_audio_stream_drain(s);
+        if (hl_audio_stream_drain(s) < 0)
+            return -LINUX_EIO;
         return 0;
     }
     if (req == SNDCTL_DSP_NONBLOCK) {
@@ -328,6 +331,32 @@ static int64_t oss_ioctl(hl_open_file_t *of, int host_fd,
     }
 
     return -LINUX_EINVAL;
+}
+
+/* Neutral metadata (mode, rdev) for an OSS fd — like hl_device_fd_stat, but
+ * for FD_OSS_DSP/FD_OSS_MIXER. statx must NOT reuse oss_fstat (that writes a
+ * linux_stat_t, the wrong layout for statx). Returns 0 if `guest_fd` is an
+ * OSS fd, -1 otherwise. */
+int hl_oss_fd_stat_meta(int guest_fd, uint32_t *mode_out, uint64_t *rdev_out) {
+    if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) return -1;
+    int type = fd_table[guest_fd].type;
+    if (type != FD_OSS_DSP && type != FD_OSS_MIXER) return -1;
+    hl_open_file_t *of = fd_table[guest_fd].of;
+    if (mode_out) *mode_out = 0020000 | 0666;   /* S_IFCHR | 0666 */
+    if (rdev_out) {
+        /* macOS makedev() encoding (major<<24 | minor), matching what
+         * hl_device_fd_stat returns and what statx/translate_stat decode —
+         * NOT the Linux (major<<8|minor) that oss_fstat writes directly. */
+        int minor = 3;   /* /dev/dsp default */
+        if (type == FD_OSS_DSP) {
+            oss_dsp_state_t *dst = of ? of->state : NULL;
+            if (dst && dst->rdev) minor = (int)(dst->rdev & 0xff);
+        } else {
+            minor = 0;   /* /dev/mixer */
+        }
+        *rdev_out = (uint64_t)makedev(14, minor);
+    }
+    return 0;
 }
 
 static int64_t oss_fstat(hl_open_file_t *of, int host_fd,

@@ -315,12 +315,20 @@ int hl_audio_stream_drain(hl_audio_stream_t *s) {
         : 5000;
     if (need_ms < 1000)  need_ms = 1000;
     if (need_ms > 60000) need_ms = 60000;
-    const int max_iters = (int)need_ms;   /* 1ms per iteration */
-    for (int i = 0; i < max_iters; i++) {
+    /* Bound by an ABSOLUTE CLOCK_MONOTONIC deadline, not an iteration count:
+     * each poll is nanosleep(1ms) + get_space() ≈ 1.24ms of wall time, so a
+     * 60000-iteration loop actually ran ~75s — past its own 60s ceiling.
+     * A real deadline holds the wall-clock bound regardless of per-poll cost. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long deadline_ms = (now.tv_sec * 1000 + now.tv_nsec / 1000000) + need_ms;
+    for (;;) {
         hl_audio_space_t sp;
         hl_audio_stream_get_space(s, &sp);
         if (sp.pending == 0) return 0;
         if (s->stop_worker || s->failed) return 0;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec * 1000 + now.tv_nsec / 1000000) >= deadline_ms) break;
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };
         nanosleep(&ts, NULL);
     }

@@ -481,6 +481,16 @@ static int dirfd_guest_path(int dirfd_guest, char *out, size_t out_sz) {
         return 0;
     }
 
+    /* A synthetic directory fd (rooted "/" and mount-ancestor dirs) has no
+     * host fd; its guest path lives on the hl_vdir_t so it can act as a
+     * dirfd for openat/fstatat (V17: find/, ls -R). */
+    if (fd_table[dirfd_guest].type == FD_VIRTUAL_DIR) {
+        const char *gp = hl_vdir_path(fd_table[dirfd_guest].dir);
+        if (!gp) return -LINUX_ENOTDIR;
+        snprintf(out, out_sz, "%s", gp);
+        return 0;
+    }
+
     int host_fd = fd_to_host(dirfd_guest);
     if (host_fd < 0) return -LINUX_ENOTDIR;
 

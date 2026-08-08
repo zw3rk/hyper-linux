@@ -28,6 +28,7 @@
 #include "audio.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 int main(void) {
     int passes = 0, fails = 0;
@@ -94,6 +95,35 @@ int main(void) {
     TEST("drain() returns promptly with nothing queued");
     if (hl_audio_stream_drain(s) == 0) PASS();
     else FAIL("drain reported a timeout on an empty stream");
+
+    /* (V7/V9) When the device is stuck (pending never drains), drain must
+     * return -1 within a wall-clock deadline derived from the real playback
+     * time — NOT run for 60000 iterations of ~1.24ms (~75s, past its own 60s
+     * cap). Pin pending>0 and time it. Configured small so the test is fast. */
+    TEST("drain honours an absolute deadline and reports timeout");
+    {
+        hl_audio_params_t q = { .format = HL_AUDIO_FMT_U8, .channels = 1,
+                                .rate = 48000, .frag_size = 2048,
+                                .frag_count = 8 };
+        hl_audio_stream_configure(s, &q);
+        hl_audio_stream_post(s);
+        /* Pin pending>0 with no backend draining it. */
+        s->accepted = s->capacity;
+        s->completed = 0;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int rc = hl_audio_stream_drain(s);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+                  (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        /* need_ms for this config is ~ capacity/(48000) *1.5 s; a few
+         * seconds at most. Assert it timed out (rc<0) and stayed well under
+         * the iteration-cap disaster (~75s) — < 10s is a wide, robust bound. */
+        if (rc == 0) FAIL("drain reported success on a stuck stream");
+        else if (ms > 10000) FAILF("drain ran %ldms — deadline not honoured", ms);
+        else PASS();
+        s->accepted = 0; s->completed = 0;   /* unpin */
+    }
 
     hl_audio_stream_destroy(s);
     SUMMARY("test-audio-restart");

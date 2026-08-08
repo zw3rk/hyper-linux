@@ -63,6 +63,7 @@ static int dir_has(const char *path, const char *name) {
 
 int main(void) {
     int passes = 0, fails = 0;
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("test-vfs-rootdir: synthetic dirs, outward symlinks, fchdir\n");
 
     TEST("opendir(\"/\") lists the top-level mounts");
@@ -231,6 +232,37 @@ int main(void) {
             else PASS();
             unlink("/data/f");
         }
+    }
+
+    /* (V17) The synthetic dir fd must work as a dirfd (openat/fstatat) and
+     * be dup-able without double-free — otherwise find/, ls -R/ fail. */
+    TEST("synthetic dir fd works as a dirfd (openat/fstatat)");
+    {
+        int d = open("/", O_RDONLY | O_DIRECTORY);
+        struct stat st;
+        int rf = (d >= 0) ? fstatat(d, "home", &st, 0) : -1;
+        int sub = (d >= 0) ? openat(d, "home", O_RDONLY | O_DIRECTORY) : -1;
+        if (d < 0) FAILF("open(/): %s", strerror(errno));
+        else if (rf != 0) FAILF("fstatat(dirfd,home): %s", strerror(errno));
+        else if (!S_ISDIR(st.st_mode)) FAIL("home not a dir via dirfd");
+        else if (sub < 0) FAILF("openat(dirfd,home): %s", strerror(errno));
+        else PASS();
+        if (sub >= 0) close(sub);
+        if (d >= 0) close(d);
+    }
+
+    TEST("a dup of a synthetic dir fd works and does not double-free");
+    {
+        int d = open("/", O_RDONLY | O_DIRECTORY);
+        int d2 = (d >= 0) ? dup(d) : -1;
+        int sub = (d2 >= 0) ? openat(d2, "home", O_RDONLY | O_DIRECTORY) : -1;
+        if (d < 0 || d2 < 0) FAILF("dup(/): %s", strerror(errno));
+        else if (sub < 0) FAILF("openat(dup,home): %s", strerror(errno));
+        else PASS();
+        if (sub >= 0) close(sub);
+        /* close both refs; a double-free would crash here or later */
+        if (d >= 0) close(d);
+        if (d2 >= 0) close(d2);
     }
 
     SUMMARY("test-vfs-rootdir");

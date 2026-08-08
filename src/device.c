@@ -63,6 +63,23 @@ static int64_t open_host_dev(const char *host_path, int linux_flags,
 
 /* Registry mode/rdev for a guest fd opened from a virtual device node.
  * Returns 0 when the fd is such a device, -1 otherwise. */
+/* Index of a registry node (stable across a fork: g_nodes[] is rebuilt
+ * identically by hl_device_init in every process). Used to carry FD_DEVICE
+ * identity across fork IPC. Returns -1 if the pointer is not a registry
+ * node. */
+int hl_device_node_index(const void *node_ptr) {
+    const hl_device_node_t *n = node_ptr;
+    if (!n) return -1;
+    for (int i = 0; i < g_nnodes; i++)
+        if (&g_nodes[i] == n) return i;
+    return -1;
+}
+
+const void *hl_device_node_by_index(int idx) {
+    if (idx < 0 || idx >= g_nnodes) return NULL;
+    return &g_nodes[idx];
+}
+
 int hl_device_fd_stat(int guest_fd, uint32_t *mode_out, uint64_t *rdev_out) {
     if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) return -1;
     if (fd_table[guest_fd].type != FD_DEVICE) return -1;

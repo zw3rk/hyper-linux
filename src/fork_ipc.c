@@ -8,6 +8,7 @@
  * the full VM state (registers, memory, FDs) over a socketpair.
  */
 #include "fork_ipc.h"
+#include "device.h"   /* hl_device_node_index/by_index */
 #include "syscall_proc.h"    /* proc_get_pid, proc_set_identity, proc_alloc_pid, proc_register_child, proc_mark_child_exited, proc_set_shim, proc_get_shim_blob, proc_get_shim_size, proc_init */
 #include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
 #include "syscall.h"         /* syscall_init, FD_CLOSED, FD_STDIO, etc. */
@@ -440,6 +441,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                      * free and overwrite them on the first allocation. */
                     fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
                     fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+
+                    /* Re-derive FD_DEVICE's registry pointer from the index
+                     * carried in pad, so fstat keeps the Linux numbers (V6). */
+                    if (fd_entries[i].type == FD_DEVICE)
+                        fd_table[gfd].dir =
+                            (void *)hl_device_node_by_index(fd_entries[i].pad);
 
                     /* Reconstruct DIR* for directory FDs. The parent's DIR*
                      * pointer is meaningless in the child's address space.
@@ -1670,6 +1677,7 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         int type;
         int linux_flags;
         int host_fd;
+        int dev_index;        /* FD_DEVICE registry index, else -1 */
         hl_open_file_t *of;   /* retained when set; released after use */
     } *scan = calloc(FD_TABLE_SIZE, sizeof(*scan));
     if (!fd_entries || !host_fds_to_send || !host_fds_duped ||
@@ -1703,6 +1711,8 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         scan[nscan].type        = fd_table[i].type;
         scan[nscan].linux_flags = fd_table[i].linux_flags;
         scan[nscan].host_fd     = fd_table[i].host_fd;
+        scan[nscan].dev_index   = (fd_table[i].type == FD_DEVICE)
+                                ? hl_device_node_index(fd_table[i].dir) : -1;
         scan[nscan].of          = NULL;
         if (fd_table[i].of && hl_oss_fd_needs_recreate(fd_table[i].type)) {
             scan[nscan].of = fd_table[i].of;
@@ -1754,7 +1764,14 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = scan[s].type;
         fd_entries[num_fds].linux_flags = scan[s].linux_flags;
-        fd_entries[num_fds].pad = has_object ? IPC_FD_HAS_OBJECT : 0;
+        /* FD_DEVICE never has an open-file object, so `pad` is free to carry
+         * the registry-node index — the child re-derives its .dir from it so
+         * fstat on an inherited /dev fd keeps the Linux device numbers (V6).
+         * -1 stays -1 (no node). */
+        if (scan[s].type == FD_DEVICE)
+            fd_entries[num_fds].pad = scan[s].dev_index;
+        else
+            fd_entries[num_fds].pad = has_object ? IPC_FD_HAS_OBJECT : 0;
         host_fds_to_send[num_fds] = host_fd;
         host_fds_duped[num_fds] = was_duped;
         num_fds++;

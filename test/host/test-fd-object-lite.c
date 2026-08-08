@@ -109,6 +109,10 @@ int64_t linux_errno(void) { return -1; }
 
 /* The eventfd/signalfd/timerfd/inotify subsystems are not linked into this
  * lite harness; hl_fd_dup3() calls this to retire their fd-keyed state. */
+/* hl_vdir_release/retain live in syscall_fs.c (not linked here). */
+void hl_vdir_release(void *p) { (void)p; }
+void hl_vdir_retain(void *p) { (void)p; }
+
 void fd_special_subsystem_close(int guest_fd, int type) {
     (void)guest_fd; (void)type;
 }

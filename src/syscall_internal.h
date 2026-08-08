@@ -94,6 +94,8 @@ int resolve_dirfd(int dirfd);
 /* Retire guest-fd-keyed state in the eventfd/signalfd/timerfd/inotify
  * subsystems. Must be called by every path that frees a guest fd. */
 void fd_special_subsystem_close(int guest_fd, int type);
+/* Guest path of a FD_VIRTUAL_DIR's hl_vdir_t (NULL if none). */
+const char *hl_vdir_path(const void *vdir);
 
 /* Translate Linux AT_* flags to macOS equivalents.
  * For unlinkat, fstatat, linkat, fchmodat, fchownat, utimensat. */

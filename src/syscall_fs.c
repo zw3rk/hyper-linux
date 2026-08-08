@@ -28,6 +28,7 @@
 #include "syscall_stats.h"   /* syscall_stats_clear_fd */
 #include "vfs.h"
 #include "device.h"
+#include "audio_oss.h"  /* hl_oss_fd_stat_meta */
 #include "trace.h"
 
 #include <stdio.h>
@@ -299,8 +300,26 @@ static int host_dirfd_for_op(int dirfd, const char *guest_path) {
 typedef struct {
     int  n;
     int  pos;
+    int  refcount;   /* shared across dup; freed when it hits 0 */
+    char guest_path[HL_VFS_PATH_MAX];  /* so it works as a dirfd (V17) */
     char names[HL_VFS_SYNTH_MAX][HL_VFS_NAME_MAX];
 } hl_vdir_t;
+
+/* Release a reference to a synthetic-dir object (dup-shared). */
+void hl_vdir_release(void *p) {
+    hl_vdir_t *vd = p;
+    if (!vd) return;
+    if (--vd->refcount <= 0) free(vd);
+}
+void hl_vdir_retain(void *p) {
+    hl_vdir_t *vd = p;
+    if (vd) vd->refcount++;
+}
+/* Guest path a synthetic-dir fd represents, so it can serve as a dirfd. */
+const char *hl_vdir_path(const void *p) {
+    const hl_vdir_t *vd = p;
+    return (vd && vd->guest_path[0]) ? vd->guest_path : NULL;
+}
 
 /* stat() for a synthetic directory: a read-only, execute-searchable dir
  * with no host inode behind it. */
@@ -323,6 +342,8 @@ static int64_t vdir_fill_stat(guest_t *g, uint64_t stat_gva) {
 static hl_vdir_t *vdir_create(const char *guest_abs) {
     hl_vdir_t *vd = calloc(1, sizeof(*vd));
     if (!vd) return NULL;
+    vd->refcount = 1;
+    snprintf(vd->guest_path, sizeof(vd->guest_path), "%s", guest_abs);
     vd->n = hl_vfs_list_synthetic(guest_abs, vd->names, HL_VFS_SYNTH_MAX);
     return vd;
 }
@@ -558,13 +579,10 @@ int64_t sys_close(int fd) {
         return 0;
     }
 
-    /* Legacy path without descriptor object */
-    if (snap.dir) {
-        if (snap.type == FD_DIR)
-            closedir((DIR *)snap.dir);
-        else if (snap.type == FD_EPOLL || snap.type == FD_VIRTUAL_DIR)
-            free(snap.dir);  /* epoll_instance_t / hl_vdir_t */
-    }
+    /* Legacy path without descriptor object. Route through the shared
+     * whitelist so FD_VIRTUAL_DIR goes through hl_vdir_release (refcounted
+     * for dup, V17) — a direct free() here double-freed a dup-shared vdir. */
+    hl_fd_free_dir(snap.type, snap.dir);
     if (snap.of)
         hl_open_file_release(snap.of);
 
@@ -645,18 +663,26 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
         host_dirfd = AT_FDCWD;
     } else {
         host_dirfd = fd_to_host(dirfd);
-        if (host_dirfd < 0) return -LINUX_EBADF;
+        /* A synthetic dir dirfd has no host fd but is valid for a relative
+         * lookup (V17). Keep host_dirfd = -1; resolve_path_for_op_ex uses
+         * dirfd_guest_path for it. Reject only a genuinely bad fd. */
+        if (host_dirfd < 0 &&
+            !(dirfd >= 0 && dirfd < FD_TABLE_SIZE &&
+              fd_table[dirfd].type == FD_VIRTUAL_DIR))
+            return -LINUX_EBADF;
     }
 
     struct stat mac_st;
 
-    /* AT_EMPTY_PATH with empty path: stat the fd itself (fstat).
-     * macOS fstatat() doesn't support AT_EMPTY_PATH. */
+    /* AT_EMPTY_PATH with empty path: stat the fd itself. Delegate to
+     * sys_fstat, which applies the /dev registry override and the OSS
+     * ops->fstat hook — otherwise fstatat reported the HOST device numbers
+     * for /dev/null and a raw socket stat for /dev/dsp (V15). */
     if ((flags & LINUX_AT_EMPTY_PATH) && path[0] == '\0') {
-        if (host_dirfd < 0 || host_dirfd == AT_FDCWD) return -LINUX_EBADF;
-        if (fstat(host_dirfd, &mac_st) < 0)
-            return linux_errno();
-    } else {
+        if (dirfd == LINUX_AT_FDCWD) return -LINUX_EBADF;
+        return sys_fstat(g, dirfd, stat_gva);
+    }
+    {
         /* Device/virtual synthetic first */
         uint32_t mode = 0;
         uint64_t rdev = 0;
@@ -743,8 +769,16 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
 
     int host_dirfd = resolve_dirfd(dirfd);
     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
-        && hl_vfs_mode() != HL_FS_ROOTED)
-        return -LINUX_EBADF;
+        && hl_vfs_mode() != HL_FS_ROOTED) {
+        /* A device/OSS/synthetic fd has no host alias but is a valid guest
+         * fd for AT_EMPTY_PATH (statx of an open /dev/mixer etc.). Only
+         * reject a genuinely bad fd. */
+        int t = (dirfd >= 0 && dirfd < FD_TABLE_SIZE)
+                ? fd_table[dirfd].type : FD_CLOSED;
+        if (!(t == FD_DEVICE || t == FD_OSS_DSP || t == FD_OSS_MIXER ||
+              t == FD_VIRTUAL_DIR))
+            return -LINUX_EBADF;
+    }
 
     struct stat mac_st;
 
@@ -761,16 +795,23 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
             mac_st.st_ino = 1;
             goto statx_have_stat;
         }
+        /* Device and OSS fds report their registered numbers and may have
+         * NO host fd (e.g. /dev/mixer), so synthesize BEFORE requiring one —
+         * else statx(AT_EMPTY) on such an fd returned EBADF. */
+        uint32_t emode = 0;
+        uint64_t erdev = 0;
+        if (hl_device_fd_stat(dirfd, &emode, &erdev) == 0 ||
+            hl_oss_fd_stat_meta(dirfd, &emode, &erdev) == 0) {
+            memset(&mac_st, 0, sizeof(mac_st));
+            mac_st.st_mode = emode;
+            mac_st.st_rdev = (dev_t)erdev;
+            mac_st.st_nlink = 1;
+            goto statx_have_stat;
+        }
         if (host_dirfd < 0 || host_dirfd == AT_FDCWD) return -LINUX_EBADF;
         if (fstat(host_dirfd, &mac_st) < 0)
             return linux_errno();
-        /* ...and a device fd must report its registered numbers, exactly
-         * as the path-based branch below does. */
-        uint32_t emode = 0;
-        uint64_t erdev = 0;
-        if (hl_device_fd_stat(dirfd, &emode, &erdev) == 0) {
-            mac_st.st_mode = emode;
-            mac_st.st_rdev = (dev_t)erdev;
+        if (0) {
         }
     } else {
         /* Same synthetic /dev and /proc interception sys_newfstatat does.
@@ -852,6 +893,15 @@ int64_t sys_dup(int oldfd) {
     if (fd_table[oldfd].desc)
         return hl_fd_dup(oldfd);
 
+    /* A synthetic dir fd has no host fd; share its refcounted object (V17). */
+    if (fd_table[oldfd].type == FD_VIRTUAL_DIR && fd_table[oldfd].dir) {
+        int gfd = fd_alloc(FD_VIRTUAL_DIR, -1);
+        if (gfd < 0) return -LINUX_EMFILE;
+        hl_vdir_retain(fd_table[oldfd].dir);
+        fd_table[gfd].dir = fd_table[oldfd].dir;
+        return gfd;
+    }
+
     int host_fd = fd_to_host(oldfd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -875,6 +925,15 @@ int64_t sys_dup(int oldfd) {
                 close(dir_fd);
         }
     }
+    /* FD_DEVICE's non-owning registry pointer must carry so fstat on the dup
+     * keeps the Linux device numbers (V6). */
+    if (fd_table[oldfd].type == FD_DEVICE)
+        fd_table[guest_fd].dir = fd_table[oldfd].dir;
+    /* Share the refcounted synthetic-dir object across the dup (V17). */
+    if (fd_table[oldfd].type == FD_VIRTUAL_DIR && fd_table[oldfd].dir) {
+        hl_vdir_retain(fd_table[oldfd].dir);
+        fd_table[guest_fd].dir = fd_table[oldfd].dir;
+    }
 
     return guest_fd;
 }
@@ -897,8 +956,18 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
     if (new_host_fd < 0) return linux_errno();
 
     /* fd_alloc_at cleans up old entry (incl. DIR* closedir) */
-    fd_alloc_at(newfd, fd_table[oldfd].type, new_host_fd);
+    int dup3_src_type = fd_table[oldfd].type;
+    void *dup3_src_dir = fd_table[oldfd].dir;
+    fd_alloc_at(newfd, dup3_src_type, new_host_fd);
     fd_table[newfd].linux_flags = (linux_flags & LINUX_O_CLOEXEC);
+    /* Carry FD_DEVICE's non-owning registry pointer (V6). */
+    if (dup3_src_type == FD_DEVICE)
+        fd_table[newfd].dir = dup3_src_dir;
+    /* Share the refcounted synthetic-dir object (V17). */
+    if (dup3_src_type == FD_VIRTUAL_DIR && dup3_src_dir) {
+        hl_vdir_retain(dup3_src_dir);
+        fd_table[newfd].dir = dup3_src_dir;
+    }
 
     /* For directory FDs, create a fresh DIR* for the new entry.
      * dup() only duplicates the kernel fd — the C library DIR*
@@ -980,6 +1049,12 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
         int gfd = fd_alloc_from((int)arg, fd_table[fd].type, new_host);
         if (gfd < 0) { close(new_host); return -LINUX_EMFILE; }
         fd_table[gfd].linux_flags = fd_table[fd].linux_flags & ~LINUX_O_CLOEXEC;
+        if (fd_table[fd].type == FD_DEVICE)   /* carry registry pointer (V6) */
+            fd_table[gfd].dir = fd_table[fd].dir;
+        if (fd_table[fd].type == FD_VIRTUAL_DIR && fd_table[fd].dir) {
+            hl_vdir_retain(fd_table[fd].dir);   /* share across dup (V17) */
+            fd_table[gfd].dir = fd_table[fd].dir;
+        }
         if (cmd == 1030)
             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
         /* Create fresh DIR* for directory FDs (see sys_dup3 comment) */

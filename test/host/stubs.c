@@ -15,3 +15,9 @@ int fd_to_host(int guest_fd) {
 int64_t linux_errno(void) {
     return -errno;
 }
+
+/* hl_vdir_path lives in syscall_fs.c (not linked into host unit tests). */
+const char *hl_vdir_path(const void *vdir) {
+    (void)vdir;
+    return NULL;
+}

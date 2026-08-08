@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 /* Linux struct statx, aarch64. Only the fields checked here matter. */
 struct hl_statx {
@@ -116,6 +117,93 @@ int main(void) {
             else PASS();
         }
         unlink("devstat-plain");
+    }
+
+    /* (V6) The registry numbers must survive dup / dup2 / F_DUPFD and fork —
+     * the fix stored them on the fd; a dup/fork used to lose them and fall
+     * back to the host device numbers. */
+    TEST("dev numbers survive dup/dup2/F_DUPFD");
+    {
+        int fd = open("/dev/null", O_RDONLY);
+        struct stat s0; fstat(fd, &s0);
+        unsigned maj = major(s0.st_rdev), min = minor(s0.st_rdev);
+        int d1 = dup(fd);
+        int d2 = fcntl(fd, F_DUPFD, 50);
+        int d3 = 60; d3 = dup2(fd, d3);
+        struct stat a, b, c;
+        int ok = fstat(d1, &a) == 0 && fstat(d2, &b) == 0 && fstat(d3, &c) == 0;
+        if (!ok) FAILF("fstat dup: %s", strerror(errno));
+        else if (major(a.st_rdev) != maj || minor(a.st_rdev) != min)
+            FAILF("dup rdev %u:%u, want %u:%u", major(a.st_rdev), minor(a.st_rdev), maj, min);
+        else if (major(b.st_rdev) != maj || minor(b.st_rdev) != min)
+            FAILF("F_DUPFD rdev %u:%u, want %u:%u", major(b.st_rdev), minor(b.st_rdev), maj, min);
+        else if (major(c.st_rdev) != maj || minor(c.st_rdev) != min)
+            FAILF("dup2 rdev %u:%u, want %u:%u", major(c.st_rdev), minor(c.st_rdev), maj, min);
+        else PASS();
+        close(fd); close(d1); close(d2); close(d3);
+    }
+
+    TEST("dev numbers survive fork");
+    {
+        int fd = open("/dev/null", O_RDONLY);
+        struct stat s0; fstat(fd, &s0);
+        unsigned maj = major(s0.st_rdev), min = minor(s0.st_rdev);
+        pid_t pid = fork();
+        if (pid == 0) {
+            struct stat cs;
+            int r = fstat(fd, &cs);
+            _exit((r == 0 && major(cs.st_rdev) == maj && minor(cs.st_rdev) == min)
+                  ? 0 : 3);
+        }
+        int st = 0; waitpid(pid, &st, 0);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) PASS();
+        else FAILF("child fstat lost the dev numbers (status 0x%x)", st);
+        close(fd);
+    }
+
+    /* (V15) AT_EMPTY_PATH: fstatat and statx on the fd itself must report
+     * the registry numbers, not the host device (fstatat) or a socket
+     * (statx on an OSS fd). */
+    TEST("fstatat(AT_EMPTY_PATH) on /dev/null reports 1:3");
+    {
+        int fd = open("/dev/null", O_RDONLY);
+        struct stat st;
+        long r = syscall(SYS_newfstatat, fd, "", &st, 0x1000 /*AT_EMPTY_PATH*/);
+        if (r != 0) FAILF("fstatat AT_EMPTY: %s", strerror(errno));
+        else if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 3)
+            FAILF("rdev %u:%u, want 1:3", major(st.st_rdev), minor(st.st_rdev));
+        else if (!S_ISCHR(st.st_mode)) FAIL("not a char device");
+        else PASS();
+        close(fd);
+    }
+
+    TEST("statx(AT_EMPTY_PATH) on /dev/null reports 1:3");
+    {
+        int fd = open("/dev/null", O_RDONLY);
+        struct hl_statx sx; memset(&sx, 0, sizeof(sx));
+        long r = syscall(SYS_statx, fd, "", 0x1000 /*AT_EMPTY_PATH*/, 0x7ff, &sx);
+        if (r != 0) FAILF("statx AT_EMPTY: %s", strerror(errno));
+        else if (sx.rdev_major != 1 || sx.rdev_minor != 3)
+            FAILF("statx rdev %u:%u, want 1:3", sx.rdev_major, sx.rdev_minor);
+        else PASS();
+        close(fd);
+    }
+
+    TEST("statx(AT_EMPTY_PATH) on /dev/mixer is a char device 14:0");
+    {
+        int fd = open("/dev/mixer", O_RDONLY);
+        if (fd < 0) { printf("(skip: no /dev/mixer) "); PASS(); }
+        else {
+            struct hl_statx sx; memset(&sx, 0, sizeof(sx));
+            long r = syscall(SYS_statx, fd, "", 0x1000, 0x7ff, &sx);
+            if (r != 0) FAILF("statx AT_EMPTY: %s", strerror(errno));
+            else if (!((sx.mode & 0170000) == 0020000))   /* S_IFCHR */
+                FAILF("mode 0%o is not a char device (S_IFSOCK?)", sx.mode);
+            else if (sx.rdev_major != 14)
+                FAILF("rdev major %u, want 14", sx.rdev_major);
+            else PASS();
+            close(fd);
+        }
     }
 
     SUMMARY("test-dev-stat");

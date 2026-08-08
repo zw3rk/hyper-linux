@@ -305,7 +305,8 @@ int hl_fd_remove(int guest_fd, hl_fd_detached_t *out) {
 void hl_fd_free_dir(int type, void *dir) {
     if (!dir) return;
     if (type == FD_DIR) closedir((DIR *)dir);
-    else if (type == FD_EPOLL || type == FD_VIRTUAL_DIR) free(dir);
+    else if (type == FD_EPOLL) free(dir);
+    else if (type == FD_VIRTUAL_DIR) hl_vdir_release(dir);  /* refcounted */
     /* FD_DEVICE and everything else: not owned here. */
 }
 
@@ -374,7 +375,12 @@ int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
         fd_table[gfd].linux_flags =
             (fd_table[oldfd].linux_flags & ~LINUX_O_CLOEXEC)
             | (cloexec ? LINUX_O_CLOEXEC : 0);
-        /* dir not shared for legacy DIR without of */
+        /* FD_DEVICE's .dir is a NON-OWNING pointer into the static device
+         * registry, so a dup must carry it (else fstat on the dup falls back
+         * to the host device numbers — V6). Never copy .dir for owning kinds
+         * (FD_DIR/FD_EPOLL/FD_VIRTUAL_DIR): that would double-free. */
+        if (fd_table[oldfd].type == FD_DEVICE)
+            fd_table[gfd].dir = fd_table[oldfd].dir;
         pthread_mutex_unlock(&fd_lock);
         hl_fd_put(&ref);
         return gfd;

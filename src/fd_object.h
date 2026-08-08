@@ -168,6 +168,9 @@ void hl_fd_detached_finish(hl_fd_detached_t *d);
 /* Release an fd's `.dir` by kind (closedir/free/nothing). The one whitelist
  * every fd-retire path must use — see fd_object.c. */
 void hl_fd_free_dir(int type, void *dir);
+/* Synthetic-dir (FD_VIRTUAL_DIR) refcount, shared across dup. */
+void hl_vdir_release(void *p);
+void hl_vdir_retain(void *p);
 
 /* Dup helpers: new descriptor sharing open-file; host dup of alias. */
 int hl_fd_dup(int oldfd);
