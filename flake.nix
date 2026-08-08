@@ -140,6 +140,7 @@
             darwinPkgs.binutils   # objcopy for shim.bin
             darwinPkgs.lldb
             darwinPkgs.shellcheck  # shell script linting
+            darwinPkgs.lima        # limactl on PATH (matrix + manual lima runs)
           ] ++ darwinBuildInputs;
 
           # GNU objcopy for Mach-O → raw binary conversion (shim.S).
@@ -148,6 +149,7 @@
           GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
 
           # Lima VM runner (for validation against real Linux kernel).
+          # Also on PATH via buildInputs; env var keeps test-matrix explicit.
           LIMACTL = "${darwinPkgs.lima}/bin/limactl";
 
           # aarch64-linux-musl guest binaries
