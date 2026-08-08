@@ -56,7 +56,8 @@ void hl_trace_path(char *dst, size_t dstsz, const char *path);
 void hl_trace(uint32_t cat, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-void hl_tracev(uint32_t cat, const char *fmt, va_list ap);
+void hl_tracev(uint32_t cat, const char *fmt, va_list ap)
+    __attribute__((format(printf, 2, 0)));
 
 /* Category name helpers for docs/errors */
 const char *hl_trace_category_names(void);

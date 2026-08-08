@@ -16,9 +16,11 @@
 #include "hv_util.h"         /* HV_CHECK, SCTLR_* constants */
 #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
 #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
+#include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
 #include "futex.h"           /* futex_wake_one */
 #include "fd_object.h"
 #include "audio_oss.h"
+#include "audio.h"           /* hl_audio_backend_name */
 #include "vfs.h"
 #include "trace.h"
 
@@ -811,12 +813,25 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
      * altstack are properly restored to the thread entry. */
     signal_set_state(&sig);
 
+    /* The [vvar] time page is written only by the vDSO publisher thread,
+     * which does not exist in a fork child (threads are not inherited). The
+     * COW child maps the backing file MAP_PRIVATE, so it never sees the
+     * parent's updates either — its clock_gettime()/gettimeofday() would be
+     * frozen at the fork instant forever, and the guest takes the vDSO fast
+     * path because the inherited page still carries a valid version stamp.
+     * Re-establish the page and restart the publisher here. vdso_build()
+     * also covers the legacy IPC copy path, which never transferred the
+     * [vdso]/[vvar] pages at all. */
+    vdso_build(&g);
+    vdso_publisher_start(&g);
+
     if (verbose)
         fprintf(stderr, "hl: fork-child: entering vCPU loop\n");
 
     /* Step 9: Enter vCPU run loop */
     int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
 
+    vdso_publisher_stop();
     guest_destroy(&g);
     return exit_code;
 }
@@ -1341,6 +1356,13 @@ static void *vm_clone_thread_run(void *arg) {
          * is not in hv_vcpu_run (loop already exited) so the exit
          * call on it is a harmless no-op. */
         thread_interrupt_all();
+        /* hv_vcpus_exit() only breaks a thread out of hv_vcpu_run(); it does
+         * nothing for one parked in host poll()/pselect(). Infinite
+         * ppoll/pselect6 wait with no timeout slice when the wake pipe is
+         * present, so without this nudge exit_group_requested is never
+         * observed and the process hangs forever. sys_exit_group pairs
+         * these two the same way. */
+        wakeup_pipe_signal();
     }
 
     hv_vcpu_destroy(vcpu);
@@ -1391,10 +1413,16 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     snprintf(fd_str, sizeof(fd_str), "%d", sock_fds[1]);
 
     /* Build child argv: [hl_path, [--verbose,] --fork-child, fd, NULL] */
-    char *child_argv[6];
+    char *child_argv[8];
     int ci = 0;
     child_argv[ci++] = self_path;
     if (verbose) child_argv[ci++] = "--verbose";
+    /* The backend is process-local state, not part of the IPC header, and
+     * fork_child_main() returns before hl.c applies profile defaults — so a
+     * child of `hl --audio-backend null` used to fall back to the compiled
+     * default and open a real Core Audio queue. Pass it through. */
+    child_argv[ci++] = "--audio-backend";
+    child_argv[ci++] = (char *)hl_audio_backend_name();
     child_argv[ci++] = "--fork-child";
     child_argv[ci++] = fd_str;
     child_argv[ci] = NULL;
@@ -1597,66 +1625,105 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     hl_fork_object_record_t *obj_records =
         calloc(FD_TABLE_SIZE, sizeof(*obj_records));
     int32_t *obj_gfds = calloc(FD_TABLE_SIZE, sizeof(*obj_gfds));
+    /* Snapshot of the table taken under fd_lock. Everything that can block
+     * (the OSS export, which takes the audio stream mutex, and open()/dup())
+     * runs afterwards with the lock released. */
+    struct fd_scan {
+        int gfd;
+        int type;
+        int linux_flags;
+        int host_fd;
+        hl_open_file_t *of;   /* retained when set; released after use */
+    } *scan = calloc(FD_TABLE_SIZE, sizeof(*scan));
     if (!fd_entries || !host_fds_to_send || !host_fds_duped ||
-        !obj_records || !obj_gfds) {
+        !obj_records || !obj_gfds || !scan) {
         free(fd_entries);
         free(host_fds_to_send);
         free(host_fds_duped);
         free(obj_records);
         free(obj_gfds);
+        free(scan);
         close(ipc_sock);
         return -LINUX_ENOMEM;
     }
     uint32_t num_fds = 0;
     uint32_t num_objects = 0;
 
-    /* Hold fd_lock while scanning the FD table to prevent concurrent
-     * close/open from another thread corrupting the snapshot.
-     * Lock order: fd_lock(3) — no higher-order locks held here. */
+    /* Pass 1: snapshot the FD table under fd_lock. Nothing here blocks.
+     *
+     * The OSS export must NOT run here: it takes the audio stream mutex,
+     * which CLAUDE.md documents as a leaf lock to be taken only after
+     * releasing fd_lock. A writer parked in hl_audio_stream_write() holds
+     * that mutex across a wait that only the Core Audio callback ends, so
+     * exporting under fd_lock could block every FD syscall on every vCPU
+     * thread indefinitely. Retain the open-file so it stays alive once the
+     * lock is dropped. */
+    int nscan = 0;
     pthread_mutex_lock(&fd_lock);
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type == FD_CLOSED) continue;
+        scan[nscan].gfd         = i;
+        scan[nscan].type        = fd_table[i].type;
+        scan[nscan].linux_flags = fd_table[i].linux_flags;
+        scan[nscan].host_fd     = fd_table[i].host_fd;
+        scan[nscan].of          = NULL;
+        if (fd_table[i].of && hl_oss_fd_needs_recreate(fd_table[i].type)) {
+            scan[nscan].of = fd_table[i].of;
+            hl_open_file_retain(scan[nscan].of);
+        }
+        nscan++;
+    }
+    pthread_mutex_unlock(&fd_lock);
 
+    /* Pass 2: blocking work with fd_lock released. */
+    for (int s = 0; s < nscan; s++) {
+        int i = scan[s].gfd;
         int host_fd;
         int was_duped = 0;
         int has_object = 0;
 
-        /* OSS / synthetic: export open-file config; do NOT share stream FDs */
-        if (fd_table[i].of && hl_oss_fd_needs_recreate(fd_table[i].type)) {
+        if (scan[s].of) {
+            /* OSS / synthetic: export open-file config; do NOT share stream FDs.
+             * Take the placeholder fd first — committing num_objects before it
+             * could leave an object record with no matching FD entry. */
             hl_fork_object_record_t rec;
-            if (hl_oss_fork_export(fd_table[i].of, &rec) == 0) {
-                has_object = 1;
-                obj_gfds[num_objects] = i;
-                obj_records[num_objects] = rec;
-                num_objects++;
-                /* Placeholder fd so SCM_RIGHTS 1:1 stays aligned; child closes */
-                host_fd = open("/dev/null", O_RDWR);
-                if (host_fd < 0) continue;
-                was_duped = 1;
-            } else {
+            if (hl_oss_fork_export(scan[s].of, &rec) != 0) {
+                hl_open_file_release(scan[s].of);
                 continue;
             }
-        } else if (fd_table[i].type != FD_STDIO) {
+            host_fd = open("/dev/null", O_RDWR);
+            if (host_fd < 0) {
+                hl_open_file_release(scan[s].of);
+                continue;
+            }
+            has_object = 1;
+            obj_gfds[num_objects] = i;
+            obj_records[num_objects] = rec;
+            num_objects++;
+            was_duped = 1;
+            hl_open_file_release(scan[s].of);
+        } else if (scan[s].type != FD_STDIO) {
             /* Dup the fd so child gets its own copy */
-            if (fd_table[i].host_fd < 0) continue;
-            int duped = dup(fd_table[i].host_fd);
+            if (scan[s].host_fd < 0) continue;
+            int duped = dup(scan[s].host_fd);
             if (duped < 0) continue; /* Skip entry if dup fails */
             host_fd = duped;
             was_duped = 1;
         } else {
             /* For stdio, send the actual fd (0, 1, 2) */
-            host_fd = fd_table[i].host_fd;
+            host_fd = scan[s].host_fd;
         }
 
         fd_entries[num_fds].guest_fd = i;
-        fd_entries[num_fds].type = fd_table[i].type;
-        fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
+        fd_entries[num_fds].type = scan[s].type;
+        fd_entries[num_fds].linux_flags = scan[s].linux_flags;
         fd_entries[num_fds].pad = has_object ? IPC_FD_HAS_OBJECT : 0;
         host_fds_to_send[num_fds] = host_fd;
         host_fds_duped[num_fds] = was_duped;
         num_fds++;
     }
-    pthread_mutex_unlock(&fd_lock);
+    free(scan);
+    scan = NULL;
     int num_host_fds = (int)num_fds; /* 1:1 with fd_entries */
 
     if (ipc_write_all(ipc_sock, &num_fds, sizeof(num_fds)) < 0) {

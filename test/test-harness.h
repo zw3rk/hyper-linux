@@ -15,6 +15,9 @@
 #define TEST(name) printf("  %-30s ", name)
 #define PASS()     do { printf("OK\n"); passes++; } while(0)
 #define FAIL(msg)  do { printf("FAIL: %s (errno=%d)\n", msg, errno); fails++; } while(0)
+/* printf-style variant for failures that need to report observed values. */
+#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); \
+                        printf(" (errno=%d)\n", errno); fails++; } while(0)
 #define SUMMARY(name) do { \
     printf("\n%s: %d passed, %d failed%s\n", \
            name, passes, fails, fails == 0 ? " — PASS" : " — FAIL"); \

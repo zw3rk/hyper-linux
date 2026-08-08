@@ -15,6 +15,7 @@
 #include "syscall_proc.h"   /* proc_get_sysroot */
 #include "guest.h"
 #include "fd_object.h"
+#include "syscall_stats.h"   /* syscall_stats_clear_fd */
 #include "vfs.h"
 #include "device.h"
 #include "trace.h"
@@ -129,8 +130,25 @@ static const char *resolve_sysroot_path(const char *path, char *buf, size_t bufs
  * create_mode=1 for O_CREAT/mkdir/rename-dest (final may not exist).
  * out_mount may be NULL; when set, receives mount used (for EXDEV checks).
  */
-static int resolve_path_for_op(int dirfd, const char *guest_path,
-                               int create_mode, char *out_buf, size_t out_sz,
+/* Synthetic mount for the --sysroot fallback, which resolves outside the
+ * mount table. hl binds the sysroot read-only (hl.c), so report RO here or
+ * every caller's `mnt && (mnt->flags & HL_MOUNT_RO)` guard is dead on this
+ * path and writes reach the host through a mount declared read-only. */
+static const hl_mount_t sysroot_fallback_mount = {
+    .id = 0,
+    .guest_prefix = "/",
+    .host_path = "",
+    .flags = HL_MOUNT_RO,
+    .guest_len = 1,
+};
+
+/* follow == 0 means "operate on the final component itself, do not follow a
+ * symlink there" — readlink/lstat/unlink/rename/symlink/O_NOFOLLOW. Most
+ * callers want the default (follow == 1), supplied by the
+ * resolve_path_for_op() wrapper macro defined after this function. */
+static int resolve_path_for_op_ex(int dirfd, const char *guest_path,
+                               int create_mode, int follow,
+                               char *out_buf, size_t out_sz,
                                const char **out_path,
                                const hl_mount_t **out_mount) {
     if (out_mount) *out_mount = NULL;
@@ -138,7 +156,7 @@ static int resolve_path_for_op(int dirfd, const char *guest_path,
 
     if (hl_vfs_mode() == HL_FS_ROOTED) {
         hl_vfs_resolve_t r;
-        int rc = hl_vfs_resolve_at(dirfd, guest_path, 1, create_mode, &r);
+        int rc = hl_vfs_resolve_at(dirfd, guest_path, follow, create_mode, &r);
         if (rc < 0) {
             /* Dynamic linker probes absolute nix RPATHs outside binds.
              * Fall back to --sysroot /lib/basename for library loads. */
@@ -149,6 +167,11 @@ static int resolve_path_for_op(int dirfd, const char *guest_path,
                 if (sr != guest_path) {
                     snprintf(out_buf, out_sz, "%s", sr);
                     *out_path = out_buf;
+                    /* This path bypassed the mount table, so callers would
+                     * otherwise see mount == NULL and skip their RO check
+                     * entirely. hl binds the sysroot read-only; report a
+                     * synthetic RO mount so those guards still fire. */
+                    if (out_mount) *out_mount = &sysroot_fallback_mount;
                     if (hl_trace_on(HL_TRACE_FS))
                         hl_trace(HL_TRACE_FS,
                                  "pathop sysroot-fallback guest=%s host=%s",
@@ -183,6 +206,12 @@ static int resolve_path_for_op(int dirfd, const char *guest_path,
     *out_path = out_buf;
     return 0;
 }
+
+/* Most path ops follow a symlink in the final component. The ones that must
+ * not (readlink, unlink, rename, symlink, lstat, O_NOFOLLOW) call
+ * resolve_path_for_op_ex directly with follow = 0. */
+#define resolve_path_for_op(dirfd, gp, cm, buf, sz, op, om) \
+    resolve_path_for_op_ex((dirfd), (gp), (cm), 1, (buf), (sz), (op), (om))
 
 /* After rooted resolve, use AT_FDCWD + absolute host path. */
 static int host_dirfd_for_resolved(void) {
@@ -232,7 +261,9 @@ int64_t sys_openat(guest_t *g, int dirfd, uint64_t path_gva,
 
     if (hl_vfs_mode() == HL_FS_ROOTED) {
         hl_vfs_resolve_t r;
-        int rc = hl_vfs_resolve_at(dirfd, path, 1, create_mode, &r);
+        int rc = hl_vfs_resolve_at(dirfd, path,
+                                   !(linux_flags & LINUX_O_NOFOLLOW),
+                                   create_mode, &r);
         if (rc < 0) {
             /* Absolute nix-store / loader paths often fall outside binds.
              * Fall back to --sysroot basename resolution so dynamic
@@ -343,6 +374,7 @@ int64_t sys_close(int fd) {
     if (!fd_snapshot_and_close(fd, &snap))
         return -LINUX_EBADF;
 
+    syscall_stats_clear_fd(fd);
     /* Special FD subsystem cleanup (keyed by guest fd number). */
     switch (snap.type) {
     case FD_EVENTFD:  eventfd_close(fd);  break;
@@ -451,7 +483,7 @@ int64_t sys_newfstatat(guest_t *g, int dirfd, uint64_t path_gva,
             if (intercepted == -2) {
                 char hostbuf[LINUX_PATH_MAX];
                 const char *stat_path = NULL;
-                int rr = resolve_path_for_op(dirfd, path, 0, hostbuf,
+                int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf,
                                              sizeof(hostbuf), &stat_path, NULL);
                 if (rr < 0) return rr;
                 int use_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
@@ -535,7 +567,7 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
     } else {
         char hostbuf[LINUX_PATH_MAX];
         const char *statx_path = NULL;
-        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+        int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf, sizeof(hostbuf),
                                      &statx_path, NULL);
         if (rr < 0) return rr;
         if (hl_vfs_mode() == HL_FS_ROOTED)
@@ -580,6 +612,17 @@ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
 /* ---------- dup/fcntl ---------- */
 
 int64_t sys_dup(int oldfd) {
+    if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+    if (fd_table[oldfd].type == FD_CLOSED) return -LINUX_EBADF;
+    /* Descriptor-backed fds must share the open-file description (POSIX).
+     * fd_alloc() below explicitly NULLs .of/.desc, so going through the
+     * legacy path gave the duplicate an independent object: closing the
+     * original tore down the shared state (for /dev/dsp, the audio stream)
+     * and broke the survivor. It also handles host_fd == -1 (e.g.
+     * /dev/mixer), which the fd_to_host() check below rejects outright. */
+    if (fd_table[oldfd].desc)
+        return hl_fd_dup(oldfd);
+
     int host_fd = fd_to_host(oldfd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -612,6 +655,12 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
     if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
     /* Linux dup3(2): EINVAL if oldfd == newfd (unlike dup2 which is a no-op) */
     if (oldfd == newfd) return -LINUX_EINVAL;
+    if (fd_table[oldfd].type == FD_CLOSED) return -LINUX_EBADF;
+    /* Share the open-file description for descriptor-backed fds — see
+     * the comment in sys_dup(). */
+    if (fd_table[oldfd].desc)
+        return hl_fd_dup3(oldfd, newfd, linux_flags);
+
     int host_fd = fd_to_host(oldfd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -642,6 +691,44 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
 
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
     if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+    if (fd_table[fd].type == FD_CLOSED) return -LINUX_EBADF;
+
+    /* F_GETFD/F_SETFD touch only descriptor state, so they must work even
+     * for fds with no host alias (/dev/mixer installs host_fd == -1).
+     * Checking fd_to_host() first made every fcntl on such a descriptor
+     * fail with EBADF right after open() returned it successfully. */
+    switch (cmd) {
+    case 1: /* F_GETFD */
+        return (fd_table[fd].linux_flags & LINUX_O_CLOEXEC) ? LINUX_FD_CLOEXEC : 0;
+    case 2: /* F_SETFD */
+        if ((int)arg & LINUX_FD_CLOEXEC)
+            fd_table[fd].linux_flags |= LINUX_O_CLOEXEC;
+        else
+            fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
+        return 0;
+    default:
+        break;
+    }
+
+    /* Descriptor-backed fds keep the guest-visible status flags on the
+     * open-file object. Their host alias is a dup() of an internal
+     * transport (the audio producer socketpair) whose O_NONBLOCK hl sets
+     * for its own purposes — reporting or mutating that leaked internal
+     * state to the guest and left the guest's own O_NONBLOCK request
+     * unseen by the OSS write path. */
+    hl_open_file_t *of = fd_table[fd].of;
+    if (of && (cmd == 3 || cmd == 4)) {
+        const uint32_t accmode = 0003; /* Linux O_ACCMODE */
+        if (cmd == 3)
+            return (int64_t)atomic_load(&of->status_flags);
+        uint32_t cur = atomic_load(&of->status_flags);
+        atomic_store(&of->status_flags,
+                     (cur & accmode) | ((uint32_t)arg & ~accmode));
+        return 0;
+    }
+    if (of && (cmd == 0 || cmd == 1030))
+        return hl_fd_dup(fd);   /* shares the open-file description */
+
     int host_fd = fd_to_host(fd);
     if (host_fd < 0) return -LINUX_EBADF;
 
@@ -775,13 +862,6 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
         if (!fd_snapshot_and_close((int)i, &snap))
             continue;
 
-        if (snap.dir) {
-            if (snap.type == FD_DIR)
-                closedir((DIR *)snap.dir);
-            else if (snap.type == FD_EPOLL)
-                free(snap.dir);
-        }
-
         /* Clean up emulated I/O subsystem state */
         switch (snap.type) {
         case FD_EVENTFD:  eventfd_close((int)i);  break;
@@ -791,7 +871,26 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
         default: break;
         }
 
-        if (snap.type != FD_STDIO)
+        /* fd_snapshot_and_close transferred ownership of desc/of to us.
+         * Releasing the descriptor runs the open-file destroy op (e.g.
+         * oss_destroy -> hl_audio_stream_destroy) and closes the host
+         * alias; skipping it leaks the object graph and leaves the audio
+         * queue playing after the guest closed the device. */
+        if (snap.desc) {
+            hl_descriptor_release(snap.desc);
+            continue;
+        }
+
+        if (snap.dir) {
+            if (snap.type == FD_DIR)
+                closedir((DIR *)snap.dir);
+            else if (snap.type == FD_EPOLL)
+                free(snap.dir);
+        }
+        if (snap.of)
+            hl_open_file_release(snap.of);
+
+        if (snap.type != FD_STDIO && snap.host_fd >= 0)
             close(snap.host_fd);
     }
     return 0;
@@ -995,7 +1094,7 @@ int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *read_path = NULL;
-    int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, path, 0, 0, hostbuf, sizeof(hostbuf),
                                  &read_path, NULL);
     if (rr < 0) return rr;
     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
@@ -1022,7 +1121,7 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
     char hostbuf[LINUX_PATH_MAX];
     const char *host_path = NULL;
     const hl_mount_t *mnt = NULL;
-    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, path, 1, 0, hostbuf, sizeof(hostbuf),
                                  &host_path, &mnt);
     if (rr < 0) return rr;
     if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1049,7 +1148,7 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
     char hostbuf[LINUX_PATH_MAX];
     const char *host_path = NULL;
     const hl_mount_t *mnt = NULL;
-    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, path, 1, 0, hostbuf, sizeof(hostbuf),
                                  &host_path, &mnt);
     if (rr < 0) return rr;
     if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1085,10 +1184,10 @@ int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
     int host_olddir, host_newdir;
 
     if (hl_vfs_mode() == HL_FS_ROOTED) {
-        int r1 = resolve_path_for_op(olddirfd, oldpath, 0, oldhost,
+        int r1 = resolve_path_for_op_ex(olddirfd, oldpath, 0, 0, oldhost,
                                      sizeof(oldhost), &oh, &om);
         if (r1 < 0) return r1;
-        int r2 = resolve_path_for_op(newdirfd, newpath, 1, newhost,
+        int r2 = resolve_path_for_op_ex(newdirfd, newpath, 1, 0, newhost,
                                      sizeof(newhost), &nh, &nm);
         if (r2 < 0) return r2;
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
@@ -1142,7 +1241,7 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
     char hostbuf[LINUX_PATH_MAX];
     const char *host_path = NULL;
     const hl_mount_t *mnt = NULL;
-    int rr = resolve_path_for_op(dirfd, path, 1, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, path, 1, 0, hostbuf, sizeof(hostbuf),
                                  &host_path, &mnt);
     if (rr < 0) return rr;
     if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1180,7 +1279,7 @@ int64_t sys_symlinkat(guest_t *g, uint64_t target_gva,
     char hostbuf[LINUX_PATH_MAX];
     const char *host_link = NULL;
     const hl_mount_t *mnt = NULL;
-    int rr = resolve_path_for_op(dirfd, linkpath, 1, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, linkpath, 1, 0, hostbuf, sizeof(hostbuf),
                                  &host_link, &mnt);
     if (rr < 0) return rr;
     if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1211,10 +1310,10 @@ int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
     int host_olddir, host_newdir;
 
     if (hl_vfs_mode() == HL_FS_ROOTED) {
-        int r1 = resolve_path_for_op(olddirfd, oldpath, 0, oldhost,
+        int r1 = resolve_path_for_op_ex(olddirfd, oldpath, 0, (flags & LINUX_AT_SYMLINK_FOLLOW) != 0, oldhost,
                                      sizeof(oldhost), &oh, &om);
         if (r1 < 0) return r1;
-        int r2 = resolve_path_for_op(newdirfd, newpath, 1, newhost,
+        int r2 = resolve_path_for_op_ex(newdirfd, newpath, 1, 0, newhost,
                                      sizeof(newhost), &nh, &nm);
         if (r2 < 0) return r2;
         if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
@@ -1249,7 +1348,7 @@ int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
 
     char hostbuf[LINUX_PATH_MAX];
     const char *check_path = NULL;
-    int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+    int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf, sizeof(hostbuf),
                                  &check_path, NULL);
     if (rr < 0) return rr;
 
@@ -1315,7 +1414,7 @@ int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
     const hl_mount_t *mnt = NULL;
     int host_dirfd;
     if (hl_vfs_mode() == HL_FS_ROOTED) {
-        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+        int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf, sizeof(hostbuf),
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1353,7 +1452,7 @@ int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
     const hl_mount_t *mnt = NULL;
     int host_dirfd;
     if (hl_vfs_mode() == HL_FS_ROOTED) {
-        int rr = resolve_path_for_op(dirfd, path, 0, hostbuf, sizeof(hostbuf),
+        int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf, sizeof(hostbuf),
                                      &host_path, &mnt);
         if (rr < 0) return rr;
         if (mnt && (mnt->flags & HL_MOUNT_RO)) return -LINUX_EROFS;
@@ -1393,7 +1492,7 @@ int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
         if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
             return -LINUX_EFAULT;
         if (hl_vfs_mode() == HL_FS_ROOTED) {
-            int rr = resolve_path_for_op(dirfd, path, 0, hostbuf,
+            int rr = resolve_path_for_op_ex(dirfd, path, 0, !(flags & LINUX_AT_SYMLINK_NOFOLLOW), hostbuf,
                                          sizeof(hostbuf), &path_arg, NULL);
             if (rr < 0) return rr;
             host_dirfd = host_dirfd_for_resolved();

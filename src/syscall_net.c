@@ -500,7 +500,12 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
                 const char *p = path;
                 if (path[0] == '\0' && path_len > 1)
                     p = path + 1; /* abstract namespace */
-                /* Match common X11 socket paths (filesystem + abstract). */
+                /* Match common X11 socket paths (filesystem + abstract).
+                 * The tagging call was missing entirely, so every x11_io
+                 * counter was permanently zero and the compiler flagged
+                 * `p` as set-but-unused. */
+                if (strncmp(p, "/tmp/.X11-unix/X", 16) == 0)
+                    syscall_stats_mark_x11_fd(fd);
             }
         }
     }
@@ -1024,24 +1029,22 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
         int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
         if (err < 0) return err;
 
-        ssize_t ret;
-        if (iovlen == 1 && host_iov[0].iov_len > 0) {
-            ret = recv(host_fd, host_iov[0].iov_base, host_iov[0].iov_len,
-                       mac_flags);
-        } else if (mac_flags == 0) {
-            ret = readv(host_fd, host_iov, iovlen);
-        } else {
-            struct msghdr msg = {
-                .msg_iov = host_iov,
-                .msg_iovlen = iovlen,
-            };
-            ret = recvmsg(host_fd, &msg, mac_flags);
-        }
+        /* Always go through recvmsg here. recv()/readv() cannot report
+         * msg_flags at all, and this fast path is gated on msg_name and
+         * msg_control being NULL — not on the socket type — so datagram and
+         * seqpacket sockets reach it too. Hard-zeroing msg_flags therefore
+         * dropped MSG_TRUNC, and a guest reading a short datagram was told
+         * it had received a complete message. */
+        struct msghdr msg = {
+            .msg_iov = host_iov,
+            .msg_iovlen = iovlen,
+        };
+        ssize_t ret = recvmsg(host_fd, &msg, mac_flags);
         if (ret < 0) return linux_errno();
 
-        /* Guest CMSG_FIRSTHDR must see controllen=0; msg_flags clear. */
+        /* Guest CMSG_FIRSTHDR must see controllen=0; msg_flags translated. */
         uint64_t zero64 = 0;
-        int32_t mflags = 0;
+        int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
         if (guest_write(g, msg_gva + 40, &zero64, 8) < 0)
             return -LINUX_EFAULT;
         if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)

@@ -28,6 +28,11 @@ typedef struct ca_state {
     hl_audio_stream_t *stream;
     uint64_t generation;
     int running;
+    /* Silence fill byte for the current format. Unsigned 8-bit PCM is
+     * centered on 0x80 — filling with 0x00 there is full-scale negative
+     * DC, i.e. a loud click on every start and every underrun. Computed
+     * at setup so the real-time callback only reads it. */
+    uint8_t silence;
 } ca_state_t;
 
 /* Callback: only copy from stream's cons_fd via pre-known state; no log/malloc. */
@@ -41,7 +46,7 @@ static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b) {
     /* generation check without lock: tear-down sets generation mismatch */
     hl_audio_stream_t *s = st->stream;
     if (st->generation != s->generation || s->stop_worker) {
-        memset(b->mAudioData, 0, b->mAudioDataBytesCapacity);
+        memset(b->mAudioData, st->silence, b->mAudioDataBytesCapacity);
         b->mAudioDataByteSize = b->mAudioDataBytesCapacity;
         AudioQueueEnqueueBuffer(q, b, 0, NULL);
         return;
@@ -50,7 +55,8 @@ static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b) {
     ssize_t got = read(s->cons_fd, b->mAudioData, (size_t)n);
     if (got < 0) got = 0;
     if (got < n)
-        memset((uint8_t *)b->mAudioData + got, 0, (size_t)(n - got));
+        memset((uint8_t *)b->mAudioData + got, st->silence,
+               (size_t)(n - got));
     b->mAudioDataByteSize = (UInt32)n;
     /* Counters: no lock (callback restriction). Worker is not started for CA. */
     if (got > 0) {
@@ -85,6 +91,9 @@ static int ca_setup_queue(hl_audio_stream_t *s, ca_state_t *st) {
     asbd.mChannelsPerFrame = (UInt32)ch;
     asbd.mBitsPerChannel = (UInt32)bps;
 
+    /* S16 silence is 0x00; unsigned 8-bit PCM is centered on 0x80. */
+    st->silence = (s->params.format == HL_AUDIO_FMT_S16_LE) ? 0x00 : 0x80;
+
     OSStatus err = AudioQueueNewOutput(&asbd, ca_callback, st, NULL, NULL, 0,
                                        &st->queue);
     if (err != noErr) {
@@ -98,7 +107,7 @@ static int ca_setup_queue(hl_audio_stream_t *s, ca_state_t *st) {
             st->queue = NULL;
             return -1;
         }
-        memset(st->bufs[i]->mAudioData, 0, AQ_BUF_SIZE);
+        memset(st->bufs[i]->mAudioData, st->silence, AQ_BUF_SIZE);
         st->bufs[i]->mAudioDataByteSize = AQ_BUF_SIZE;
         AudioQueueEnqueueBuffer(st->queue, st->bufs[i], 0, NULL);
     }

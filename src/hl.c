@@ -21,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -53,6 +54,14 @@
 /* ---------- Main ---------- */
 
 int main(int argc, char **argv) {
+    /* Ignore host SIGPIPE. The guest's SIGPIPE is emulated: write()/send()
+     * handlers translate EPIPE into signal_queue(LINUX_SIGPIPE). Without
+     * this, the host write() inside those handlers is killed by SIGPIPE
+     * before it can return EPIPE, so the whole VM dies (exit 141) and the
+     * emulation is unreachable. Applies to the normal, --fork-child and
+     * rosettad paths alike, and is inherited across posix_spawn. */
+    signal(SIGPIPE, SIG_IGN);
+
     int verbose = 0;
     int timeout_sec = 10;  /* Default: 10 second timeout */
     int fork_child_fd = -1; /* IPC fd for --fork-child mode */
@@ -216,6 +225,9 @@ int main(int argc, char **argv) {
                         argv[arg_start + 1]);
                 return 1;
             }
+            /* Flag wins over HL_AUDIO_BACKEND, which hl_audio_init() reads
+             * later from syscall_init(). */
+            hl_audio_set_backend_explicit();
             audio_backend_set = 1;
             arg_start += 2;
         } else if (strcmp(argv[arg_start], "--gdb") == 0 &&

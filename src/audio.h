@@ -93,6 +93,10 @@ void hl_audio_shutdown(void);
 void hl_audio_set_backend(hl_audio_backend_kind_t kind);
 hl_audio_backend_kind_t hl_audio_get_backend(void);
 int hl_audio_set_backend_name(const char *name);
+/* Mark the backend as explicitly chosen (CLI), so HL_AUDIO_BACKEND loses. */
+void hl_audio_set_backend_explicit(void);
+/* Current backend as a --audio-backend-compatible name. */
+const char *hl_audio_backend_name(void);
 
 hl_audio_stream_t *hl_audio_stream_create(void);
 void hl_audio_stream_destroy(hl_audio_stream_t *s);

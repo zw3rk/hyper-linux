@@ -72,6 +72,8 @@ const char *hl_vfs_sysroot(void);
 int hl_vfs_set_guest_home(const char *guest_path);
 int hl_vfs_set_cwd(const char *guest_abs);
 const char *hl_vfs_cwd(void);
+/* Thread-safe snapshot of the virtual CWD. */
+void hl_vfs_cwd_copy(char *out, size_t out_sz);
 
 /* Add bind: guest_prefix -> host_path. Longest prefix wins. */
 int hl_vfs_add_bind(const char *guest_prefix, const char *host_path,

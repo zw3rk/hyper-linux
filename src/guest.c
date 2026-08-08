@@ -1469,10 +1469,24 @@ int guest_map_va_range(guest_t *g, uint64_t va_start, uint64_t va_end,
         unsigned l2_idx = (unsigned)((va % BLOCK_1GB) / BLOCK_2MB);
 
         /* Block descriptor: output IPA may be non-identity (SysV SHM).
-         * Install when empty; overwrite existing L2 blocks so remaps work.
-         * Leave L3 tables alone (mixed-permission splits). */
+         * Install ONLY into an empty slot — first mapping wins.
+         *
+         * Overwriting existing valid blocks here re-pointed a live 2MB
+         * block at a freshly allocated GPA and re-stamped its permissions.
+         * sys_mmap_high_va documents and relies on the reuse contract
+         * ("guest_ptr walks the page tables and returns the host pointer
+         * for the ACTUAL GPA"), and it skips its own already-mapped guard
+         * for PROT_NONE — which is exactly rosetta's two-phase
+         * reserve-then-map pattern. The kbuf alias mapping was likewise a
+         * no-op before and would otherwise demote a shared block to one
+         * mmap's permissions.
+         *
+         * SysV SHM does not need the relaxation: hl_shm_find_guest_va() is
+         * a monotonic bump allocator in a band above mmap_limit that the
+         * page-table builders never touch, so its L2 slots are always
+         * empty on first attach. */
         uint64_t output_ipa = base + gpa_cursor;
-        if (!(l2[l2_idx] & PT_VALID) || !(l2[l2_idx] & PT_TABLE)) {
+        if (!(l2[l2_idx] & PT_BLOCK)) {
             l2[l2_idx] = make_block_desc(output_ipa, perms);
         }
     }

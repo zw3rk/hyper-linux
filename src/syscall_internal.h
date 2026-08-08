@@ -17,6 +17,24 @@
  *   6. pid_lock     (syscall_proc.c) — process table / wait state
  *   7. futex bucket (futex.c)       — per-bucket, index-ordered if >1
  *   7. inotify_lock (syscall_inotify.c) — inotify watch table
+ *
+ * Locks added by the VFS/audio/device/SHM work, with their ranks:
+ *   1a. shm_lock    (syscall_shm.c) — SysV segment table. Taken UNDER
+ *       mmap_lock: gva_resolve() -> hl_shm_resolve() reaches it from any
+ *       guest-memory access, and sys_shmat/sys_shmdt are dispatched with
+ *       mmap_lock held. Never take mmap_lock while holding it.
+ *   2a. vfs_lock    (vfs.c)         — mount table, virtual CWD, mode.
+ *       Leaf: no other lock is acquired while held.
+ *   2b. dev_lock    (device.c)      — /dev node registry. Released before
+ *       any ops->open callback, so it never nests with fd_lock.
+ *   5b. g_live_dsp_lock (audio_oss.c) — live DSP stream list. Taken before
+ *       an audio stream lock, never with fd_lock held.
+ *   8.  hl_audio_stream_t.lock (audio.h) — LEAF. Take only after releasing
+ *       fd_lock; never call FD-table code while holding it. The holder can
+ *       block for an unbounded time (the space wait ends only when the
+ *       Core Audio callback drains), so fd_lock must not be held across it.
+ *   8.  trace_lock  (trace.c)       — LEAF, stderr serialization only.
+ *   8.  dump_lock   (syscall_stats.c) — LEAF, stats dump serialization.
  */
 #ifndef SYSCALL_INTERNAL_H
 #define SYSCALL_INTERNAL_H

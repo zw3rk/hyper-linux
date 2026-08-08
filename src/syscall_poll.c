@@ -41,11 +41,24 @@ void wakeup_pipe_init(void) {
     }
 }
 
+/* Threads currently parked in an infinite poll/select with the wake pipe in
+ * their fd set. A wake must reach every one of them: the byte is a broadcast,
+ * but the pipe is shared and each waiter re-evaluates its own readiness after
+ * waking. Writing a single byte let the first thread to wake consume it and
+ * re-sleep, stranding the thread the wake was actually meant for — with an
+ * uninterruptible infinite wait that is a permanent hang. */
+static _Atomic int poll_waiters;
+
 void wakeup_pipe_signal(void) {
-    if (wakeup_pipe_wr >= 0) {
-        uint8_t byte = 1;
-        write(wakeup_pipe_wr, &byte, 1);
-    }
+    if (wakeup_pipe_wr < 0) return;
+    int n = atomic_load(&poll_waiters);
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;          /* bounded; pipe buffer is 64 KiB */
+    uint8_t bytes[64];
+    memset(bytes, 1, (size_t)n);
+    /* Non-blocking write end: a short write is fine, the waiters that miss
+     * out re-check their own condition and the next signal tops it up. */
+    write(wakeup_pipe_wr, bytes, (size_t)n);
 }
 
 /* Linux POLLNVAL (same numeric value on Darwin poll.h). */
@@ -115,6 +128,7 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
      * Linux: gfd < 0 is ignored; gfd >= 0 but not open → POLLNVAL. */
     struct pollfd host_fds[256];
     int nval_count = 0;
+    int ready_now_count = 0;   /* open fds with no host alias: always ready */
     for (uint32_t i = 0; i < nfds; i++) {
         int gfd = guest_fds[i].fd;
         host_fds[i].events = guest_fds[i].events;
@@ -129,8 +143,17 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
         } else {
             host_fds[i].fd = fd_to_host(gfd);
             if (host_fds[i].fd < 0) {
-                guest_fds[i].revents = (uint16_t)POLLNVAL;
-                nval_count++;
+                /* Open descriptor with no host alias — /dev/mixer is pure
+                 * emulation and installs host_fd = -1. Linux reports a
+                 * character device with no poll method as immediately
+                 * ready. Reporting POLLNVAL here both lied about a valid
+                 * fd and, via force_immediate below, turned the whole call
+                 * into a 0-timeout busy loop for every other fd in it. */
+                host_fds[i].fd = -1;
+                guest_fds[i].revents =
+                    (uint16_t)(guest_fds[i].events & (POLLIN | POLLOUT));
+                if (guest_fds[i].revents != 0)
+                    ready_now_count++;
             }
         }
     }
@@ -206,13 +229,14 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
     /* Linux: closed/invalid fds already have POLLNVAL ready → return
      * without waiting. Sample valid host fds once (timeout 0). Never
      * enter the infinite-retry path when nval_count > 0. */
-    int force_immediate = (nval_count > 0);
+    int force_immediate = (nval_count > 0 || ready_now_count > 0);
     int host_timeout = timeout_ms;
     if (force_immediate)
         host_timeout = 0;
     else if (timeout_ms < 0)
         host_timeout = added_wakeup ? -1 : 200; /* fallback if no wake pipe */
 
+    if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
     do {
         ret = poll(host_fds, nfds + added_wakeup, host_timeout);
 
@@ -228,12 +252,15 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
     } while (ret == 0 && timeout_ms < 0 && !added_wakeup && !force_immediate);
 
     int saved_errno = errno;
+    if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
 
     /* Drain the wakeup pipe if it fired, and subtract from count since
-     * the wakeup pipe is not visible to the guest. */
+     * the wakeup pipe is not visible to the guest. Consume exactly one
+     * byte: draining the whole pipe here stole the wakes intended for the
+     * other threads parked on the same shared pipe. */
     if (added_wakeup && (host_fds[nfds].revents & POLLIN)) {
         uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        (void)read(wakeup_pipe_rd, &drain, 1);
         if (ret > 0) ret--;
     }
 
@@ -246,7 +273,9 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
     /* Write back revents: keep POLLNVAL pre-sets; copy host revents otherwise. */
     int ready_count = 0;
     for (uint32_t i = 0; i < nfds; i++) {
-        if (guest_fds[i].revents & POLLNVAL) {
+        /* Pre-set revents (POLLNVAL for a closed fd, or the always-ready
+         * result for a host-alias-less device) must survive the copy. */
+        if (guest_fds[i].revents != 0) {
             ready_count++;
             continue;
         }
@@ -285,6 +314,14 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
 
     int max_host_fd = -1;
 
+    /* Open descriptors with no host alias (e.g. /dev/mixer) are always
+     * ready, like a Linux char device with no poll method. Track them here
+     * so they can be OR'd into the result sets; previously they made the
+     * whole call fail with EBADF, poisoning every other fd in it. */
+    uint64_t always_r[FD_TABLE_SIZE / 64] = {0};
+    uint64_t always_w[FD_TABLE_SIZE / 64] = {0};
+    int always_count = 0;
+
     /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask.
      * FD_TABLE_SIZE=1024 → max 16 uint64_t words (128 bytes). */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
@@ -311,8 +348,19 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
                 return -LINUX_EBADF;
 
             int host_fd = fd_to_host(i);
-            if (host_fd < 0)
-                return -LINUX_EBADF;
+            if (host_fd < 0) {
+                /* Valid fd, no host alias: report ready rather than
+                 * failing the entire select with EBADF. */
+                if (rbits[i / 64] & (1ULL << (i % 64))) {
+                    always_r[i / 64] |= (1ULL << (i % 64));
+                    always_count++;
+                }
+                if (wbits[i / 64] & (1ULL << (i % 64))) {
+                    always_w[i / 64] |= (1ULL << (i % 64));
+                    always_count++;
+                }
+                continue;
+            }
             /* Guard against host fds exceeding FD_SETSIZE (macOS stack
              * buffer overflow if the host fd number is >= FD_SETSIZE). */
             if (host_fd >= FD_SETSIZE) continue;
@@ -383,6 +431,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         saved_write  = write_set;
         saved_except = except_set;
     }
+    if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
 
     int ret;
     do {
@@ -393,7 +442,10 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         }
 
         const struct timespec *pts;
-        if (has_timeout)
+        static const struct timespec zero_ts = { .tv_sec = 0, .tv_nsec = 0 };
+        if (always_count > 0)
+            pts = &zero_ts;  /* something is already ready: sample, don't block */
+        else if (has_timeout)
             pts = &ts;
         else if (added_wakeup)
             pts = NULL; /* infinite */
@@ -412,15 +464,16 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             errno = EINTR;
             break;
         }
-    } while (ret == 0 && !has_timeout && !added_wakeup);
+    } while (ret == 0 && !has_timeout && !added_wakeup && always_count == 0);
 
     int save_errno = errno;
+    if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
 
     /* Drain wakeup pipe if it fired, and subtract from count since
      * the wakeup pipe is not visible to the guest. */
     if (added_wakeup && FD_ISSET(wakeup_pipe_rd, &read_set)) {
         uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        (void)read(wakeup_pipe_rd, &drain, 1); /* one byte: see poll_waiters */
         FD_CLR(wakeup_pipe_rd, &read_set);
         if (ret > 0) ret--;
     }
@@ -437,6 +490,10 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
         uint64_t wbits[FD_TABLE_SIZE / 64] = {0};
         uint64_t ebits[FD_TABLE_SIZE / 64] = {0};
         for (int i = 0; i < nfds; i++) {
+            /* Host-alias-less fds were never handed to select(); fold their
+             * always-ready result back in here. */
+            rbits[i / 64] |= always_r[i / 64];
+            wbits[i / 64] |= always_w[i / 64];
             int host_fd = fd_to_host(i);
             if (host_fd < 0) continue;
             if (host_fd >= FD_SETSIZE) continue;  /* Must match setup loop guard */
@@ -456,7 +513,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             return -LINUX_EFAULT;
     }
 
-    return ret;
+    return ret + always_count;
 }
 
 /* ================================================================
@@ -722,7 +779,7 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
         kevent(kq_fd, &del_ev, 1, NULL, 0, NULL);
         /* Drain the wakeup pipe */
         uint8_t drain;
-        while (read(wakeup_pipe_rd, &drain, 1) > 0) ;
+        (void)read(wakeup_pipe_rd, &drain, 1); /* one byte: see poll_waiters */
         /* Filter out wakeup pipe events from results */
         for (int i = 0; i < nready; i++) {
             if ((uintptr_t)kevents[i].udata == (uintptr_t)-1) {

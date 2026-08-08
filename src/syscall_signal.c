@@ -205,11 +205,20 @@ void signal_queue_directed(int signum, int64_t target_tid, int si_code) {
      * instance is already pending for a different thread, widen to
      * process-directed so no instance can get stuck behind a thread that
      * never reaches a delivery point. */
-    if (!was_pending)
+    if (!was_pending) {
         sig_target_tid[signum] = target_tid;
-    else if (sig_target_tid[signum] != target_tid)
+        sig_si_code[signum] = si_code;
+    } else if (sig_target_tid[signum] != target_tid) {
         sig_target_tid[signum] = 0;
-    sig_si_code[signum] = si_code;
+        /* Deliberately keep the already-pending instance's si_code. There is
+         * one target/si_code slot per signal number, so overwriting it let a
+         * later process-directed queue (an internal SIGPIPE/SIGCHLD/SIGALRM,
+         * or a guest kill()) downgrade a pending directed SI_TKILL to
+         * SI_USER. glibc's __nptl_setxid_sighandler and musl's handlers
+         * return early on the wrong si_code, so the sender's handshake then
+         * hangs — the exact failure this directed-signal path exists to
+         * prevent. */
+    }
     pthread_mutex_unlock(&sig_lock);
 
     /* Notify any signalfd instances whose mask includes this signal.
@@ -611,7 +620,13 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva,
          * check if any signal became deliverable with the new mask. If
          * yes, the vCPU loop will deliver it. If no, restore the mask —
          * the caller will loop (musl retries on -EINTR). */
-        if (!(sig_state.pending & ~*blocked)) {
+        /* Must match what signal_deliver() will actually take on THIS
+         * thread. Testing the raw pending set instead meant a signal
+         * directed at a *different* thread looked deliverable here: the
+         * temporary sigsuspend mask was then left installed permanently
+         * (no handler ever ran to restore it) and saved_blocked_valid
+         * stayed set, so a later signal restored an unrelated mask. */
+        if (!deliverable_here_locked()) {
             *blocked = saved_blocked;
         }
         /* If a signal IS pending, the mask stays temporarily modified.

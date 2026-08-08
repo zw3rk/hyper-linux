@@ -20,6 +20,8 @@
 #include "vdso.h"            /* VDSO_BASE, VDSO_SIZE */
 #include "syscall_fd.h"      /* eventfd_close, signalfd_close, timerfd_close */
 #include "syscall_inotify.h" /* inotify_close */
+#include "fd_object.h"       /* hl_descriptor_release, hl_open_file_release */
+#include "vfs.h"             /* hl_vfs_mode, hl_vfs_resolve_at */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,12 +68,29 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
                    uint64_t path_gva, uint64_t argv_gva, uint64_t envp_gva,
                    int verbose) {
     /* Step 1: Read path from guest memory */
-    char path[LINUX_PATH_MAX];
-    if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+    char guest_path[LINUX_PATH_MAX];
+    if (guest_read_str(g, path_gva, guest_path, sizeof(guest_path)) < 0)
         return -LINUX_EFAULT;
 
+    /* Resolve through the VFS like every other path syscall. execve was the
+     * one path op that bypassed it entirely and used the raw guest string
+     * against the host filesystem, so in rooted mode nothing inside a bind
+     * was executable, a relative path resolved against hl's host cwd rather
+     * than the guest's virtual cwd, and any host-path ELF could be exec'd
+     * straight through the mount table. */
+    char path[LINUX_PATH_MAX];
+    if (hl_vfs_mode() == HL_FS_ROOTED) {
+        hl_vfs_resolve_t r;
+        int rc = hl_vfs_resolve_at(LINUX_AT_FDCWD, guest_path, 1, 0, &r);
+        if (rc < 0) return rc;
+        if (r.is_virtual) return -LINUX_EACCES;   /* nothing to exec there */
+        snprintf(path, sizeof(path), "%s", r.host_path);
+    } else {
+        snprintf(path, sizeof(path), "%s", guest_path);
+    }
+
     if (verbose)
-        fprintf(stderr, "hl: execve(\"%s\")\n", path);
+        fprintf(stderr, "hl: execve(\"%s\" -> \"%s\")\n", guest_path, path);
 
     /* Step 2: Read argv[] and envp[] from guest memory */
     #define MAX_ARGS 256
@@ -198,7 +217,19 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         argc = ni;
 
         /* Replace path with interpreter and re-try ELF load */
-        strncpy(path, interp_start, sizeof(path) - 1);
+        /* The shebang interpreter is a GUEST path too — resolve it the same
+         * way as the script itself rather than hitting the host directly. */
+        if (hl_vfs_mode() == HL_FS_ROOTED) {
+            hl_vfs_resolve_t ir;
+            if (hl_vfs_resolve_at(LINUX_AT_FDCWD, interp_start, 1, 0, &ir) < 0 ||
+                ir.is_virtual) {
+                free(argv_buf); free(envp_buf);
+                return -LINUX_ENOENT;
+            }
+            snprintf(path, sizeof(path), "%s", ir.host_path);
+        } else {
+            strncpy(path, interp_start, sizeof(path) - 1);
+        }
         path[sizeof(path) - 1] = '\0';
 
         if (elf_load(path, &elf_info) < 0) {
@@ -276,7 +307,10 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
      * (eventfd_close, signalfd_close, etc.) acquire sfd_lock or
      * inotify_lock, which must NOT be held under fd_lock (lock
      * ordering: fd_lock(3) < sfd_lock(5a) < inotify_lock(7)). */
-    typedef struct { int fd; int type; int host_fd; void *dir; } cloexec_t;
+    typedef struct {
+        int fd; int type; int host_fd; void *dir;
+        hl_descriptor_t *desc; hl_open_file_t *of;
+    } cloexec_t;
     cloexec_t cloexec_list[FD_TABLE_SIZE];
     int cloexec_count = 0;
 
@@ -284,8 +318,12 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
         if (fd_table[i].type != FD_CLOSED &&
             (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
+            /* Capture desc/of before fd_mark_closed_unlocked NULLs them —
+             * otherwise the open-file destroy op never runs and the object
+             * graph (and any live audio stream) leaks across exec. */
             cloexec_list[cloexec_count++] = (cloexec_t){
-                i, fd_table[i].type, fd_table[i].host_fd, fd_table[i].dir
+                i, fd_table[i].type, fd_table[i].host_fd, fd_table[i].dir,
+                fd_table[i].desc, fd_table[i].of
             };
             fd_table[i].dir = NULL;
             fd_mark_closed_unlocked(i);
@@ -295,12 +333,6 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
 
     /* Now do type-specific cleanup without holding fd_lock */
     for (int j = 0; j < cloexec_count; j++) {
-        if (cloexec_list[j].dir) {
-            if (cloexec_list[j].type == FD_DIR)
-                closedir((DIR *)cloexec_list[j].dir);
-            else
-                free(cloexec_list[j].dir); /* FD_EPOLL */
-        }
         switch (cloexec_list[j].type) {
         case FD_EVENTFD:  eventfd_close(cloexec_list[j].fd);  break;
         case FD_SIGNALFD: signalfd_close(cloexec_list[j].fd); break;
@@ -308,7 +340,21 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         case FD_INOTIFY:  inotify_close(cloexec_list[j].fd);  break;
         default: break;
         }
-        if (cloexec_list[j].type != FD_STDIO)
+        /* Descriptor release (outside fd_lock) closes the host alias, the
+         * dir handle and the open-file, running its destroy op. */
+        if (cloexec_list[j].desc) {
+            hl_descriptor_release(cloexec_list[j].desc);
+            continue;
+        }
+        if (cloexec_list[j].dir) {
+            if (cloexec_list[j].type == FD_DIR)
+                closedir((DIR *)cloexec_list[j].dir);
+            else
+                free(cloexec_list[j].dir); /* FD_EPOLL */
+        }
+        if (cloexec_list[j].of)
+            hl_open_file_release(cloexec_list[j].of);
+        if (cloexec_list[j].type != FD_STDIO && cloexec_list[j].host_fd >= 0)
             close(cloexec_list[j].host_fd);
     }
 

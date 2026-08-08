@@ -109,9 +109,14 @@ Set the guest home directory path used by profiles.
 .It Fl -guest-cwd Ar path
 Set the initial virtual guest working directory
 .Pq rooted mode .
-Default:
-.Pa /home/user
-when the home bind is active.
+Default when the home bind is active:
+.Pa /home/user/Music
+if
+.Pa $HOME/Music
+exists on the host, otherwise
+.Pa /home/user .
+GTK file dialogs list the working directory, and a full macOS home can stall
+on cloud placeholders, so the media root is preferred when present.
 .It Fl -isolated
 Do not auto-bind
 .Pa $HOME
@@ -127,7 +132,7 @@ Documents, Downloads, /Volumes, virtual /dev and /proc).
 .It Fl -trace Ar categories
 Enable category tracing.
 Categories:
-.Ar fs,fd,dev,audio,proc,fork
+.Ar fs,fd,dev,audio,proc,fork,sys
 (or
 .Ar all ).
 Also set via
@@ -353,8 +358,52 @@ CLOEXEC semantics follow POSIX: all file descriptors are inherited
 across fork; O_CLOEXEC takes effect only at execve.
 .Sh ENVIRONMENT
 .Nm
-does not use any special environment variables.
-The guest inherits the host's environment verbatim.
+reads the following host environment variables:
+.Bl -tag -width "HL_GUEST_LANG_OFF"
+.It Ev HL_TRACE
+Trace categories, same syntax as
+.Fl -trace .
+Applied before option parsing, so it also covers startup events.
+.It Ev HL_TRACE_REDACT
+Reserved for path redaction in trace output.
+.It Ev HL_AUDIO_BACKEND
+Default audio backend. An explicit
+.Fl -audio-backend
+takes precedence.
+.It Ev HL_AUDIO_WAV
+Output path for the
+.Cm wav
+backend.
+.It Ev HL_SYSCALL_STATS
+Enable syscall volume statistics
+.Pq also enabled by Fl -trace Ns = Ns Cm sys .
+.It Ev HL_GUEST_LD_PRELOAD , Ev HL_GTK_THEME , Ev HL_GTK_RC
+Injected into the guest environment when set.
+.It Ev HL_GUEST_LANG , Ev HL_GUEST_LANG_OFF
+Override or disable the guest locale default.
+.El
+.Pp
+The guest does
+.Em not
+inherit the host environment verbatim in rooted mode. The following keys are
+set or rewritten for the guest:
+.Ev LD_LIBRARY_PATH ,
+.Ev LD_PRELOAD ,
+.Ev HOME ,
+.Ev XAUTHORITY ,
+.Ev DISPLAY ,
+.Ev TMPDIR ,
+.Ev TMP ,
+.Ev GTK_RC_FILES ,
+.Ev XLOCALEDIR ,
+.Ev GTK_EXE_PREFIX
+and
+.Ev LANG ,
+which is set to
+.Ev C.UTF-8
+unless
+.Ev HL_GUEST_LANG_OFF
+is set.
 .Sh EXIT STATUS
 The exit status of
 .Nm

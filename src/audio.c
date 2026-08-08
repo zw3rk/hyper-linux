@@ -24,6 +24,10 @@ static hl_audio_backend_kind_t g_backend = HL_AUDIO_BACKEND_COREAUDIO;
 static char g_wav_path[1024] = "hl-audio-debug.wav";
 static atomic_ullong g_stream_id = 1;
 static int g_audio_inited = 0;
+/* Set when --audio-backend named a backend explicitly. HL_AUDIO_BACKEND must
+ * not override an explicit flag: hl_audio_init() runs from syscall_init(),
+ * i.e. AFTER option parsing, so the env read used to silently win. */
+static int g_backend_explicit = 0;
 
 void hl_audio_set_wav_path(const char *path) {
     if (path)
@@ -38,7 +42,7 @@ void hl_audio_init(void) {
     if (g_audio_inited) return;
     g_audio_inited = 1;
     const char *env = getenv("HL_AUDIO_BACKEND");
-    if (env) hl_audio_set_backend_name(env);
+    if (env && !g_backend_explicit) hl_audio_set_backend_name(env);
     env = getenv("HL_AUDIO_WAV");
     if (env) hl_audio_set_wav_path(env);
 }
@@ -49,6 +53,22 @@ void hl_audio_shutdown(void) {
 
 void hl_audio_set_backend(hl_audio_backend_kind_t kind) {
     g_backend = kind;
+}
+
+/* Record that the backend came from the command line, so the environment
+ * variable does not override it later. */
+void hl_audio_set_backend_explicit(void) {
+    g_backend_explicit = 1;
+}
+
+const char *hl_audio_backend_name(void) {
+    switch (g_backend) {
+    case HL_AUDIO_BACKEND_NULL:          return "null";
+    case HL_AUDIO_BACKEND_NULL_REALTIME: return "null-realtime";
+    case HL_AUDIO_BACKEND_WAV:           return "wav";
+    case HL_AUDIO_BACKEND_COREAUDIO:     return "coreaudio";
+    }
+    return "coreaudio";
 }
 
 hl_audio_backend_kind_t hl_audio_get_backend(void) {
@@ -188,9 +208,14 @@ void hl_audio_stream_destroy(hl_audio_stream_t *s) {
         pthread_join(s->worker, NULL);
         s->worker_started = 0;
     }
-    if (s->cons_fd >= 0) { close(s->cons_fd); s->cons_fd = -1; }
+    /* Tear the backend down BEFORE closing cons_fd. For Core Audio there is
+     * no worker to join, and the AQ callback reads cons_fd from a real-time
+     * thread; AudioQueueStop/Dispose(true) are synchronous and wait for
+     * in-flight callbacks. Closing cons_fd first leaves a window where a
+     * callback reads a recycled fd number and steals another fd's data. */
     if (s->backend && s->backend->destroy)
         s->backend->destroy(s);
+    if (s->cons_fd >= 0) { close(s->cons_fd); s->cons_fd = -1; }
     pthread_mutex_destroy(&s->lock);
     pthread_cond_destroy(&s->space_cond);
     free(s);
@@ -200,7 +225,14 @@ int hl_audio_stream_configure(hl_audio_stream_t *s, const hl_audio_params_t *p) 
     if (!s || !p) return -1;
     pthread_mutex_lock(&s->lock);
     s->params = *p;
+    /* Clamp BOTH ends. Only the SNDCTL_DSP_SETFRAGMENT ioctl path bounded
+     * frag_size from above; the fork-import path replayed the guest's raw
+     * SETFRAGMENT word, so a shift of 30 gave frag_size = 1GB and
+     * frag_size * frag_count overflowed this int — wrapping to 0 (every
+     * write blocks forever) or negative (cast to uint64_t, ~1.8e19 free
+     * bytes, space accounting disabled). 65536 * 128 = 8MB fits easily. */
     if (s->params.frag_size < 256) s->params.frag_size = 256;
+    if (s->params.frag_size > 65536) s->params.frag_size = 65536;
     if (s->params.frag_count < 2) s->params.frag_count = 2;
     if (s->params.frag_count > 128) s->params.frag_count = 128;
     s->capacity = s->params.frag_size * s->params.frag_count;
@@ -237,10 +269,40 @@ int hl_audio_stream_reset(hl_audio_stream_t *s) {
 
 int hl_audio_stream_post(hl_audio_stream_t *s) {
     if (!s) return -1;
-    s->running = 1;
+
+    /* Serialize start against a concurrent start/reset on the same stream.
+     * ca_setup_queue() does AudioQueueStop + AudioQueueDispose and rebuilds
+     * st->queue with no locking of its own, and the old `if (!s->running)`
+     * check-then-act sat outside any lock — two threads (a write() and a
+     * SNDCTL_DSP_POST ioctl on the same fd) could both observe !running and
+     * both dispose the same AudioQueueRef. */
+    pthread_mutex_lock(&s->lock);
+    if (s->failed) {
+        pthread_mutex_unlock(&s->lock);
+        return -1;
+    }
+    if (s->running) {
+        /* Already playing. Re-running backend->start() here rebuilt the
+         * queue and discarded everything already enqueued, so a guest
+         * issuing SNDCTL_DSP_POST per buffer lost ~93ms of audio each
+         * time and got silence re-primed in its place. */
+        pthread_mutex_unlock(&s->lock);
+        return 0;
+    }
+    int rc = 0;
     if (s->backend && s->backend->start)
-        s->backend->start(s);
-    return 0;
+        rc = s->backend->start(s);
+    if (rc < 0) {
+        /* Latch the failure. Nothing will ever drain cons_fd, so without
+         * this every writer would block forever waiting for space that
+         * can never be freed. Wake anyone already parked. */
+        s->failed = 1;
+        pthread_cond_broadcast(&s->space_cond);
+    } else {
+        s->running = 1;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return rc < 0 ? -1 : 0;
 }
 
 void hl_audio_apply_gain(const hl_audio_stream_t *s,
@@ -301,8 +363,12 @@ int64_t hl_audio_stream_write(hl_audio_stream_t *s, const void *buf, size_t n) {
      * only drains cons_fd from the AQ callback, which never runs until
      * AudioQueueStart. Without auto-start, accepted hits capacity and
      * writers block forever in the free_bytes wait below. */
-    if (!s->running)
-        hl_audio_stream_post(s);
+    if (!s->running) {
+        if (hl_audio_stream_post(s) < 0) {
+            errno = EIO;
+            return -1;
+        }
+    }
 
     uint8_t *tmp = NULL;
     const void *outp = buf;
@@ -335,7 +401,8 @@ int64_t hl_audio_stream_write(hl_audio_stream_t *s, const void *buf, size_t n) {
                 uint64_t acc = atomic_load(&s->accepted);
                 uint64_t cmp = atomic_load(&s->completed);
                 uint64_t pending = (acc >= cmp) ? (acc - cmp) : 0;
-                if (pending < (uint64_t)s->capacity || s->stop_worker) break;
+                if (pending < (uint64_t)s->capacity || s->stop_worker ||
+                    s->failed) break;
                 /* Timed wait: CA callback cannot broadcast under lock */
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
@@ -346,7 +413,16 @@ int64_t hl_audio_stream_write(hl_audio_stream_t *s, const void *buf, size_t n) {
                 }
                 pthread_cond_timedwait(&s->space_cond, &s->lock, &ts);
             }
+            int dead = s->failed || s->stop_worker;
             pthread_mutex_unlock(&s->lock);
+            /* Backend died or the stream is being torn down: space will never
+             * free up, so returning to the top would spin forever. */
+            if (dead) {
+                free(tmp);
+                if (done > 0) return (int64_t)done;
+                errno = EIO;
+                return -1;
+            }
             continue;
         }
         size_t chunk = n - done;

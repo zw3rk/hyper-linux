@@ -782,8 +782,13 @@ static int run_rosettad_translate(const char *bin_path, const char *aot_path) {
     static const char rosettad_path[] =
         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosettad";
 
+    /* bin_path/aot_path are HOST paths (from F_GETPATH and mkstemp). This
+     * helper re-enters main(), which defaults to --fs-mode=rooted, so
+     * without an explicit legacy mode those paths match no mount and the
+     * translate step fails with ENOENT — silently disabling AOT for every
+     * x86_64 binary outside /nix/store or /tmp. */
     char *argv[] = {
-        (char *)hl_bin, (char *)rosettad_path,
+        (char *)hl_bin, "--fs-mode=legacy", (char *)rosettad_path,
         "translate", (char *)bin_path, (char *)aot_path, NULL
     };
 

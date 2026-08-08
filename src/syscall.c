@@ -2296,11 +2296,24 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_shmctl:
         result = sys_shmctl(g, (int)x0, (int)x1, x2);
         break;
+    /* shmat/shmdt mutate g->regions[] and the guest page tables, exactly
+     * like mmap/munmap/mprotect, so they need mmap_lock too. Without it a
+     * concurrent mmap on another vCPU thread raced guest_region_add()'s
+     * insertion shift against guest_region_remove()'s memmove, losing or
+     * duplicating entries and corrupting the gap allocator.
+     *
+     * Lock order is mmap_lock -> shm_lock, matching the edge that already
+     * exists via gva_resolve() -> hl_shm_resolve(); nothing takes mmap_lock
+     * while holding shm_lock, so this adds no cycle. */
     case SYS_shmat:
+        pthread_mutex_lock(&mmap_lock);
         result = sys_shmat(g, (int)x0, x1, (int)x2);
+        pthread_mutex_unlock(&mmap_lock);
         break;
     case SYS_shmdt:
+        pthread_mutex_lock(&mmap_lock);
         result = sys_shmdt(g, x0);
+        pthread_mutex_unlock(&mmap_lock);
         break;
 
     default:

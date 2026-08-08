@@ -54,7 +54,7 @@ hl --isolated --bind /path/to/media:/media ./app
 # Deterministic tests (legacy paths + silent backend)
 hl --fs-mode=legacy --audio-backend null ./test-program
 
-# Category traces: HL_TRACE=fs,fd,dev,audio,proc,fork
+# Category traces: HL_TRACE=fs,fd,dev,audio,proc,fork,sys
 ```
 
 ## Requirements

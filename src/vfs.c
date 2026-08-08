@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -90,17 +91,33 @@ int hl_vfs_set_guest_home(const char *guest_path) {
 int hl_vfs_set_cwd(const char *guest_abs) {
     if (!guest_abs || guest_abs[0] != '/') return -1;
     hl_vfs_t *v = hl_vfs_get();
+    /* chdir() on one guest thread runs concurrently with path resolution on
+     * every other one. The in-place snprintf + trailing-slash trim below
+     * briefly leaves a torn string, so a concurrent reader could resolve a
+     * relative path against a truncated directory — opening or deleting the
+     * wrong object. vfs_lock previously guarded only init/reset/fork. */
+    pthread_mutex_lock(&vfs_lock);
     snprintf(v->cwd, sizeof(v->cwd), "%s", guest_abs);
     /* Normalize trailing slashes except root */
     size_t n = strlen(v->cwd);
     while (n > 1 && v->cwd[n - 1] == '/') {
         v->cwd[--n] = '\0';
     }
+    pthread_mutex_unlock(&vfs_lock);
     return 0;
 }
 
 const char *hl_vfs_cwd(void) {
     return hl_vfs_get()->cwd;
+}
+
+/* Stable snapshot of the virtual CWD for readers on other threads. */
+void hl_vfs_cwd_copy(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    hl_vfs_t *v = hl_vfs_get();
+    pthread_mutex_lock(&vfs_lock);
+    snprintf(out, out_sz, "%s", v->cwd);
+    pthread_mutex_unlock(&vfs_lock);
 }
 
 static void strip_trailing_slash(char *s) {
@@ -120,8 +137,21 @@ int hl_vfs_add_bind(const char *guest_prefix, const char *host_path,
     m->id = v->next_mount_id++;
     snprintf(m->guest_prefix, sizeof(m->guest_prefix), "%s", guest_prefix);
     strip_trailing_slash(m->guest_prefix);
-    if (host_path)
-        snprintf(m->host_path, sizeof(m->host_path), "%s", host_path);
+    if (host_path) {
+        /* Canonicalize the mount root. macOS hands out symlinked paths for
+         * common roots (/tmp -> /private/tmp, mktemp's /var/... ->
+         * /private/var/...), and fcntl(F_GETPATH) always reports the
+         * resolved form. Storing the resolved form keeps forward
+         * resolution, the reverse map and dirfd lookups consistent, and
+         * stops a bind root from being mistaken for a symlink to re-map.
+         * If the path does not exist yet, keep it verbatim. */
+        char real[HL_VFS_PATH_MAX];
+        if (!(flags & HL_MOUNT_VIRTUAL) && realpath(host_path, real))
+            snprintf(m->host_path, sizeof(m->host_path), "%s", real);
+        else
+            snprintf(m->host_path, sizeof(m->host_path), "%s", host_path);
+        strip_trailing_slash(m->host_path);
+    }
     m->flags = flags;
     m->guest_len = strlen(m->guest_prefix);
     v->nmounts++;
@@ -133,31 +163,55 @@ int hl_vfs_add_bind(const char *guest_prefix, const char *host_path,
     return 0;
 }
 
-/* Accept "HOST:GUEST" (host path may contain ':') by splitting on last ':',
- * or "GUEST=HOST". */
+/* Accept "HOST:GUEST" (host path may contain ':') by splitting on the last
+ * ':' that introduces an absolute guest path, or the legacy "GUEST=HOST".
+ * An optional ":ro" suffix makes the mount read-only.
+ *
+ * The HOST:GUEST form is tried FIRST. Testing '=' first meant a host path
+ * containing '=' (legal on macOS) silently took the other branch — with the
+ * operands in the opposite order — so `--bind /data=v2:/data` bound host
+ * "v2:/data" onto guest "/data=v2" and exited 0 with no diagnostic. */
 int hl_vfs_parse_bind_arg(const char *arg) {
     if (!arg || !*arg) return -1;
-    const char *eq = strchr(arg, '=');
-    if (eq && eq != arg) {
-        char guest[HL_VFS_PATH_MAX], host[HL_VFS_PATH_MAX];
-        size_t gl = (size_t)(eq - arg);
-        if (gl >= sizeof(guest)) return -1;
-        memcpy(guest, arg, gl);
-        guest[gl] = '\0';
-        snprintf(host, sizeof(host), "%s", eq + 1);
-        return hl_vfs_add_bind(guest, host, 0);
+
+    char spec[HL_VFS_PATH_MAX * 2];
+    if (snprintf(spec, sizeof(spec), "%s", arg) >= (int)sizeof(spec))
+        return -1;   /* too long: refuse rather than bind a truncated path */
+
+    uint32_t flags = 0;
+    size_t sl = strlen(spec);
+    if (sl > 3 && strcmp(spec + sl - 3, ":ro") == 0) {
+        flags |= HL_MOUNT_RO;
+        spec[sl - 3] = '\0';
     }
-    /* HOST:GUEST — find last colon that separates host from guest path
-     * starting with /. */
-    const char *colon = strrchr(arg, ':');
-    if (!colon || colon == arg || colon[1] != '/') return -1;
+
     char host[HL_VFS_PATH_MAX], guest[HL_VFS_PATH_MAX];
-    size_t hl = (size_t)(colon - arg);
-    if (hl >= sizeof(host)) return -1;
-    memcpy(host, arg, hl);
-    host[hl] = '\0';
-    snprintf(guest, sizeof(guest), "%s", colon + 1);
-    return hl_vfs_add_bind(guest, host, 0);
+
+    /* HOST:GUEST — last colon whose right-hand side is an absolute path. */
+    const char *colon = strrchr(spec, ':');
+    if (colon && colon != spec && colon[1] == '/') {
+        size_t hlen = (size_t)(colon - spec);
+        if (hlen >= sizeof(host)) return -1;
+        memcpy(host, spec, hlen);
+        host[hlen] = '\0';
+        if (snprintf(guest, sizeof(guest), "%s", colon + 1) >= (int)sizeof(guest))
+            return -1;
+        return hl_vfs_add_bind(guest, host, flags);
+    }
+
+    /* GUEST=HOST */
+    const char *eq = strchr(spec, '=');
+    if (eq && eq != spec) {
+        size_t glen = (size_t)(eq - spec);
+        if (glen >= sizeof(guest)) return -1;
+        memcpy(guest, spec, glen);
+        guest[glen] = '\0';
+        if (snprintf(host, sizeof(host), "%s", eq + 1) >= (int)sizeof(host))
+            return -1;
+        return hl_vfs_add_bind(guest, host, flags);
+    }
+
+    return -1;
 }
 
 /* Longest-prefix mount lookup. */
@@ -215,7 +269,11 @@ static int normalize_guest(char *path) {
             if (n > 0) n--;
             continue;
         }
-        if (n < 256) components[n++] = tok;
+        /* Silently dropping components past the cap while ".." still
+         * popped made a long path resolve to a DIFFERENT existing path
+         * instead of failing — destructive for unlink/rename/O_TRUNC. */
+        if (n >= 256) return -1;
+        components[n++] = tok;
     }
     out[0] = '/';
     out[1] = '\0';
@@ -235,11 +293,106 @@ static int normalize_guest(char *path) {
     return 0;
 }
 
+/* Read-only synthetic directory: "/" and the interior path components that
+ * lead to a mount point. HL_MOUNT_VIRTUAL keeps callers from treating the
+ * guest path as a host path for mutation ops. */
+static const hl_mount_t vfs_synthetic_dir_mount = {
+    .id = 0,
+    .guest_prefix = "/",
+    .host_path = "",
+    .flags = HL_MOUNT_VIRTUAL | HL_MOUNT_RO,
+    .guest_len = 1,
+};
+
+/* True when the canonicalized host_dir lies inside mount_root.
+ *
+ * Used to catch interior-symlink escapes: the resolver builds host paths by
+ * string concatenation, so a symlink in any non-final component is followed
+ * by the host kernel and can leave the bind. Both sides are canonical
+ * (hl_vfs_add_bind() realpath()s mount roots), so a prefix test on a
+ * component boundary is sufficient.
+ *
+ * A path that does not resolve yet (ENOENT on a component) has not been
+ * subverted — the caller's own syscall will fail naturally — so that case is
+ * allowed through rather than reported as an escape. */
+static int real_within(const char *path, const char *mount_root, size_t rl) {
+    char real[HL_VFS_PATH_MAX];
+    if (!realpath(path, real)) return -1;           /* does not resolve */
+    if (strncmp(real, mount_root, rl) != 0) return 0;
+    /* Exact match, or a proper component boundary — "/foo" must not match
+     * "/foobar". A root mount ("/") contains everything. */
+    return (real[rl] == '\0' || real[rl] == '/' || rl == 1) ? 1 : 0;
+}
+
+static int path_within_mount(const char *host_path, const char *host_parent,
+                             const char *mount_root) {
+    if (!mount_root || !mount_root[0]) return 1;   /* virtual: no host root */
+
+    size_t rl = strlen(mount_root);
+    while (rl > 1 && mount_root[rl - 1] == '/') rl--;
+
+    /* Prefer the full path: it covers the mount root itself, whose parent
+     * legitimately lies outside the mount. */
+    int r = real_within(host_path, mount_root, rl);
+    if (r >= 0) return r;
+
+    /* Leaf does not exist yet (a create). Its parent must still be inside;
+     * a parent that also does not resolve has not been subverted, so let
+     * the caller's own syscall produce the natural ENOENT. */
+    r = real_within(host_parent, mount_root, rl);
+    return (r < 0) ? 1 : r;
+}
+
+/* True when guest_abs is "/" or a proper ancestor directory of some mount
+ * point, e.g. "/home" for a mount at "/home/user". */
+static int mount_ancestor(const hl_vfs_t *v, const char *guest_abs) {
+    if (guest_abs[0] == '/' && guest_abs[1] == '\0') return 1;   /* "/" */
+    size_t len = strlen(guest_abs);
+    for (int i = 0; i < v->nmounts; i++) {
+        const char *gp = v->mounts[i].guest_prefix;
+        if (strncmp(gp, guest_abs, len) == 0 && gp[len] == '/')
+            return 1;
+    }
+    return 0;
+}
+
+/* Map a guest directory fd to its guest absolute path.
+ *
+ * Prefer an explicit hint on the open-file object when one is set. Plain
+ * directory opens go through fd_alloc and have no open-file object at all,
+ * so fall back to asking the host for the descriptor's current path and
+ * running that back through the mount table. Without this fallback every
+ * *at() call with a real dirfd failed with ENOTDIR in rooted mode, because
+ * guest_path_hint is never assigned anywhere. */
+static int dirfd_guest_path(int dirfd_guest, char *out, size_t out_sz) {
+    if (dirfd_guest < 0 || dirfd_guest >= FD_TABLE_SIZE ||
+        fd_table[dirfd_guest].type == FD_CLOSED)
+        return -LINUX_EBADF;
+
+    if (fd_table[dirfd_guest].of && fd_table[dirfd_guest].of->guest_path_hint) {
+        snprintf(out, out_sz, "%s", fd_table[dirfd_guest].of->guest_path_hint);
+        return 0;
+    }
+
+    int host_fd = fd_to_host(dirfd_guest);
+    if (host_fd < 0) return -LINUX_ENOTDIR;
+
+    /* F_GETPATH needs a buffer of at least MAXPATHLEN. */
+    char hostbuf[HL_VFS_PATH_MAX];
+    if (fcntl(host_fd, F_GETPATH, hostbuf) < 0) return -LINUX_ENOTDIR;
+    if (hl_vfs_host_to_guest(hostbuf, out, out_sz) < 0) return -LINUX_ENOTDIR;
+    return 0;
+}
+
 int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
                       int follow_final_symlink, int create_mode,
                       hl_vfs_resolve_t *out) {
-    (void)follow_final_symlink;
     if (!guest_path || !out) return -LINUX_EFAULT;
+    /* Linux returns ENOENT for an empty pathname on every path syscall.
+     * join_path() left it as the CWD, so rmdir("") removed the guest's
+     * working directory and open("") returned a directory fd.
+     * AT_EMPTY_PATH callers are handled before they reach the resolver. */
+    if (guest_path[0] == '\0') return -LINUX_ENOENT;
     memset(out, 0, sizeof(*out));
 
     hl_vfs_t *v = hl_vfs_get();
@@ -256,18 +409,14 @@ int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
     if (guest_path[0] == '/') {
         snprintf(base, sizeof(base), "%s", guest_path);
     } else if (dirfd_guest == LINUX_AT_FDCWD) {
-        join_path(base, sizeof(base), v->cwd, guest_path);
+        char cwd_snap[HL_VFS_PATH_MAX];
+        hl_vfs_cwd_copy(cwd_snap, sizeof(cwd_snap));
+        join_path(base, sizeof(base), cwd_snap, guest_path);
     } else {
-        /* Resolve via dirfd guest path hint if available */
-        if (dirfd_guest < 0 || dirfd_guest >= FD_TABLE_SIZE ||
-            fd_table[dirfd_guest].type == FD_CLOSED)
-            return -LINUX_EBADF;
-        const char *hint = NULL;
-        if (fd_table[dirfd_guest].of && fd_table[dirfd_guest].of->guest_path_hint)
-            hint = fd_table[dirfd_guest].of->guest_path_hint;
-        if (!hint)
-            return -LINUX_ENOTDIR;
-        join_path(base, sizeof(base), hint, guest_path);
+        char dirbase[HL_VFS_PATH_MAX];
+        int drc = dirfd_guest_path(dirfd_guest, dirbase, sizeof(dirbase));
+        if (drc < 0) return drc;
+        join_path(base, sizeof(base), dirbase, guest_path);
     }
 
     if (normalize_guest(base) < 0) return -LINUX_EINVAL;
@@ -279,6 +428,22 @@ int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
         const hl_mount_t *m = find_mount(v, out->guest_abs);
         out->mount = m;
         if (!m) {
+            /* "/" and the interior directories leading to a mount must
+             * exist: Linux always has a root, and file dialogs stat("/")
+             * and every parent on the way down. Returning ENOENT for them
+             * made chdir("/"), stat("/") and opendir("/") fail in the
+             * default profile. Synthesize them as read-only virtual
+             * directories so they are visible but not mutable — the
+             * HL_MOUNT_VIRTUAL flag stops callers handing the guest path
+             * to a host mutation syscall. */
+            if (mount_ancestor(v, out->guest_abs)) {
+                out->mount = &vfs_synthetic_dir_mount;
+                out->is_virtual = 1;
+                snprintf(out->host_path, sizeof(out->host_path), "%s",
+                         out->guest_abs);
+                out->phase = 2;
+                return 0;
+            }
             out->phase = 1; /* mount-select fail */
             if (hl_trace_on(HL_TRACE_FS))
                 hl_trace(HL_TRACE_FS, "resolve miss guest=%s", out->guest_abs);
@@ -294,11 +459,18 @@ int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
         /* Map to host */
         const char *suffix = out->guest_abs + m->guest_len;
         if (*suffix == '/') suffix++;
+        /* Truncation here would silently yield a DIFFERENT existing path —
+         * typically the parent directory — which unlink/rename/O_TRUNC would
+         * then act on. Report ENAMETOOLONG instead. */
+        int need;
         if (*suffix)
-            snprintf(out->host_path, sizeof(out->host_path), "%s/%s",
-                     m->host_path, suffix);
+            need = snprintf(out->host_path, sizeof(out->host_path), "%s/%s",
+                            m->host_path, suffix);
         else
-            snprintf(out->host_path, sizeof(out->host_path), "%s", m->host_path);
+            need = snprintf(out->host_path, sizeof(out->host_path), "%s",
+                            m->host_path);
+        if (need < 0 || (size_t)need >= sizeof(out->host_path))
+            return -LINUX_ENAMETOOLONG;
 
         /* Parent + leaf */
         char *slash = strrchr(out->host_path, '/');
@@ -312,13 +484,39 @@ int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
             snprintf(out->leaf, sizeof(out->leaf), "%s", out->host_path);
         }
 
-        /* Follow intermediate symlinks when not create of final */
+        /* Containment check.
+         *
+         * host_path is built by string concatenation, and only the FINAL
+         * component is inspected for symlinks below — every interior
+         * component is resolved by the host kernel with host semantics. A
+         * symlink planted inside a bind (the guest can create one itself
+         * via symlinkat) therefore escaped the mount entirely:
+         *   ln -s / esc && cat /home/user/esc/etc/passwd
+         * read the host's /etc/passwd.
+         *
+         * Canonicalize the parent directory and require it to stay inside
+         * the mount root. The parent is used rather than the full path so
+         * that creating a new leaf still works. Mount roots are themselves
+         * canonicalized in hl_vfs_add_bind(), so this is a plain prefix
+         * test. A parent that does not exist yet cannot have been
+         * subverted, so a realpath() failure is not treated as an escape. */
+        if (!path_within_mount(out->host_path, out->host_parent, m->host_path)) {
+            out->phase = 3; /* containment */
+            if (hl_trace_on(HL_TRACE_FS))
+                hl_trace(HL_TRACE_FS,
+                         "resolve escape guest=%s host=%s mount=%s",
+                         out->guest_abs, out->host_path, m->host_path);
+            return -LINUX_EACCES;
+        }
+
         struct stat st;
         if (lstat(out->host_path, &st) == 0 && S_ISLNK(st.st_mode)) {
-            if (create_mode && links == 0) {
-                /* For O_CREAT on final, if final is symlink we still follow
-                 * unless O_NOFOLLOW — handled by caller flags. Default follow. */
-            }
+            /* The caller wants the link itself, not its target: readlink,
+             * lstat, unlink, rename, symlink, O_NOFOLLOW. Stop here and
+             * return the link's own path. Following it here made `rm link`
+             * delete the target and readlink() fail with EINVAL. */
+            if (!follow_final_symlink)
+                break;
             char linkbuf[HL_VFS_PATH_MAX];
             ssize_t nr = readlink(out->host_path, linkbuf, sizeof(linkbuf) - 1);
             if (nr < 0) return -LINUX_EIO;
@@ -364,9 +562,16 @@ int hl_vfs_host_to_guest(const char *host_path, char *guest_out, size_t out_sz) 
         if (m->flags & HL_MOUNT_VIRTUAL) continue;
         if (!m->host_path[0]) continue;
         size_t hl = strlen(m->host_path);
+        /* hl_vfs_add_bind strips a trailing '/' from guest_prefix but not
+         * from host_path, so ignore it here or the boundary test below
+         * never matches. */
+        while (hl > 1 && m->host_path[hl - 1] == '/') hl--;
         if (strncmp(host_path, m->host_path, hl) != 0) continue;
-        if (host_path[hl] != '\0' && host_path[hl] != '/') continue;
-        if (hl > best_len) {
+        /* A root host mount ("/") covers every path; for anything else
+         * require a component boundary so /foo does not match /foobar. */
+        if (!(hl == 1 && m->host_path[0] == '/') &&
+            host_path[hl] != '\0' && host_path[hl] != '/') continue;
+        if (hl > best_len || !best) {
             best = m;
             best_len = hl;
         }
@@ -374,10 +579,12 @@ int hl_vfs_host_to_guest(const char *host_path, char *guest_out, size_t out_sz) 
     if (!best) return -1;
     const char *suffix = host_path + best_len;
     if (*suffix == '/') suffix++;
-    if (*suffix)
-        snprintf(guest_out, out_sz, "%s/%s", best->guest_prefix, suffix);
-    else
+    if (!*suffix)
         snprintf(guest_out, out_sz, "%s", best->guest_prefix);
+    else if (best->guest_prefix[0] == '/' && best->guest_prefix[1] == '\0')
+        snprintf(guest_out, out_sz, "/%s", suffix);   /* avoid "//path" */
+    else
+        snprintf(guest_out, out_sz, "%s/%s", best->guest_prefix, suffix);
     return 0;
 }
 
@@ -416,11 +623,11 @@ int hl_vfs_fchdir(int guest_fd) {
         if (fchdir(h) < 0) return linux_errno();
         return 0;
     }
-    if (fd_table[guest_fd].of && fd_table[guest_fd].of->guest_path_hint) {
-        hl_vfs_set_cwd(fd_table[guest_fd].of->guest_path_hint);
-        return 0;
-    }
-    return -LINUX_ENOENT;
+    char dirbase[HL_VFS_PATH_MAX];
+    int drc = dirfd_guest_path(guest_fd, dirbase, sizeof(dirbase));
+    if (drc < 0) return drc;
+    hl_vfs_set_cwd(dirbase);
+    return 0;
 }
 
 int hl_vfs_getcwd(char *buf, size_t sz) {

@@ -9,7 +9,7 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl clean dist pkg release test-hello test-all test-coreutils \
+.PHONY: all hl clean dist pkg release test-hello test-all test-all-rooted test-both-modes test-coreutils \
        test-busybox test-static-bins test-dynamic test-dynamic-coreutils \
        test-glibc-dynamic test-glibc-coreutils \
        test-perf test-multi-vcpu test-rwx test-haskell test-haskell-bins \
@@ -185,7 +185,23 @@ test-hello: $(BUILD_DIR)/hl $(TEST_DEPS)
 	$(BUILD_DIR)/hl $(TEST_DIR)/test-hello
 
 # Deterministic suite flags: host-path tests need legacy VFS; audio needs null.
+#
+# NOTE: this is NOT the shipped default. hl.c defaults to --fs-mode=rooted
+# and --audio-backend coreaudio, so a suite run with these flags alone never
+# exercises the configuration users actually get. Run `make test-all-rooted`
+# (or `make test-both-modes`) to cover the default resolver as well.
 HL_TEST_FLAGS ?= --fs-mode=legacy --audio-backend null
+
+## Run the whole suite in the shipped default fs mode (rooted).
+## Binds the repo at its own path so host-path tests still resolve, while
+## every path op goes through the rooted resolver rather than passthrough.
+test-all-rooted:
+	@printf "\n$(BLUE)━━━ Suite in default (rooted) fs mode ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-all HL_TEST_FLAGS="--fs-mode=rooted \
+		--bind $(CURDIR):$(CURDIR) --guest-cwd $(CURDIR) --audio-backend null"
+
+## Run the suite in both fs modes (legacy passthrough and the rooted default).
+test-both-modes: test-all test-all-rooted
 
 ## Run all tests
 test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
@@ -228,6 +244,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-argc a b c; \
 	expected_rc=42 run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-complex; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vdso-time; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vdso-fork; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fileio CLAUDE.md; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-string; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-malloc; \
@@ -287,6 +304,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)── VFS / OSS / device tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-dsp-presence; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-bare-name; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigpipe-survival; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-open; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-tier1; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-fork; \
@@ -294,6 +313,18 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	tmpdir=$$(mktemp -d); \
 	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
 		--guest-cwd /home/user $(TEST_DIR)/test-vfs-rooted; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-dirfd; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-symlink; \
+	rm -rf "$$tmpdir"; \
+	tmpdir=$$(mktemp -d); \
+	run_test $(BUILD_DIR)/hl --fs-mode=rooted --bind "$$tmpdir:/home/user" \
+		--guest-cwd /home/user $(TEST_DIR)/test-vfs-containment; \
 	rm -rf "$$tmpdir"; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]

@@ -109,8 +109,10 @@ static const char *basename_dev(const char *path) {
     if (!path) return NULL;
     if (strncmp(path, "/dev/", 5) == 0) return path + 5;
     if (strcmp(path, "/dev") == 0) return "";
-    /* bare name */
-    if (strchr(path, '/') == NULL) return path;
+    /* Only absolute /dev/ paths name a virtual device. Matching bare
+     * single-component names here would hijack ordinary relative files:
+     * open("random") in a data directory returned /dev/urandom, and
+     * `echo x > null` silently discarded the write. */
     return NULL;
 }
 

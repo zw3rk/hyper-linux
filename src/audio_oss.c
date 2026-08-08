@@ -234,7 +234,12 @@ static int64_t oss_ioctl(hl_open_file_t *of, int host_fd,
     }
     if (req == SNDCTL_DSP_SETFRAGMENT) {
         st->frag_arg = ival;
-        int frag_size = 1 << (ival & 0xffff);
+        /* Clamp the shift before applying: `1 << n` is undefined for
+         * n >= 32 (C11 6.5.7p3), and the guest supplies n directly. */
+        int frag_shift = ival & 0xffff;
+        if (frag_shift < 8)  frag_shift = 8;
+        if (frag_shift > 16) frag_shift = 16;
+        int frag_size = 1 << frag_shift;
         int frag_count = (ival >> 16) & 0xffff;
         if (frag_size < 256) frag_size = 256;
         if (frag_size > 65536) frag_size = 65536;
@@ -404,7 +409,14 @@ static hl_open_file_t *oss_fork_import(const hl_fork_object_record_t *in,
             .frag_count = 16,
         };
         if (st->frag_arg) {
-            ap.frag_size = 1 << (st->frag_arg & 0xffff);
+            /* frag_arg is the guest's raw SETFRAGMENT word. Clamp the shift
+             * before applying it: a count >= 32 is undefined behaviour, and
+             * anything large overflowed the capacity computation downstream.
+             * hl_audio_stream_configure() clamps the results as well. */
+            int shift = st->frag_arg & 0xffff;
+            if (shift < 8)  shift = 8;    /* 256 bytes */
+            if (shift > 16) shift = 16;   /* 64 KiB   */
+            ap.frag_size = 1 << shift;
             ap.frag_count = (st->frag_arg >> 16) & 0xffff;
         }
         hl_audio_stream_configure(st->stream, &ap);

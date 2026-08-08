@@ -8,13 +8,38 @@
 - Virtual device registry; OSS `/dev/dsp`, `/dev/dsp0`, `/dev/audio`, `/dev/mixer`
 - Audio stream manager with null / null-realtime / WAV / Core Audio backends
 - Software mixer gain (never changes macOS system volume); live mixer → open DSP streams
-- Category tracing: `HL_TRACE` / `--trace=fs,fd,dev,audio,proc,fork`
+- Category tracing: `HL_TRACE` / `--trace=fs,fd,dev,audio,proc,fork,sys`
 - Guest DISPLAY / X11 socket bridging; SysV SHM (MIT-SHM); guest vDSO text
 - Guest tests: OSS/VFS/vdso/tgkill; host unit tests for VFS/FD/audio
 
 ### Removed
 - Paravirtual X11 ring (`HL_X11_PV`, `libhl_x11_pv.so`, `packages.*.hl-x11-pv`) —
   high complexity, no product win; stock AF_UNIX X path is sufficient
+
+### Fixed (post-0.3.0-rc review)
+- Host `SIGPIPE` is ignored: a guest write to a broken pipe killed the VM
+  (exit 141) and made the guest-side SIGPIPE emulation unreachable
+- Rooted mode (the default) resolves dirfd-relative `*at()` paths and
+  `fchdir()`; `guest_path_hint` was never assigned so all of them failed
+- `follow_final_symlink` is honored: `rm link` deleted the target,
+  `readlink()` returned EINVAL, and `lstat()` never reported a symlink
+- Mount roots are canonicalized, fixing `chdir("/tmp")` on macOS
+- `/` and mount ancestors exist; empty pathnames return ENOENT
+- Read-only mounts are enforced on the `--sysroot` fallback path
+- `execve` resolves through the VFS instead of the raw host filesystem
+- `/dev` registry no longer matches bare relative filenames (`open("random")`)
+- `close_range()` and the exec CLOEXEC sweep release the FD object graph
+- `dup()`/`fcntl()` share the open-file description
+- Infinite `ppoll`/`pselect6` hangs: wake-pipe pairing, lost wakeups, and an
+  `EBADF` regression for descriptors with no host alias
+- Fork children run their own vDSO time publisher (clock was frozen)
+- `fd_lock` is no longer held across the audio stream lock
+- SysV SHM attach/detach take `mmap_lock`; page-table reuse contract restored
+- Audio: start race, `POST` discarding queued audio, U8 silence value,
+  fragment-size overflow
+- `--audio-backend` beats `HL_AUDIO_BACKEND` and is inherited by fork children
+- `--bind` accepts hosts containing `=` and a `:ro` suffix
+- Builds warning-free again; X11 stats tagging actually wired up
 
 ### Notes
 - CLI defaults: `--fs-mode=rooted`, bind `$HOME:/home/user`, `--guest-cwd /home/user`,
