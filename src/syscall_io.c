@@ -643,6 +643,87 @@ static void digest_to_hex(const uint8_t digest[ROSETTAD_DIGEST_SIZE], char *buf)
         snprintf(buf + (size_t)i * 2, 3, "%02x", digest[i]);
 }
 
+/* Structural sanity check of an AOT file (fd; position restored to start).
+ * Validates the fixed header invariants so hl never maps a truncated/garbage
+ * .aot (which would fault as soon as rosetta jumps into it). Returns 0 if the
+ * header looks like a well-formed AOT file, -1 otherwise.
+ * Header layout (little-endian; host is ARM64 LE): see CLAUDE.md "AOT File
+ * Format": total_size@0x00, version@0x08(==1), code_offset@0x18(==0x1000),
+ * code_align@0x50(==0x1000), entry_count@0x54(>0). */
+static int aot_header_valid(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0x1000)
+        return -1;
+    uint8_t h[0x58];
+    if (pread(fd, h, sizeof(h), 0) != (ssize_t)sizeof(h))
+        return -1;
+    uint64_t total_size, version, code_offset;
+    uint32_t code_align, entry_count;
+    memcpy(&total_size, h + 0x00, 8);
+    memcpy(&version,     h + 0x08, 8);
+    memcpy(&code_offset, h + 0x18, 8);
+    memcpy(&code_align,  h + 0x50, 4);
+    memcpy(&entry_count, h + 0x54, 4);
+    if (version != 1 || code_offset != 0x1000 || code_align != 0x1000 ||
+        total_size == 0 || entry_count == 0 ||
+        (uint64_t)st.st_size <= code_offset)
+        return -1;
+    return 0;
+}
+
+/* Write <aot_path>.sha256 = hex SHA256 of the file content, atomically. This
+ * lets aot_verify() detect any post-store truncation/bit-rot on later loads. */
+static void aot_write_checksum(const char *aot_path) {
+    int fd = open(aot_path, O_RDONLY);
+    if (fd < 0) return;
+    uint8_t d[CC_SHA256_DIGEST_LENGTH];
+    int ok = (compute_fd_sha256(fd, d) == 0);
+    close(fd);
+    if (!ok) return;
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        snprintf(hex + (size_t)i * 2, 3, "%02x", d[i]);
+    char sc[PATH_MAX], tmp[PATH_MAX];
+    snprintf(sc, sizeof(sc), "%s.sha256", aot_path);
+    snprintf(tmp, sizeof(tmp), "%s.sha256.tmp", aot_path);
+    int w = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (w >= 0) {
+        if (write(w, hex, CC_SHA256_DIGEST_LENGTH * 2) == CC_SHA256_DIGEST_LENGTH * 2) {
+            close(w);
+            rename(tmp, sc);
+        } else {
+            close(w);
+            unlink(tmp);
+        }
+    }
+}
+
+/* Verify a cached AOT fd: structural header check + content SHA256 vs the
+ * stored <path>.sha256 sidecar. Returns 0 only if BOTH pass (so a truncated,
+ * garbage, or sidecar-less/legacy entry is treated as invalid). */
+static int aot_verify(int fd, const char *path) {
+    if (aot_header_valid(fd) != 0)
+        return -1;
+    uint8_t d[CC_SHA256_DIGEST_LENGTH];
+    if (compute_fd_sha256(fd, d) != 0)
+        return -1;
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        snprintf(hex + (size_t)i * 2, 3, "%02x", d[i]);
+    char sc[PATH_MAX];
+    snprintf(sc, sizeof(sc), "%s.sha256", path);
+    int sfd = open(sc, O_RDONLY);
+    if (sfd < 0)
+        return -1;  /* no sidecar (or unreadable) → cannot verify → invalid */
+    char want[CC_SHA256_DIGEST_LENGTH * 2 + 1] = {0};
+    ssize_t n = read(sfd, want, CC_SHA256_DIGEST_LENGTH * 2);
+    close(sfd);
+    if (n != CC_SHA256_DIGEST_LENGTH * 2 ||
+        memcmp(hex, want, (size_t)n) != 0)
+        return -1;
+    return 0;
+}
+
 /* Look up a cached AOT file by binary SHA256 digest.
  * Returns an open fd on hit, -1 on miss. */
 static int aot_cache_lookup(const uint8_t digest[ROSETTAD_DIGEST_SIZE]) {
@@ -652,7 +733,23 @@ static int aot_cache_lookup(const uint8_t digest[ROSETTAD_DIGEST_SIZE]) {
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s.aot", aot_cache_dir, hex);
-    return open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    if (aot_verify(fd, path) != 0) {
+        /* Poisoned/truncated/unverifiable cache entry — NEVER serve it.
+         * Self-heal: remove it (and its sidecar) so the caller re-translates. */
+        fprintf(stderr, "hl: rosettad: cached AOT %s.aot failed validation — "
+                "discarding and re-translating\n", hex);
+        close(fd);
+        unlink(path);
+        char sc[PATH_MAX];
+        snprintf(sc, sizeof(sc), "%s.sha256", path);
+        unlink(sc);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    return fd;
 }
 
 /* Store an AOT file in the persistent cache, keyed by binary SHA256.
@@ -672,6 +769,8 @@ static void aot_cache_store(const uint8_t digest[ROSETTAD_DIGEST_SIZE],
     } else {
         rename(aot_path, dest);  /* cross-device fallback */
     }
+    /* Record the content checksum so aot_verify() can detect later corruption. */
+    aot_write_checksum(dest);
 }
 
 /* Run 'hl rosettad translate <input> <output>' via posix_spawn().
@@ -845,9 +944,22 @@ static void *rosettad_handler_thread(void *arg) {
             close(aot_fd);
 
             int ret = run_rosettad_translate(bin_path, aot_path);
-            if (ret != 0) {
-                fprintf(stderr, "hl: rosettad: translate failed (exit=%d) "
-                        "for %s\n", ret, bin_path);
+            int aot_ok = 0;
+            if (ret == 0) {
+                /* Even on exit 0, validate the output structurally before
+                 * caching — a truncated/garbage translate must NOT poison the
+                 * cache (which would fault every later run). */
+                int vfd = open(aot_path, O_RDONLY);
+                if (vfd >= 0) {
+                    aot_ok = (aot_header_valid(vfd) == 0);
+                    close(vfd);
+                }
+            }
+            if (ret != 0 || !aot_ok) {
+                fprintf(stderr, "hl: rosettad: translate %s for %s (exit=%d) — "
+                        "serving MISS, not caching\n",
+                        ret != 0 ? "failed" : "produced an invalid AOT",
+                        bin_path, ret);
                 uint8_t resp = ROSETTAD_RESP_MISS;
                 if (write(fd, &resp, 1) != 1) { unlink(aot_path); goto done; }
                 unlink(aot_path);

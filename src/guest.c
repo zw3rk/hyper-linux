@@ -115,8 +115,60 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa) {
 
 /* ---------- Public API ---------- */
 
-int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
+/* Negotiate the VM IPA width. `requested`==0 means auto. The result is capped
+ * to the host's advertised max: macOS 26 strictly rejects set_ipa_size(>max)
+ * with HV_UNSUPPORTED (older macOS silently accepted it), so requesting more
+ * than the max buys nothing and must be avoided. *out_max returns the host max. */
+static uint32_t guest_pick_ipa(uint32_t requested, uint32_t *out_max) {
+    uint32_t max_ipa = 0;
+    if (hv_vm_config_get_max_ipa_size(&max_ipa) != HV_SUCCESS || max_ipa < 36)
+        max_ipa = 36;
+    if (out_max) *out_max = max_ipa;
+    uint32_t want = requested ? requested : (max_ipa >= 40 ? 40 : 36);
+    if (want > max_ipa) want = max_ipa;   /* cap — see comment above */
+    return want;
+}
+
+/* Create an HVF VM at exactly `ipa` bits. Checks set_ipa_size's return and
+ * reads the value back, so a rejected width fails loudly here instead of
+ * silently creating a smaller VM whose later hv_vm_map fails with a cryptic
+ * HV_BAD_ARGUMENT. Retries hv_vm_create for transient HVF resource exhaustion.
+ * Returns HV_SUCCESS with the VM created, or an error (no VM) with a diagnostic. */
+static hv_return_t guest_create_vm_ipa(uint32_t ipa) {
+    hv_return_t ret = HV_ERROR;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        hv_vm_config_t config = hv_vm_config_create();
+        hv_return_t sret = hv_vm_config_set_ipa_size(config, ipa);
+        if (sret != HV_SUCCESS) {
+            os_release(config);
+            fprintf(stderr, "guest: hv_vm_config_set_ipa_size(%u) failed: %d — "
+                    "host HVF max IPA is smaller; x86_64/rosetta needs a %u-bit "
+                    "primary buffer that this host cannot map.\n",
+                    ipa, (int)sret, ipa);
+            return sret;
+        }
+        uint32_t got = 0;
+        hv_vm_config_get_ipa_size(config, &got);
+        if (got != ipa) {
+            os_release(config);
+            fprintf(stderr, "guest: IPA size readback mismatch: set %u, got %u\n",
+                    ipa, got);
+            return HV_BAD_ARGUMENT;
+        }
+        ret = hv_vm_create(config);
+        os_release(config);
+        if (ret == HV_SUCCESS)
+            return HV_SUCCESS;
+        usleep(500000);  /* 500ms between attempts */
+    }
+    fprintf(stderr, "guest: hv_vm_create failed: %d (ipa_bits=%u)\n",
+            (int)ret, ipa);
+    return ret;
+}
+
+int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits, int is_rosetta) {
     memset(g, 0, sizeof(*g));
+    g->is_rosetta = is_rosetta;
     g->shm_fd = -1;
     g->ipa_base = GUEST_IPA_BASE;
     g->pt_pool_next = PT_POOL_BASE;
@@ -125,35 +177,17 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     g->mmap_next = MMAP_BASE;
     g->mmap_rx_next = MMAP_RX_BASE;
 
-    /* Query the maximum IPA size supported by the hardware/kernel.
-     * macOS 15+ on Apple Silicon reports 40 bits (1TB). Older versions
-     * or fallback yields 36 bits (64GB). Apple Silicon actually supports
-     * up to 48-bit IPA despite the API reporting 36 as default — this is
-     * needed for rosetta at 0x800000000000 (128TB). */
-    uint32_t max_ipa = 0;
-    hv_vm_config_get_max_ipa_size(&max_ipa);
-    if (max_ipa < 36) max_ipa = 36;
+    /* Determine the VM IPA width, capped to the host's advertised max.
+     * ipa_bits=0 auto-detects; ipa_bits>0 is a ceiling request (rosetta asks
+     * for as much as possible). NOTE: rosetta's binary is linked at VA 128TB
+     * but hl maps it (and everything else) at a LOW guest-physical/IPA address
+     * (see rosetta.c: guest_add_va_alias) — 128TB is a VIRTUAL address, NOT an
+     * IPA requirement. So the VM only needs enough IPA to cover the primary
+     * buffer (≤1TB / 40-bit), which is all macOS 26 grants anyway. */
+    uint32_t vm_ipa = guest_pick_ipa(ipa_bits, NULL);
 
-    /* Determine VM IPA width.
-     * ipa_bits=0: auto-detect (40-bit on macOS 15+, else 36-bit).
-     * ipa_bits>0: use that exact value (e.g., 48 for rosetta support).
-     *   Apple Silicon supports 48-bit IPA even when the API reports 36. */
-    uint32_t vm_ipa;
-    if (ipa_bits > 0)
-        vm_ipa = ipa_bits;
-    else if (max_ipa >= 40)
-        vm_ipa = 40;
-    else
-        vm_ipa = 36;
-
-    /* Primary buffer size: use the VM's configured IPA width (capped at
-     * 40-bit = 1TB). When rosetta is active (vm_ipa=48), this gives 1TB
-     * instead of 64GB on M2, providing ~1008GB of mmap backing space for
-     * rosetta's high-VA JIT allocations (slab at 240TB, PIE at 85TB, etc.).
-     * The hv_vm_map call supports any size up to the VM's IPA width —
-     * confirmed by rosetta's own segments mapped at 128TB via hv_vm_map.
-     * macOS demand-pages the host reservation, so only touched pages cost
-     * physical memory. */
+    /* Primary buffer size = the (capped) VM IPA width, at most 40-bit = 1TB.
+     * macOS demand-pages the host reservation, so only touched pages cost RAM. */
     uint32_t buf_bits = (vm_ipa > 40) ? 40 : vm_ipa;
     uint64_t buf_capacity = 1ULL << buf_bits;
     if (size == 0 || size > buf_capacity)
@@ -196,10 +230,11 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
      * If any step fails, we silently keep the MAP_ANON mapping and fall
      * back to the IPC region-copy path on fork.
      *
-     * Skip for rosetta mode (vm_ipa > max_ipa): rosetta always uses the
-     * legacy IPC copy path (fork_ipc.c checks g->is_rosetta), so the
-     * file-backed upgrade is pointless and avoids a 1TB ftruncate. */
-    if (vm_ipa <= max_ipa) {
+     * Skip for rosetta mode: rosetta always uses the legacy IPC copy path
+     * (fork_ipc.c checks g->is_rosetta), so the file-backed upgrade is
+     * pointless and avoids a 1TB ftruncate. (Gate on the explicit flag, not
+     * vm_ipa vs max_ipa — since capping made vm_ipa==max_ipa for rosetta.) */
+    if (!is_rosetta) {
         char tmppath[] = "/tmp/hl-XXXXXX";
         int sfd = mkstemp(tmppath);
         if (sfd >= 0) {
@@ -220,27 +255,10 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
         /* If shm_fd is still -1, we're on MAP_ANON — fork uses IPC copy */
     }
 
-    /* Create Hypervisor VM with the determined IPA width and map the
-     * primary slab at GUEST_IPA_BASE.
-     *
-     * macOS may not release HVF VM resources immediately after
-     * hv_vm_destroy(), so rapid sequential VM creation (e.g. running
-     * many test binaries) can hit transient resource exhaustion.
-     * Retry with linear backoff (500ms intervals, up to 30 attempts =
-     * 15 seconds max wait) to handle this gracefully. */
-    hv_return_t ret = HV_ERROR;
-    for (int attempt = 0; attempt < 30; attempt++) {
-        hv_vm_config_t config = hv_vm_config_create();
-        hv_vm_config_set_ipa_size(config, vm_ipa);
-        ret = hv_vm_create(config);
-        os_release(config);
-        if (ret == HV_SUCCESS)
-            break;
-        usleep(500000);  /* 500ms between attempts */
-    }
+    /* Create the Hypervisor VM at the negotiated IPA width (checked), then map
+     * the primary slab at GUEST_IPA_BASE. */
+    hv_return_t ret = guest_create_vm_ipa(vm_ipa);
     if (ret != HV_SUCCESS) {
-        fprintf(stderr, "guest: hv_vm_create failed: %d (ipa_bits=%u)\n",
-                (int)ret, vm_ipa);
         munmap(g->host_base, size);
         g->host_base = NULL;
         if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
@@ -249,19 +267,19 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
 
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-    if (ret != HV_SUCCESS && buf_bits > max_ipa) {
-        /* 1TB primary map failed — fall back to hardware-default buffer.
-         * This handles undocumented HVF limits on primary buffer size.
-         * Close shm_fd since the fallback uses anonymous memory (the file
-         * is no longer mapped to host_base, so COW fork won't work). */
+    /* Defensive: a full 1TB primary map should succeed in a real 40-bit VM
+     * (native aarch64 does exactly this), but if the host rejects the full
+     * slab, step the PRIMARY size down by one bit — the VM keeps its
+     * negotiated IPA width, only the mapped backing shrinks. */
+    if (ret != HV_SUCCESS && buf_bits > 36) {
+        uint32_t fb_bits = buf_bits - 1;
         fprintf(stderr, "guest: hv_vm_map %lluGB failed (%d), "
-                "retrying with %u-bit (%lluGB)\n",
+                "retrying primary with %u-bit (%lluGB); IPA width stays %u\n",
                 (unsigned long long)(size >> 30), (int)ret,
-                max_ipa, 1ULL << (max_ipa - 30));
+                fb_bits, 1ULL << (fb_bits - 30), vm_ipa);
         munmap(g->host_base, size);
         if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
-        buf_bits = (max_ipa > 40) ? 40 : max_ipa;
-        size = 1ULL << buf_bits;
+        size = 1ULL << fb_bits;
         g->guest_size = size;
         g->interp_base = size - 0x100000000ULL;
         g->mmap_limit  = size - 0x200000000ULL;
@@ -327,19 +345,9 @@ int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
     /* Close the shm fd — the mapping keeps the pages alive */
     close(shm_fd);
 
-    /* Create HVF VM with the same IPA width as the parent */
-    hv_return_t ret = HV_ERROR;
-    for (int attempt = 0; attempt < 30; attempt++) {
-        hv_vm_config_t config = hv_vm_config_create();
-        hv_vm_config_set_ipa_size(config, ipa_bits);
-        ret = hv_vm_create(config);
-        os_release(config);
-        if (ret == HV_SUCCESS)
-            break;
-        usleep(500000);
-    }
+    /* Create HVF VM with the same IPA width as the parent (checked). */
+    hv_return_t ret = guest_create_vm_ipa(ipa_bits);
     if (ret != HV_SUCCESS) {
-        fprintf(stderr, "guest: hv_vm_create (shm) failed: %d\n", (int)ret);
         munmap(g->host_base, size);
         g->host_base = NULL;
         return -1;
@@ -485,6 +493,20 @@ uint64_t guest_overflow_alloc(guest_t *g) {
 
     uint64_t seg_size = GUEST_OVERFLOW_SIZE;
     uint64_t seg_ipa  = g->overflow_ipa_next;
+
+    /* Reject anything past the VM's IPA window (2^ipa_bits). On macOS 26 the
+     * window is 40-bit, and overflow starts at guest_size (=1TB=2^40), so the
+     * first overflow segment is already out of range — fail loudly here rather
+     * than let hv_vm_map return a cryptic HV_BAD_ARGUMENT. TIER 2 (packing
+     * overflow inside the 40-bit window) is the real fix if this fires. */
+    if (seg_ipa + seg_size > (1ULL << g->ipa_bits)) {
+        fprintf(stderr, "hl: overflow IPA 0x%llx+0x%llx exceeds the %u-bit VM "
+                "window (2^%u); the binary needs more guest-physical space than "
+                "this host's HVF IPA allows.\n",
+                (unsigned long long)seg_ipa, (unsigned long long)seg_size,
+                g->ipa_bits, g->ipa_bits);
+        return UINT64_MAX;
+    }
 
     /* Allocate host buffer (demand-paged, costs nothing until touched) */
     void *host = mmap(NULL, seg_size, PROT_READ | PROT_WRITE,

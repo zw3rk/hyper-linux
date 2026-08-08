@@ -27,10 +27,12 @@
 #define GUEST_MEM_SIZE_DEFAULT GUEST_MEM_SIZE_36BIT /* Fallback if IPA query fails */
 
 /* Rosetta Linux binary: static aarch64-linux ELF that JIT-translates x86_64
- * instructions to ARM64. Linked at 128TB (ET_EXEC, not relocatable). When
- * running x86_64-linux binaries, rosetta is loaded at this fixed address
- * and makes ARM64 Linux syscalls that hl handles transparently. */
-#define ROSETTA_IPA_BASE     0x800000000000ULL   /* 128TB: rosetta link address */
+ * instructions to ARM64. Linked at VIRTUAL address 128TB (ET_EXEC, not
+ * relocatable). This is a guest VIRTUAL address, NOT an IPA requirement — hl
+ * maps rosetta's segments to a LOW guest-physical/IPA address inside the
+ * primary buffer and aliases the 128TB VA to it (see rosetta.c). The name is
+ * historical; the VM's IPA width need only cover the primary buffer (≤40-bit). */
+#define ROSETTA_IPA_BASE     0x800000000000ULL   /* 128TB: rosetta link VA */
 #define ROSETTA_PATH         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta"
 #define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
 #define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
@@ -256,7 +258,7 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset) {
  * size: primary buffer size (0 = auto-detect from IPA capacity).
  * ipa_bits: IPA width for HVF VM (0 = auto-detect).
  * Returns 0 on success, -1 on failure. */
-int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits);
+int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits, int is_rosetta);
 
 /* Initialize guest from a POSIX shared memory fd (COW fork path).
  * Maps shm_fd MAP_PRIVATE (copy-on-write), creates HVF VM, maps to

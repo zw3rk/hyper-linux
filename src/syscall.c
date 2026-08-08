@@ -1473,10 +1473,16 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 }
                 g->need_tlbi = 1;
             } else {
-                /* High VA: above primary buffer. Page table entries were
-                 * created by sys_mmap_high_va via guest_map_va_range.
-                 * Walk page tables to find the backing GPA, then update
-                 * permissions on the GPA-based entries. */
+                /* High VA: above primary buffer, mapped non-identity (VA→low
+                 * GPA) by sys_mmap_high_va/guest_map_va_range.
+                 *
+                 * The page-table helpers walk TTBR0 KEYED BY VA and preserve
+                 * the descriptor's stored output GPA. So we must pass the high
+                 * VA itself — NOT its backing GPA. The old code resolved VA→GPA
+                 * and passed the GPA, which made split/update operate on the
+                 * WRONG page (the low identity alias at VA==GPA) and left the
+                 * intended high-VA page's permissions unchanged — so rosetta's
+                 * mprotect on its JIT/data pages silently no-oped. */
                 uint64_t va_end = mprot_addr + mprot_len;
                 int page_perms = MEM_PERM_R;
                 if (mprot_prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
@@ -1484,20 +1490,13 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
 
                 for (uint64_t va = mprot_addr & ~4095ULL;
                      va < va_end; va += 4096) {
-                    void *ptr = guest_ptr(g, va);
-                    if (!ptr) continue;
-
-                    /* Compute GPA from host pointer (handles both primary
-                     * buffer and overflow segments) */
-                    uint64_t gpa;
-                    if (guest_host_to_gpa(g, ptr, &gpa) < 0) continue;
+                    if (!guest_ptr(g, va)) continue;  /* skip unmapped pages */
 
                     if (mprot_prot == LINUX_PROT_NONE) {
-                        guest_invalidate_ptes(g, gpa, gpa + 4096);
+                        guest_invalidate_ptes(g, va, va + 4096);
                     } else {
-                        guest_split_block(g, gpa & ~(BLOCK_2MB - 1));
-                        guest_update_perms(g, gpa, gpa + 4096,
-                                           page_perms);
+                        guest_split_block(g, va & ~(BLOCK_2MB - 1));
+                        guest_update_perms(g, va, va + 4096, page_perms);
                     }
                 }
                 g->need_tlbi = 1;

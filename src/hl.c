@@ -412,15 +412,16 @@ int main(int argc, char **argv) {
     memset(&rr, 0, sizeof(rr));
 
     /* ---- Step 2: Initialize guest memory and VM ---- */
-    /* For rosetta mode, request 48-bit IPA even on M2 (which defaults to
-     * 36-bit). This gives a 1TB primary buffer (buf_bits = min(48, 40) = 40)
-     * instead of 64GB, providing ~1008GB of mmap backing space for rosetta's
-     * high-VA JIT allocations that would otherwise exhaust the 48GB M2 pool.
-     * The VM's Stage-2 IPA width also needs 48-bit for rosetta's page tables
-     * to map VAs above 64GB (e.g., PIE base at 85TB). For native aarch64,
-     * auto-detect (36/40-bit) is sufficient. */
+    /* Rosetta requests as much IPA as the host grants (ceiling 48), which
+     * guest_init caps to the host max (40-bit / 1TB on macOS 26). That 1TB
+     * primary is the whole guest-physical window: rosetta's binary (linked at
+     * VA 128TB), its high-VA JIT/AOT/PIE regions, and the x86_64 target are all
+     * mapped to LOW IPAs inside it (rosetta.c / the high-VA mmap packer), so no
+     * >40-bit IPA is needed. The explicit is_rosetta flag keeps the file-backed
+     * COW path (a 1TB ftruncate) off, since rosetta forks via the IPC copy path.
+     * For native aarch64, auto-detect (36/40-bit) is sufficient. */
     guest_t g;
-    if (guest_init(&g, 0, need_rosetta ? 48 : 0) < 0) {
+    if (guest_init(&g, 0, need_rosetta ? 48 : 0, need_rosetta) < 0) {
         fprintf(stderr, "hl: failed to initialize guest\n");
         return 1;
     }

@@ -257,7 +257,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
             fprintf(stderr, "hl: fork-child: COW fork via shm fd\n");
     } else {
         /* Legacy path: allocate fresh guest memory and receive regions */
-        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
+        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits, (int)hdr.is_rosetta) < 0) {
             fprintf(stderr, "hl: fork-child: failed to init guest\n");
             close(ipc_fd);
             return 1;
