@@ -39,22 +39,28 @@ Two master-origin items are deliberately left for dedicated work rather than
 shipped as risky or racy partial changes. NEITHER is a host escape — both are
 guest-confinement / defense-in-depth completeness.
 
-### V2 — [vvar] / pt-pool are EL0-writable (guest integrity)
-The guest runs at EL0 but can read and write hl's stage-1 page-table pool and
-the [vvar] time page (documented "RO to EL0" but mapped RW), letting it forge
-its own vDSO clock and rewrite its own translation. HVF stage-2 still bounds
-the host (verified: a crafted EL0 PTE produces a stage-2 permission fault, so
-this is NOT a host escape) — it is a guest-integrity gap.
+### V2 — [vvar] / pt-pool were EL0-writable (guest integrity) — FIXED
+Fixed on branch `work/v2-vvar-hardening`. Full trace, evidence, and design:
+`docs/implementation/v2-vvar-trace.md`.
 
-A post-build hardening pass (set the low block's [vvar] page EL0-RO and the
-pt-pool pages EL1-only) was implemented and reverted: the low 2MB block is a
-single BLOCK descriptor whose observed AP bits did not match the empirical
-EL0-writability, so [vvar]/pt-pool are evidently mapped via a path this model
-does not capture. Getting the shim's own page-table permissions wrong is
-high-risk (the shim writes page tables at EL1 on every TLBI-extend), so this
-needs the low-block mapping traced end-to-end first — split block 0 to L3,
-then set [vvar] EL0-RO/XN, [vdso] EL0-RO/RX, pt-pool EL1-only, holes invalid —
-under the full suite as the guard. Not a one-sitting change.
+The model mismatch that reverted the prior attempt is resolved: block 0's
+descriptor really is AP=RO, but the shim's **W^X demand-toggle** promoted any
+write-faulting RO page to RW (HVC #9, unconditional), so the RO setting was
+defeated on the first write. Block 0 is also already L3-split by the existing
+null-guard (`guest_invalidate_ptes(g,0,0x1000)`), so no new split logic was
+needed. The fix is two parts:
+
+- **shim** (`src/shim.S`): a permission fault with `FAR < 0x200000` (block 0)
+  goes to `handle_el0_fault` (SIGSEGV) instead of the W^X toggle — nothing in
+  block 0 legitimately needs a toggle. Blocks EL0 writes/execs to
+  [vvar]/[vdso]/pt-pool/shim.
+- **per-page perms** (`src/vdso.c vdso_harden_low_block`, called from `hl.c`
+  and `syscall_exec.c`): pt-pool stage-1 invalid (EL1-only; walker uses
+  stage-2), holes invalid, [vvar] EL0-RO/XN, [vdso] left RX.
+
+Regression test `test/test-vvar-protect.c` (in `make test-all`, mutation-
+verified). `test-both-modes` 66→67 per fs mode, both green. The x86_64/rosetta
+lane was not run (change expected inert there; unverified).
 
 ### VFS-F2 — inotify_add_watch and bind(AF_UNIX) bypass the rooted resolver
 In rooted mode `inotify_add_watch` opens, and `bind`/`connect`/`sendto`/

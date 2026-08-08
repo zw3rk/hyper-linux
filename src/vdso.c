@@ -261,6 +261,28 @@ void vdso_publisher_stop(void) {
     pub_guest = NULL;
 }
 
+void vdso_harden_low_block(guest_t *g) {
+    if (!g) return;
+
+    /* Page-table pool: no EL0 access at all. The MMU stage-1 walker reads
+     * these page-table pages by IPA through stage-2 (never via their own
+     * stage-1 VA mapping), so invalidating the stage-1 PTEs does not disturb
+     * translation — it only stops the guest from reading/writing hl's page
+     * tables. An EL0 access now takes a translation fault → SIGSEGV. */
+    guest_invalidate_ptes(g, PT_POOL_BASE, PT_POOL_END);
+
+    /* Unused holes between the null-guard page and [vvar]: no EL0 access. */
+    guest_invalidate_ptes(g, 0x1000ULL, VVAR_BASE);
+
+    /* [vvar] time page: EL0 read-only + execute-never. The host still writes
+     * it via host_base (vdso_vvar_update), which bypasses stage-1 perms.
+     * A guest write hits a permission fault the shim rejects (SIGSEGV). */
+    guest_update_perms(g, VVAR_BASE, VVAR_BASE + VVAR_SIZE, MEM_PERM_R);
+
+    /* [vdso] stays RX (guest reads + executes it). A guest write to it is a
+     * permission fault the shim's block-0 guard turns into SIGSEGV. */
+}
+
 uint64_t vdso_build(guest_t *g) {
     if (vdso_guest_bin_len < VDSO_GUEST_TEXT_SIZE) {
         fprintf(stderr, "vdso: guest text blob too small (%u < %u)\n",

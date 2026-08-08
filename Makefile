@@ -300,6 +300,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigill; \
+	printf "\n$(BLUE)── Guest-integrity (vvar / pt-pool) tests ──$(RESET)\n"; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-vvar-protect; \
 	printf "\n$(BLUE)── X11 raw protocol tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)── VFS / OSS / device tests ──$(RESET)\n"; \

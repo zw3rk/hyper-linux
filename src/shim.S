@@ -30,6 +30,13 @@
  * the exception handler MUST save and restore ALL 31 GPRs.
  */
 
+/* End of the hl-internal low region (block 0: 0x0..0x1FFFFF). Covers the
+ * page-table pool, the [vvar] time page, [vdso] code, and the shim itself.
+ * A permission fault below this address is NEVER a JIT W^X demand-toggle —
+ * it is the guest tampering with hl-internal state, so we deliver SIGSEGV
+ * instead of promoting the page to RW. Matches SHIM_DATA_BASE in guest.h. */
+.equ HL_LOW_PROTECT_END, 0x200000
+
 .text
 .align 4
 .globl _start
@@ -381,6 +388,12 @@ handle_inst_abort:
     b handle_el0_fault
 
 1:  mrs x0, far_el1           /* Faulting address */
+    /* Reject execute-toggle for the hl-internal low region: the guest must
+     * not turn [vvar]/[vdso]/pt-pool/shim pages executable. handle_el0_fault
+     * restores x0/x11 from the saved frame, so clobbering them here is fine. */
+    mov x11, #HL_LOW_PROTECT_END
+    cmp x0, x11
+    b.lo handle_el0_fault
     mov x1, #0                /* Type 0 = instruction fault → flip to RX */
     hvc #9
     b tlbi_restore_eret
@@ -408,6 +421,12 @@ handle_data_abort:
     b.eq handle_el0_fault     /* Read permission fault → SIGSEGV */
 
     mrs x0, far_el1           /* Faulting address */
+    /* Reject write-toggle for the hl-internal low region: a write to
+     * [vvar]/[vdso]/pt-pool/shim must fault, not silently promote to RW.
+     * handle_el0_fault restores x0/x11 from the saved frame. */
+    mov x11, #HL_LOW_PROTECT_END
+    cmp x0, x11
+    b.lo handle_el0_fault
     mov x1, #1                /* Type 1 = write fault → flip to RW */
     hvc #9
     b tlbi_restore_eret

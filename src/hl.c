@@ -892,6 +892,12 @@ too_many_regions:
      * invalidating page 0 matches Linux kernel behavior. */
     guest_invalidate_ptes(&g, 0, 0x1000);
 
+    /* Harden the rest of block 0 against EL0 tampering: page-table pool
+     * becomes EL1-only, [vvar] EL0 read-only, unused holes invalid. Writes
+     * to the still-mapped [vvar]/[vdso]/shim pages are rejected by the
+     * shim's block-0 permission-fault guard (see src/shim.S). */
+    vdso_harden_low_block(&g);
+
     if (verbose) {
         fprintf(stderr, "hl: TTBR0=0x%llx, IPA base=0x%llx\n",
                 (unsigned long long)ttbr0, (unsigned long long)g.ipa_base);

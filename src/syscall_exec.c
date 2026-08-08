@@ -599,6 +599,9 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
     /* Null guard page: invalidate page 0 (same as hl.c startup) */
     guest_invalidate_ptes(g, 0, 0x1000);
 
+    /* Harden block 0: pt-pool EL1-only, [vvar] EL0-RO, holes invalid. */
+    vdso_harden_low_block(g);
+
     /* Step 9: Build new stack with new argv/envp */
     const char **argv_const = (const char **)argv;
     const char **envp_const = (const char **)envp;
