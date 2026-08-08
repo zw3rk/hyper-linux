@@ -7,7 +7,7 @@
  * fd_object.c entry points (create/install/get/put/dup/remove).
  */
 #include "fd_object.h"
-#include "syscall.h"
+#include "syscall_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>

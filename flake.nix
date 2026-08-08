@@ -76,7 +76,7 @@
         # Display: zw3rk/hyper-linux-x11; demos: zw3rk/hyper-linux-examples
         default = darwinPkgs.stdenv.mkDerivation {
           pname = "hl";
-          version = "0.3.0-rc1";
+          version = "0.3.0-rc2";
           src = ./.;
 
           nativeBuildInputs = [
@@ -140,6 +140,7 @@
             darwinPkgs.binutils   # objcopy for shim.bin
             darwinPkgs.lldb
             darwinPkgs.shellcheck  # shell script linting
+            darwinPkgs.actionlint  # GitHub Actions workflow linting
             darwinPkgs.lima        # limactl on PATH (matrix + manual lima runs)
           ] ++ darwinBuildInputs;
 
@@ -252,6 +253,7 @@
             darwinPkgs.binutils
             darwinPkgs.xxd        # needed by shim_blob.h generation
             darwinPkgs.shellcheck  # shell script linting
+            darwinPkgs.actionlint  # GitHub Actions workflow linting
           ] ++ darwinBuildInputs;
           GNU_OBJCOPY = "${darwinPkgs.binutils}/bin/objcopy";
         };

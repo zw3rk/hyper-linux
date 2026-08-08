@@ -17,6 +17,7 @@ set -u
 
 HL=${HL:-./_build/hl}
 BUILD=$(dirname "$HL")
+GUEST_BIN_DIR=${GUEST_BIN_DIR:-$BUILD}
 pass=0; fail=0
 ok()   { printf '  %-52s OK\n'   "$1"; pass=$((pass+1)); }
 bad()  { printf '  %-52s FAIL: %s\n' "$1" "$2"; fail=$((fail+1)); }
@@ -27,8 +28,8 @@ echo "test-diagnostics: redaction and SIGUSR1 stats"
 # Rooted mode binds $HOME at /home/user, so the mount trace carries the
 # host home path — exactly what redaction is supposed to replace with "~".
 run_trace() { "$HL" --fs-mode=rooted --audio-backend null --trace=fs \
-                 "$BUILD/test-cat" /home/user/.hl-does-not-exist 2>&1 >/dev/null; }
-out=$(HL_TRACE_REDACT=1 run_trace)
+                 "$GUEST_BIN_DIR/test-cat" /home/user/.hl-does-not-exist >/dev/null; }
+out=$(HL_TRACE_REDACT=1 run_trace 2>&1)
 if [ -z "$out" ]; then
     bad "HL_TRACE_REDACT applies to --trace=" "no trace output at all"
 elif printf '%s' "$out" | grep -qF "$HOME"; then
@@ -39,7 +40,7 @@ fi
 
 # (+) Without the variable, paths are NOT redacted — proves the check above
 # is actually observing redaction rather than an absence of paths.
-out=$(run_trace)
+out=$(run_trace 2>&1)
 if [ -z "$out" ]; then
     bad "without it, paths are left alone" "no trace output at all"
 elif printf '%s' "$out" | grep -qF "$HOME"; then
@@ -51,7 +52,7 @@ fi
 # ---- 2. SIGUSR1 dump while the guest makes no syscalls ----
 tmp=$(mktemp)
 HL_SYSCALL_STATS=1 "$HL" --fs-mode=legacy --audio-backend null \
-    "$BUILD/helper-idle" >/dev/null 2>"$tmp" &
+    "$GUEST_BIN_DIR/helper-idle" >/dev/null 2>"$tmp" &
 hlpid=$!
 # Wait for the guest to reach its parked state.
 for _ in $(seq 1 50); do
@@ -82,7 +83,8 @@ rm -f "$tmp"
 # ---- 3. SHM detach reclaims page-table pages (H2) ----
 # 300 attach/partial-mprotect/detach cycles exceed the 240-page pool. With
 # the L3 reclaim, hl never exhausts it; without, it logs "pool exhausted".
-churn_err=$("$HL" --fs-mode=legacy --audio-backend null "$BUILD/helper-shm-churn" 2>&1 >/dev/null)
+churn_err=$({ "$HL" --fs-mode=legacy --audio-backend null \
+    "$GUEST_BIN_DIR/helper-shm-churn" >/dev/null; } 2>&1)
 if printf '%s' "$churn_err" | grep -q "page table pool exhausted"; then
     bad "SHM detach reclaims page-table pages" "pool exhausted — L3 not reclaimed"
 else
@@ -93,7 +95,7 @@ fi
 # A guest that loops on vDSO gettimeofday makes no VM exits — the exact
 # pattern the old 10s default killed. By default it must run to completion.
 wd_out=$(timeout 30 "$HL" --fs-mode=legacy --audio-backend null \
-             "$BUILD/helper-watchdog" 12 2>&1)
+             "$GUEST_BIN_DIR/helper-watchdog" 12 2>&1)
 if printf '%s' "$wd_out" | grep -q "wd-done"; then
     ok "watchdog off by default: a 12s no-exit guest completes"
 else
@@ -102,7 +104,7 @@ else
 fi
 # Opt-in must still catch a hang: --timeout 2 kills the same 12s loop.
 wd_out=$(timeout 30 "$HL" --timeout 2 --fs-mode=legacy --audio-backend null \
-             "$BUILD/helper-watchdog" 12 2>&1)
+             "$GUEST_BIN_DIR/helper-watchdog" 12 2>&1)
 if printf '%s' "$wd_out" | grep -q "wd-done"; then
     bad "--timeout arms the opt-in watchdog" "12s loop was NOT killed by --timeout 2"
 elif printf '%s' "$wd_out" | grep -q "timed out after 2s"; then
@@ -115,7 +117,7 @@ fi
 absname="hl-h6-$$-$RANDOM"
 # Holder binds the name and keeps it for ~5s.
 "$HL" --fs-mode=legacy --audio-backend null \
-    "$BUILD/helper-abstract-hold" hold "$absname" >/tmp/h6_hold.$$ 2>&1 &
+    "$GUEST_BIN_DIR/helper-abstract-hold" hold "$absname" >/tmp/h6_hold.$$ 2>&1 &
 hpid=$!
 for _ in $(seq 1 50); do grep -q BOUND /tmp/h6_hold.$$ 2>/dev/null && break; sleep 0.1; done
 if ! grep -q BOUND /tmp/h6_hold.$$ 2>/dev/null; then
@@ -123,7 +125,7 @@ if ! grep -q BOUND /tmp/h6_hold.$$ 2>/dev/null; then
 else
     # Second process must be refused while the holder is alive.
     got=$("$HL" --fs-mode=legacy --audio-backend null \
-              "$BUILD/helper-abstract-hold" try "$absname" 2>&1)
+              "$GUEST_BIN_DIR/helper-abstract-hold" try "$absname" 2>&1)
     if printf '%s' "$got" | grep -q EADDRINUSE; then
         ok "a live abstract name cannot be stolen"
     else
@@ -133,7 +135,7 @@ fi
 wait $hpid 2>/dev/null
 # (+) Once the holder is gone, the name is reclaimable.
 got=$("$HL" --fs-mode=legacy --audio-backend null \
-          "$BUILD/helper-abstract-hold" try "$absname" 2>&1)
+          "$GUEST_BIN_DIR/helper-abstract-hold" try "$absname" 2>&1)
 if printf '%s' "$got" | grep -q BOUND; then
     ok "a freed abstract name is reclaimable"
 else
@@ -144,7 +146,7 @@ rm -f /tmp/h6_hold.$$
 # ---- 6. Rooted mutating ops cannot escape the bind (H5) ----
 mdir=$(mktemp -d); mkdir -p "$mdir/bound"; echo SECRET > "$mdir/secret.txt"
 "$HL" --fs-mode=rooted --bind "$mdir/bound:/home/user" --guest-cwd /home/user \
-    --audio-backend null "$BUILD/helper-vfs-mutate" >/dev/null 2>&1
+    --audio-backend null "$GUEST_BIN_DIR/helper-vfs-mutate" >/dev/null 2>&1
 if [ -f "$mdir/secret.txt" ] && [ "$(cat "$mdir/secret.txt")" = SECRET ]; then
     ok "rooted mutating ops cannot escape the bind"
 else
@@ -157,7 +159,7 @@ rm -rf "$mdir"
 # A guest arg carrying the host home path mid-token must appear redacted in
 # the crash report (the output meant for public issues), not raw.
 crash_out=$(HL_TRACE_REDACT=1 timeout 20 "$HL" --timeout 2 --fs-mode=legacy \
-    --audio-backend null "$BUILD/helper-crash" "--data-dir=$HOME/pandoc" 2>&1)
+    --audio-backend null "$GUEST_BIN_DIR/helper-crash" "--data-dir=$HOME/pandoc" 2>&1)
 if printf '%s' "$crash_out" | grep -qF "$HOME/pandoc"; then
     bad "crash report redacts \$HOME mid-token" "raw host path in the report"
 elif printf '%s' "$crash_out" | grep -q "cmdline"; then

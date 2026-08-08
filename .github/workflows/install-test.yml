@@ -86,8 +86,9 @@ jobs:
 
       - name: Run install script
         run: |
-          export INSTALL_DIR="$(mktemp -d)/bin"
-          export MAN_DIR="$(mktemp -d)/man/man1"
+          INSTALL_DIR="$(mktemp -d)/bin"
+          MAN_DIR="$(mktemp -d)/man/man1"
+          export INSTALL_DIR MAN_DIR
           mkdir -p "$INSTALL_DIR" "$MAN_DIR"
           sed "s|/usr/local/bin|$INSTALL_DIR|g; s|/usr/local/share/man/man1|$MAN_DIR|g" \
             site/install.sh | sh
@@ -234,11 +235,16 @@ jobs:
         run: |
           VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
           export VERSION
+          make dist-clean
+          # VERSION is expanded by the nested shell, not this one.
+          # shellcheck disable=SC2016
           nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make pkg VERSION="$VERSION"'
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Validate pkg contents
         run: |
-          PKG=$(ls dist/out/*.pkg | head -1)
+          PKG="dist/out/hl-${VERSION}.pkg"
+          test -f "$PKG"
           EXPAND_DIR=$(mktemp -d)
           pkgutil --expand "$PKG" "$EXPAND_DIR/pkg"
           test -d "$EXPAND_DIR/pkg"
@@ -247,7 +253,8 @@ jobs:
 
       - name: Install pkg to temp prefix
         run: |
-          PKG=$(ls dist/out/*.pkg | head -1)
+          PKG="dist/out/hl-${VERSION}.pkg"
+          test -f "$PKG"
           INSTALL_PREFIX=$(mktemp -d)
           # --expand-full extracts payload contents directly (handles pbzx)
           pkgutil --expand-full "$PKG" "$INSTALL_PREFIX/expanded"
@@ -343,11 +350,16 @@ jobs:
         run: |
           VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
           export VERSION
+          make dist-clean
+          # VERSION is expanded by the nested shell, not this one.
+          # shellcheck disable=SC2016
           nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make dist VERSION="$VERSION"'
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Validate zip contents
         run: |
-          ZIP=$(ls dist/out/*.zip | head -1)
+          ZIP="dist/out/hl-${VERSION}.zip"
+          test -f "$ZIP"
           EXTRACT_DIR=$(mktemp -d)
           unzip -qo "$ZIP" -d "$EXTRACT_DIR"
           DIR=$(find "$EXTRACT_DIR" -maxdepth 1 -type d -name 'hl-*' | head -1)

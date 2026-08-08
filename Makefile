@@ -9,11 +9,12 @@
 # Example: make test-hello
 #          make hl SIGN_IDENTITY="Apple Development: ..."
 
-.PHONY: all hl clean dist pkg release test-hello test-all test-all-rooted test-both-modes test-coreutils \
+.PHONY: all hl clean dist-clean dist pkg release test-hello test-all test-all-rooted test-both-modes test-coreutils \
        test-busybox test-static-bins test-dynamic test-dynamic-coreutils \
        test-glibc-dynamic test-glibc-coreutils \
        test-perf test-multi-vcpu test-rwx test-haskell test-haskell-bins \
-       test-x64-hello test-x64-all test-x64-coreutils test-x64-busybox \
+       test-x64-hello test-x64-all test-x64-all-rooted test-x64-both-modes \
+       test-x64-coreutils test-x64-busybox \
        test-x64-static-bins \
        test-x64-musl-dynamic test-x64-musl-coreutils \
        test-x64-glibc-dynamic test-x64-glibc-coreutils \
@@ -21,8 +22,8 @@
        test-full \
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
        test-matrix-lima-aarch64 test-matrix-lima-x64 \
-       test-host-units test-page-table-pool \
-       lint analyze format shellcheck \
+       test-host-units test-page-table-pool test-release-plumbing \
+       lint analyze format shellcheck lint-actions \
        site site-serve release-interactive help
 
 # ── Configuration ──────────────────────────────────────────────────
@@ -30,6 +31,10 @@ ENTITLEMENTS := entitlements.plist
 SIGN_IDENTITY ?= -
 BUILD_DIR := _build
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+# A version-only change must invalidate version.h even when HEAD and every
+# source timestamp are unchanged. Keep one stamp so switching versions in
+# either direction cannot reuse a stale generated header.
+VERSION_STAMP := $(BUILD_DIR)/.version-$(subst /,_,$(VERSION))
 
 # GNU objcopy for Mach-O → raw binary.  The clang wrapper in newer nixpkgs
 # shadows binutils' objcopy with llvm-objcopy, which doesn't handle
@@ -109,10 +114,16 @@ $(BUILD_DIR):
 # Override: make hl VERSION=v0.1.0 (used by nix build in sandbox).
 # When .git/ is absent (nix sandbox), skip git-file deps.
 VERSION_DEPS := $(wildcard .git/HEAD .git/index)
-$(BUILD_DIR)/version.h: $(VERSION_DEPS) | $(BUILD_DIR)
-	@printf '#define HL_VERSION "%s"\n' "$(VERSION)" > $@.tmp
-	@cmp -s $@.tmp $@ 2>/dev/null || mv $@.tmp $@
-	@rm -f $@.tmp
+$(VERSION_STAMP): | $(BUILD_DIR)
+	@rm -f "$(BUILD_DIR)"/.version-*
+	@touch "$@"
+	@printf '#define HL_VERSION "%s"\n' "$(VERSION)" > $(BUILD_DIR)/version.h.tmp
+	@cmp -s $(BUILD_DIR)/version.h.tmp $(BUILD_DIR)/version.h 2>/dev/null || \
+		mv $(BUILD_DIR)/version.h.tmp $(BUILD_DIR)/version.h
+	@rm -f $(BUILD_DIR)/version.h.tmp
+
+$(BUILD_DIR)/version.h: $(VERSION_STAMP) $(VERSION_DEPS) | $(BUILD_DIR)
+	@test -f "$@"
 
 # ── Shim binary blob ──────────────────────────────────────────────
 
@@ -201,10 +212,10 @@ test-all-rooted:
 	@$(MAKE) --no-print-directory test-all HL_TEST_FLAGS="--fs-mode=rooted \
 		--bind $(CURDIR):$(CURDIR) --guest-cwd $(CURDIR) --audio-backend null"
 
-## Run the suite in both fs modes (legacy passthrough and the rooted default).
-test-both-modes: test-all test-all-rooted
+## Run guest tests in both fs modes, then run host-side tests once.
+test-both-modes: test-all test-all-rooted test-host-units
 
-## Run all tests
+## Run the aarch64 guest integration suite (legacy VFS by default)
 test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	@printf "\n$(BLUE)━━━ Running test suite ━━━$(RESET)\n\n"
 	@pass=0; fail=0; \
@@ -362,10 +373,9 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	rm -rf "$$tmpdir"; \
 	printf "\n$(BLUE)━━━ Results: $$pass passed, $$fail failed ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
-	@$(MAKE) --no-print-directory test-host-units
 
-## Host-side unit tests (no guest VM): VFS, audio, app-open, and page tables
-test-host-units: test-page-table-pool | $(BUILD_DIR)
+## Host-side unit tests plus operator diagnostics using the guest helper bundle
+test-host-units: $(BUILD_DIR)/hl $(TEST_DEPS) test-page-table-pool | $(BUILD_DIR)
 	@printf "$(BLUE)▸ Host unit tests$(RESET)\n"
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-vfs-unit \
 		test/host/test-vfs-unit.c test/host/stubs.c \
@@ -404,7 +414,7 @@ test-host-units: test-page-table-pool | $(BUILD_DIR)
 	$(BUILD_DIR)/test-oss-abi
 	$(BUILD_DIR)/test-audio-coreaudio
 	@# Operator-facing output: path redaction and the SIGUSR1 stats dump.
-	@HL=$(BUILD_DIR)/hl bash test/test-diagnostics.sh
+	@HL=$(BUILD_DIR)/hl GUEST_BIN_DIR=$(TEST_DIR) bash test/test-diagnostics.sh
 
 ## Run host-side page-table-pool capacity regression
 test-page-table-pool: | $(BUILD_DIR)
@@ -414,6 +424,10 @@ test-page-table-pool: | $(BUILD_DIR)
 		test/host/test-page-table-pool.c $(SRC_DIR)/guest.c \
 		-framework Hypervisor -lpthread
 	$(BUILD_DIR)/test-page-table-pool
+
+## Run deterministic release version/artifact regression tests
+test-release-plumbing:
+	@sh test/test-release-plumbing.sh
 
 # ── Coreutils integration test ───────────────────────────────────
 
@@ -550,6 +564,8 @@ test-haskell-bins: $(BUILD_DIR)/hl
 X64_TEST_DIR ?= $(GUEST_X64_TEST_BINARIES)/bin
 X64_COREUTILS_BIN ?= $(GUEST_X64_COREUTILS)/bin
 X64_BUSYBOX_BIN ?= $(GUEST_X64_BUSYBOX)/bin/busybox
+X64_TEST_FLAGS ?= --fs-mode=legacy --audio-backend null
+X64_HL = $(BUILD_DIR)/hl $(X64_TEST_FLAGS)
 
 ## Run x86_64 assembly hello world via rosetta
 test-x64-hello: $(BUILD_DIR)/hl
@@ -602,71 +618,80 @@ test-x64-all: $(BUILD_DIR)/hl
 		xfail=$$((xfail + 1)); \
 	}; \
 	printf "$(BLUE)── Assembly tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-hello; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-hello; \
 	printf "\n$(BLUE)── C tests (x86_64 musl static, via rosetta) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-musl; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/hello-write; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/echo-test hello world; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-argc arg1 arg2; \
-	expected_rc=42 run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-complex; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fileio CLAUDE.md; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-string; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-malloc; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cat test/hello.S; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-ls test/; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-roundtrip; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-comprehensive; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/hello-musl; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/hello-write; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/echo-test hello world; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-argc arg1 arg2; \
+	expected_rc=42 run_test $(X64_HL) $(X64_TEST_DIR)/test-complex; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-fileio CLAUDE.md; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-string; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-malloc; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-cat test/hello.S; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-ls test/; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-roundtrip; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-comprehensive; \
 	printf "\n$(BLUE)── Process tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-exec $(X64_TEST_DIR)/echo-test exec-works; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fork; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-fork-exec $(X64_TEST_DIR)/echo-test exec-works; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-exec $(X64_TEST_DIR)/echo-test exec-works; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork-exec $(X64_TEST_DIR)/echo-test exec-works; \
 	printf "\n$(BLUE)── Signal tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-signal "rosetta: SA_RESETHAND not reset (also fails in Lima, 3/4 subtests pass)"; \
 	printf "\n$(BLUE)── Socket tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-socket; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-file-ops; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sysinfo; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-io-opt; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-poll; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-file-ops; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-sysinfo; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-io-opt; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-poll; \
 	printf "\n$(BLUE)── I/O subsystem tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-eventfd; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-signalfd; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-epoll; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-timerfd; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-eventfd; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-signalfd; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-epoll; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-timerfd; \
 	printf "\n$(BLUE)── /proc and /dev emulation tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-proc; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-proc; \
 	printf "\n$(BLUE)── Network tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-net; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-thread "rosetta: raw clone(CLONE_THREAD) hangs (also hangs in Lima)"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-pthread; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)── Stress tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-stress "rosetta: raw clone hangs (also hangs in Lima)"; \
 	printf "\n$(BLUE)── Negative / error-path tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-negative; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-negative; \
 	printf "\n$(BLUE)── Signal + thread tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-signal-thread "rosetta: SA_RESETHAND not reset (also fails in Lima, 4/5 subtests pass)"; \
 	printf "\n$(BLUE)── O_CLOEXEC tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cloexec; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-cloexec; \
 	printf "\n$(BLUE)── Guard page / mmap edge cases (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-guard-page; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-guard-page; \
 	printf "\n$(BLUE)── Scatter-gather I/O tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-readv-writev; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-readv-writev; \
 	printf "\n$(BLUE)── inotify emulation tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-inotify; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-inotify; \
 	printf "\n$(BLUE)── COW fork isolation tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-cow-fork; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── PI futex + EINTR regression tests (x86_64) ──$(RESET)\n"; \
 	run_xfail test-futex-pi "rosetta: raw clone(CLONE_THREAD) in dead-owner test hangs"; \
 	printf "\n$(BLUE)── Directed signal (tkill/tgkill) tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-tgkill-target; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-sigill; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-sigill; \
 	printf "\n$(BLUE)── X11 raw protocol tests (x86_64) ──$(RESET)\n"; \
-	run_test $(BUILD_DIR)/hl $(X64_TEST_DIR)/test-x11; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-x11; \
 	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
+
+## Run the x86_64 suite in the shipped default rooted filesystem mode
+test-x64-all-rooted:
+	@printf "\n$(BLUE)━━━ x86_64 suite in default (rooted) fs mode ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-x64-all X64_TEST_FLAGS="--fs-mode=rooted \
+		--bind $(CURDIR):$(CURDIR) --guest-cwd $(CURDIR) --audio-backend null"
+
+## Run the x86_64 suite in both legacy and rooted filesystem modes
+test-x64-both-modes: test-x64-all test-x64-all-rooted
 
 ## Run x86_64 coreutils integration tests (via rosetta)
 test-x64-coreutils: $(BUILD_DIR)/hl
@@ -919,6 +944,10 @@ shellcheck:
 		exit 1; \
 	fi
 
+## Validate GitHub Actions workflows and embedded shell snippets
+lint-actions:
+	actionlint .github/workflows/*.yml
+
 # ── Cleanup ────────────────────────────────────────────────────────
 
 ## Remove all build artifacts
@@ -929,6 +958,10 @@ clean:
 
 DIST_OUT  := dist/out
 DIST_NAME := hl-$(VERSION)
+
+## Remove distribution archives and staging directories
+dist-clean:
+	rm -rf dist/out dist/staging
 
 ## Build distribution zip archive
 dist: $(BUILD_DIR)/hl
@@ -957,7 +990,7 @@ pkg: $(BUILD_DIR)/hl
 release:
 	@sh dist/build-release.sh "$(VERSION)"
 
-## Interactive release: changelog, version bump, tag, push (uses claude)
+## Prepare exact artifacts/tag and optionally push a draft release
 release-interactive:
 	@sh dist/release.sh
 

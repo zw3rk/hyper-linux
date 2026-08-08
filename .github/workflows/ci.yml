@@ -72,6 +72,12 @@ jobs:
       - name: Run shellcheck
         run: nix develop .#ci -c make shellcheck
 
+      - name: Test release plumbing
+        run: nix develop .#ci -c make test-release-plumbing
+
+      - name: Validate workflows
+        run: nix develop .#ci -c make lint-actions
+
   # ── Guest binaries (x86_64-linux, GitHub-hosted) ────────────────
   guest-bins:
     runs-on: ubuntu-latest
@@ -198,6 +204,13 @@ jobs:
       - name: Build hl
         run: nix develop .#ci -c make hl
 
+      - name: "[host] Unit tests and operator diagnostics"
+        id: host-units
+        if: always()
+        env:
+          GUEST_TEST_BINARIES: ${{ github.workspace }}/guest-bins/test-binaries
+        run: nix develop .#ci -c make test-host-units
+
       # ── Native HVF validation ──────────────────────────────────
       - name: "[native] Multi-vCPU HVF validation"
         id: native-multi-vcpu
@@ -218,7 +231,10 @@ jobs:
         if: always()
         env:
           GUEST_TEST_BINARIES: ${{ github.workspace }}/guest-bins/test-binaries
-        run: nix develop .#ci -c make test-all
+        # Host tests have their own always-run step above. Keep this lane to
+        # one legacy and one rooted guest pass rather than compiling host
+        # fixtures a second time.
+        run: nix develop .#ci -c make test-all test-all-rooted
 
       - name: "[aarch64] Coreutils (static musl)"
         id: aarch64-coreutils
@@ -289,7 +305,7 @@ jobs:
         if: always()
         env:
           GUEST_X64_TEST_BINARIES: ${{ github.workspace }}/guest-bins/x64-test-binaries
-        run: nix develop .#ci -c make test-x64-all
+        run: nix develop .#ci -c make test-x64-both-modes
 
       - name: "[x86_64] Coreutils (static musl)"
         id: x86_64-coreutils
@@ -312,12 +328,11 @@ jobs:
           X64_STATIC_BINS_DIR: ${{ github.workspace }}/guest-bins/x64-static-bins/bin
         run: nix develop .#ci -c make test-x64-static-bins
 
-      # x86_64 dynamic musl: requires 48-bit IPA (M3+) for rosetta's
-      # dynamic linker mapping.  M1 (36-bit IPA) crashes with SIGFPE.
+      # Required in 0.3: IPA width is negotiated and the low-IPA Rosetta path
+      # has dedicated cache/mapping fixes. A regression here blocks release.
       - name: "[x86_64] Dynamic coreutils (musl --sysroot)"
         id: x86_64-dynamic-musl
         if: always()
-        continue-on-error: true
         env:
           X64_MUSL_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
           GUEST_X64_MUSL_SYSROOT: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
@@ -341,23 +356,20 @@ jobs:
           nix develop .#ci -c make test-x64-glibc-dynamic
           nix develop .#ci -c make test-x64-glibc-coreutils
 
-      # x86_64 haskell hello: dynamically linked, requires 48-bit IPA (M3+).
+      # Required dynamic Rosetta integration coverage.
       - name: "[x86_64] Haskell smoke test (hello-hyper)"
         id: x86_64-haskell-smoke
         if: always()
-        continue-on-error: true
         env:
           X64_HASKELL_HELLO: ${{ github.workspace }}/haskell-x64-bins/haskell-hello/bin/hello-hyper
           X64_MUSL_SYSROOT_DIR: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
           GUEST_X64_MUSL_SYSROOT: ${{ github.workspace }}/guest-bins/x64-musl-sysroot
         run: nix develop .#ci -c make test-x64-haskell
 
-      # x86_64 Haskell bins: glibc dynamic linking requires 48-bit IPA (M3+).
-      # M1 (36-bit IPA) can't map glibc's dynamic linker at high VA.
+      # Required dynamic Rosetta integration coverage.
       - name: "[x86_64] Haskell bins (pandoc + shellcheck)"
         id: x86_64-haskell-bins
         if: always()
-        continue-on-error: true
         env:
           X64_HASKELL_BINS_DIR: ${{ github.workspace }}/haskell-x64-bins/haskell-bins/bin
           X64_HASKELL_SYSROOT: ${{ github.workspace }}/haskell-x64-bins/haskell-sysroot
@@ -373,6 +385,7 @@ jobs:
             echo ""
             echo "| Suite | Status |"
             echo "|-------|--------|"
+            echo "| [host] Unit tests + diagnostics | $(icon '${{ steps.host-units.outcome }}') |"
             echo "| [native] Multi-vCPU HVF | $(icon '${{ steps.native-multi-vcpu.outcome }}') |"
             echo "| [native] W^X page tables | $(icon '${{ steps.native-rwx.outcome }}') |"
             echo "| [aarch64] Unit tests | $(icon '${{ steps.aarch64-unit.outcome }}') |"
@@ -387,21 +400,16 @@ jobs:
             echo "| [x86_64] Coreutils (musl) | $(icon '${{ steps.x86_64-coreutils.outcome }}') |"
             echo "| [x86_64] Busybox | $(icon '${{ steps.x86_64-busybox.outcome }}') |"
             echo "| [x86_64] Static bins | $(icon '${{ steps.x86_64-static.outcome }}') |"
-            echo "| [x86_64] Dynamic (musl) ⚠️ | $(icon '${{ steps.x86_64-dynamic-musl.outcome }}') |"
+            echo "| [x86_64] Dynamic (musl) | $(icon '${{ steps.x86_64-dynamic-musl.outcome }}') |"
             echo "| [x86_64] Dynamic (glibc) | $(icon '${{ steps.x86_64-dynamic-glibc.outcome }}') |"
-            echo "| [x86_64] Haskell smoke ⚠️ | $(icon '${{ steps.x86_64-haskell-smoke.outcome }}') |"
-            echo "| [x86_64] Haskell bins ⚠️ | $(icon '${{ steps.x86_64-haskell-bins.outcome }}') |"
-            echo ""
-            echo "_⚠️ = optional (requires 48-bit IPA / M3+)_"
+            echo "| [x86_64] Haskell smoke | $(icon '${{ steps.x86_64-haskell-smoke.outcome }}') |"
+            echo "| [x86_64] Haskell bins | $(icon '${{ steps.x86_64-haskell-bins.outcome }}') |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Fail the job if any required test suite failed.
           FAILED=0
-          # Note: x86_64-dynamic-musl, x86_64-haskell-smoke, and
-          # x86_64-haskell-bins are excluded — they require 48-bit IPA
-          # (M3+) for rosetta dynamic linking at high VA.  M1 runners
-          # only support 36-bit IPA.
           for outcome in \
+            "${{ steps.host-units.outcome }}" \
             "${{ steps.native-multi-vcpu.outcome }}" \
             "${{ steps.native-rwx.outcome }}" \
             "${{ steps.aarch64-unit.outcome }}" \
@@ -416,7 +424,10 @@ jobs:
             "${{ steps.x86_64-coreutils.outcome }}" \
             "${{ steps.x86_64-busybox.outcome }}" \
             "${{ steps.x86_64-static.outcome }}" \
-            "${{ steps.x86_64-dynamic-glibc.outcome }}"; do
+            "${{ steps.x86_64-dynamic-musl.outcome }}" \
+            "${{ steps.x86_64-dynamic-glibc.outcome }}" \
+            "${{ steps.x86_64-haskell-smoke.outcome }}" \
+            "${{ steps.x86_64-haskell-bins.outcome }}"; do
             if [ "$outcome" = "failure" ]; then FAILED=1; fi
           done
           if [ "$FAILED" = "1" ]; then
@@ -448,12 +459,19 @@ jobs:
             VERSION="$(git describe --tags --always --dirty)"
           fi
           export VERSION
+          make dist-clean
+          # VERSION is expanded by the nested shell, not this one.
+          # shellcheck disable=SC2016
           nix develop .#ci -c sh -c 'make hl VERSION="$VERSION" && make dist VERSION="$VERSION" && make pkg VERSION="$VERSION"'
 
       - name: Generate SHA256SUMS
         run: |
           cd dist/out
-          shasum -a 256 *.zip *.pkg 2>/dev/null > SHA256SUMS || true
+          VERSION="${GITHUB_REF#refs/tags/}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            VERSION="$(git -C ../.. describe --tags --always --dirty)"
+          fi
+          shasum -a 256 "hl-${VERSION}.zip" "hl-${VERSION}.pkg" > SHA256SUMS
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -464,10 +482,10 @@ jobs:
             dist/out/*.pkg
             dist/out/SHA256SUMS
 
-  # ── GitHub Release (tags only) ──────────────────────────────────
-  # If release.sh already created the release with signed artifacts,
-  # skip upload to preserve Homebrew SHA256 integrity.  Only create
-  # a release (with CI-built artifacts) for manual tag pushes.
+  # ── Draft GitHub Release (tags only) ────────────────────────────
+  # release.sh normally creates a draft with signed artifacts before this job.
+  # A manual tag push gets a reviewable CI-built fallback draft. The publisher
+  # rejects it until its assets exactly match the local signed release build.
   # dist already depends on [build, test], so needs: dist is sufficient.
   release:
     needs: dist
@@ -498,7 +516,7 @@ jobs:
           name: hl-dist
           path: dist-out
 
-      - name: Create GitHub Release (manual tag only)
+      - name: Create draft GitHub Release (manual tag only)
         if: steps.check.outputs.release_exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
@@ -508,3 +526,5 @@ jobs:
             dist-out/**/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-rc') }}

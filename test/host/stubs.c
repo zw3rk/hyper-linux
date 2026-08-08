@@ -2,7 +2,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
-#include "syscall.h"
+#include "syscall_internal.h"
 
 fd_entry_t fd_table[FD_TABLE_SIZE];
 pthread_mutex_t fd_lock;

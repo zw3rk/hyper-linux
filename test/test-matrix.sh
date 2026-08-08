@@ -56,6 +56,7 @@ pass=0
 fail=0
 skip=0
 timeout_count=0
+HL_MATRIX_FLAGS=${HL_MATRIX_FLAGS:---fs-mode=legacy --audio-backend null}
 
 # Test fixture directory — must be accessible from the runner's context.
 # For hl modes, a local macOS temp dir works fine.
@@ -104,7 +105,9 @@ trap 'cleanup_fixtures' EXIT
 
 # Run binary via hl, with timeout (stderr suppressed to avoid hl debug noise)
 run_hl() {
-    timeout 30 "$HL" "$@" 2>/dev/null
+    # Intentional splitting of the operator-supplied flag list.
+    # shellcheck disable=SC2086
+    timeout 30 "$HL" $HL_MATRIX_FLAGS "$@" 2>/dev/null
 }
 
 # Run binary directly in Lima VM (stderr suppressed to avoid limactl warnings)
@@ -126,7 +129,8 @@ run_hl_sysroot() {
         sysroot_args="--sysroot $_SYSROOT"
     fi
     # shellcheck disable=SC2086
-    timeout "$_HL_TIMEOUT" "$HL" $sysroot_args "$bin" $_GUEST_EXTRA "$@" 2>/dev/null
+    timeout "$_HL_TIMEOUT" "$HL" $HL_MATRIX_FLAGS $sysroot_args \
+        "$bin" $_GUEST_EXTRA "$@" 2>/dev/null
 }
 
 # Generic test: run binary, check output contains pattern
