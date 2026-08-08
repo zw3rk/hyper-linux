@@ -21,6 +21,7 @@
        test-full \
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
        test-matrix-lima-aarch64 test-matrix-lima-x64 \
+       test-host-units test-page-table-pool \
        lint analyze format shellcheck \
        site site-serve release-interactive help
 
@@ -248,6 +249,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fileio CLAUDE.md; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-string; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-malloc; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-brk-stack-collision; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-cat test/hello.S; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-ls test/; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-roundtrip; \
@@ -362,8 +364,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	[ "$$fail" -eq 0 ]
 	@$(MAKE) --no-print-directory test-host-units
 
-## Host-side unit tests (no guest VM): VFS resolver + audio gain
-test-host-units:
+## Host-side unit tests (no guest VM): VFS, audio, app-open, and page tables
+test-host-units: test-page-table-pool | $(BUILD_DIR)
 	@printf "$(BLUE)▸ Host unit tests$(RESET)\n"
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-vfs-unit \
 		test/host/test-vfs-unit.c test/host/stubs.c \
@@ -403,6 +405,15 @@ test-host-units:
 	$(BUILD_DIR)/test-audio-coreaudio
 	@# Operator-facing output: path redaction and the SIGUSR1 stats dump.
 	@HL=$(BUILD_DIR)/hl bash test/test-diagnostics.sh
+
+## Run host-side page-table-pool capacity regression
+test-page-table-pool: | $(BUILD_DIR)
+	@printf "$(BLUE)▸ Page table pool unit test$(RESET)\n"
+	clang $(CFLAGS) -ffunction-sections -Wl,-dead_strip -I$(SRC_DIR) \
+		-o $(BUILD_DIR)/test-page-table-pool \
+		test/host/test-page-table-pool.c $(SRC_DIR)/guest.c \
+		-framework Hypervisor -lpthread
+	$(BUILD_DIR)/test-page-table-pool
 
 # ── Coreutils integration test ───────────────────────────────────
 

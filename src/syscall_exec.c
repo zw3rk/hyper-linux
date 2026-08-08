@@ -512,11 +512,11 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
         };
     }
 
-    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
+    /* brk region (RW). Stop at the stack reservation. */
     if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g->brk_base,
-        .gpa_end   = MMAP_RX_BASE,
+        .gpa_end   = g->stack_base,
         .perms     = MEM_PERM_RW
     };
 

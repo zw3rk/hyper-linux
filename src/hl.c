@@ -594,7 +594,7 @@ int main(int argc, char **argv) {
     g.brk_current = brk_start;
 
     /* Place stack above brk, 2MB-aligned.  For small binaries the stack
-     * stays at the default 128MB position.  For large binaries (e.g.,
+     * stays at the default 256MB position.  For large binaries (e.g.,
      * 200MB pandoc) the stack moves up so it doesn't overlap the binary's
      * address space — rosetta uses MAP_FIXED_NOREPLACE to reserve the
      * binary range and will fail with EEXIST if the stack is in the way. */
@@ -765,12 +765,12 @@ int main(int argc, char **argv) {
         };
     }
 
-    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE; brk can grow
-     * beyond via dynamic page table extension in sys_brk. */
+    /* brk region (RW). The stack base is the hard upper bound so heap
+     * growth cannot overwrite the guard page or live stack. */
     if (nregions >= MAX_REGIONS) goto too_many_regions;
     regions[nregions++] = (mem_region_t){
         .gpa_start = g.brk_base,
-        .gpa_end   = MMAP_RX_BASE,
+        .gpa_end   = g.stack_base,
         .perms     = MEM_PERM_RW
     };
 

@@ -133,7 +133,7 @@ int rosetta_prepare(guest_t *g, const char *binary_path,
             memset(g->kbuf_base, 0, KBUF_SIZE);
 
         /* Rebuild TTBR1 page tables from the reset PT pool.
-         * guest_reset() zeroed pt_pool_next back to PT_POOL_BASE, so
+         * guest_reset() returned pt_pool_next to the pool base, so
          * calling guest_init_kbuf() here allocates fresh L0/L1/L2 pages
          * BEFORE guest_build_page_tables() allocates TTBR0 pages.
          * Without this, g->ttbr1 would point at stale/overwritten data

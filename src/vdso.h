@@ -46,12 +46,13 @@ typedef struct hl_vvar {
 /* Build vDSO ELF image at VDSO_BASE; zero/init [vvar]. Returns VDSO_BASE or 0. */
 uint64_t vdso_build(guest_t *g);
 
-/* Harden the hl-internal low 2MB block (block 0) against EL0 tampering.
+/* Harden hl-internal pages against EL0 tampering.
  * Call once after the page tables are built and the null-guard has split
  * block 0 into L3 pages (guest_invalidate_ptes(g, 0, 0x1000)):
- *   - page-table pool (PT_POOL_BASE..PT_POOL_END): stage-1 invalid (no EL0
- *     access; the MMU still walks it by IPA via stage-2),
- *   - holes below [vvar]: stage-1 invalid,
+ *   - page-table pool (high end of primary buffer, see guest_page_table_pool_*):
+ *     stage-1 invalid (no EL0 access; the MMU still walks it by IPA via stage-2),
+ *   - holes below [vvar] and the former low pool range up to SHIM_BASE:
+ *     stage-1 invalid,
  *   - [vvar]: EL0 read-only + execute-never,
  *   - [vdso]: left RX (EL0 read + execute).
  * EL0 *writes* to the still-mapped [vvar]/[vdso]/shim pages are rejected by

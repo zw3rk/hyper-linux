@@ -72,16 +72,29 @@ static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 /* Track whether the 80% warning has been emitted (avoid log spam) */
 static int pt_pool_warned = 0;
 
+uint64_t guest_page_table_pool_base(const guest_t *g) {
+    /* mmap_limit reserves the final 8GB of the primary buffer. Keep page
+     * tables in the final 16MB of that reservation, outside every guest
+     * application mapping arena and the low fixed ELF/shim addresses. */
+    return g->guest_size - PT_POOL_SIZE;
+}
+
+uint64_t guest_page_table_pool_end(const guest_t *g) {
+    return g->guest_size;
+}
+
 /* Allocate a zeroed 4KB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
  * Acquires pt_lock internally. Caller typically holds mmap_lock. */
 static uint64_t pt_alloc_page(guest_t *g) {
     pthread_mutex_lock(&pt_lock);
-    if (g->pt_pool_next + PAGE_SIZE > PT_POOL_END) {
+    uint64_t pool_base = guest_page_table_pool_base(g);
+    uint64_t pool_end = guest_page_table_pool_end(g);
+    if (g->pt_pool_next + PAGE_SIZE > pool_end) {
         fprintf(stderr, "guest: page table pool exhausted "
                 "(used %llu / %llu bytes)\n",
-                (unsigned long long)(g->pt_pool_next - PT_POOL_BASE),
-                (unsigned long long)(PT_POOL_END - PT_POOL_BASE));
+                (unsigned long long)(g->pt_pool_next - pool_base),
+                (unsigned long long)(pool_end - pool_base));
         pthread_mutex_unlock(&pt_lock);
         return 0;
     }
@@ -94,8 +107,8 @@ static uint64_t pt_alloc_page(guest_t *g) {
     }
 
     /* Warn at 80% pool usage so users can anticipate exhaustion */
-    uint64_t used = gpa + PAGE_SIZE - PT_POOL_BASE;
-    uint64_t total = PT_POOL_END - PT_POOL_BASE;
+    uint64_t used = gpa + PAGE_SIZE - pool_base;
+    uint64_t total = pool_end - pool_base;
     if (!pt_pool_warned && used > (total * 4 / 5)) {
         if (hl_verbose)
             fprintf(stderr, "guest: warning: page table pool at %llu%% "
@@ -186,7 +199,6 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits, int is_rosetta) {
     g->is_rosetta = is_rosetta;
     g->shm_fd = -1;
     g->ipa_base = GUEST_IPA_BASE;
-    g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
@@ -209,6 +221,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits, int is_rosetta) {
         size = buf_capacity;
     g->guest_size = size;
     g->ipa_bits = vm_ipa;
+    g->pt_pool_next = guest_page_table_pool_base(g);
 
     /* Compute dynamic layout limits from primary buffer size.
      * interp_base: last 4GB (dynamic linker load address)
@@ -296,6 +309,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits, int is_rosetta) {
         if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
         size = 1ULL << fb_bits;
         g->guest_size = size;
+        g->pt_pool_next = guest_page_table_pool_base(g);
         g->interp_base = size - 0x100000000ULL;
         g->mmap_limit  = size - 0x200000000ULL;
         g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -333,13 +347,13 @@ int guest_init_from_shm(guest_t *g, int shm_fd, uint64_t size,
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1;  /* Child doesn't own the shm */
     g->ipa_base = GUEST_IPA_BASE;
-    g->pt_pool_next = PT_POOL_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
     g->mmap_rx_next = MMAP_RX_BASE;
     g->guest_size = size;
     g->ipa_bits = ipa_bits;
+    g->pt_pool_next = guest_page_table_pool_base(g);
 
     /* Compute layout limits (same formula as guest_init) */
     g->interp_base = size - 0x100000000ULL;
@@ -820,9 +834,10 @@ void guest_reset(guest_t *g) {
     }
 
     /* Zero page table pool (not tracked in region array) */
-    if (g->pt_pool_next > PT_POOL_BASE)
-        memset((uint8_t *)g->host_base + PT_POOL_BASE, 0,
-               g->pt_pool_next - PT_POOL_BASE);
+    uint64_t pt_pool_base = guest_page_table_pool_base(g);
+    if (g->pt_pool_next > pt_pool_base)
+        memset((uint8_t *)g->host_base + pt_pool_base, 0,
+               g->pt_pool_next - pt_pool_base);
 
     /* Zero shim code + data (not tracked in region array by guest_reset
      * callers — shim regions are added AFTER reset by the exec path) */
@@ -831,7 +846,7 @@ void guest_reset(guest_t *g) {
 
     /* Reset allocation state */
     pt_pool_warned = 0;  /* Reset 80% warning for new binary */
-    g->pt_pool_next = PT_POOL_BASE;
+    g->pt_pool_next = pt_pool_base;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
@@ -866,9 +881,10 @@ int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
     int n = 0;
 
     /* Page table pool */
-    if (n < max && g->pt_pool_next > PT_POOL_BASE) {
-        out[n].offset = PT_POOL_BASE;
-        out[n].size = g->pt_pool_next - PT_POOL_BASE;
+    uint64_t pt_pool_base = guest_page_table_pool_base(g);
+    if (n < max && g->pt_pool_next > pt_pool_base) {
+        out[n].offset = pt_pool_base;
+        out[n].size = g->pt_pool_next - pt_pool_base;
         n++;
     }
 
@@ -1980,4 +1996,3 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
 
     return 0;
 }
-

@@ -34,23 +34,22 @@
  * historical; the VM's IPA width need only cover the primary buffer (≤40-bit). */
 #define ROSETTA_IPA_BASE     0x800000000000ULL   /* 128TB: rosetta link VA */
 #define ROSETTA_PATH         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta"
-#define PT_POOL_BASE         0x00010000ULL   /* Page table pool start */
-#define PT_POOL_END          0x00100000ULL   /* Page table pool end (960KB) */
+#define PT_POOL_SIZE         0x01000000ULL   /* 16MB page table pool */
 #define SHIM_BASE            0x00100000ULL   /* Shim code (2MB block, RX) */
 #define SHIM_DATA_BASE       0x00200000ULL   /* Shim stack/data (2MB block, RW) */
 #define ELF_DEFAULT_BASE     0x00400000ULL   /* Typical ELF load base */
 #define PIE_LOAD_BASE        0x00400000ULL   /* PIE (ET_DYN) executable base (4MB) */
 #define BRK_BASE_DEFAULT     0x01000000ULL   /* Default brk start (16MB) */
-#define STACK_SIZE           0x00800000ULL   /* 8MB stack (4×2MB blocks).
-                                              * macOS demand-pages HVF backing memory, so
-                                              * unused stack pages consume no host RAM. */
-#define STACK_TOP_DEFAULT    0x08000000ULL   /* Default stack top (128MB) — used when
-                                              * brk_start is below this.  Otherwise stack
-                                              * is placed dynamically above brk. */
-#define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_BASE         0x10000000ULL   /* mmap RX region start (for PROT_EXEC).
                                               * Below 8GB — only code goes here, not
                                               * subject to GHC's minimumAddress check. */
+#define STACK_SIZE           0x00800000ULL   /* 8MB stack (4×2MB blocks).
+                                              * macOS demand-pages HVF backing memory, so
+                                              * unused stack pages consume no host RAM. */
+#define STACK_TOP_DEFAULT    MMAP_RX_BASE    /* Default stack top (256MB), directly below
+                                              * the executable mmap arena. This leaves
+                                              * 232MB of low-address heap headroom. */
+#define STACK_GUARD_SIZE     0x00001000ULL   /* 4KB guard page at bottom of stack */
 #define MMAP_RX_INITIAL_END  0x20000000ULL   /* Initial pre-mapped mmap RX end (512MB) */
 #define MMAP_BASE            0x200000000ULL  /* mmap RW region start (8GB). Placed high to
                                               * match real Linux mmap address space layout.
@@ -413,6 +412,11 @@ typedef struct {
  * shim_size is the shim binary size (needed to determine shim region). */
 int guest_get_used_regions(const guest_t *g, unsigned int shim_size,
                            used_region_t *out, int max);
+
+/* Page-table pool bounds. Page-table pages are Stage-2-visible guest physical
+ * memory but are not mapped into the guest's application VA ranges. */
+uint64_t guest_page_table_pool_base(const guest_t *g);
+uint64_t guest_page_table_pool_end(const guest_t *g);
 
 /* ---------- Semantic region tracking API ---------- */
 

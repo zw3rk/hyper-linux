@@ -584,16 +584,11 @@ static int64_t sys_brk(guest_t *g, uint64_t addr) {
         return (int64_t)ipa_brk;
     }
 
-    /* Extend page tables if brk grows beyond currently-mapped region.
-     * The brk region is initially mapped up to MMAP_RX_BASE; if it grows
-     * past that, we need to extend dynamically. */
-    uint64_t brk_pt_end = (g->brk_current + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
-    if (brk_pt_end < MMAP_RX_BASE) brk_pt_end = MMAP_RX_BASE;
-    if (new_off > brk_pt_end) {
-        uint64_t new_end = (new_off + BLOCK_2MB - 1) & ~(BLOCK_2MB - 1);
-        if (guest_extend_page_tables(g, brk_pt_end, new_end, MEM_PERM_RW) < 0)
-            return (int64_t)ipa_brk;
-    }
+    /* Linux leaves the break unchanged when growth would collide with
+     * another mapping. The stack reservation begins at stack_base; allowing
+     * brk beyond it would overwrite the guard page and then the live stack. */
+    if (new_off > g->stack_base)
+        return (int64_t)ipa_brk;
 
     /* Zero new pages if growing */
     if (new_off > g->brk_current) {

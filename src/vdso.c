@@ -264,15 +264,22 @@ void vdso_publisher_stop(void) {
 void vdso_harden_low_block(guest_t *g) {
     if (!g) return;
 
-    /* Page-table pool: no EL0 access at all. The MMU stage-1 walker reads
-     * these page-table pages by IPA through stage-2 (never via their own
-     * stage-1 VA mapping), so invalidating the stage-1 PTEs does not disturb
-     * translation — it only stops the guest from reading/writing hl's page
-     * tables. An EL0 access now takes a translation fault → SIGSEGV. */
-    guest_invalidate_ptes(g, PT_POOL_BASE, PT_POOL_END);
+    /* Page-table pool (high end of the primary buffer): no EL0 access.
+     * The MMU stage-1 walker reads these page-table pages by IPA through
+     * stage-2 (never via their own stage-1 VA mapping), so invalidating the
+     * stage-1 PTEs does not disturb translation — it only stops the guest
+     * from reading/writing hl's page tables. An EL0 access now takes a
+     * translation fault → SIGSEGV. */
+    guest_invalidate_ptes(g, guest_page_table_pool_base(g),
+                          guest_page_table_pool_end(g));
 
     /* Unused holes between the null-guard page and [vvar]: no EL0 access. */
     guest_invalidate_ptes(g, 0x1000ULL, VVAR_BASE);
+
+    /* Former low pool range (0x10000..SHIM_BASE) is now an unused hole in
+     * block 0 after the pool moved to the high end of guest memory. Keep it
+     * unmapped so EL0 cannot treat that range as ordinary RW memory. */
+    guest_invalidate_ptes(g, 0x10000ULL, SHIM_BASE);
 
     /* [vvar] time page: EL0 read-only + execute-never. The host still writes
      * it via host_base (vdso_vvar_update), which bypasses stage-1 perms.
