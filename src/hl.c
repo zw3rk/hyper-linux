@@ -1000,11 +1000,17 @@ too_many_regions:
         }
     }
 
-    /* HOME / XAUTHORITY: host $HOME is /Users/... but default bind maps
-     * it to /home/user. Point guest HOME (and X auth cookie file) there. */
-    if (!isolated && home_bind_set && n_owned_env < 16) {
+    /* HOME: any explicit or implicit /home/user bind is a guest-visible home,
+     * including under --isolated (which disables defaults, not explicit
+     * binds). */
+    if (home_bind_set && n_owned_env < 16) {
         { char *e = strdup("HOME=/home/user");
           if (e) owned_env_vars[n_owned_env++] = e; }
+    }
+
+    /* XAUTHORITY: only propagate the implicit host profile. Under --isolated,
+     * an explicit /home/user bind need not contain the host cookie file. */
+    if (!isolated && home_bind_set) {
         const char *host_home = getenv("HOME");
         if (host_home && host_home[0] && n_owned_env < 16) {
             char xauth_host[LINUX_PATH_MAX];

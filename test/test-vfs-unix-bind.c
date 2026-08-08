@@ -55,6 +55,15 @@ static socklen_t fill_un(struct sockaddr_un *un, const char *path) {
 int main(void) {
     printf("test-vfs-unix-bind: AF_UNIX bind/connect must stay in the bind\n");
 
+    /* --isolated disables implicit binds, not the guest environment for an
+     * explicit /home/user bind supplied by the caller. */
+    TEST("explicit isolated home bind sets guest HOME");
+    {
+        const char *home = getenv("HOME");
+        if (home && strcmp(home, "/home/user") == 0) PASS();
+        else FAILF("HOME=%s", home ? home : "(unset)");
+    }
+
     /* Control (+): bind an AF_UNIX socket INSIDE the bind (CWD /home/user),
      * then connect a client to it — proves the confined bind+connect path
      * works end to end, otherwise the refusals below prove nothing. */
