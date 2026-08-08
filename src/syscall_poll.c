@@ -605,6 +605,31 @@ typedef struct {
     epoll_reg_t regs[FD_TABLE_SIZE];
 } epoll_instance_t;
 
+static int64_t epoll_add_filters(int kq_fd, int guest_fd, int host_fd,
+                                 uint32_t events) {
+    struct kevent changes[2];
+    int nchanges = 0;
+    uint16_t kflags = EV_ADD;
+    if (events & LINUX_EPOLLET) kflags |= EV_CLEAR;
+    if (events & LINUX_EPOLLONESHOT) kflags |= EV_ONESHOT;
+
+    void *udata = (void *)(uintptr_t)guest_fd;
+    if (events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+        EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
+               kflags, 0, 0, udata);
+        nchanges++;
+    }
+    if (events & LINUX_EPOLLOUT) {
+        EV_SET(&changes[nchanges], host_fd, EVFILT_WRITE,
+               kflags, 0, 0, udata);
+        nchanges++;
+    }
+
+    if (nchanges > 0 && kevent(kq_fd, changes, nchanges, NULL, 0, NULL) < 0)
+        return linux_errno();
+    return 0;
+}
+
 int64_t sys_epoll_create1(int flags) {
     int kq = kqueue();
     if (kq < 0) return linux_errno();
@@ -701,31 +726,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
         kevent(kq_fd, del, ndel, NULL, 0, NULL);
     }
 
-    /* Build kevent changes */
-    struct kevent changes[2];
-    int nchanges = 0;
-    uint16_t kflags = EV_ADD;
-    if (ev.events & LINUX_EPOLLET) kflags |= EV_CLEAR;
-    if (ev.events & LINUX_EPOLLONESHOT) kflags |= EV_ONESHOT;
-
-    /* Use (void*)(uintptr_t)fd as udata to identify the guest fd */
-    void *udata = (void *)(uintptr_t)fd;
-
-    if (ev.events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-        EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
-               kflags, 0, 0, udata);
-        nchanges++;
-    }
-    if (ev.events & LINUX_EPOLLOUT) {
-        EV_SET(&changes[nchanges], host_fd, EVFILT_WRITE,
-               kflags, 0, 0, udata);
-        nchanges++;
-    }
-
-    if (nchanges > 0) {
-        if (kevent(kq_fd, changes, nchanges, NULL, 0, NULL) < 0)
-            return linux_errno();
-    }
+    int64_t add_result = epoll_add_filters(kq_fd, fd, host_fd, ev.events);
+    if (add_result < 0) return add_result;
 
     /* Store registration data in per-instance table.
      * Clear oneshot_armed when MOD successfully re-arms. */
@@ -734,6 +736,76 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
     reg->active = 1;
     reg->oneshot_armed = 0;
 
+    return 0;
+}
+
+int hl_epoll_fork_export(int epfd, hl_epoll_fork_reg_t *out, int max_regs) {
+    if (epfd < 0 || epfd >= FD_TABLE_SIZE || max_regs < 0)
+        return -1;
+    if (fd_table[epfd].type != FD_EPOLL || !fd_table[epfd].dir)
+        return -1;
+
+    epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
+    int count = 0;
+    for (int fd = 0; fd < FD_TABLE_SIZE; fd++) {
+        epoll_reg_t *reg = &inst->regs[fd];
+        if (!reg->active) continue;
+        if (count >= max_regs || !out) return -1;
+        out[count++] = (hl_epoll_fork_reg_t){
+            .guest_fd = fd,
+            .events = reg->events,
+            .data = reg->data,
+            .oneshot_fired = (uint32_t)reg->oneshot_armed,
+        };
+    }
+    return count;
+}
+
+int hl_epoll_fork_import(int epfd, const hl_epoll_fork_reg_t *regs,
+                         int num_regs) {
+    if (epfd < 0 || epfd >= FD_TABLE_SIZE || num_regs < 0 ||
+        num_regs > FD_TABLE_SIZE || (num_regs > 0 && !regs))
+        return -1;
+
+    int linux_flags = fd_table[epfd].linux_flags;
+    int kq = kqueue();
+    if (kq < 0) return -1;
+    if (linux_flags & LINUX_O_CLOEXEC)
+        (void)fcntl(kq, F_SETFD, FD_CLOEXEC);
+
+    epoll_instance_t *inst = calloc(1, sizeof(*inst));
+    if (!inst) {
+        close(kq);
+        return -1;
+    }
+    if (fd_alloc_at(epfd, FD_EPOLL, kq) < 0) {
+        free(inst);
+        close(kq);
+        return -1;
+    }
+    fd_table[epfd].dir = inst;
+    fd_table[epfd].linux_flags = linux_flags;
+
+    for (int i = 0; i < num_regs; i++) {
+        int fd = regs[i].guest_fd;
+        if (fd < 0 || fd >= FD_TABLE_SIZE || fd == epfd)
+            return -1;
+        int host_fd = fd_to_host(fd);
+        if (host_fd < 0) return -1;
+
+        epoll_reg_t *reg = &inst->regs[fd];
+        if (reg->active) return -1;
+        reg->events = regs[i].events;
+        reg->data = regs[i].data;
+        reg->active = 1;
+        reg->oneshot_armed = regs[i].oneshot_fired != 0;
+
+        /* EV_ONESHOT removes the host filter after delivery.  Preserve that
+         * fired-but-still-registered state and let EPOLL_CTL_MOD re-arm it. */
+        if (!reg->oneshot_armed &&
+            epoll_add_filters(kq, fd, host_fd, reg->events) < 0)
+            return -1;
+    }
     return 0;
 }
 

@@ -47,8 +47,9 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
 #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
-#define IPC_VERSION       6            /* v6: + SysV SHM segment records */
+#define IPC_VERSION       7            /* v7: recreate kqueue-backed epoll fds */
 #define IPC_FD_HAS_OBJECT 1            /* ipc_fd_entry_t.pad: synthetic open-file follows */
+#define IPC_FD_RECREATE_EPOLL 2        /* ipc_fd_entry_t.pad: epoll state follows */
 
 /* IPC header: sent first over socketpair */
 typedef struct {
@@ -112,6 +113,11 @@ typedef struct {
     int32_t pad;
 } ipc_fd_entry_t;
 
+typedef struct {
+    int32_t epfd;
+    uint32_t num_regs;
+} ipc_epoll_header_t;
+
 /* ---------- IPC I/O helpers ---------- */
 
 /* Write exactly len bytes to fd (retry on EINTR/short writes) */
@@ -142,6 +148,90 @@ static int ipc_read_all(int fd, void *buf, size_t len) {
         len -= n;
     }
     return 0;
+}
+
+/* Darwin rejects kqueue descriptors in SCM_RIGHTS messages.  Send their
+ * semantic state separately so the child can create a fresh kqueue and replay
+ * the inherited Linux epoll interest list against its received descriptors. */
+static int send_epoll_states(int sock, const ipc_fd_entry_t *fd_entries,
+                             uint32_t num_fds) {
+    uint32_t num_epolls = 0;
+    for (uint32_t i = 0; i < num_fds; i++) {
+        if (fd_entries[i].type == FD_EPOLL &&
+            (fd_entries[i].pad & IPC_FD_RECREATE_EPOLL))
+            num_epolls++;
+    }
+    if (ipc_write_all(sock, &num_epolls, sizeof(num_epolls)) < 0)
+        return -1;
+    if (num_epolls == 0) return 0;
+
+    hl_epoll_fork_reg_t *regs =
+        calloc(FD_TABLE_SIZE, sizeof(*regs));
+    if (!regs) return -1;
+
+    int result = 0;
+    for (uint32_t i = 0; i < num_fds; i++) {
+        if (fd_entries[i].type != FD_EPOLL ||
+            !(fd_entries[i].pad & IPC_FD_RECREATE_EPOLL))
+            continue;
+
+        int nregs = hl_epoll_fork_export(fd_entries[i].guest_fd, regs,
+                                         FD_TABLE_SIZE);
+        if (nregs < 0) {
+            result = -1;
+            break;
+        }
+        ipc_epoll_header_t header = {
+            .epfd = fd_entries[i].guest_fd,
+            .num_regs = (uint32_t)nregs,
+        };
+        if (ipc_write_all(sock, &header, sizeof(header)) < 0 ||
+            (nregs > 0 && ipc_write_all(sock, regs,
+                                        (size_t)nregs * sizeof(*regs)) < 0)) {
+            result = -1;
+            break;
+        }
+        if (hl_trace_on(HL_TRACE_FORK))
+            hl_trace(HL_TRACE_FORK, "export epoll gfd=%d registrations=%d",
+                     header.epfd, nregs);
+    }
+
+    free(regs);
+    return result;
+}
+
+static int receive_epoll_states(int sock) {
+    uint32_t num_epolls = 0;
+    if (ipc_read_all(sock, &num_epolls, sizeof(num_epolls)) < 0 ||
+        num_epolls > FD_TABLE_SIZE)
+        return -1;
+    if (num_epolls == 0) return 0;
+
+    hl_epoll_fork_reg_t *regs =
+        calloc(FD_TABLE_SIZE, sizeof(*regs));
+    if (!regs) return -1;
+
+    int result = 0;
+    for (uint32_t i = 0; i < num_epolls; i++) {
+        ipc_epoll_header_t header;
+        if (ipc_read_all(sock, &header, sizeof(header)) < 0 ||
+            header.epfd < 0 || header.epfd >= FD_TABLE_SIZE ||
+            header.num_regs > FD_TABLE_SIZE ||
+            (header.num_regs > 0 &&
+             ipc_read_all(sock, regs,
+                          (size_t)header.num_regs * sizeof(*regs)) < 0) ||
+            hl_epoll_fork_import(header.epfd, regs,
+                                 (int)header.num_regs) < 0) {
+            result = -1;
+            break;
+        }
+        if (hl_trace_on(HL_TRACE_FORK))
+            hl_trace(HL_TRACE_FORK, "import epoll gfd=%d registrations=%u",
+                     header.epfd, header.num_regs);
+    }
+
+    free(regs);
+    return result;
 }
 
 /* Send file descriptors via SCM_RIGHTS ancillary message */
@@ -414,8 +504,8 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
          * 1:1 correspondence — each entry at index i has its host FD
          * at host_fds[i] (STDIO entries include their FD too, but we
          * use the child's existing stdio instead).
-         * pad & IPC_FD_HAS_OBJECT: host_fd is a placeholder; real open-file
-         * is recreated from object records after SCM_RIGHTS (IPC v5). */
+         * IPC_FD_HAS_OBJECT / IPC_FD_RECREATE_EPOLL mark placeholders whose
+         * process-local host state is recreated after SCM_RIGHTS. */
         for (uint32_t i = 0; i < num_fds; i++) {
             int gfd = fd_entries[i].guest_fd;
             if (gfd < 0 || gfd >= FD_TABLE_SIZE) continue;
@@ -428,8 +518,15 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                     close(host_fds[i]);
                 fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             } else if ((int)i < received_count) {
-                if (fd_entries[i].pad & IPC_FD_HAS_OBJECT) {
-                    /* Placeholder only — close; object import fills slot. */
+                int recreate_object =
+                    fd_entries[i].type != FD_DEVICE &&
+                    (fd_entries[i].pad & IPC_FD_HAS_OBJECT);
+                int recreate_epoll =
+                    fd_entries[i].type == FD_EPOLL &&
+                    (fd_entries[i].pad & IPC_FD_RECREATE_EPOLL);
+                if (recreate_object || recreate_epoll) {
+                    /* Placeholder only — close; a later semantic import fills
+                     * the slot with process-local host state. */
                     close(host_fds[i]);
                     /* Temporarily mark slot used so bitmap stays consistent;
                      * import will fd_alloc_at again. */
@@ -533,6 +630,13 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                          "import gfd=%d kind=%d policy=recreate-empty of=%llu",
                          gfd, of->kind, (unsigned long long)of->object_id);
         }
+    }
+
+    /* IPC v7: recreate process-local kqueues and their Linux epoll watches. */
+    if (receive_epoll_states(ipc_fd) < 0) {
+        fprintf(stderr, "hl: fork-child: failed to recreate epoll state\n");
+        guest_destroy(&g);
+        return 1;
     }
 
     /* Step 6: Read process info (cwd + umask) */
@@ -1728,6 +1832,7 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         int host_fd;
         int was_duped = 0;
         int has_object = 0;
+        int recreate_epoll = 0;
 
         if (scan[s].of) {
             /* OSS / synthetic: export open-file config; do NOT share stream FDs.
@@ -1749,6 +1854,14 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
             num_objects++;
             was_duped = 1;
             hl_open_file_release(scan[s].of);
+        } else if (scan[s].type == FD_EPOLL) {
+            /* kqueue fds cannot be sent with SCM_RIGHTS on Darwin.  Preserve
+             * the 1:1 descriptor framing with a transferable placeholder;
+             * IPC v7 sends the semantic epoll state after the object graph. */
+            host_fd = open("/dev/null", O_RDWR);
+            if (host_fd < 0) continue;
+            recreate_epoll = 1;
+            was_duped = 1;
         } else if (scan[s].type != FD_STDIO) {
             /* Dup the fd so child gets its own copy */
             if (scan[s].host_fd < 0) continue;
@@ -1770,6 +1883,8 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          * -1 stays -1 (no node). */
         if (scan[s].type == FD_DEVICE)
             fd_entries[num_fds].pad = scan[s].dev_index;
+        else if (recreate_epoll)
+            fd_entries[num_fds].pad = IPC_FD_RECREATE_EPOLL;
         else
             fd_entries[num_fds].pad = has_object ? IPC_FD_HAS_OBJECT : 0;
         host_fds_to_send[num_fds] = host_fd;
@@ -1853,6 +1968,17 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
         if (hl_trace_on(HL_TRACE_FORK))
             hl_trace(HL_TRACE_FORK, "export gfd=%d kind=%u policy=recreate-empty",
                      (int)obj_gfds[oi], obj_records[oi].kind);
+    }
+
+    if (send_epoll_states(ipc_sock, fd_entries, num_fds) < 0) {
+        fprintf(stderr, "hl: clone: failed to send epoll state\n");
+        free(fd_entries);
+        free(host_fds_to_send);
+        free(host_fds_duped);
+        free(obj_records);
+        free(obj_gfds);
+        close(ipc_sock);
+        return -LINUX_ENOMEM;
     }
     free(fd_entries);
     free(host_fds_to_send);

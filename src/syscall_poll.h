@@ -26,6 +26,21 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
                          int maxevents, int timeout_ms,
                          uint64_t sigmask_gva);
 
+/* A kqueue descriptor cannot cross a Darwin SCM_RIGHTS boundary.  Fork
+ * therefore recreates each epoll instance in the child and replays these
+ * semantic registration records against the child's inherited host fds. */
+typedef struct hl_epoll_fork_reg {
+    int32_t guest_fd;
+    uint32_t events;
+    uint64_t data;
+    uint32_t oneshot_fired;
+    uint32_t reserved;
+} hl_epoll_fork_reg_t;
+
+int hl_epoll_fork_export(int epfd, hl_epoll_fork_reg_t *out, int max_regs);
+int hl_epoll_fork_import(int epfd, const hl_epoll_fork_reg_t *regs,
+                         int num_regs);
+
 /* Global wakeup pipe for interrupting blocking poll/select/epoll.
  * When exit_group or futex_interrupt is requested, write to
  * wakeup_pipe_wr to unblock any thread stuck in a host-side
