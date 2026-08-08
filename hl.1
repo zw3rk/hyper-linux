@@ -50,10 +50,12 @@ For dynamic binaries, a sysroot must be provided via
 .Pp
 Guest memory is identity-mapped with 2MB block page tables.
 The address space size is determined at runtime by querying the
-maximum IPA (Intermediate Physical Address) size:
-36-bit (64GB) on M1/M2, or 40-bit (1TB) on M3+.
-x86_64 mode uses 48-bit IPA to accommodate Rosetta's link address
-at 128TB.
+maximum IPA (Intermediate Physical Address) size and capping it at
+40 bits: a 36-bit VM has a 64GB primary mapping and a 40-bit VM has
+a 1TB primary mapping.
+Both guest architectures use the negotiated host width.
+High Rosetta virtual addresses are translated into the available primary
+GPA span and do not require a 48-bit VM.
 .Sh OPTIONS
 .Bl -tag -width indent
 .It Fl h , Fl -help
@@ -379,9 +381,10 @@ Trace categories, same syntax as
 .Fl -trace .
 Applied before option parsing, so it also covers startup events.
 .It Ev HL_TRACE_REDACT
-Reserved for path redaction in trace output.
+Redact host home paths in trace and crash-report output.
 .It Ev HL_AUDIO_BACKEND
-Default audio backend. An explicit
+Default audio backend.
+An explicit
 .Fl -audio-backend
 takes precedence.
 .It Ev HL_AUDIO_WAV
@@ -399,7 +402,8 @@ Override or disable the guest locale default.
 .Pp
 The guest does
 .Em not
-inherit the host environment verbatim in rooted mode. The following keys are
+inherit the host environment verbatim in rooted mode.
+The following keys are
 set or rewritten for the guest:
 .Ev LD_LIBRARY_PATH ,
 .Ev LD_PRELOAD ,

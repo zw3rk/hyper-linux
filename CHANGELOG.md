@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 0.3.0-rc (hl core only)
+## [0.3.0-rc2] - 2026-08-08
 
 ### Added
 - Ref-counted open-file FD core (`src/fd_object.*`) with per-descriptor ops
@@ -11,6 +11,16 @@
 - Category tracing: `HL_TRACE` / `--trace=fs,fd,dev,audio,proc,fork,sys`
 - Guest DISPLAY / X11 socket bridging; SysV SHM (MIT-SHM); guest vDSO text
 - Guest tests: OSS/VFS/vdso/tgkill; host unit tests for VFS/FD/audio
+
+### Changed
+- Make rooted VFS and Core Audio the product defaults; retain explicit legacy,
+  isolated and deterministic null/WAV modes
+- Negotiate the HVF IPA width and translate Rosetta high virtual addresses into
+  the available primary GPA span instead of requiring a 48-bit VM
+- Make the vCPU watchdog opt-in (`--timeout 0`/unset is off) so compute-bound or
+  vDSO-polling guests are not killed as hangs
+- Split AppKit X and XMMS packaging into independently releasable sibling
+  repositories; keep this release runtime-only
 
 ### Removed
 - Paravirtual X11 ring (`HL_X11_PV`, `libhl_x11_pv.so`, `packages.*.hl-x11-pv`) —
@@ -40,12 +50,36 @@
 - `--audio-backend` beats `HL_AUDIO_BACKEND` and is inherited by fork children
 - `--bind` accepts hosts containing `=` and a `:ro` suffix
 - Builds warning-free again; X11 stats tagging actually wired up
+- Validate Rosetta AOT cache entries and regenerate poisoned translations;
+  correct high-VA permission updates on negotiated-width VMs
+- Preserve non-identity backing GPAs when reactivating high-VA pages, reject
+  non-canonical syscall pointers, return EFAULT from the Rosetta vDSO path,
+  and retain directed-signal `si_code` through Rosetta forwarding
+- Relocate and expand the page-table pool, enforce its bounds after vDSO
+  relocation, and keep the pool EL1-only while exposing `[vvar]` read-only
+- Keep `brk` below the guest stack and reject guest attempts to forge the vDSO,
+  `[vvar]`, page-table pool, or protected block-zero mappings
+- Make synthetic directory FDs usable as dirfds and preserve virtual device
+  identity across `dup`, `fork`, `fstatat(AT_EMPTY_PATH)` and `statx`
+- Confine mutating/metadata VFS operations, inotify and named AF_UNIX operations
+  beneath rooted bind mounts using parent-directory resolution
+- Enforce live-name ownership for abstract AF_UNIX sockets and close SCM_RIGHTS
+  truncation/leak paths
+- Recreate kqueue-backed epoll descriptors during fork and replay their Linux
+  registrations, so an open epoll fd no longer breaks clone IPC on macOS
+- Apply absolute wall-clock deadlines to audio drain and report `SYNC` failures
+  instead of silently succeeding
+- Redact every sensitive-path occurrence in traces/crash reports and preserve
+  the host environment on allocation failure
 
 ### Notes
 - CLI defaults: `--fs-mode=rooted`, bind `$HOME:/home/user`, `--guest-cwd /home/user`,
   `--audio-backend coreaudio`; `--isolated` skips auto home bind
 - OSS fork policy v1: recreate-empty independent streams (no AQ pointer IPC)
-- AppKit X and XMMS live in sibling repos (see `docs/SIBLING-REPOS.md`)
+- AppKit X and XMMS are being prepared in sibling repos (see
+  `docs/SIBLING-REPOS.md`); their public releases follow this runtime RC
+- Rooted AF_UNIX `connect()` can still follow an outward symlink at the final
+  leaf on Darwin; parent traversal remains confined
 
 ## [0.2.4] - 2026-03-15
 

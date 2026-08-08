@@ -5,13 +5,12 @@
 - **Remote `origin/master`** and tag **`v0.2.4`** (`41cea39`) are the
   locked public line. Do not force-push them.
 
-## Inflight rewrite (local, 2026-07-30)
+## Core-only rewrite (local, 2026-07-30 onward)
 
-Branch **`split/hl-only`** was rewritten so that commits **after**
-`origin/master` contain only hyper-linux core work (2 commits):
-
-1. `feat: VFS, audio/OSS, X11 bridge, SHM, vDSO, PV export (0.3.0-rc)`
-2. `docs: 0.3.0-rc changelog, sibling repos, nix-linux-builder`
+Branch **`split/hl-only`** established the core-only ancestry after
+`origin/master`. It is now an ancestor of local `master`; subsequent commits
+contain the runtime implementation, adversarial review fixes, regressions and
+release hardening for 0.3.
 
 AppKit X / XMMS product history is **not** in this branch’s ancestry after
 the rewrite.
@@ -26,5 +25,7 @@ the rewrite.
 
 ### Local `master`
 
-Aligned to `origin/master` (drops two unpublished local XMMS-only commits
-that never belonged on the public line).
+Local `master` intentionally advances the core-only line beyond the published
+`v0.2.4` baseline. AppKit X and XMMS product work remain outside its ancestry.
+Publish only through a reviewed release-preparation commit and explicit tag;
+never force-push the public baseline.

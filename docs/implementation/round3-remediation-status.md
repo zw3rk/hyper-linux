@@ -100,7 +100,7 @@ rooted resolver; legacy mode is unchanged.
 Suite: 68/68 both fs modes (was 66; +2 tests). All AF_UNIX/X11 socket tests
 (test-socket, test-net, test-x11, test-abstract-unix) still pass.
 
-## Verification debt (unchanged from round 2)
+## Verification debt
 - The 4-mode matrix (`test/test-matrix.sh all`) was not run — the full
   `nix develop` shell fails to build an unrelated x86_64-musl GHC here, so
   everything was verified on `hl-aarch64` in both fs modes via `.#ci` plus a
@@ -108,5 +108,6 @@ Suite: 68/68 both fs modes (was 66; +2 tests). All AF_UNIX/X11 socket tests
   region-overlap, H2's SHM Stage-2, H5's resolver, and the poll/EINTR change
   all touch it.
 - No TSan run on the concurrency-touching fixes (H4 poll, H6 flock table).
-- The clone/SCM_RIGHTS failure with an open epoll fd (observed round 3) is
-  still unfixed and untracked beyond this note.
+- The clone/SCM_RIGHTS failure with an open epoll fd was closed after this
+  review: IPC v7 recreates the kqueue-backed epoll object and replays its
+  registration set. Focused native and Rosetta fork/epoll tests pass.

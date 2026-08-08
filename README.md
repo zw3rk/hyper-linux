@@ -1,14 +1,14 @@
 # hl — Run Linux ELF Binaries on macOS Apple Silicon
 
-`hl` core only. Sibling repos (split in progress):
+`hl` core only. Related repositories are being prepared for public release:
 
 | Repo | Role |
 |------|------|
 | [zw3rk/hyper-linux](https://github.com/zw3rk/hyper-linux) | **This** — runtime |
-| [zw3rk/hyper-linux-x11](https://github.com/zw3rk/hyper-linux-x11) | AppKit-origin X |
-| [zw3rk/hyper-linux-examples](https://github.com/zw3rk/hyper-linux-examples) | XMMS demo |
+| `zw3rk/hyper-linux-x11` (publication pending) | AppKit-origin X |
+| `zw3rk/hyper-linux-examples` (publication pending) | XMMS demo |
 
-Freeze tag: `split-base-2026-07-30`. Plan: `docs/plan-repo-split-and-cleanup.md`.
+The pre-split monorepo is preserved by tag `split-base-2026-07-30`.
 
 `hl` executes **aarch64-linux** and **x86_64-linux** ELF binaries on macOS Apple Silicon using Apple's Hypervisor.framework.
 No Docker, no full VM — just a lightweight per-process virtual machine that translates Linux syscalls to macOS equivalents.
@@ -130,8 +130,16 @@ hl [options] <elf-binary> [args...]
 | `-h`, `--help` | Show man page (or brief usage) |
 | `-V`, `--version` | Print version and exit |
 | `-v`, `--verbose` | Verbose output (ELF loading, syscalls) |
-| `-t`, `--timeout` | Per-iteration vCPU watchdog timeout (default: 10s) |
+| `-t`, `--timeout SECONDS` | Opt-in per-iteration vCPU watchdog (default: 0/off) |
 | `--sysroot PATH` | Musl/glibc sysroot for dynamically-linked binaries |
+| `--fs-mode legacy\|rooted` | Filesystem namespace mode (default: rooted) |
+| `--bind HOST:GUEST` | Add a rooted-mode bind; accepts `:ro` and `GUEST=HOST` |
+| `--guest-home PATH` | Set the guest home used by application profiles |
+| `--guest-cwd PATH` | Set the initial rooted-mode virtual working directory |
+| `--isolated` | Disable the automatic `$HOME` bind and default guest CWD |
+| `--app-profile` | Add the fuller home/media/volume application profile |
+| `--trace=CATEGORIES` | Trace `fs,fd,dev,audio,proc,fork,sys` or `all` |
+| `--audio-backend NAME` | Select `null`, `null-realtime`, `wav`, or `coreaudio` |
 | `--gdb PORT` | Start GDB RSP stub on TCP port (aarch64 only) |
 | `--gdb-stop-on-entry` | Stop at ELF entry point and wait for GDB attach |
 | `--` | Stop processing hl options |
@@ -176,7 +184,9 @@ nix develop
 make hl
 
 # Run tests
-make test-all              # Unit tests
+make test-both-modes       # aarch64 suite in legacy + rooted modes
+make test-x64-both-modes   # x86_64/Rosetta suite in both modes
+make test-host-units       # Host units + operator diagnostics
 make test-coreutils        # 104 GNU coreutils tools
 make test-busybox          # BusyBox applets
 make test-static-bins      # Static binaries (bash, lua, jq, etc.)
@@ -188,6 +198,8 @@ make test-x64-hello        # x86_64 via Rosetta
 # All available targets
 make help
 ```
+
+Release maintainers: see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Project Structure
 
@@ -223,7 +235,7 @@ All source lives under `src/` (~26,000 lines of C + assembly):
 
 ## Known Limitations
 
-- **No kernel features** — no namespaces, cgroups, or devices beyond `/dev/null`, `/dev/zero`, `/dev/urandom`
+- **No full kernel environment** — no namespaces or cgroups; `/dev` is a targeted virtual registry including null/zero/random and OSS audio nodes
 - **Single-VM fork** — macOS HVF allows one VM per process; fork uses `posix_spawn` + IPC serialization
 - **MAP_SHARED** treated as MAP_PRIVATE (single-process, so semantically equivalent)
 - **`timeout`** with dynamic linking — fork+exec with the dynamic linker has issues

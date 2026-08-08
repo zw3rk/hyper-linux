@@ -1,5 +1,9 @@
 # Implementation report: PR1–PR8 — FD core, VFS, devices, audio/OSS
 
+> Historical implementation snapshot. The product default changed from legacy
+> to rooted VFS during 0.3 review; current behavior is documented in `hl.1`,
+> `README.md`, and `CHANGELOG.md`.
+
 ## Interfaces introduced
 
 ### FD core (`src/fd_object.[ch]`)

@@ -1,6 +1,9 @@
 # Section 30 release acceptance status
 
-**Branch:** `feature/xmms-audio-vfs`  
+> Historical feature-branch snapshot retained for archaeology. It is not the
+> current release gate; use the root Makefile, CI workflow, and `CHANGELOG.md`.
+
+**Branch:** `feature/xmms-audio-vfs`
 **Updated:** 2026-07-24 (post-skeptic fix-up)
 
 ## Status
@@ -25,6 +28,6 @@
 
 ## Approved exceptions
 
-1. Full four-mode matrix: capture aarch64 smoke; CI runs `test-matrix.sh all`.  
-2. x64 guest runtime: IPA map failure on this host for all x64; ABI + aarch64 prove OSS.  
-3. XMMS audible GUI: null/WAV + path gates are CI bar (plan §6).  
+1. Full four-mode matrix: capture aarch64 smoke; CI runs `test-matrix.sh all`.
+2. x64 guest runtime: IPA map failure on this host for all x64; ABI + aarch64 prove OSS.
+3. XMMS audible GUI: null/WAV + path gates are CI bar (plan §6).

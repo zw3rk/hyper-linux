@@ -91,12 +91,15 @@ with a regression test that **fails when that fix alone is reverted**
 4. **SHM fork sharing is tested single-level.** Nested fork (grandchild) is
    still not exercised.
 
-5. **`clone` cannot pass fds when a kqueue fd is open.** Observed while
-   writing `test-poll-wakeup`: `clone: failed to send fds via SCM_RIGHTS` /
-   `fork-child: fd count mismatch: received 0, expected 6`. The child ends
-   up with no fds at all. Not investigated — filed here so it is not lost.
-
-6. **"faccessat/fchmodat read undefined" did not reproduce.** The paths are
+5. **"faccessat/fchmodat read undefined" did not reproduce.** The paths are
    assigned before use and clang's `-Wconditional-uninitialized` /
    `-Wsometimes-uninitialized` report nothing in `syscall_fs.c`. Recorded as
    not-reproduced rather than silently dropped.
+
+### Closed after round 3
+
+- **Fork with an open epoll fd:** macOS rejects kqueue descriptors in
+  `SCM_RIGHTS`. IPC v7 now sends a transferable placeholder, serializes the
+  Linux registration set and recreates the child kqueue. `test-epoll` covers
+  ordinary inherited descriptors plus readiness and `epoll_data` across fork
+  in both native and Rosetta guests.

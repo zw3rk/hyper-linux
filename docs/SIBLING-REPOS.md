@@ -1,12 +1,14 @@
 # Sibling repositories
 
-Hyper Linux is split into three repos under `zw3rk/`:
+Hyper Linux is split into three repositories under `zw3rk/`. The runtime is
+public; the two local split seeds are being release-hardened before their
+public repositories are created.
 
 | Repo | Role |
 |------|------|
 | **hyper-linux** (this) | `hl` runtime only |
-| **hyper-linux-x11** | AppKit-origin X server packaging |
-| **hyper-linux-examples** | XMMS demos + sysroots |
+| **hyper-linux-x11** *(publication pending)* | AppKit-origin X server packaging |
+| **hyper-linux-examples** *(publication pending)* | XMMS demos + sysroots |
 
 This tree no longer carries AppKit X or XMMS product sources.
 

@@ -36,13 +36,13 @@ All source lives under `src/`.  Build with `make hl` (sources found via `-Isrc`)
 
 Lock ordering (acquire ascending; see also `syscall_internal.h`):
 
-1. `mmap_lock` — mmap/brk + page tables  
-2. `pt_lock` — page table pool  
-3. `fd_lock` — FD table (alloc/close/dup); never hold while blocking on audio  
-4. `sig_lock` — signals  
-5. `thread_lock` / special-fd locks  
-6. `pid_lock`  
-7. futex buckets / inotify  
+1. `mmap_lock` — mmap/brk + page tables
+2. `pt_lock` — page table pool
+3. `fd_lock` — FD table (alloc/close/dup); never hold while blocking on audio
+4. `sig_lock` — signals
+5. `thread_lock` / special-fd locks
+6. `pid_lock`
+7. futex buckets / inotify
 
 **Audio stream mutex** (`hl_audio_stream_t.lock`) is a **leaf** lock: take it only
 after releasing `fd_lock`. Never call into FD table code while holding an audio
