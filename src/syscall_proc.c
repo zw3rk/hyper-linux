@@ -908,18 +908,25 @@ static void alarm_handler(int sig) {
  * Both modes check exit_group_requested so the main thread also reacts
  * to exit_group called by a worker. */
 int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
-                  guest_t *g, int verbose, int timeout_sec) {
+                  guest_t *g, int verbose, int timeout_sec, int is_main) {
     int exit_code = 0;
     int running = 1;
     int iter = 0;
-    const int is_main = (timeout_sec > 0);
+    /* The watchdog is now OPT-IN and covers the main vCPU only: it fires when
+     * the guest runs `timeout_sec` seconds without a VM exit (a coarse hang
+     * detector). It is OFF by default (timeout_sec == 0) because it killed
+     * every compute-bound or vDSO-time-polling guest — the alarm is armed
+     * per hv_vcpu_run() iteration, and such loops make no exits. `is_main`
+     * (the initial/forked-process vCPU, not a clone-thread worker) is a
+     * separate flag so role and watchdog-enablement no longer conflate. */
+    const int watchdog = is_main && timeout_sec > 0;
     const char *prefix = is_main ? "hl" : "hl: worker";
 
     /* Main thread: set up alarm-based per-iteration timeout.
      * Guest ITIMER_REAL is emulated internally by signal_check_timer()
      * rather than using host setitimer, because macOS shares alarm()
      * and setitimer(ITIMER_REAL) as the same underlying timer. */
-    if (is_main) {
+    if (watchdog) {
         g_timeout_vcpu = vcpu;
         g_timed_out = 0;
         signal(SIGALRM, alarm_handler);
@@ -940,14 +947,14 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         }
         iter++;
 
-        /* Main: arm per-iteration safety timeout */
-        if (is_main)
+        /* Main: arm per-iteration safety timeout (opt-in watchdog) */
+        if (watchdog)
             alarm((unsigned)timeout_sec);
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         /* Main: disarm timeout */
-        if (is_main)
+        if (watchdog)
             alarm(0);
 
         /* Re-check exit_group after waking from hv_vcpu_run */
@@ -957,7 +964,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
         }
 
         /* Main: check for alarm timeout */
-        if (is_main && g_timed_out) {
+        if (watchdog && g_timed_out) {
             fprintf(stderr, "%s: vCPU execution timed out after %ds\n",
                     prefix, timeout_sec);
 
@@ -1721,7 +1728,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
              * exit_group from another thread, or signal preemption
              * (signal_queue called hv_vcpus_exit to deliver a signal
              * while the guest was in a tight loop). */
-            if (is_main && g_timed_out) {
+            if (watchdog && g_timed_out) {
                 /* Timeout already handled above the exception switch —
                  * loop back so the timeout check fires. */
                 continue;
@@ -1797,7 +1804,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     }
 
     /* Clean up timeout if we set it up */
-    if (is_main) {
+    if (watchdog) {
         signal(SIGALRM, SIG_DFL);
         alarm(0);
     }

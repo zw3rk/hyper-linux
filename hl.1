@@ -68,11 +68,25 @@ Enable verbose output on stderr.
 Shows ELF loading details, page table layout, vCPU register
 configuration, and syscall-level diagnostics.
 .It Fl t Ar seconds , Fl -timeout Ar seconds
-Set the per-iteration vCPU timeout in seconds.
-Default: 10.
-The timeout is a safety watchdog that prevents infinite loops in the
-guest from hanging the host.
-It does not limit total execution time.
+Opt-in hang watchdog for the main vCPU.
+Default: 0 (off).
+When
+.Ar seconds
+is greater than 0, the guest is terminated if it runs that long without a
+VM exit (a coarse hang detector: the alarm is armed per
+.Fn hv_vcpu_run
+iteration).
+A value of 0 disables it; other values must be 0..86400.
+This is
+.Em not
+a total-execution-time limit and does not fire for a guest that keeps
+making syscalls.
+It is off by default because a compute-bound or
+.Pa vDSO Ns -time-polling
+guest makes no VM exits and was killed by the old 10-second default.
+It covers the main vCPU only and is inherited by
+.Fl -fork-child
+processes.
 .It Fl -sysroot Ar path
 Path to a sysroot directory containing the dynamic linker and shared
 libraries (musl or glibc).

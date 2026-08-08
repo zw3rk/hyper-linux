@@ -21,8 +21,12 @@
 #include <sys/wait.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <stdint.h>
 
 #define SEG_SIZE 4096
+#define HL_SHM_2MB (2u * 1024 * 1024)
 
 int main(void) {
     int passes = 0, fails = 0;
@@ -239,6 +243,171 @@ int main(void) {
                 if (pv != (char *)-1) shmdt(pv);
             }
             shmctl(id2, IPC_RMID, NULL);
+        }
+    }
+
+    /* (H1) An explicit shmaddr onto the guest's OWN mapping must fail with
+     * EINVAL and leave that mapping intact. The round-3 regression unmapped
+     * the guest's blocks (SIGSEGV) because the failure cleanup tore down the
+     * whole span, including blocks it never installed. */
+    TEST("explicit shmaddr onto own mmap fails, mapping survives");
+    {
+        void *m = mmap(NULL, 2 * HL_SHM_2MB, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { FAILF("mmap: %s", strerror(errno)); }
+        else {
+            uintptr_t a = ((uintptr_t)m + (HL_SHM_2MB - 1)) & ~(uintptr_t)(HL_SHM_2MB - 1);
+            memset((void *)a, 0xA5, HL_SHM_2MB);
+            int id2 = shmget(IPC_PRIVATE, SEG_SIZE, IPC_CREAT | 0600);
+            errno = 0;
+            void *r = (id2 >= 0) ? shmat(id2, (void *)a, 0) : (void *)-1;
+            if (id2 < 0) FAILF("shmget: %s", strerror(errno));
+            else if (r != (void *)-1) FAILF("aliased at %p instead of EINVAL", r);
+            else if (errno != EINVAL) FAILF("errno %s, want EINVAL", strerror(errno));
+            else {
+                volatile unsigned char *p = (volatile unsigned char *)a;
+                if (p[0] == 0xA5 && p[HL_SHM_2MB - 1] == 0xA5) PASS();
+                else FAIL("own mapping was clobbered/unmapped by shmat");
+            }
+            if (id2 >= 0) shmctl(id2, IPC_RMID, NULL);
+            munmap(m, 2 * HL_SHM_2MB);
+        }
+    }
+
+    /* (H1) Collision in the SECOND block of a 2-block attach: block[0] is a
+     * hole (munmap'd), block[1] overlaps a live mapping. Must be rejected
+     * wholesale (the preflight is a range overlap, per-block). */
+    TEST("explicit shmaddr with a 2nd-block collision is rejected");
+    {
+        void *m = mmap(NULL, 2 * HL_SHM_2MB, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { FAILF("mmap: %s", strerror(errno)); }
+        else {
+            uintptr_t base = ((uintptr_t)m + (HL_SHM_2MB - 1)) & ~(uintptr_t)(HL_SHM_2MB - 1);
+            memset((void *)(base + HL_SHM_2MB), 0x5A, HL_SHM_2MB);  /* mark 2nd block */
+            munmap((void *)base, HL_SHM_2MB);          /* free block[0] only */
+            int id2 = shmget(IPC_PRIVATE, 3 * 1024 * 1024, IPC_CREAT | 0600); /* 2 blocks */
+            errno = 0;
+            void *r = (id2 >= 0) ? shmat(id2, (void *)base, 0) : (void *)-1;
+            if (id2 < 0) FAILF("shmget: %s", strerror(errno));
+            else if (r != (void *)-1) FAILF("aliased at %p (2nd block collided)", r);
+            else if (errno != EINVAL) FAILF("errno %s, want EINVAL", strerror(errno));
+            else if (*(volatile unsigned char *)(base + HL_SHM_2MB) != 0x5A)
+                FAIL("the live 2nd-block mapping was clobbered");
+            else PASS();
+            if (id2 >= 0) shmctl(id2, IPC_RMID, NULL);
+            munmap((void *)(base + HL_SHM_2MB), HL_SHM_2MB);
+        }
+    }
+
+    /* (+) An explicit shmaddr at a genuinely free address still works: the
+     * preflight must reject only a LIVE overlap, not every address. Use an
+     * address hl itself just vacated — attach with addr=0, note where it
+     * landed, detach (which removes the region), then re-attach a second
+     * segment at that exact explicit address. */
+    TEST("explicit shmaddr at a freed SHM address still attaches");
+    {
+        char *first = shmat(id, NULL, 0);   /* let hl choose */
+        if (first == (char *)-1) { FAILF("shmat(addr=0): %s", strerror(errno)); }
+        else {
+            uintptr_t freed = (uintptr_t)first;
+            shmdt(first);                    /* region removed → addr now free */
+            int id2 = shmget(IPC_PRIVATE, SEG_SIZE, IPC_CREAT | 0600);
+            errno = 0;
+            void *r = (id2 >= 0) ? shmat(id2, (void *)freed, 0) : (void *)-1;
+            if (id2 < 0) FAILF("shmget: %s", strerror(errno));
+            else if (r == (void *)-1)
+                FAILF("shmat at freed addr 0x%lx: %s", freed, strerror(errno));
+            else if ((uintptr_t)r != freed)
+                FAILF("attached at %p, asked for 0x%lx", r, freed);
+            else {
+                memcpy(r, "FREEADDR", 9);
+                if (memcmp(r, "FREEADDR", 9) == 0) PASS();
+                else FAIL("readback mismatch");
+                shmdt(r);
+            }
+            if (id2 >= 0) shmctl(id2, IPC_RMID, NULL);
+        }
+    }
+
+    /* (H2) A guest mprotect on an attached window splits its 2MB block into
+     * an L3 table. Detach must COLLAPSE that split (free the L3 page, clear
+     * the L2 slot); otherwise the slot reads "mapped" forever and every
+     * later shmat of ANY segment fails EINVAL for the process lifetime. */
+    TEST("mprotect on a window does not permanently disable SHM");
+    {
+        char *p = shmat(id, NULL, 0);
+        if (p == (char *)-1) { FAILF("shmat: %s", strerror(errno)); }
+        else {
+            *p = 'A';
+            if (mprotect(p, 4096, PROT_READ) != 0) FAILF("mprotect: %s", strerror(errno));
+            else if (shmdt(p) != 0) FAILF("shmdt: %s", strerror(errno));
+            else {
+                /* same id must re-attach */
+                char *q = shmat(id, NULL, 0);
+                /* a DIFFERENT segment must also still attach */
+                int id2 = shmget(IPC_PRIVATE, SEG_SIZE, IPC_CREAT | 0600);
+                char *w = (id2 >= 0) ? shmat(id2, NULL, 0) : (char *)-1;
+                if (q == (char *)-1)
+                    FAILF("re-attach same id failed: %s", strerror(errno));
+                else if (w == (char *)-1)
+                    FAILF("attach different id failed: %s", strerror(errno));
+                else {
+                    *q = 'B'; *w = 'C';   /* both windows usable */
+                    PASS();
+                }
+                if (q != (char *)-1) shmdt(q);
+                if (w != (char *)-1) shmdt(w);
+                if (id2 >= 0) shmctl(id2, IPC_RMID, NULL);
+            }
+        }
+    }
+
+    /* (H2) Repeated attach → partial-mprotect → detach must keep working.
+     * (Pool RECLAMATION itself is asserted host-side in test-diagnostics.sh,
+     * because exhaustion degrades gracefully in-guest and is not observable
+     * here — only the "pool exhausted" stderr is.) */
+    TEST("attach/mprotect/detach cycles keep succeeding");
+    {
+        int ok = 1;
+        for (int i = 0; i < 300 && ok; i++) {
+            char *p = shmat(id, NULL, 0);
+            if (p == (char *)-1) {
+                FAILF("cycle %d shmat: %s (PT pool exhausted?)", i, strerror(errno));
+                ok = 0; break;
+            }
+            *p = (char)i;
+            if (mprotect(p, 4096, PROT_READ) != 0) { FAILF("cycle %d mprotect: %s", i, strerror(errno)); ok = 0; break; }
+            if (shmdt(p) != 0) { FAILF("cycle %d shmdt: %s", i, strerror(errno)); ok = 0; break; }
+        }
+        if (ok) PASS();
+    }
+
+    /* (H2/SHM-F3) After detaching a split window, the VA must be gone —
+     * accessing it faults, it does not silently alias primary RAM. */
+    TEST("a detached (split) window is no longer accessible");
+    {
+        char *p = shmat(id, NULL, 0);
+        if (p == (char *)-1) { FAILF("shmat: %s", strerror(errno)); }
+        else {
+            *p = 'Z';
+            mprotect(p, 4096, PROT_READ);   /* split */
+            shmdt(p);
+            /* Reading *p now must fault (SIGSEGV), caught below. */
+            pid_t pid = fork();
+            if (pid == 0) {
+                volatile char c = *(volatile char *)p;  /* expect SIGSEGV */
+                _exit((c == 'Z') ? 42 : 43);             /* reached only if no fault */
+            }
+            int st = 0; waitpid(pid, &st, 0);
+            /* The read must NOT succeed (42/43). It faults; hl may report a
+             * guest signal-death either as WIFSIGNALED or as an encoded
+             * exit code (128 + signo). Either means "no stale alias". */
+            int read_ok = WIFEXITED(st) &&
+                          (WEXITSTATUS(st) == 42 || WEXITSTATUS(st) == 43);
+            if (read_ok)
+                FAIL("detached window still readable — stale alias onto RAM");
+            else PASS();
         }
     }
 

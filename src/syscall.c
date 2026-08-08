@@ -68,6 +68,10 @@ pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 
 /* ---------- Global verbose flag (set by hl.c main) ---------- */
 int hl_verbose = 0;
+/* Parent's opt-in watchdog timeout (seconds; 0 = off). Read when building a
+ * --fork-child argv so posix_spawn children inherit it — the child argv is
+ * assembled in fork_ipc.c, not hl.c. */
+int hl_watchdog_timeout_sec = 0;
 
 /* ---------- FD table ---------- */
 fd_entry_t fd_table[FD_TABLE_SIZE];

@@ -85,8 +85,13 @@ static uint64_t pt_alloc_page(guest_t *g) {
         pthread_mutex_unlock(&pt_lock);
         return 0;
     }
-    uint64_t gpa = g->pt_pool_next;
-    g->pt_pool_next += PAGE_SIZE;
+    uint64_t gpa;
+    if (g->pt_free_count > 0) {
+        gpa = g->pt_free_list[--g->pt_free_count];  /* recycle */
+    } else {
+        gpa = g->pt_pool_next;
+        g->pt_pool_next += PAGE_SIZE;
+    }
 
     /* Warn at 80% pool usage so users can anticipate exhaustion */
     uint64_t used = gpa + PAGE_SIZE - PT_POOL_BASE;
@@ -106,6 +111,16 @@ static uint64_t pt_alloc_page(guest_t *g) {
     memset((uint8_t *)g->host_base + gpa, 0, PAGE_SIZE);
     pthread_mutex_unlock(&pt_lock);
     return gpa;
+}
+
+/* Return a page-table page to the pool for reuse (see pt_free_list). */
+static void pt_free_page(guest_t *g, uint64_t gpa) {
+    pthread_mutex_lock(&pt_lock);
+    if (g->pt_free_count < (int)(sizeof(g->pt_free_list)/sizeof(g->pt_free_list[0])))
+        g->pt_free_list[g->pt_free_count++] = gpa;
+    /* Overflow (should be impossible: pool < free-list capacity) simply
+     * leaks the page back into the bump region — never a correctness issue. */
+    pthread_mutex_unlock(&pt_lock);
 }
 
 /* Get host pointer to a page table entry array at a given GPA */
@@ -1429,7 +1444,26 @@ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms
  * whatever the IPA is restored to. Only whole 2MB blocks are cleared; L3
  * tables (mixed-permission splits) are left alone, since nothing that uses
  * this helper ever splits a block. */
-int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
+/* Does [start, end) overlap any LIVE tracked region (mmap/brk/stack/ELF/
+ * SHM)? Interval overlap, not the point lookup guest_region_find does — a
+ * region starting mid-request would be missed by a per-block point test.
+ *
+ * The region table is authoritative for "semantically live": munmap removes
+ * the region even when it deliberately leaves the PTE valid, so this does
+ * NOT false-reject a freed-but-stale range the way a raw page-table walk
+ * would. It does not see rosetta's high-VA/kbuf aliases (stored at their
+ * backing GPA), but those sit at or above interp_base and the shmat caller
+ * already rejects addresses there. Returns 1 on overlap, 0 if free. */
+int guest_region_overlaps(const guest_t *g, uint64_t start, uint64_t end) {
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (start < r->end && r->start < end) return 1;
+    }
+    return 0;
+}
+
+static int guest_unmap_va_range_impl(guest_t *g, uint64_t va_start,
+                                     uint64_t va_end, int collapse)
 {
     uint64_t base = g->ipa_base;
     int cleared = 0;
@@ -1444,8 +1478,21 @@ int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
         uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
         uint64_t *l2 = pt_at(g, l2_ipa - base);
         unsigned l2_idx = (unsigned)((va % BLOCK_1GB) / BLOCK_2MB);
-        /* Leave L3 table descriptors intact. */
-        if ((l2[l2_idx] & PT_VALID) && !(l2[l2_idx] & PT_TABLE)) {
+        if (!(l2[l2_idx] & PT_VALID)) continue;
+        if (l2[l2_idx] & PT_TABLE) {
+            /* L3-split block. Non-collapse callers (generic unmap) leave it
+             * intact — a mixed-perm region may still use its other pages.
+             * A SHM detach owns the whole 2MB block, so collapse: free the
+             * L3 page and clear the L2 entry, else the stale table
+             * descriptor makes the slot read "mapped" forever (permanent
+             * shmat EINVAL) and the pool leaks a page every mprotect. */
+            if (collapse) {
+                uint64_t l3_ipa = l2[l2_idx] & 0xFFFFFFFFF000ULL;
+                l2[l2_idx] = 0;              /* clear before freeing the page */
+                pt_free_page(g, l3_ipa);
+                cleared = 1;
+            }
+        } else {
             l2[l2_idx] = 0;
             cleared = 1;
         }
@@ -1453,6 +1500,16 @@ int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
     if (cleared)
         g->need_tlbi = 1;
     return 0;
+}
+
+int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end)
+{
+    return guest_unmap_va_range_impl(g, va_start, va_end, 0 /* keep L3 */);
+}
+
+int guest_unmap_va_range_collapse(guest_t *g, uint64_t va_start, uint64_t va_end)
+{
+    return guest_unmap_va_range_impl(g, va_start, va_end, 1 /* collapse L3 */);
 }
 
 static int guest_map_va_range_impl(guest_t *g, uint64_t va_start, uint64_t va_end,

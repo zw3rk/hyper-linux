@@ -8,6 +8,7 @@
  * rebuilds page tables, and restarts at the new entry point.
  */
 #include "syscall_exec.h"
+#include "syscall_net.h"   /* hl_abstract_bind_release */
 #include "syscall_proc.h"    /* proc_set_elf_path, proc_get_shim_blob, proc_get_shim_size, SYSCALL_EXEC_HAPPENED */
 #include "syscall_internal.h" /* fd_table, FD_TABLE_SIZE */
 #include "syscall.h"         /* FD_CLOSED, FD_STDIO, LINUX_O_CLOEXEC, etc. */
@@ -346,14 +347,14 @@ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
             hl_descriptor_release(cloexec_list[j].desc);
             continue;
         }
-        if (cloexec_list[j].dir) {
-            if (cloexec_list[j].type == FD_DIR)
-                closedir((DIR *)cloexec_list[j].dir);
-            else
-                free(cloexec_list[j].dir); /* FD_EPOLL */
-        }
+        /* Blind `else free()` here freed FD_DEVICE's pointer into the
+         * static registry → SIGABRT on execve. Use the shared whitelist. */
+        hl_fd_free_dir(cloexec_list[j].type, cloexec_list[j].dir);
+        cloexec_list[j].dir = NULL;
         if (cloexec_list[j].of)
             hl_open_file_release(cloexec_list[j].of);
+        if (cloexec_list[j].type == FD_SOCKET)
+            hl_abstract_bind_release(cloexec_list[j].host_fd);
         if (cloexec_list[j].type != FD_STDIO && cloexec_list[j].host_fd >= 0)
             close(cloexec_list[j].host_fd);
     }

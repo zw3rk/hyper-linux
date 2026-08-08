@@ -165,6 +165,9 @@ int hl_fd_install_at(int guest_fd, hl_open_file_t *of,
 /* Remove table entry; cleanup outside lock via detached. */
 int hl_fd_remove(int guest_fd, hl_fd_detached_t *out);
 void hl_fd_detached_finish(hl_fd_detached_t *d);
+/* Release an fd's `.dir` by kind (closedir/free/nothing). The one whitelist
+ * every fd-retire path must use — see fd_object.c. */
+void hl_fd_free_dir(int type, void *dir);
 
 /* Dup helpers: new descriptor sharing open-file; host dup of alias. */
 int hl_fd_dup(int oldfd);

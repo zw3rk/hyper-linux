@@ -141,6 +141,6 @@ extern _Atomic int exit_group_code;
  * (SIGALRM is process-wide). Workers are terminated by exit_group via
  * hv_vcpus_exit(). Both modes check exit_group_requested. */
 int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
-                  guest_t *g, int verbose, int timeout_sec);
+                  guest_t *g, int verbose, int timeout_sec, int is_main);
 
 #endif /* SYSCALL_PROC_H */

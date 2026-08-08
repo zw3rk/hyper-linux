@@ -201,6 +201,12 @@ typedef struct guest {
     uint64_t    mmap_limit;   /* Max mmap address (computed from guest_size) */
     uint64_t    interp_base;  /* Dynamic linker load base (computed from guest_size) */
     uint64_t    pt_pool_next; /* Next free page table page in pool */
+    /* Recycled page-table pages (freed L3 tables from SHM detach-collapse).
+     * The pool is a 960KB / 240-page bump region; without reclamation a
+     * repeated attach → partial-mprotect → detach cycle exhausts it in
+     * < 240 iterations. LIFO stack of freed page GPAs. */
+    uint64_t    pt_free_list[256];
+    int         pt_free_count;
     uint64_t    brk_base;     /* Initial brk (set after ELF load) */
     uint64_t    brk_current;  /* Current brk position */
     uint64_t    stack_base;   /* Bottom of stack region (dynamic, above brk) */
@@ -366,6 +372,12 @@ int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * come from gpa_start. Both va_start and gpa_start must be 2MB-aligned.
  * Sets g->need_tlbi = 1. Returns 0 on success, -1 on failure. */
 int guest_unmap_va_range(guest_t *g, uint64_t va_start, uint64_t va_end);
+/* Does [start,end) overlap any live tracked region? (interval overlap) */
+int guest_region_overlaps(const guest_t *g, uint64_t start, uint64_t end);
+/* Like guest_unmap_va_range but also COLLAPSES an L3-split 2MB block: frees
+ * the L3 page back to the pool and clears the L2 entry. Only safe for a
+ * fully hl-owned span (SysV shmat windows) — see sys_shmdt. */
+int guest_unmap_va_range_collapse(guest_t *g, uint64_t va_start, uint64_t va_end);
 /* As guest_map_va_range, but reports the number of 2MB blocks skipped
  * because they were already mapped. Callers that require a fresh mapping
  * (SysV shmat) must treat a non-zero count as failure. */

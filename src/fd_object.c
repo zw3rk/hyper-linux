@@ -294,6 +294,21 @@ int hl_fd_remove(int guest_fd, hl_fd_detached_t *out) {
     return 0;
 }
 
+/* Single source of truth for releasing an fd's `.dir` handle by kind.
+ *
+ * FD_DIR holds a DIR* (closedir); FD_EPOLL and FD_VIRTUAL_DIR hold a
+ * malloc'd block (free); FD_DEVICE holds a NON-OWNING pointer into the
+ * static device registry and must NEVER be freed — a blind `free()` here
+ * aborted the process on execve of any guest holding an O_CLOEXEC /dev fd.
+ * Every fd-retire path (close, close_range, exec CLOEXEC sweep,
+ * detached_finish) must route through this so the whitelist cannot drift. */
+void hl_fd_free_dir(int type, void *dir) {
+    if (!dir) return;
+    if (type == FD_DIR) closedir((DIR *)dir);
+    else if (type == FD_EPOLL || type == FD_VIRTUAL_DIR) free(dir);
+    /* FD_DEVICE and everything else: not owned here. */
+}
+
 void hl_fd_detached_finish(hl_fd_detached_t *d) {
     if (!d) return;
     if (d->desc) {
@@ -307,8 +322,7 @@ void hl_fd_detached_finish(hl_fd_detached_t *d) {
     }
     /* Legacy path without descriptor object */
     if (d->dir) {
-        if (d->type == FD_DIR) closedir((DIR *)d->dir);
-        else if (d->type == FD_EPOLL || d->type == FD_VIRTUAL_DIR) free(d->dir);
+        hl_fd_free_dir(d->type, d->dir);
         d->dir = NULL;
     }
     if (d->of) {

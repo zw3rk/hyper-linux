@@ -264,7 +264,13 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
             uint8_t drain;
             (void)read(wakeup_pipe_rd, &drain, 1);
             host_fds[nfds].revents = 0;
-            if (--ret == 0) { pure_wake = 1; break; }
+            /* Drain unconditionally, but only convert to EINTR when there is
+             * nothing guest-visible. When force_immediate holds (a closed fd
+             * pre-set POLLNVAL, or an always-ready device like /dev/mixer),
+             * fall through to the writeback so those results reach the guest
+             * instead of being swallowed as a spurious EINTR. */
+            --ret;
+            if (ret == 0 && !force_immediate) { pure_wake = 1; break; }
         }
 
         /* Only retry a sliced infinite wait that has no wake pipe. */
@@ -489,7 +495,12 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
             uint8_t drain;
             (void)read(wakeup_pipe_rd, &drain, 1);
             FD_CLR(wakeup_pipe_rd, &read_set);
-            if (--ret == 0) { pure_wake = 1; break; }
+            /* Drain unconditionally; only EINTR when nothing is guest-visible.
+             * always_count > 0 means a pre-ready fd is already set, so fall
+             * through to the set writeback (which reports ret + always_count)
+             * rather than swallowing it as EINTR. */
+            --ret;
+            if (ret == 0 && always_count == 0) { pure_wake = 1; break; }
         }
     } while (ret == 0 && !has_timeout && !added_wakeup && always_count == 0);
 

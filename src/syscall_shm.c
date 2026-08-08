@@ -387,6 +387,11 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
 
     if (shmflg & LINUX_SHM_RDONLY)
         host_flg |= SHM_RDONLY;
+    /* SHM_REMAP (replace an existing mapping at shmaddr) is not implemented;
+     * the flag was defined but silently ignored. Reject it rather than
+     * pretend, so a guest relying on remap semantics fails loudly. */
+    if ((shmflg & LINUX_SHM_REMAP) && shmaddr != 0)
+        return -LINUX_EINVAL;
 
     if (!s->host_addr) {
         host = shmat(shmid, NULL, host_flg);
@@ -507,11 +512,21 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
             SHMAT_FAIL(-LINUX_EINVAL);
         }
         guest_va = shmaddr;
-        if (va_range_busy(guest_va, ipa_span)) {
-            /* An explicit shmaddr onto an occupied window used to "succeed"
-             * and then quietly alias: guest_map_va_range leaves an already
-             * valid L2 block alone, so the guest kept reading the previous
-             * segment. Linux returns EINVAL without SHM_REMAP; so do we. */
+        /* Overflow / range guard before touching the page tables. */
+        if (guest_va + ipa_span < guest_va ||
+            guest_va + ipa_span > g->interp_base) {
+            SHMAT_FAIL(-LINUX_EINVAL);
+        }
+        /* Reject an explicit shmaddr that collides with ANYTHING already
+         * mapped — checked against the live page tables (authoritative),
+         * not just the SHM window table. The previous code checked only SHM
+         * windows, so an explicit address over a plain mmap passed the
+         * guard; guest_map_va_range then skipped the occupied L2 block and
+         * the failure cleanup unmapped the guest's OWN mapping (SIGSEGV).
+         * Rejecting BEFORE any mutation is both Linux-correct (EINVAL for a
+         * busy address without SHM_REMAP) and non-destructive. */
+        if (va_range_busy(guest_va, ipa_span) ||
+            guest_region_overlaps(g, guest_va, guest_va + ipa_span)) {
             SHMAT_FAIL(-LINUX_EINVAL);
         }
     } else {
@@ -538,13 +553,16 @@ sys_shmat(guest_t *g, int shmid, uint64_t shmaddr, int shmflg)
         SHMAT_FAIL(-LINUX_ENOMEM);
     }
     if (va_skipped) {
-        /* "First mapping wins" is right for mmap's high-VA reuse but is
-         * silent corruption here: the attach would report success while the
-         * guest still saw the old contents. Fail loudly instead. */
+        /* Unreachable now that both the explicit-addr and the fresh-VA paths
+         * preflight to an empty range. If it ever fires, an invariant broke
+         * — fail loudly but do NOT unmap: tearing down the span here is
+         * exactly what destroyed the guest's own mapping (H1). Leave the
+         * blocks we did install; the SHM record is not committed on this
+         * error path, so nothing dangles. */
         fprintf(stderr,
-                "hl: shmat: VA 0x%llx already mapped (%d blocks); refusing "
-                "to alias\n", (unsigned long long)guest_va, va_skipped);
-        guest_unmap_va_range(g, guest_va, guest_va + ipa_span);
+                "hl: shmat: VA 0x%llx unexpectedly had %d mapped blocks; "
+                "refusing (no teardown)\n",
+                (unsigned long long)guest_va, va_skipped);
         SHMAT_FAIL(-LINUX_EINVAL);
     }
     guest_region_add(g, guest_va, guest_va + map_size, MEM_PERM_RW,
@@ -627,7 +645,11 @@ sys_shmdt(guest_t *g, uint64_t shmaddr)
      * window stayed valid and writable after detach and aliased primary
      * guest RAM once the IPA slice was restored — Linux would SIGSEGV.
      * Detaching one of several windows must not tear down the others. */
-    guest_unmap_va_range(g, shmaddr, shmaddr + s->ipa_span);
+    /* Collapse an L3-split window (from a guest mprotect on the segment):
+     * free the L3 page and clear the L2 entry, so the slot reads free again.
+     * Without this, first-fit kept returning this dead VA and every later
+     * shmat of ANY segment failed EINVAL for the process lifetime (H2). */
+    guest_unmap_va_range_collapse(g, shmaddr, shmaddr + s->ipa_span);
     guest_region_remove(g, shmaddr, shmaddr + s->map_size);
     shm_forget_va(s, shmaddr);
     if (s->guest_va == shmaddr)

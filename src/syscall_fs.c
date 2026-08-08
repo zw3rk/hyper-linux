@@ -7,6 +7,7 @@
  * operations. All functions are called from syscall_dispatch() in syscall.c.
  */
 #include "syscall_fs.h"
+#include "syscall_net.h"   /* hl_abstract_bind_release */
 #include "syscall.h"
 #include "syscall_internal.h"
 #include "syscall_fd.h"
@@ -483,6 +484,10 @@ int64_t sys_close(int fd) {
     }
     if (snap.of)
         hl_open_file_release(snap.of);
+
+    /* Release any abstract-socket name lock this fd held (frees the name for
+     * a same-process rebind). Harmless for non-socket fds. */
+    if (snap.type == FD_SOCKET) hl_abstract_bind_release(snap.host_fd);
 
     /* Don't actually close stdin/stdout/stderr on the host */
     if (snap.type != FD_STDIO && snap.host_fd >= 0) {
@@ -1040,15 +1045,11 @@ int64_t sys_close_range(unsigned int first, unsigned int last,
             continue;
         }
 
-        if (snap.dir) {
-            if (snap.type == FD_DIR)
-                closedir((DIR *)snap.dir);
-            else if (snap.type == FD_EPOLL)
-                free(snap.dir);
-        }
+        hl_fd_free_dir(snap.type, snap.dir);  /* incl. FD_VIRTUAL_DIR (V16) */
         if (snap.of)
             hl_open_file_release(snap.of);
 
+        if (snap.type == FD_SOCKET) hl_abstract_bind_release(snap.host_fd);
         if (snap.type != FD_STDIO && snap.host_fd >= 0)
             close(snap.host_fd);
     }

@@ -118,6 +118,7 @@ int linux_to_mac_status_flags(int linux_flags);
  * (rosettad handler) that don't have access to a guest_t. For code
  * running in syscall context, prefer g->verbose instead. */
 extern int hl_verbose;
+extern int hl_watchdog_timeout_sec;
 
 /* ---------- Guest memory helpers (from guest.h, used by net module) ---------- */
 /* These are already declared in guest.h but listed here for reference:

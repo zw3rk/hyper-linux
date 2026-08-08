@@ -307,6 +307,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-dsp-presence; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-bare-name; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-stat; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-dev-cloexec; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-sigpipe-survival; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-open; \
 	run_test $(BUILD_DIR)/hl --audio-backend null $(TEST_DIR)/test-oss-tier1; \
@@ -315,6 +316,7 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-at-dirfd; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-fcntl-dup; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-poll-wakeup; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-poll-ready; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-abstract-unix; \
 	absdir=$$(mktemp -d); mkdir -m 0777 "$$absdir/hl-abstract-$$(id -u)"; \
 	run_test env TMPDIR="$$absdir" $(BUILD_DIR)/hl $(HL_TEST_FLAGS) \

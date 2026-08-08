@@ -860,7 +860,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
         fprintf(stderr, "hl: fork-child: entering vCPU loop\n");
 
     /* Step 9: Enter vCPU run loop */
-    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
+    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, 1 /* forked main */);
 
     vdso_publisher_stop();
     guest_destroy(&g);
@@ -1103,7 +1103,7 @@ static void *thread_create_and_run(void *arg) {
         fprintf(stderr, "hl: thread tid=%lld starting on vCPU\n",
                 (long long)t->guest_tid);
 
-    vcpu_run_loop(vcpu, vexit, g, verbose, 0);
+    vcpu_run_loop(vcpu, vexit, g, verbose, 0, 0 /* worker */);
 
     /* CLONE_CHILD_CLEARTID: write 0 to the address and wake one waiter.
      * This is how pthread_join works in musl — the joining thread does
@@ -1346,7 +1346,7 @@ static void *vm_clone_thread_run(void *arg) {
         fprintf(stderr, "hl: vm_clone tid=%lld starting on vCPU\n",
                 (long long)t->guest_tid);
 
-    int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0);
+    int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, 0 /* worker */);
 
     /* CLONE_CHILD_CLEARTID cleanup */
     if (t->clear_child_tid != 0) {
@@ -1443,7 +1443,7 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
     snprintf(fd_str, sizeof(fd_str), "%d", sock_fds[1]);
 
     /* Build child argv: [hl_path, [--verbose,] --fork-child, fd, NULL] */
-    char *child_argv[8];
+    char *child_argv[12];
     int ci = 0;
     child_argv[ci++] = self_path;
     if (verbose) child_argv[ci++] = "--verbose";
@@ -1453,6 +1453,13 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
      * default and open a real Core Audio queue. Pass it through. */
     child_argv[ci++] = "--audio-backend";
     child_argv[ci++] = (char *)hl_audio_backend_name();
+    /* Inherit the parent's opt-in watchdog. Absent → child defaults to off. */
+    char timeout_str[16];
+    if (hl_watchdog_timeout_sec > 0) {
+        snprintf(timeout_str, sizeof(timeout_str), "%d", hl_watchdog_timeout_sec);
+        child_argv[ci++] = "--timeout";
+        child_argv[ci++] = timeout_str;
+    }
     child_argv[ci++] = "--fork-child";
     child_argv[ci++] = fd_str;
     child_argv[ci] = NULL;

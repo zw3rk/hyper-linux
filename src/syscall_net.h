@@ -115,4 +115,8 @@ int64_t sys_sendmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
 int64_t sys_recvmmsg(guest_t *g, int fd, uint64_t mmsg_gva,
                      unsigned int vlen, int flags, uint64_t timeout_gva);
 
+/* Release the abstract-socket name lock held for a closing socket host
+ * fd. Called from every socket-close path. */
+void hl_abstract_bind_release(int sock_host_fd);
+
 #endif /* SYSCALL_NET_H */

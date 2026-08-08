@@ -30,6 +30,7 @@
 #include <netinet/tcp.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
+#include <sys/file.h>   /* flock */
 #include <stddef.h>
 
 /* ---------- Address family translation ---------- */
@@ -81,18 +82,19 @@ static int translate_af_to_linux(int mac_af) {
  * namespace, not to the machine. */
 static const char *hl_abstract_dir(void) {
     static char dir[256];
-    static int  checked;          /* 0 = unknown, 1 = usable, -1 = refused */
-    if (checked) return checked > 0 ? dir : NULL;
-
+    /* Re-verify (and re-create) on EVERY call — do NOT cache success, or a
+     * tmp reaper / rm -rf $TMPDIR that removes the directory permanently
+     * breaks abstract sockets for the process lifetime. mkdir is idempotent
+     * (EEXIST), so this is cheap and self-healing. */
     const char *base = getenv("TMPDIR");
     if (!base || base[0] != '/') base = "/tmp";
     size_t bl = strlen(base);
     int n = snprintf(dir, sizeof(dir), "%s%shl-abstract-%u", base,
                      (bl && base[bl - 1] == '/') ? "" : "/",
                      (unsigned)geteuid());
-    if (n < 0 || (size_t)n >= sizeof(dir)) { checked = -1; return NULL; }
+    if (n < 0 || (size_t)n >= sizeof(dir)) return NULL;
 
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) { checked = -1; return NULL; }
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) return NULL;
 
     /* Never follow into something we do not own outright. */
     struct stat st;
@@ -101,10 +103,8 @@ static const char *hl_abstract_dir(void) {
         fprintf(stderr, "hl: refusing abstract-socket dir %s "
                         "(not a private directory owned by uid %u)\n",
                 dir, (unsigned)geteuid());
-        checked = -1;
         return NULL;
     }
-    checked = 1;
     return dir;
 }
 
@@ -114,22 +114,92 @@ static const char *hl_abstract_dir(void) {
  * abstract name "\0/tmp/.X11-unix/X0" first. Map the abstract name onto a
  * deterministic filesystem path instead, so guest processes binding and
  * connecting to the same abstract name still find each other. */
+/* Map a Linux abstract name (a counted byte string that may contain '/',
+ * NUL, and any byte) to a filesystem stand-in. The old '/'->'_' + stop-at-NUL
+ * mangling was not injective ("a/b" vs "a_b" collided; NUL truncated), and a
+ * long name plus a long $TMPDIR prefix overran sun_path. Hash the EXACT bytes
+ * (length included) into a fixed 16-hex-char filename: injective for
+ * practical purposes, collision-resistant, and always short enough to fit.
+ * FNV-1a is not cryptographic, but a handful of abstract names never collide;
+ * a sidecar for adversarial collisions is a documented residual. */
 static int abstract_to_path(const uint8_t *name, uint32_t name_len,
                             char *out, size_t out_sz) {
-    size_t o = 0;
     const char *dir = hl_abstract_dir();
     if (!dir) return -1;
-    int n = snprintf(out, out_sz, "%s/", dir);
+    uint64_t h = 1469598103934665603ULL;              /* FNV-1a offset */
+    h = (h ^ (uint64_t)name_len) * 1099511628211ULL;  /* fold the length */
+    for (uint32_t i = 0; i < name_len; i++)
+        h = (h ^ name[i]) * 1099511628211ULL;
+    int n = snprintf(out, out_sz, "%s/%016llx",
+                     dir, (unsigned long long)h);
     if (n < 0 || (size_t)n >= out_sz) return -1;
-    o = (size_t)n;
-    for (uint32_t i = 0; i < name_len && o + 1 < out_sz; i++) {
-        unsigned char c = name[i];
-        if (c == '\0') break;
-        out[o++] = (c == '/') ? '_' : (char)c;
+    return n;
+}
+
+/* Per-name advisory locks for abstract sockets.
+ *
+ * A Linux abstract name is occupied from bind() until the last reference is
+ * gone, and a second binder must get EADDRINUSE. The filesystem stand-in
+ * does not enforce that, and blindly unlinking it let a second hl process
+ * STEAL a live name. Gate the unlink+bind with a non-blocking flock on a
+ * per-name lock file: holding the flock proves ownership; a stale socket
+ * whose owner has died leaves the flock free (the fd was closed on exit).
+ * The lock fd is held for the bound socket's lifetime and released when the
+ * socket closes (hl_abstract_bind_release, called from the close paths). */
+typedef struct {
+    int sock_host_fd;   /* the bound socket's host fd (the key) */
+    int lock_fd;        /* fd holding flock(LOCK_EX) on <path>.lk */
+} hl_abstract_lock_t;
+
+#define HL_ABSTRACT_LOCKS 64
+static hl_abstract_lock_t abstract_locks[HL_ABSTRACT_LOCKS];
+static pthread_mutex_t abstract_lock_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Acquire the per-name lock. Returns a held lock fd (>=0), or -1 if another
+ * live owner holds it (caller returns EADDRINUSE), or -2 on internal error. */
+static int abstract_lock_acquire(const char *sun_path) {
+    char lk[128];
+    if ((size_t)snprintf(lk, sizeof(lk), "%s.lk", sun_path) >= sizeof(lk))
+        return -2;
+    int fd = open(lk, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -2;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return (errno == EWOULDBLOCK) ? -1 : -2;  /* live owner → EADDRINUSE */
     }
-    if (o + 1 >= out_sz) return -1;
-    out[o] = '\0';
-    return (int)o;
+    return fd;
+}
+
+/* Record (socket fd → lock fd) so the lock is released when the socket
+ * closes. If the slot table is full, we keep the lock but cannot auto-release
+ * it until process exit — conservative (over-holds), never unsafe. */
+static void abstract_lock_record(int sock_host_fd, int lock_fd) {
+    pthread_mutex_lock(&abstract_lock_mtx);
+    for (int i = 0; i < HL_ABSTRACT_LOCKS; i++) {
+        if (abstract_locks[i].lock_fd == 0 || abstract_locks[i].lock_fd == -1) {
+            abstract_locks[i].sock_host_fd = sock_host_fd;
+            abstract_locks[i].lock_fd = lock_fd;
+            pthread_mutex_unlock(&abstract_lock_mtx);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&abstract_lock_mtx);
+}
+
+/* Release the abstract-name lock (if any) held for a closing socket host fd.
+ * Closing the flock fd frees the name for a same-process rebind. */
+void hl_abstract_bind_release(int sock_host_fd) {
+    if (sock_host_fd < 0) return;
+    pthread_mutex_lock(&abstract_lock_mtx);
+    for (int i = 0; i < HL_ABSTRACT_LOCKS; i++) {
+        if (abstract_locks[i].lock_fd > 0 &&
+            abstract_locks[i].sock_host_fd == sock_host_fd) {
+            close(abstract_locks[i].lock_fd);
+            abstract_locks[i].lock_fd = -1;
+            abstract_locks[i].sock_host_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&abstract_lock_mtx);
 }
 
 static int linux_to_mac_sockaddr_ex(const void *linux_sa, uint32_t linux_len,
@@ -474,19 +544,26 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
                                            &was_abstract);
     if (mac_len < 0) return -LINUX_EINVAL;
 
-    /* Linux abstract names vanish with their last reference; the file that
-     * stands in for one here does not, so a previous run left a socket that
-     * failed every later bind with EADDRINUSE. Safe now that the directory
-     * is verified private: only unlink something that is actually a socket. */
+    /* Abstract name: gate with the per-name flock so we never steal a name a
+     * live process still holds, and only then clear a stale stand-in. */
+    int lock_fd = -1;
     if (was_abstract) {
         const struct sockaddr_un *un = (const struct sockaddr_un *)&mac_sa;
+        lock_fd = abstract_lock_acquire(un->sun_path);
+        if (lock_fd == -1) return -LINUX_EADDRINUSE;  /* live owner */
+        if (lock_fd == -2) return -LINUX_EADDRINUSE;  /* be conservative */
+        /* We own the name now: a leftover socket is definitely stale. */
         struct stat st;
         if (lstat(un->sun_path, &st) == 0 && S_ISSOCK(st.st_mode))
             unlink(un->sun_path);
     }
 
-    if (bind(host_fd, (struct sockaddr *)&mac_sa, (socklen_t)mac_len) < 0)
+    if (bind(host_fd, (struct sockaddr *)&mac_sa, (socklen_t)mac_len) < 0) {
+        if (lock_fd >= 0) { close(lock_fd); }
         return linux_errno();
+    }
+    if (lock_fd >= 0)
+        abstract_lock_record(host_fd, lock_fd);  /* held for socket lifetime */
     return 0;
 }
 

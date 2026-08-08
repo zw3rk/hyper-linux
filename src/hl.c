@@ -18,6 +18,7 @@
 #include <Hypervisor/hv_vcpu.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -63,7 +64,11 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     int verbose = 0;
-    int timeout_sec = 10;  /* Default: 10 second timeout */
+    /* Watchdog OFF by default (0). It armed alarm() per hv_vcpu_run()
+     * iteration, so a 10s default killed every compute-bound or
+     * vDSO-time-polling guest. --timeout N (N>0) opts in to a coarse
+     * hang detector on the main vCPU; 0 disables it. */
+    int timeout_sec = 0;
     int fork_child_fd = -1; /* IPC fd for --fork-child mode */
     const char *sysroot = NULL; /* Sysroot for dynamic linker resolution */
     int gdb_port = 0;         /* GDB RSP port (0 = disabled) */
@@ -138,8 +143,21 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[arg_start], "--timeout") == 0 ||
                     strcmp(argv[arg_start], "-t") == 0) &&
                    arg_start + 1 < argc) {
-            timeout_sec = atoi(argv[arg_start + 1]);
-            if (timeout_sec <= 0) timeout_sec = 10;
+            /* Checked parse: 0 = off, N>0 = arm; reject junk/negative/overflow
+             * rather than silently snapping to a default. */
+            {
+                char *end = NULL;
+                errno = 0;
+                long v = strtol(argv[arg_start + 1], &end, 10);
+                if (errno != 0 || !end || *end != '\0' || v < 0 || v > 86400) {
+                    fprintf(stderr, "hl: --timeout: invalid value '%s' "
+                            "(expected 0..86400 seconds; 0 = off)\n",
+                            argv[arg_start + 1]);
+                    return 1;
+                }
+                timeout_sec = (int)v;
+            }
+            hl_watchdog_timeout_sec = timeout_sec; /* for fork-child argv */
             arg_start += 2;
         } else if (strcmp(argv[arg_start], "--fork-child") == 0 &&
                    arg_start + 1 < argc) {
@@ -1400,7 +1418,7 @@ too_many_regions:
     }
 
     /* ---- Step 8: vCPU execution loop ---- */
-    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
+    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, 1 /* main */);
 
     /* ---- Cleanup ---- */
     vdso_publisher_stop();

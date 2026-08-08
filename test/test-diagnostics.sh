@@ -79,6 +79,68 @@ else
 fi
 rm -f "$tmp"
 
+# ---- 3. SHM detach reclaims page-table pages (H2) ----
+# 300 attach/partial-mprotect/detach cycles exceed the 240-page pool. With
+# the L3 reclaim, hl never exhausts it; without, it logs "pool exhausted".
+churn_err=$("$HL" --fs-mode=legacy --audio-backend null "$BUILD/helper-shm-churn" 2>&1 >/dev/null)
+if printf '%s' "$churn_err" | grep -q "page table pool exhausted"; then
+    bad "SHM detach reclaims page-table pages" "pool exhausted — L3 not reclaimed"
+else
+    ok "SHM detach reclaims page-table pages"
+fi
+
+# ---- 4. Watchdog is OFF by default; opt-in --timeout kills a hang (H7) ----
+# A guest that loops on vDSO gettimeofday makes no VM exits — the exact
+# pattern the old 10s default killed. By default it must run to completion.
+wd_out=$(timeout 30 "$HL" --fs-mode=legacy --audio-backend null \
+             "$BUILD/helper-watchdog" 12 2>&1)
+if printf '%s' "$wd_out" | grep -q "wd-done"; then
+    ok "watchdog off by default: a 12s no-exit guest completes"
+else
+    bad "watchdog off by default: a 12s no-exit guest completes" \
+        "guest was killed (watchdog armed by default?)"
+fi
+# Opt-in must still catch a hang: --timeout 2 kills the same 12s loop.
+wd_out=$(timeout 30 "$HL" --timeout 2 --fs-mode=legacy --audio-backend null \
+             "$BUILD/helper-watchdog" 12 2>&1)
+if printf '%s' "$wd_out" | grep -q "wd-done"; then
+    bad "--timeout arms the opt-in watchdog" "12s loop was NOT killed by --timeout 2"
+elif printf '%s' "$wd_out" | grep -q "timed out after 2s"; then
+    ok "--timeout arms the opt-in watchdog"
+else
+    bad "--timeout arms the opt-in watchdog" "unexpected: $wd_out"
+fi
+
+# ---- 5. Abstract socket names are not stealable across processes (H6) ----
+absname="hl-h6-$$-$RANDOM"
+# Holder binds the name and keeps it for ~5s.
+"$HL" --fs-mode=legacy --audio-backend null \
+    "$BUILD/helper-abstract-hold" hold "$absname" >/tmp/h6_hold.$$ 2>&1 &
+hpid=$!
+for _ in $(seq 1 50); do grep -q BOUND /tmp/h6_hold.$$ 2>/dev/null && break; sleep 0.1; done
+if ! grep -q BOUND /tmp/h6_hold.$$ 2>/dev/null; then
+    bad "a live abstract name cannot be stolen" "holder never bound"
+else
+    # Second process must be refused while the holder is alive.
+    got=$("$HL" --fs-mode=legacy --audio-backend null \
+              "$BUILD/helper-abstract-hold" try "$absname" 2>&1)
+    if printf '%s' "$got" | grep -q EADDRINUSE; then
+        ok "a live abstract name cannot be stolen"
+    else
+        bad "a live abstract name cannot be stolen" "second bind: $got (want EADDRINUSE)"
+    fi
+fi
+wait $hpid 2>/dev/null
+# (+) Once the holder is gone, the name is reclaimable.
+got=$("$HL" --fs-mode=legacy --audio-backend null \
+          "$BUILD/helper-abstract-hold" try "$absname" 2>&1)
+if printf '%s' "$got" | grep -q BOUND; then
+    ok "a freed abstract name is reclaimable"
+else
+    bad "a freed abstract name is reclaimable" "bind after holder exit: $got"
+fi
+rm -f /tmp/h6_hold.$$
+
 echo
 echo "test-diagnostics: $pass passed, $fail failed — $([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 [ $fail -eq 0 ]
