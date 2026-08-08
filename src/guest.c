@@ -5,8 +5,8 @@
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
  * The guest address space size is determined by the VM's configured IPA
- * width (capped at 40-bit = 1TB): 64GB for native aarch64 on M2 (36-bit),
- * 1TB for M3+ (40-bit) or rosetta mode on any hardware. Reserved via
+ * width (capped at 40-bit = 1TB): 64GB for a 36-bit VM and 1TB for a
+ * 40-bit VM, for either guest architecture. Reserved via
  * mmap(MAP_ANON); macOS demand-pages physical memory on first touch, so
  * only used pages consume RAM. The slab is mapped RWX to
  * Hypervisor.framework. The guest's own page tables
@@ -712,6 +712,12 @@ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
             return (uint8_t *)g->kbuf_base + koff;
         }
     }
+    /* Reject the non-canonical gap between the 48-bit user range and the
+     * explicit TTBR1 kbuf window.  Feeding such an address to the table
+     * walker aliases it through the low 48 address bits; Rosetta guests then
+     * observe a bogus mapped pointer instead of the syscall's EFAULT. */
+    if (gva > GUEST_USER_VA_MAX)
+        return NULL;
     /* Walk page tables for high VAs (rosetta binary, JIT regions, etc.).
      * This correctly handles non-identity mappings where multiple mmap
      * calls share 2MB page table blocks — each VA resolves to whatever
@@ -1775,7 +1781,12 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end) {
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx = (unsigned)(((base + pa) % BLOCK_2MB) / PAGE_SIZE);
-            l3[l3_idx] = 0;  /* Invalid descriptor */
+            /* Keep the output IPA while clearing the descriptor attributes.
+             * A later mmap/mprotect may reactivate this page.  Retaining the
+             * IPA is essential for Rosetta high-VA aliases, where VA != IPA;
+             * zeroing the entry forced guest_update_perms() to invent an
+             * impossible identity mapping at the high virtual address. */
+            l3[l3_idx] &= 0xFFFFFFFFF000ULL;
         }
 
         g->need_tlbi = 1;
@@ -1976,17 +1987,17 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
              * must use the IPA already stored in the descriptor (set by
              * guest_split_block).
              *
-             * For invalidated entries (set to 0 by guest_invalidate_ptes),
-             * the stored IPA is 0 — wrong. Fall back to computing the
-             * identity-mapped IPA (base + pa). This is correct for TTBR0
-             * user-space regions where VA == IPA == GPA. Non-identity
-             * mapped regions (rosetta VA aliases) should never have
-             * invalidated entries that get re-activated here. */
-            uint64_t page_ipa;
-            if (l3[l3_idx] & PT_VALID)
-                page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
-            else
+             * guest_invalidate_ptes() deliberately retains these address
+             * bits in invalid L3 entries so non-identity aliases can be
+             * reactivated without changing their backing GPA.  A zero entry
+             * can still come from older whole-block invalidation; identity
+             * reconstruction is valid only inside the primary VA span. */
+            uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+            if (page_ipa == 0) {
+                if (pa >= g->guest_size)
+                    return -1;
                 page_ipa = base + (pa & ~(PAGE_SIZE - 1));
+            }
             l3[l3_idx] = make_page_desc(page_ipa, perms);
         }
 

@@ -5,9 +5,8 @@
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
  * host buffer). Buffer size is determined by the VM's configured IPA width:
- *   - Native aarch64 on M2 (36-bit IPA): 64GB
- *   - Native aarch64 on M3+ (40-bit IPA): 1TB
- *   - Rosetta x86_64 on any hardware (48-bit IPA, capped at 40): 1TB
+ *   - 36-bit IPA: 64GB, for native aarch64 or Rosetta x86_64
+ *   - 40-bit IPA: 1TB, for native aarch64 or Rosetta x86_64
  * Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on first
  * touch, so unused pages cost nothing. The slab is mapped RWX to
  * Hypervisor.framework; fine-grained permissions are enforced by the guest's
@@ -77,6 +76,7 @@
  * buffer's Stage-2 mapping already covers the GPA range. */
 #define KBUF_VA_BASE    0xFFFFFFFFF0000000ULL  /* Bottom of 256MB kernel window */
 #define KBUF_SIZE       0x10000000ULL          /* 256MB */
+#define GUEST_USER_VA_MAX 0x0000FFFFFFFFFFFFULL /* 48-bit userspace ceiling */
 
 /* User VA mirror of the kbuf region. Bits 47:0 match KBUF_VA_BASE.
  * Rosetta's tagged pointer system (TaggedPointer.h) extracts pointers

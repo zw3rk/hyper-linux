@@ -38,7 +38,7 @@
  *   0x000   ELF64 header         64 bytes
  *   0x040   Phdr[0] (PT_LOAD)    56 bytes
  *   0x078   Phdr[1] (PT_DYNAMIC) 56 bytes
- *   0x0B0   .text (guest blob)   0xF8 bytes (see vdso_guest.S / VDSO_SYM_*)
+ *   0x0B0   .text (guest blob)   0x100 bytes (see vdso_guest.S / VDSO_SYM_*)
  *   0x1B0   .dynstr strings      90 bytes
  *   0x210   .dynsym entries      120 bytes (NULL + 4 symbols)
  *   0x288   .hash (ELF hash)     32 bytes (1 bucket, 5 chains)
@@ -123,8 +123,7 @@ typedef struct {
 #define VDSO_OFF_PHDR    0x040   /* = sizeof(elf64_ehdr_t) */
 #define VDSO_OFF_PHDR1   0x078   /* = PHDR + sizeof(elf64_phdr_t) */
 /* VDSO_OFF_TEXT defined in vdso.h (shared with syscall_signal.c) */
-/* .text size = VDSO_GUEST_TEXT_SIZE (0xF8); ends at 0x0B0+0xF8 = 0x1A8.
- * Round up to 8-byte align for .dynstr: 0x1B0 */
+/* .text size = VDSO_GUEST_TEXT_SIZE (0x100); ends at 0x1B0. */
 #define VDSO_OFF_DYNSTR  0x1B0   /* after .text (real helpers + trampolines) */
 /* DYNSTR_SIZE = 90 bytes → ends at 0x20A, round up to 8-byte align: 0x210 */
 #define VDSO_OFF_DYNSYM  0x210   /* after .dynstr */
@@ -151,7 +150,7 @@ typedef struct {
  *   [0] rt_sigreturn   @ 0x00  (SVC trampoline — must stay first)
  *   [1] clock_getres   @ 0x0C  (SVC trampoline)
  *   [2] clock_gettime  @ 0x18  (vvar seqlock reader)
- *   [3] gettimeofday   @ 0xA8  (vvar seqlock reader)
+ *   [3] gettimeofday   @ 0xB0  (vvar seqlock reader)
  * Sizes are derived from consecutive symbol offsets. */
 static const uint32_t sym_text_off[VDSO_NUM_SYMS] = {
     VDSO_SYM_RT_SIGRETURN,

@@ -63,7 +63,13 @@ Lcg_check:
     ldr     w12, [x10]
     cmp     w11, w12
     b.ne    Lcg_retry
-    cbz     x1, Lcg_ok
+    /* Rosetta routes x86_64 clock_gettime syscalls through this helper.
+     * Fall back to the real syscall for NULL/non-canonical result pointers so
+     * the kernel-side guest_write check returns EFAULT instead of taking an
+     * EL0 fault while the vDSO stores the timespec. */
+    cbz     x1, Lcg_svc
+    lsr     x15, x1, #48
+    cbnz    x15, Lcg_svc
     stp     x13, x14, [x1]
 Lcg_ok:
     mov     x0, xzr

@@ -27,8 +27,8 @@
 #define VDSO_SYM_RT_SIGRETURN   0x00
 #define VDSO_SYM_CLOCK_GETRES   0x0C
 #define VDSO_SYM_CLOCK_GETTIME  0x18
-#define VDSO_SYM_GETTIMEOFDAY   0xA8
-#define VDSO_GUEST_TEXT_SIZE    0xF8
+#define VDSO_SYM_GETTIMEOFDAY   0xB0
+#define VDSO_GUEST_TEXT_SIZE    0x100
 
 /* Guest-visible time data (host publishes; guest vDSO reads). LE. */
 typedef struct hl_vvar {

@@ -872,7 +872,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
          * (0xFFFF...) violates this, but user VA passes. The user VA
          * is mapped via TTBR0 page tables to the same GPA as the
          * kernel VA's TTBR1 mapping, so CPU access works either way. */
-        if (addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
+        if (addr > GUEST_USER_VA_MAX && g->kbuf_base) {
             uint64_t koff = addr - KBUF_VA_BASE;
             if (koff + length > KBUF_SIZE) {
                 fprintf(stderr, "hl: mmap: kernel buffer exhausted "
@@ -914,7 +914,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
         }
 
         /* Kernel VA without kbuf: fail like real Linux (above TASK_SIZE) */
-        if (addr > 0x0000FFFFFFFFFFFFULL)
+        if (addr > GUEST_USER_VA_MAX)
             return -LINUX_ENOMEM;
 
         /* MAP_FIXED: addr is IPA-based, convert to offset */
@@ -1305,7 +1305,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         }
         pthread_mutex_lock(&mmap_lock);
 
-        if (unmap_addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
+        if (unmap_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
             /* Kernel VA (TTBR1 kbuf): zero the backing memory and
              * remove region tracking. PTEs remain valid — kbuf L2
              * block descriptors are pre-built. Only process addresses
@@ -1315,7 +1315,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 memset((uint8_t *)g->kbuf_base + koff, 0, unmap_len);
                 guest_region_remove(g, unmap_addr, unmap_addr + unmap_len);
             }
-        } else if (unmap_addr > 0x0000FFFFFFFFFFFFULL) {
+        } else if (unmap_addr > GUEST_USER_VA_MAX) {
             /* Kernel VA without kbuf: no-op */
         } else {
             /* TTBR0 (user VA): convert to offset for region tracking */
@@ -1430,7 +1430,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
         }
         pthread_mutex_lock(&mmap_lock);
 
-        if (mprot_addr > 0x0000FFFFFFFFFFFFULL && g->kbuf_base) {
+        if (mprot_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
             /* Kbuf (TTBR1 kernel VA): update page permissions via
              * kbuf page table helpers. */
             uint64_t kbuf_end = mprot_addr + mprot_len;
@@ -1446,7 +1446,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 guest_kbuf_update_perms(g, mprot_addr, kbuf_end, page_perms);
             }
             g->need_tlbi = 1;
-        } else if (mprot_addr > 0x0000FFFFFFFFFFFFULL) {
+        } else if (mprot_addr > GUEST_USER_VA_MAX) {
             /* Kernel VA without kbuf: no-op */
         } else {
             /* TTBR0 (user VA) region */
@@ -1955,9 +1955,15 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
                 fprintf(stderr, "hl: rt_tgsigqueueinfo(tgid=%d, tid=%d, "
                         "sig=%d, uinfo=0x%llx [unreadable])\n",
                         tgid, tid, sig, (unsigned long long)uinfo_gva);
+            result = -LINUX_EFAULT;
+            break;
         }
 
-        signal_queue(sig);
+        /* Rosetta re-delivers the translated signal through this syscall.
+         * Keep both its target and siginfo code: collapsing this to the
+         * process-directed signal_queue() replaced SI_TKILL with SI_USER,
+         * so the translated x86_64 SA_SIGINFO handler observed si_code=0. */
+        signal_queue_directed(sig, target->guest_tid, info.si_code);
         result = 0;
         break;
     }
