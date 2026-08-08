@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Tests: epoll_create1, epoll_ctl (ADD/MOD/DEL), epoll_wait with
- *        pipes and eventfds, data.u64 preservation, timeout behavior
+ *        pipes and eventfds, data.u64 preservation, timeout behavior,
+ *        and fork inheritance of epoll registrations
  *
  * Syscalls exercised: epoll_create1(20), epoll_ctl(21), epoll_pwait(22),
  *                     pipe2(59), eventfd2(19), write(64), close(57)
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/wait.h>
 
 int main(void) {
     int passes = 0, fails = 0;
@@ -233,6 +235,87 @@ int main(void) {
         close(pipefd[0]);
         close(pipefd[1]);
         close(epfd);
+    }
+
+    /* Positive control for the fork FD-transfer path: ordinary pipe
+     * descriptors must remain usable in the child. */
+    TEST("fork inherits pipe descriptors");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            FAIL("pipe failed");
+        } else {
+            pid_t pid = fork();
+            if (pid == 0) {
+                char byte = 'p';
+                _exit(write(pipefd[1], &byte, 1) == 1 ? 0 : 10);
+            } else if (pid < 0) {
+                FAIL("fork failed");
+            } else {
+                int status = 0;
+                char byte = 0;
+                pid_t waited = waitpid(pid, &status, 0);
+                ssize_t nread = -1;
+                if (waited == pid && WIFEXITED(status) &&
+                    WEXITSTATUS(status) == 0)
+                    nread = read(pipefd[0], &byte, 1);
+                if (waited == pid && WIFEXITED(status) &&
+                    WEXITSTATUS(status) == 0 &&
+                    nread == 1 && byte == 'p')
+                    PASS();
+                else
+                    FAIL("inherited pipe unusable");
+            }
+            close(pipefd[0]);
+            close(pipefd[1]);
+        }
+    }
+
+    /* Linux fork inherits the epoll open-file description and its interest
+     * list.  The child must therefore see readiness through a watch installed
+     * before fork, including the original epoll_data value. */
+    TEST("fork inherits epoll watch state");
+    {
+        int epfd = epoll_create1(0);
+        int pipefd[2];
+        if (epfd < 0 || pipe(pipefd) != 0) {
+            FAIL("epoll/pipe setup failed");
+            if (epfd >= 0) close(epfd);
+        } else {
+            struct epoll_event ev = {
+                .events = EPOLLIN,
+                .data.u64 = 0xF04B1A11ULL,
+            };
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) != 0) {
+                FAIL("epoll_ctl ADD failed");
+            } else {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    char byte = 'e';
+                    struct epoll_event out;
+                    if (write(pipefd[1], &byte, 1) != 1)
+                        _exit(20);
+                    int n = epoll_wait(epfd, &out, 1, 1000);
+                    if (n != 1 || !(out.events & EPOLLIN))
+                        _exit(21);
+                    if (out.data.u64 != 0xF04B1A11ULL)
+                        _exit(22);
+                    _exit(0);
+                } else if (pid < 0) {
+                    FAIL("fork with open epoll fd failed");
+                } else {
+                    int status = 0;
+                    if (waitpid(pid, &status, 0) == pid &&
+                        WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                        PASS();
+                    else
+                        FAIL("child lost inherited epoll state");
+                }
+            }
+            close(pipefd[0]);
+            close(pipefd[1]);
+            close(epfd);
+        }
     }
 
     SUMMARY("test-epoll");
