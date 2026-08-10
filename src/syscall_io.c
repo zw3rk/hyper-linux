@@ -20,6 +20,7 @@
 #include "guest.h"
 #include "thread.h"
 #include "fd_object.h"
+#include "fd_digest.h"
 #include "trace.h"
 
 #include <stdio.h>
@@ -37,7 +38,6 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <termios.h>
-#include <CommonCrypto/CommonDigest.h>
 
 /* ---------- Linux terminal struct types ---------- */
 
@@ -658,27 +658,6 @@ static ssize_t send_fd(int sock, const void *buf, size_t buflen, int send_fd_val
     return sendmsg(sock, &msg, 0);
 }
 
-/* Compute SHA256 digest of a file by fd (seeks back to start after).
- * Returns 0 on success, -1 on error. */
-static int compute_fd_sha256(int fd, uint8_t digest[CC_SHA256_DIGEST_LENGTH]) {
-    off_t saved = lseek(fd, 0, SEEK_CUR);
-    lseek(fd, 0, SEEK_SET);
-
-    CC_SHA256_CTX ctx;
-    CC_SHA256_Init(&ctx);
-
-    uint8_t buf[65536];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0)
-        CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
-
-    lseek(fd, saved, SEEK_SET);
-    if (n < 0) return -1;
-
-    CC_SHA256_Final(digest, &ctx);
-    return 0;
-}
-
 /* ---------- Persistent AOT cache ---------- */
 
 /* Cache directory: ~/.cache/hl-rosettad/
@@ -740,7 +719,7 @@ static void aot_write_checksum(const char *aot_path) {
     int fd = open(aot_path, O_RDONLY);
     if (fd < 0) return;
     uint8_t d[CC_SHA256_DIGEST_LENGTH];
-    int ok = (compute_fd_sha256(fd, d) == 0);
+    int ok = (hl_fd_sha256(fd, d) == 0);
     close(fd);
     if (!ok) return;
     char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
@@ -768,7 +747,7 @@ static int aot_verify(int fd, const char *path) {
     if (aot_header_valid(fd) != 0)
         return -1;
     uint8_t d[CC_SHA256_DIGEST_LENGTH];
-    if (compute_fd_sha256(fd, d) != 0)
+    if (hl_fd_sha256(fd, d) != 0)
         return -1;
     char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
@@ -946,7 +925,7 @@ static void *rosettad_handler_thread(void *arg) {
              * This is the digest rosetta stores in .flu files and sends
              * via 'd' for subsequent cache lookups. */
             uint8_t bin_digest[ROSETTAD_DIGEST_SIZE];
-            if (compute_fd_sha256(bin_fd, bin_digest) < 0) {
+            if (hl_fd_sha256(bin_fd, bin_digest) < 0) {
                 fprintf(stderr, "hl: rosettad: SHA256 of binary failed\n");
                 close(bin_fd);
                 uint8_t resp = ROSETTAD_RESP_MISS;

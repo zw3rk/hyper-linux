@@ -96,7 +96,7 @@ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_signal.h syscall_net.h stack.h hv_util.h \
            thread.h futex.h vdso.h crash_report.h rosetta.h \
            gdb_stub.h trace.h syscall_stats.h fd_object.h vfs.h device.h \
-           audio.h audio_oss.h linux_oss_abi.h app_open.h)
+           audio.h audio_oss.h linux_oss_abi.h app_open.h fd_digest.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -395,6 +395,8 @@ test-host-units: $(BUILD_DIR)/hl $(TEST_DEPS) test-page-table-pool | $(BUILD_DIR
 		$(SRC_DIR)/app_open.c $(SRC_DIR)/vfs.c $(SRC_DIR)/trace.c -lpthread
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-oss-abi \
 		test/host/test-oss-abi.c
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-fd-digest \
+		test/host/test-fd-digest.c
 	@# The ONLY lane that compiles audio_coreaudio.c for real. Everywhere
 	@# else it is built without HL_HAVE_COREAUDIO and the whole file —
 	@# ca_callback included — becomes a stub, so the production audio path
@@ -413,6 +415,7 @@ test-host-units: $(BUILD_DIR)/hl $(TEST_DEPS) test-page-table-pool | $(BUILD_DIR
 	$(BUILD_DIR)/test-audio-restart
 	$(BUILD_DIR)/test-app-open
 	$(BUILD_DIR)/test-oss-abi
+	$(BUILD_DIR)/test-fd-digest
 	$(BUILD_DIR)/test-audio-coreaudio
 	@# Operator-facing output: path redaction and the SIGUSR1 stats dump.
 	@HL=$(BUILD_DIR)/hl GUEST_BIN_DIR=$(TEST_DIR) bash test/test-diagnostics.sh
