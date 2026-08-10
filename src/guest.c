@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
- * The guest address space size is determined by the VM's configured IPA
- * width (capped at 40-bit = 1TB): 64GB for native aarch64 on M2 (36-bit),
- * 1TB for M3+ (40-bit) or rosetta mode on any hardware. Reserved via
+ * The guest address space size is chosen from the VM's configured IPA
+ * width (capped at 40-bit = 1TB), then reduced if Hypervisor.framework
+ * rejects the primary map: 64GB for 36-bit IPA, up to 1TB for 40-bit
+ * or rosetta mode. Reserved via
  * mmap(MAP_ANON); macOS demand-pages physical memory on first touch, so
  * only used pages consume RAM. The slab is mapped RWX to
  * Hypervisor.framework. The guest's own page tables
@@ -113,6 +114,12 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa) {
     return (uint64_t *)((uint8_t *)g->host_base + gpa);
 }
 
+static void guest_set_primary_size(guest_t *g, uint64_t size) {
+    g->guest_size = size;
+    g->interp_base = size - 0x100000000ULL;
+    g->mmap_limit  = size - 0x200000000ULL;
+}
+
 /* ---------- Public API ---------- */
 
 int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
@@ -146,19 +153,18 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
     else
         vm_ipa = 36;
 
-    /* Primary buffer size: use the VM's configured IPA width (capped at
-     * 40-bit = 1TB). When rosetta is active (vm_ipa=48), this gives 1TB
-     * instead of 64GB on M2, providing ~1008GB of mmap backing space for
-     * rosetta's high-VA JIT allocations (slab at 240TB, PIE at 85TB, etc.).
-     * The hv_vm_map call supports any size up to the VM's IPA width —
-     * confirmed by rosetta's own segments mapped at 128TB via hv_vm_map.
-     * macOS demand-pages the host reservation, so only touched pages cost
-     * physical memory. */
+    /* Primary buffer target: use the VM's configured IPA width (capped at
+     * 40-bit = 1TB). When rosetta is active (vm_ipa=48), start with 1TB
+     * instead of 64GB to provide more mmap backing space for rosetta's
+     * high-VA JIT allocations (slab at 240TB, PIE at 85TB, etc.). Some
+     * macOS/Apple Silicon combinations reject large primary hv_vm_map calls,
+     * so guest_init retries with smaller buffers after VM creation. macOS
+     * demand-pages the host reservation, so only touched pages cost physical
+     * memory. */
     uint32_t buf_bits = (vm_ipa > 40) ? 40 : vm_ipa;
     uint64_t buf_capacity = 1ULL << buf_bits;
     if (size == 0 || size > buf_capacity)
         size = buf_capacity;
-    g->guest_size = size;
     g->ipa_bits = vm_ipa;
 
     /* Compute dynamic layout limits from primary buffer size.
@@ -166,8 +172,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
      * mmap_limit:  last 8GB reserved (max mmap RW address)
      * For 64GB:  interp=60GB, mmap_limit=56GB
      * For 1TB:   interp=1020GB, mmap_limit=1016GB */
-    g->interp_base = g->guest_size - 0x100000000ULL;
-    g->mmap_limit  = g->guest_size - 0x200000000ULL;
+    guest_set_primary_size(g, size);
 
     /* Reserve primary address space via mmap(MAP_ANON). macOS demand-pages
      * this: physical pages are allocated only on first touch, so reserving
@@ -249,22 +254,26 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits) {
 
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-    if (ret != HV_SUCCESS && buf_bits > max_ipa) {
-        /* 1TB primary map failed — fall back to hardware-default buffer.
-         * This handles undocumented HVF limits on primary buffer size.
-         * Close shm_fd since the fallback uses anonymous memory (the file
+    for (uint32_t fallback_bits = buf_bits - 1;
+         ret != HV_SUCCESS && fallback_bits >= 36;
+         fallback_bits--) {
+        /* The VM can be configured with a wider IPA than the largest primary
+         * slab HVF will accept on every macOS/Apple Silicon combination. Keep
+         * the VM IPA width, but retry with progressively smaller primary
+         * buffers down to the 36-bit baseline required by the current layout.
+         *
+         * Close shm_fd since fallback retries use anonymous memory (the file
          * is no longer mapped to host_base, so COW fork won't work). */
+        uint64_t fallback_size = 1ULL << fallback_bits;
+
         fprintf(stderr, "guest: hv_vm_map %lluGB failed (%d), "
                 "retrying with %u-bit (%lluGB)\n",
                 (unsigned long long)(size >> 30), (int)ret,
-                max_ipa, 1ULL << (max_ipa - 30));
+                fallback_bits, (unsigned long long)(fallback_size >> 30));
         munmap(g->host_base, size);
         if (g->shm_fd >= 0) { close(g->shm_fd); g->shm_fd = -1; }
-        buf_bits = (max_ipa > 40) ? 40 : max_ipa;
-        size = 1ULL << buf_bits;
-        g->guest_size = size;
-        g->interp_base = size - 0x100000000ULL;
-        g->mmap_limit  = size - 0x200000000ULL;
+        size = fallback_size;
+        guest_set_primary_size(g, size);
         g->host_base = mmap(NULL, size, PROT_READ | PROT_WRITE,
                             MAP_ANON | MAP_PRIVATE, -1, 0);
         if (g->host_base == MAP_FAILED) {
@@ -1815,4 +1824,3 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
 
     return 0;
 }
-

@@ -184,9 +184,9 @@ int main(int argc, char **argv) {
 
     /* ---- Step 2: Initialize guest memory and VM ---- */
     /* For rosetta mode, request 48-bit IPA even on M2 (which defaults to
-     * 36-bit). This gives a 1TB primary buffer (buf_bits = min(48, 40) = 40)
-     * instead of 64GB, providing ~1008GB of mmap backing space for rosetta's
-     * high-VA JIT allocations that would otherwise exhaust the 48GB M2 pool.
+     * 36-bit). This allows high-VA rosetta page tables and lets guest_init()
+     * try a large primary buffer for rosetta's high-VA JIT allocations, with
+     * smaller primary-buffer fallbacks for hosts where HVF rejects that map.
      * The VM's Stage-2 IPA width also needs 48-bit for rosetta's page tables
      * to map VAs above 64GB (e.g., PIE base at 85TB). For native aarch64,
      * auto-detect (36/40-bit) is sufficient. */

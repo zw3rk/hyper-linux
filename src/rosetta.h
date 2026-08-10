@@ -75,8 +75,8 @@
 #define ROSETTAD_DIGEST_HEX_LEN (ROSETTAD_DIGEST_SIZE * 2 + 1)  /* Hex + NUL */
 
 /* AOT translation limits — no binary size cap needed since overflow
- * segments (4×1GB) and 1TB primary buffer (48-bit IPA) provide ample
- * backing space for rosetta's high-VA JIT/AOT allocations. */
+ * segments (4×1GB) and an adaptive primary buffer provide backing space
+ * for rosetta's high-VA JIT/AOT allocations. */
 
 /* Persistent AOT cache directory (under $HOME) */
 #define ROSETTAD_CACHE_SUBDIR  ".cache/hl-rosettad"

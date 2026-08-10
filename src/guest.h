@@ -6,8 +6,9 @@
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
  * host buffer). Buffer size is determined by the VM's configured IPA width:
  *   - Native aarch64 on M2 (36-bit IPA): 64GB
- *   - Native aarch64 on M3+ (40-bit IPA): 1TB
- *   - Rosetta x86_64 on any hardware (48-bit IPA, capped at 40): 1TB
+ *   - Native aarch64 on M3+ (40-bit IPA): up to 1TB
+ *   - Rosetta x86_64 on any hardware (48-bit IPA, primary buffer attempts
+ *     up to 1TB and falls back as needed)
  * Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on first
  * touch, so unused pages cost nothing. The slab is mapped RWX to
  * Hypervisor.framework; fine-grained permissions are enforced by the guest's
