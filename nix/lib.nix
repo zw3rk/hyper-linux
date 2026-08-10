@@ -149,14 +149,24 @@ in {
       dontFixup = true;
       buildPhase = ''
         $CC -O2 -o hello-dynamic hello-dynamic.c
+        $CC -O2 -pthread -o pthread-exit dynamic/pthread-exit.c
+        $CC -O2 -pthread -o pthread-segv dynamic/pthread-segv.c
         file hello-dynamic | grep -q "dynamically linked" || {
           echo "ERROR: hello-dynamic is not dynamically linked!"
+          exit 1
+        }
+        file pthread-exit | grep -q "dynamically linked" || {
+          echo "ERROR: pthread-exit is not dynamically linked!"
+          exit 1
+        }
+        file pthread-segv | grep -q "dynamically linked" || {
+          echo "ERROR: pthread-segv is not dynamically linked!"
           exit 1
         }
       '';
       installPhase = ''
         mkdir -p $out/bin
-        cp hello-dynamic $out/bin/
+        cp hello-dynamic pthread-exit pthread-segv $out/bin/
       '';
     };
 

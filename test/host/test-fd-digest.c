@@ -53,8 +53,11 @@ int main(void) {
     int pipe_status = pipe(pipe_fds);
     check(pipe_status == 0, "create non-regular descriptor fixture");
     if (pipe_status == 0) {
+        errno = 0;
         check(hl_fd_sha256(pipe_fds[0], digest) == -1,
               "digest rejects non-regular descriptors");
+        check(errno == EINVAL,
+              "non-regular digest failure reports a stable error");
         close(pipe_fds[0]);
         close(pipe_fds[1]);
     }

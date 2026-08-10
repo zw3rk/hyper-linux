@@ -138,6 +138,7 @@
           buildInputs = [
             darwinPkgs.gnumake
             darwinPkgs.binutils   # objcopy for shim.bin
+            darwinPkgs.python3    # signal-aware process-exit test runner
             darwinPkgs.lldb
             darwinPkgs.shellcheck  # shell script linting
             darwinPkgs.actionlint  # GitHub Actions workflow linting
@@ -251,6 +252,7 @@
           buildInputs = [
             darwinPkgs.gnumake
             darwinPkgs.binutils
+            darwinPkgs.python3    # signal-aware process-exit test runner
             darwinPkgs.xxd        # needed by shim_blob.h generation
             darwinPkgs.shellcheck  # shell script linting
             darwinPkgs.actionlint  # GitHub Actions workflow linting

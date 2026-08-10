@@ -281,6 +281,8 @@ jobs:
           GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/glibc-dynamic-coreutils/bin
         run: |
           nix develop .#ci -c make test-glibc-dynamic
+          nix develop .#ci -c make test-glibc-pthread-exit
+          nix develop .#ci -c make test-glibc-pthread-segv
           nix develop .#ci -c make test-glibc-coreutils
 
       - name: "[aarch64] Haskell smoke test (hello-hyper)"
@@ -354,6 +356,8 @@ jobs:
           X64_GLIBC_DYNAMIC_COREUTILS_BIN: ${{ github.workspace }}/guest-bins/x64-glibc-dynamic-coreutils/bin
         run: |
           nix develop .#ci -c make test-x64-glibc-dynamic
+          nix develop .#ci -c make test-x64-glibc-pthread-exit
+          nix develop .#ci -c make test-x64-glibc-pthread-segv
           nix develop .#ci -c make test-x64-glibc-coreutils
 
       # Required dynamic Rosetta integration coverage.

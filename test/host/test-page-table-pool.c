@@ -12,7 +12,12 @@
 
 int hl_verbose = 0;
 
-void thread_destroy_all_vcpus(void) {}
+int thread_has_active_workers(void) { return 0; }
+
+int thread_retire_vcpu(thread_entry_t *thread) {
+    (void)thread;
+    return 0;
+}
 
 int main(void) {
     const uint64_t guest_size = GUEST_MEM_SIZE_36BIT;

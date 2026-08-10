@@ -11,13 +11,13 @@
 
 .PHONY: all hl clean dist-clean dist pkg release test-hello test-all test-all-rooted test-both-modes test-coreutils \
        test-busybox test-static-bins test-dynamic test-dynamic-coreutils \
-       test-glibc-dynamic test-glibc-coreutils \
+       test-glibc-dynamic test-glibc-pthread-exit test-glibc-pthread-segv test-glibc-coreutils \
        test-perf test-multi-vcpu test-rwx test-haskell test-haskell-bins \
        test-x64-hello test-x64-all test-x64-all-rooted test-x64-both-modes \
        test-x64-coreutils test-x64-busybox \
        test-x64-static-bins \
        test-x64-musl-dynamic test-x64-musl-coreutils \
-       test-x64-glibc-dynamic test-x64-glibc-coreutils \
+       test-x64-glibc-dynamic test-x64-glibc-pthread-exit test-x64-glibc-pthread-segv test-x64-glibc-coreutils \
        test-x64-haskell test-x64-haskell-bins \
        test-full \
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
@@ -96,7 +96,8 @@ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
            syscall_signal.h syscall_net.h stack.h hv_util.h \
            thread.h futex.h vdso.h crash_report.h rosetta.h \
            gdb_stub.h trace.h syscall_stats.h fd_object.h vfs.h device.h \
-           audio.h audio_oss.h linux_oss_abi.h app_open.h fd_digest.h)
+           audio.h audio_oss.h linux_oss_abi.h app_open.h fd_digest.h \
+           aot_format.h)
 
 # ── Default target ─────────────────────────────────────────────────
 .DEFAULT_GOAL := help
@@ -397,6 +398,14 @@ test-host-units: $(BUILD_DIR)/hl $(TEST_DEPS) test-page-table-pool | $(BUILD_DIR
 		test/host/test-oss-abi.c
 	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-fd-digest \
 		test/host/test-fd-digest.c
+	clang $(CFLAGS) -I$(SRC_DIR) -o $(BUILD_DIR)/test-aot-format \
+		test/host/test-aot-format.c
+	clang $(CFLAGS) -ffunction-sections -Wl,-dead_strip -I$(SRC_DIR) \
+		-Dhv_vcpu_destroy=test_hv_vcpu_destroy \
+		-Dhv_vcpus_exit=test_hv_vcpus_exit \
+		-o $(BUILD_DIR)/test-thread-vcpu-lifetime \
+		test/host/test-thread-vcpu-lifetime.c src/thread.c \
+		-framework Hypervisor -lpthread
 	@# The ONLY lane that compiles audio_coreaudio.c for real. Everywhere
 	@# else it is built without HL_HAVE_COREAUDIO and the whole file —
 	@# ca_callback included — becomes a stub, so the production audio path
@@ -416,7 +425,18 @@ test-host-units: $(BUILD_DIR)/hl $(TEST_DEPS) test-page-table-pool | $(BUILD_DIR
 	$(BUILD_DIR)/test-app-open
 	$(BUILD_DIR)/test-oss-abi
 	$(BUILD_DIR)/test-fd-digest
+	$(BUILD_DIR)/test-aot-format
+	$(BUILD_DIR)/test-thread-vcpu-lifetime
 	$(BUILD_DIR)/test-audio-coreaudio
+	@# A guest exit code 139 is valid, but a host SIGSEGV must never satisfy
+	@# that contract. Exercise both waitpid branches in the process checker.
+	python3 test/assert-exit-status.py --timeout 5 --expected 7 -- \
+		/bin/sh -c 'exit 7'
+	@if python3 test/assert-exit-status.py --timeout 5 --expected 139 -- \
+		/bin/sh -c 'kill -SEGV $$$$'; then \
+		echo "FAIL: signal termination satisfied a normal-exit contract"; \
+		exit 1; \
+	fi
 	@# Operator-facing output: path redaction and the SIGUSR1 stats dump.
 	@HL=$(BUILD_DIR)/hl GUEST_BIN_DIR=$(TEST_DIR) bash test/test-diagnostics.sh
 
@@ -504,6 +524,7 @@ test-dynamic-coreutils: $(BUILD_DIR)/hl
 # glibc sysroot with dynamic linker + libc.so (set by nix develop)
 GLIBC_SYSROOT_DIR ?= $(GUEST_GLIBC_SYSROOT)
 GLIBC_DYNAMIC_COREUTILS_BIN ?= $(GUEST_GLIBC_DYNAMIC_COREUTILS)/bin
+THREAD_EXIT_ITERATIONS ?= 50
 
 ## Run glibc dynamic linking smoke test (hello-dynamic via --sysroot)
 test-glibc-dynamic: $(BUILD_DIR)/hl
@@ -513,6 +534,31 @@ test-glibc-dynamic: $(BUILD_DIR)/hl
 	fi
 	@printf "$(BLUE)▸ Running$(RESET) glibc hello-dynamic (--sysroot)\n"
 	$(BUILD_DIR)/hl --sysroot $(GLIBC_SYSROOT_DIR) $(GUEST_GLIBC_DYNAMIC_TESTS)/bin/hello-dynamic
+
+## Repeat native glibc nested pthread joins followed by immediate exit_group
+test-glibc-pthread-exit: $(BUILD_DIR)/hl
+	@if [ -z "$(GLIBC_SYSROOT_DIR)" ] || [ ! -d "$(GLIBC_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ glibc sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) glibc nested pthread exit (%s iterations)\n" \
+		"$(THREAD_EXIT_ITERATIONS)"
+	@set -e; \
+		for iteration in $$(seq 1 "$(THREAD_EXIT_ITERATIONS)"); do \
+			timeout 30 $(BUILD_DIR)/hl --sysroot $(GLIBC_SYSROOT_DIR) \
+				$(GUEST_GLIBC_DYNAMIC_TESTS)/bin/pthread-exit; \
+			done
+
+## Verify a fatal worker SIGSEGV terminates the native guest thread group
+test-glibc-pthread-segv: $(BUILD_DIR)/hl
+	@if [ -z "$(GLIBC_SYSROOT_DIR)" ] || [ ! -d "$(GLIBC_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ glibc sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) glibc fatal worker SIGSEGV\n"
+	python3 test/assert-exit-status.py --timeout 30 --expected 139 -- \
+		$(BUILD_DIR)/hl --sysroot $(GLIBC_SYSROOT_DIR) \
+		$(GUEST_GLIBC_DYNAMIC_TESTS)/bin/pthread-segv
 
 ## Run glibc dynamically-linked coreutils tests (--sysroot)
 test-glibc-coreutils: $(BUILD_DIR)/hl
@@ -776,6 +822,31 @@ test-x64-glibc-dynamic: $(BUILD_DIR)/hl
 	@printf "$(BLUE)▸ Running$(RESET) x86_64 glibc hello-dynamic (via rosetta --sysroot)\n"
 	$(BUILD_DIR)/hl --sysroot $(X64_GLIBC_SYSROOT_DIR) $(GUEST_X64_GLIBC_DYNAMIC_TESTS)/bin/hello-dynamic
 
+## Repeat nested glibc pthread joins followed by immediate exit_group
+test-x64-glibc-pthread-exit: $(BUILD_DIR)/hl
+	@if [ -z "$(X64_GLIBC_SYSROOT_DIR)" ] || [ ! -d "$(X64_GLIBC_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 glibc sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) x86_64 glibc nested pthread exit (%s iterations)\n" \
+		"$(THREAD_EXIT_ITERATIONS)"
+	@set -e; \
+		for iteration in $$(seq 1 "$(THREAD_EXIT_ITERATIONS)"); do \
+			timeout 30 $(BUILD_DIR)/hl --sysroot $(X64_GLIBC_SYSROOT_DIR) \
+				$(GUEST_X64_GLIBC_DYNAMIC_TESTS)/bin/pthread-exit; \
+			done
+
+## Verify a fatal worker SIGSEGV terminates the Rosetta guest thread group
+test-x64-glibc-pthread-segv: $(BUILD_DIR)/hl
+	@if [ -z "$(X64_GLIBC_SYSROOT_DIR)" ] || [ ! -d "$(X64_GLIBC_SYSROOT_DIR)" ]; then \
+		printf "$(RED)✗ x86_64 glibc sysroot not found.$(RESET) Run inside nix develop.\n"; \
+		exit 1; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) x86_64 glibc fatal worker SIGSEGV\n"
+	python3 test/assert-exit-status.py --timeout 30 --expected 139 -- \
+		$(BUILD_DIR)/hl --sysroot $(X64_GLIBC_SYSROOT_DIR) \
+		$(GUEST_X64_GLIBC_DYNAMIC_TESTS)/bin/pthread-segv
+
 ## Run x86_64 glibc dynamically-linked coreutils tests (via rosetta --sysroot)
 test-x64-glibc-coreutils: $(BUILD_DIR)/hl
 	@if [ -z "$(X64_GLIBC_SYSROOT_DIR)" ] || [ ! -d "$(X64_GLIBC_SYSROOT_DIR)" ]; then \
@@ -831,41 +902,47 @@ test-full: $(BUILD_DIR)/hl
 	@printf "$(CYAN)║              hl full test suite                      ║$(RESET)\n"
 	@printf "$(CYAN)╚══════════════════════════════════════════════════════╝$(RESET)\n"
 	@fail=0; \
-	printf "\n$(BLUE)━━━ [1/16] aarch64 unit tests ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [1/18] aarch64 unit tests ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-all || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [2/16] aarch64 coreutils (static musl) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [2/18] aarch64 coreutils (static musl) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [3/16] aarch64 busybox ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [3/18] aarch64 busybox ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-busybox || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [4/16] aarch64 static bins (bash, jq, sqlite, lua, ...) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [4/18] aarch64 static bins (bash, jq, sqlite, lua, ...) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-static-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [5/16] aarch64 dynamic coreutils (musl --sysroot) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [5/18] aarch64 dynamic coreutils (musl --sysroot) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-dynamic-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [6/16] aarch64 dynamic coreutils (glibc --sysroot) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [6/18] aarch64 dynamic coreutils (glibc --sysroot) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-glibc-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [7/16] aarch64 haskell bins (pandoc, shellcheck) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [7/18] aarch64 nested pthread exit ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-glibc-pthread-exit || fail=$$((fail + 1)); \
+	$(MAKE) --no-print-directory test-glibc-pthread-segv || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [8/18] aarch64 haskell bins (pandoc, shellcheck) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-haskell-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [8/16] x86_64 unit tests (via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [9/18] x86_64 unit tests (via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-all || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [9/16] x86_64 coreutils (static musl, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [10/18] x86_64 coreutils (static musl, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [10/16] x86_64 busybox (via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [11/18] x86_64 busybox (via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-busybox || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [11/16] x86_64 static bins (bash, jq, sqlite, lua, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [12/18] x86_64 static bins (bash, jq, sqlite, lua, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-static-bins || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [12/16] x86_64 dynamic coreutils (musl, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [13/18] x86_64 dynamic coreutils (musl, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-musl-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [13/16] x86_64 dynamic coreutils (glibc, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [14/18] x86_64 dynamic coreutils (glibc, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-glibc-coreutils || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [14/16] x86_64 haskell hello (via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [15/18] x86_64 nested pthread exit (via rosetta) ━━━$(RESET)\n"; \
+	$(MAKE) --no-print-directory test-x64-glibc-pthread-exit || fail=$$((fail + 1)); \
+	$(MAKE) --no-print-directory test-x64-glibc-pthread-segv || fail=$$((fail + 1)); \
+	printf "\n$(BLUE)━━━ [16/18] x86_64 haskell hello (via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-haskell || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [15/16] aarch64 haskell hello ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [17/18] aarch64 haskell hello ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-haskell || fail=$$((fail + 1)); \
-	printf "\n$(BLUE)━━━ [16/16] x86_64 haskell bins (pandoc, shellcheck, via rosetta) ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ [18/18] x86_64 haskell bins (pandoc, shellcheck, via rosetta) ━━━$(RESET)\n"; \
 	$(MAKE) --no-print-directory test-x64-haskell-bins || fail=$$((fail + 1)); \
 	printf "\n$(CYAN)╔══════════════════════════════════════════════════════╗$(RESET)\n"; \
 	if [ "$$fail" -eq 0 ]; then \
-		printf "$(CYAN)║  $(GREEN)✓ All 16 suites passed$(CYAN)                              ║$(RESET)\n"; \
+		printf "$(CYAN)║  $(GREEN)✓ All 18 suites passed$(CYAN)                              ║$(RESET)\n"; \
 	else \
 		printf "$(CYAN)║  $(RED)✗ $$fail suite(s) had failures$(CYAN)                        ║$(RESET)\n"; \
 	fi; \
