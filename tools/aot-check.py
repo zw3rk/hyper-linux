@@ -22,17 +22,15 @@ def check(path):
     version     = le(h, 0x08, 8)
     orig_size   = le(h, 0x10, 8)
     code_offset = le(h, 0x18, 8)
-    code_align  = le(h, 0x50, 4)
-    entry_count = le(h, 0x54, 4)
     if version != 1:            problems.append(f"version={version} (want 1)")
     if code_offset != 0x1000:   problems.append(f"code_offset=0x{code_offset:x} (want 0x1000)")
-    if code_align != 0x1000:    problems.append(f"code_align=0x{code_align:x} (want 0x1000)")
-    if total_size == 0:         problems.append("total_size=0")
-    if entry_count == 0:        problems.append("entry_count=0")
+    if total_size <= 0x1000:    problems.append(f"total_size=0x{total_size:x} (<= 0x1000)")
+    if total_size % 0x1000:     problems.append(f"total_size=0x{total_size:x} (not page-aligned)")
+    if orig_size == 0:          problems.append("orig_size=0")
+    if orig_size % 0x1000:      problems.append(f"orig_size=0x{orig_size:x} (not page-aligned)")
     if sz <= code_offset:       problems.append(f"no code section (size 0x{sz:x} <= code_offset)")
-    # total_size is the mapped (code+BSS) size and is >= the stored code; the file
-    # must at least hold the header+code up to code_offset. A well-formed file has
-    # size >= code_offset and typically < total_size (BSS not stored).
+    # Fields after offset 0x20 have changed across macOS releases. Do not
+    # reject a valid current AOT by assigning old meanings to those bytes.
     return problems
 
 def main():

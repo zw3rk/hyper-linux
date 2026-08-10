@@ -348,24 +348,19 @@ SCTLR_EL1.DZE (bit 14) is also set to allow DC ZVA at EL0.
 - BSS signal handler pre-population: incorrect (BSS stores OLD handler)
 - rosettad AOT metadata at offsets 0x80/0x88: unrelated to the crash
 
-**AOT file format** (from `rosettad translate` output):
+**AOT file common prefix** (from `rosettad translate` output):
 ```
 Offset  Size  Field
 0x00    8     total_size (mapped code+data region size)
 0x08    8     version (always 1)
 0x10    8     orig_size (original x86_64 binary mapped size)
 0x18    8     code_offset (file offset of translated ARM64 code, always 0x1000)
-0x20    8     unknown
-0x28    8     unknown
-0x30    8     unknown
-0x38    8     metadata_offset
-0x40    8     metadata_end
-0x48    8     block_table_end
-0x50    4     code_align (0x1000)
-0x54    4     entry_count (number of translated entry points)
-0x58-0xFFF    zero padding
+0x20+         version-specific metadata
 0x1000+       translated ARM64 code
 ```
+Fields after offset `0x20` changed by macOS 26.5.2. Validate only the stable
+common prefix, page-aligned mapped sizes, and the presence of bytes after the
+code offset. Cache sidecars validate the complete AOT content after storage.
 Offsets 0x80 and 0x88 (the `is_aot_mode` source fields) are always zero
 in standalone `rosettad translate` output. hl patches bit 4 of the uint64
 at offset 0x88 after rosettad translate (in `patch_aot_is_aot_mode()`,

@@ -23,7 +23,11 @@ static inline int
 hl_fd_sha256(int fd, uint8_t digest[HL_SHA256_DIGEST_SIZE])
 {
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    if (fstat(fd, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     CC_SHA256_CTX context;
     CC_SHA256_Init(&context);
