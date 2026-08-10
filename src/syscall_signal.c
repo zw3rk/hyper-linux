@@ -826,6 +826,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
         case SIG_DISP_CORE:
             *exit_code = 128 + signum;
             pthread_mutex_unlock(&sig_lock);
+            *exit_code = proc_request_exit_group(*exit_code);
             return -1;  /* Terminate */
         case SIG_DISP_IGN:
         case SIG_DISP_CONT:

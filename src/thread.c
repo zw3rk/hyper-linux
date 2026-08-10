@@ -53,6 +53,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
     t->guest_tid       = tid;
     t->vcpu            = vcpu;
     t->vexit           = vexit;
+    t->vcpu_valid      = 1;
     t->host_thread     = pthread_self();
     t->clear_child_tid = 0;
     t->sp_el1          = sp_el1;
@@ -134,6 +135,52 @@ void thread_deactivate(thread_entry_t *t) {
      * condvars when the slot is reused via thread_alloc(). */
 
     pthread_mutex_unlock(&thread_lock);
+}
+
+void thread_publish_vcpu(thread_entry_t *t, hv_vcpu_t vcpu,
+                         hv_vcpu_exit_t *vexit) {
+    if (!t) return;
+
+    pthread_mutex_lock(&thread_lock);
+    t->vcpu = vcpu;
+    t->vexit = vexit;
+    t->vcpu_valid = 1;
+    pthread_mutex_unlock(&thread_lock);
+}
+
+int thread_retire_vcpu(thread_entry_t *t) {
+    int retired = 0;
+    if (!t) return 0;
+
+    /* Every hv_vcpus_exit user takes this same lock through thread_for_each()
+     * or thread_interrupt_all(). Null publication and destruction must stay
+     * inside that critical section: snapshotting a handle and unlocking before
+     * hv_vcpus_exit would still allow a stale-handle race. */
+    pthread_mutex_lock(&thread_lock);
+    if (t->vcpu_valid) {
+        hv_vcpu_t vcpu = t->vcpu;
+        t->vcpu_valid = 0;
+        t->vexit = NULL;
+        HV_CHECK(hv_vcpu_destroy(vcpu));
+        retired = 1;
+    }
+    pthread_mutex_unlock(&thread_lock);
+    return retired;
+}
+
+int thread_interrupt_tid(int64_t tid) {
+    int interrupted = 0;
+    pthread_mutex_lock(&thread_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        thread_entry_t *t = &thread_table[i];
+        if (t->active && t->guest_tid == tid && t->vcpu_valid) {
+            hv_vcpus_exit(&t->vcpu, 1);
+            interrupted = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_lock);
+    return interrupted;
 }
 
 /* Resolve a guest tid to itself if (and only if) it is live, entirely under
@@ -252,7 +299,7 @@ void thread_join_workers(void) {
     int nworkers = 0;
 
     pthread_mutex_lock(&thread_lock);
-    for (int i = 0; i < MAX_THREADS; i++) {
+    for (int i = 1; i < MAX_THREADS; i++) {
         if (thread_table[i].active && &thread_table[i] != current_thread) {
             workers[nworkers].thr = thread_table[i].host_thread;
             workers[nworkers].idx = i;
@@ -280,39 +327,37 @@ void thread_join_workers(void) {
     }
 }
 
-void thread_destroy_all_vcpus(void) {
+int thread_has_active_workers(void) {
+    int found = 0;
     pthread_mutex_lock(&thread_lock);
-    for (int i = 0; i < MAX_THREADS; i++) {
-        if (thread_table[i].active && thread_table[i].vcpu) {
-            hv_vcpu_destroy(thread_table[i].vcpu);
-            thread_table[i].vcpu = 0;
-            thread_free_sp_el1_locked(thread_table[i].sp_el1);
-            thread_table[i].active = 0;
-            /* Do NOT destroy condvars — same race as thread_deactivate:
-             * a waiter woken by an earlier broadcast may still reference
-             * the condvar. Process is exiting, so the leak is harmless. */
+    for (int i = 1; i < MAX_THREADS; i++) {
+        if (thread_table[i].active) {
+            found = 1;
+            break;
         }
     }
     pthread_mutex_unlock(&thread_lock);
+    return found;
 }
 
 void thread_interrupt_all(void) {
-    /* Collect active vCPUs under the lock, then call hv_vcpus_exit
-     * outside the lock to avoid holding it during a framework call. */
+    /* Keep the lock through hv_vcpus_exit. Worker owners use the same lock
+     * while null-publishing and destroying handles, so no interrupt caller can
+     * retain a stale handle past its destruction. */
     hv_vcpu_t vcpus[MAX_THREADS];
     int count = 0;
 
     pthread_mutex_lock(&thread_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
-        if (thread_table[i].active)
+        if (thread_table[i].active && thread_table[i].vcpu_valid)
             vcpus[count++] = thread_table[i].vcpu;
     }
-    pthread_mutex_unlock(&thread_lock);
 
     /* Force all active vCPUs out of hv_vcpu_run(). Each vCPU will see
      * HV_EXIT_REASON_CANCELED and check for pending signals. */
     if (count > 0)
         hv_vcpus_exit(vcpus, (uint32_t)count);
+    pthread_mutex_unlock(&thread_lock);
 }
 
 /* ---------- Ptrace helpers ---------- */

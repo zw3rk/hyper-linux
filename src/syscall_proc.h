@@ -132,6 +132,10 @@ extern _Atomic int exit_group_requested;
  * can return the same code. */
 extern _Atomic int exit_group_code;
 
+/* Request Linux thread-group termination and wake every host wait path.
+ * The first request owns the group status; returns that preserved status. */
+int proc_request_exit_group(int code);
+
 /* ---------- vCPU run loop ---------- */
 
 /* Run the vCPU execution loop. Returns the exit code.

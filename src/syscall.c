@@ -627,6 +627,21 @@ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
                                 int prot, int flags, int fd, int64_t offset) {
     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
 
+    if (!is_anon && hl_trace_on(HL_TRACE_PROC)) {
+        int host_fd = fd_to_host(fd);
+        char host_path[LINUX_PATH_MAX] = "(unavailable)";
+        char guest_path[LINUX_PATH_MAX] = "(unmapped)";
+        if (host_fd >= 0)
+            (void)fcntl(host_fd, F_GETPATH, host_path);
+        if (hl_vfs_host_to_guest(host_path, guest_path,
+                                 sizeof(guest_path)) != 0)
+            snprintf(guest_path, sizeof(guest_path), "%s", host_path);
+        hl_trace(HL_TRACE_PROC,
+                 "mmap file va=0x%llx len=0x%llx prot=0x%x off=0x%llx path=%s",
+                 (unsigned long long)va, (unsigned long long)length, prot,
+                 (unsigned long long)offset, guest_path);
+    }
+
     /* Determine page table permissions */
     int page_perms = MEM_PERM_R;
     if (prot & LINUX_PROT_WRITE) page_perms |= MEM_PERM_W;
@@ -1137,20 +1152,6 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
     return (int64_t)guest_ipa(g, result_off);
 }
 
-/* ---------- exit_group helper ---------- */
-
-/* Callback for thread_for_each: force-exit each worker vCPU.
- * Skips the calling thread (main thread, handled by should_exit). */
-static void thread_force_exit_cb(thread_entry_t *t, void *ctx) {
-    (void)ctx;
-    /* Don't force-exit our own vCPU — we handle that via should_exit */
-    if (t == current_thread) return;
-    hv_vcpus_exit(&t->vcpu, 1);
-}
-
-/* Defined in thread.c — joins workers outside thread_lock so
- * they can call thread_deactivate() to set active=0. */
-
 /* ---------- Main dispatch ---------- */
 
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
@@ -1197,24 +1198,14 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
     case SYS_exit_group: {
         /* Terminate all threads. Set the global flag and force-exit all
          * worker vCPUs so they break out of hv_vcpu_run. */
-        exit_group_code = (int)x0;
-        exit_group_requested = 1;
-
-        /* Wake threads blocked in host poll/select/kevent so they can
-         * see exit_group_requested and exit. hv_vcpus_exit only cancels
-         * hv_vcpu_run — threads in host blocking syscalls need this. */
-        wakeup_pipe_signal();
-
-        /* Force-cancel all worker vCPUs. The main thread's vCPU is
-         * handled by the normal should_exit path below. */
-        thread_for_each(thread_force_exit_cb, NULL);
+        int group_code = proc_request_exit_group((int)x0);
 
         /* Join worker threads to allow CLONE_CHILD_CLEARTID futex wake
          * to complete before the process exits. Without this, the main
          * thread may exit before workers finish their cleanup. */
         thread_join_workers();
 
-        *exit_code = (int)x0;
+        *exit_code = group_code;
         should_exit = 1;
         break;
     }

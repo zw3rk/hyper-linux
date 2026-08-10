@@ -893,6 +893,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
     HV_CHECK(hv_vcpu_create(&vcpu, &vexit, NULL));
     g.vcpu = vcpu;
     g.exit = vexit;
+    g.vcpu_valid = 1;
 
     /* Restore system registers. For fork children, we enable the MMU
      * directly via hv_vcpu_set_sys_reg (rather than going through the
@@ -1058,6 +1059,20 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
     for (int i = 0; i < 31; i++)
         parent_gprs[i] = vcpu_get_gpr(parent_vcpu, (unsigned)i);
 
+    if (hl_trace_on(HL_TRACE_FORK)) {
+        uint64_t parent_sp = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_SP_EL0);
+        hl_trace(HL_TRACE_FORK,
+                 "clone_thread child_tid=%lld parent_sp=0x%llx child_sp=0x%llx "
+                 "elr=0x%llx x18=0x%llx x21=0x%llx x24=0x%llx",
+                 (long long)child_tid,
+                 (unsigned long long)parent_sp,
+                 (unsigned long long)child_stack,
+                 (unsigned long long)parent_elr,
+                 (unsigned long long)parent_gprs[18],
+                 (unsigned long long)parent_gprs[21],
+                 (unsigned long long)parent_gprs[24]);
+    }
+
     thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
     if (!tca) {
         thread_deactivate(t);
@@ -1163,8 +1178,7 @@ static void *thread_create_and_run(void *arg) {
         return NULL;
     }
 
-    t->vcpu  = vcpu;
-    t->vexit = vexit;
+    thread_publish_vcpu(t, vcpu, vexit);
 
     /* Copy system registers from parent (shared page tables, same MMU config) */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
@@ -1216,18 +1230,25 @@ static void *thread_create_and_run(void *arg) {
 
     vcpu_run_loop(vcpu, vexit, g, verbose, 0, 0 /* worker */);
 
-    /* CLONE_CHILD_CLEARTID: write 0 to the address and wake one waiter.
-     * This is how pthread_join works in musl — the joining thread does
-     * FUTEX_WAIT on this address until it becomes 0. */
-    if (t->clear_child_tid != 0) {
+    uint64_t clear_child_tid = t->clear_child_tid;
+    int64_t guest_tid = t->guest_tid;
+
+    /* The guest join must not complete while this worker still publishes a
+     * live HVF handle. An immediate exit_group would otherwise race
+     * hv_vcpus_exit against hv_vcpu_destroy. */
+    thread_retire_vcpu(t);
+
+    /* CLONE_CHILD_CLEARTID: write 0 to the address and wake one waiter only
+     * after the worker's vCPU handle is gone. */
+    if (clear_child_tid != 0) {
         uint32_t zero = 0;
-        if (guest_write(g, t->clear_child_tid, &zero, sizeof(zero)) == 0) {
-            futex_wake_one(g, t->clear_child_tid);
+        if (guest_write(g, clear_child_tid, &zero, sizeof(zero)) == 0) {
+            futex_wake_one(g, clear_child_tid);
         } else {
             fprintf(stderr, "hl: warning: thread tid=%lld clear_child_tid "
                     "write failed (gva=0x%llx)\n",
-                    (long long)t->guest_tid,
-                    (unsigned long long)t->clear_child_tid);
+                    (long long)guest_tid,
+                    (unsigned long long)clear_child_tid);
         }
     }
 
@@ -1235,7 +1256,6 @@ static void *thread_create_and_run(void *arg) {
         fprintf(stderr, "hl: thread tid=%lld exiting\n",
                 (long long)t->guest_tid);
 
-    hv_vcpu_destroy(vcpu);
     thread_deactivate(t);
 
     /* When all CLONE_THREAD workers have exited and only the main
@@ -1412,8 +1432,7 @@ static void *vm_clone_thread_run(void *arg) {
         return NULL;
     }
 
-    t->vcpu  = vcpu;
-    t->vexit = vexit;
+    thread_publish_vcpu(t, vcpu, vexit);
 
     /* Copy system registers from parent */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
@@ -1459,11 +1478,17 @@ static void *vm_clone_thread_run(void *arg) {
 
     int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, 0 /* worker */);
 
+    uint64_t clear_child_tid = t->clear_child_tid;
+
+    /* Retire the handle before exposing child exit through clear_child_tid or
+     * wait4. The active slot remains reserved until the parent collects it. */
+    thread_retire_vcpu(t);
+
     /* CLONE_CHILD_CLEARTID cleanup */
-    if (t->clear_child_tid != 0) {
+    if (clear_child_tid != 0) {
         uint32_t zero = 0;
-        if (guest_write(g, t->clear_child_tid, &zero, sizeof(zero)) == 0)
-            futex_wake_one(g, t->clear_child_tid);
+        if (guest_write(g, clear_child_tid, &zero, sizeof(zero)) == 0)
+            futex_wake_one(g, clear_child_tid);
     }
 
     /* Mark exit status for parent's wait4 to collect.
@@ -1479,8 +1504,7 @@ static void *vm_clone_thread_run(void *arg) {
         fprintf(stderr, "hl: vm_clone tid=%lld exiting (code=%d)\n",
                 (long long)t->guest_tid, exit_code);
 
-    /* Check if this was the last VM-clone child BEFORE destroying the
-     * vCPU — thread_interrupt_all needs valid vCPU handles. In real
+    /* Check if this was the last VM-clone child. In real
      * Linux, child exit delivers exit_signal (SIGCHLD) which interrupts
      * the parent's futex_wait with -EINTR. We simulate this by
      * requesting exit_group and interrupting all vCPUs. */
@@ -1489,24 +1513,12 @@ static void *vm_clone_thread_run(void *arg) {
     if (last_clone) {
         if (verbose)
             fprintf(stderr, "hl: last vm_clone exited, triggering exit_group\n");
-        atomic_store(&exit_group_requested, 1);
-        atomic_store(&exit_group_code, exit_code);
-        /* Interrupt all vCPUs while ours is still valid. The main
-         * thread's vCPU may be blocked in hv_vcpu_run — this forces
-         * it out so it can check exit_group_requested. Our own vCPU
-         * is not in hv_vcpu_run (loop already exited) so the exit
-         * call on it is a harmless no-op. */
-        thread_interrupt_all();
-        /* hv_vcpus_exit() only breaks a thread out of hv_vcpu_run(); it does
-         * nothing for one parked in host poll()/pselect(). Infinite
-         * ppoll/pselect6 wait with no timeout slice when the wake pipe is
-         * present, so without this nudge exit_group_requested is never
-         * observed and the process hangs forever. sys_exit_group pairs
-         * these two the same way. */
-        wakeup_pipe_signal();
+        /* The main thread may be in hv_vcpu_run or a host wait. The shared
+         * exit-group helper interrupts both paths; this retired handle is no
+         * longer included in the vCPU scan. */
+        (void)proc_request_exit_group(exit_code);
     }
 
-    hv_vcpu_destroy(vcpu);
     /* Don't deactivate yet — parent needs to wait4 to collect status.
      * The slot is freed when thread_ptrace_wait reads vm_exited. */
 

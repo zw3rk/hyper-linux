@@ -18,6 +18,7 @@
 #include "thread.h"
 #include "futex.h"
 #include "gdb_stub.h"
+#include "syscall_poll.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -76,6 +77,70 @@ _Atomic int exit_group_requested = 0;
 
 /* Exit code set by the thread that calls exit_group */
 _Atomic int exit_group_code = 0;
+
+static pthread_mutex_t exit_group_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int proc_request_exit_group(int code) {
+    pthread_mutex_lock(&exit_group_lock);
+    if (!atomic_load(&exit_group_requested)) {
+        atomic_store(&exit_group_code, code);
+        atomic_store(&exit_group_requested, 1);
+    }
+    int preserved_code = atomic_load(&exit_group_code);
+    pthread_mutex_unlock(&exit_group_lock);
+
+    wakeup_pipe_signal();
+    thread_interrupt_all();
+    return preserved_code;
+}
+
+/* Locate a guest-visible address in the region table. Rosetta aliases some
+ * low GPAs at high VAs, so guest_region_find() alone is not sufficient for
+ * fault diagnostics. */
+static const guest_region_t *find_display_region(const guest_t *g,
+                                                  uint64_t addr,
+                                                  uint64_t *display_start) {
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *region = &g->regions[i];
+        uint64_t start = region->start;
+        uint64_t size = region->end - region->start;
+
+        if (region->display_va) {
+            start = region->display_va;
+        } else {
+            for (int j = 0; j < g->naliases; j++) {
+                const guest_va_alias_t *alias = &g->va_aliases[j];
+                if (region->start >= alias->gpa_start &&
+                    region->end <= alias->gpa_start + alias->size) {
+                    start = alias->va_start +
+                            (region->start - alias->gpa_start);
+                    break;
+                }
+            }
+        }
+
+        if (addr >= start && addr < start + size) {
+            if (display_start) *display_start = start;
+            return region;
+        }
+    }
+    return NULL;
+}
+
+static void log_fault_region(const char *prefix, const guest_t *g,
+                             const char *label, uint64_t addr) {
+    uint64_t start = 0;
+    const guest_region_t *region = find_display_region(g, addr, &start);
+    if (!region) {
+        fprintf(stderr, "%s:   %s=0x%llx is not in a mapped region\n",
+                prefix, label, (unsigned long long)addr);
+        return;
+    }
+    fprintf(stderr, "%s:   %s=0x%llx maps to %s+0x%llx\n",
+            prefix, label, (unsigned long long)addr,
+            region->name[0] ? region->name : "<anonymous>",
+            (unsigned long long)(addr - start + region->offset));
+}
 
 /* ---------- Rosetta memory dump for debugging ---------- */
 
@@ -434,8 +499,7 @@ int64_t sys_ptrace(guest_t *g, uint64_t request, int64_t pid,
         if (target->ptrace_stopped)
             return 0;  /* Already stopped */
 
-        hv_vcpus_exit(&target->vcpu, 1);
-        return 0;
+        return thread_interrupt_tid(pid) ? 0 : -LINUX_ESRCH;
     }
 
     case LINUX_PTRACE_GETREGSET: {
@@ -1479,11 +1543,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                 (si_code == LINUX_SEGV_MAPERR) ? "MAPERR"
                                                                : "ACCERR";
                             uint64_t x0 = 0, x1 = 0, x2 = 0, x3 = 0;
+                            uint64_t x18 = 0, x21 = 0, x24 = 0;
                             uint64_t x29 = 0, x30 = 0, tpidr = 0, sp = 0;
                             hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
                             hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
                             hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
                             hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X18, &x18);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X21, &x21);
+                            hv_vcpu_get_reg(vcpu, HV_REG_X24, &x24);
                             hv_vcpu_get_reg(vcpu, HV_REG_X29, &x29);
                             hv_vcpu_get_reg(vcpu, HV_REG_X30, &x30);
                             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0,
@@ -1493,7 +1561,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                     "ELR=0x%llx (ESR=0x%llx FSC=0x%x) "
                                     "→ SIGSEGV/%s\n"
                                     "%s:   X0=%llx X1=%llx X2=%llx X3=%llx "
-                                    "X29=%llx X30=%llx SP=%llx TPIDR=%llx\n",
+                                    "X18=%llx X21=%llx X24=%llx X29=%llx "
+                                    "X30=%llx SP=%llx TPIDR=%llx\n",
                                     prefix, fault_type,
                                     (unsigned long long)far_addr,
                                     (unsigned long long)elr_addr,
@@ -1504,10 +1573,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                                     (unsigned long long)x1,
                                     (unsigned long long)x2,
                                     (unsigned long long)x3,
+                                    (unsigned long long)x18,
+                                    (unsigned long long)x21,
+                                    (unsigned long long)x24,
                                     (unsigned long long)x29,
                                     (unsigned long long)x30,
                                     (unsigned long long)sp,
                                     (unsigned long long)tpidr);
+                            log_fault_region(prefix, g, "ELR", elr_addr);
+                            log_fault_region(prefix, g, "X30", x30);
                         }
                     } else {
                         /* EC=0x00 (undefined instruction) or other unrecognized

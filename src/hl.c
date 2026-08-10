@@ -1239,6 +1239,7 @@ too_many_regions:
     HV_CHECK(hv_vcpu_create(&vcpu, &vexit, NULL));
     g.vcpu = vcpu;
     g.exit = vexit;
+    g.vcpu_valid = 1;
 
     if (need_rosetta) {
         /* Rosetta phase 2: kbuf dual-mapping, vDSO, fd 3, argv, proc state.
@@ -1252,7 +1253,6 @@ too_many_regions:
         if (rosetta_finalize(&g, vcpu, elf_path,
                              guest_argc, guest_argv, &rr, verbose,
                              &rosetta_argc, &rosetta_argv, &vdso_addr) < 0) {
-            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }
@@ -1271,7 +1271,6 @@ too_many_regions:
         if (sp == 0) {
             fprintf(stderr, "hl: failed to build initial stack\n");
             vdso_publisher_stop();
-            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }
@@ -1288,7 +1287,6 @@ too_many_regions:
             free(guest_env_owned);
             for (int k = 0; k < n_owned_env; k++)
                 free(owned_env_vars[k]);
-            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }
@@ -1306,7 +1304,6 @@ too_many_regions:
             for (int k = 0; k < n_owned_env; k++)
                 free(owned_env_vars[k]);
             vdso_publisher_stop();
-            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }
@@ -1429,7 +1426,6 @@ too_many_regions:
     if (gdb_port > 0 && !need_rosetta) {
         if (gdb_stub_init(gdb_port, &g) < 0) {
             fprintf(stderr, "hl: failed to initialize GDB stub\n");
-            hv_vcpu_destroy(vcpu);
             guest_destroy(&g);
             return 1;
         }

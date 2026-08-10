@@ -33,7 +33,7 @@
  */
 #include "guest.h"
 #include "syscall_internal.h"  /* hl_verbose */
-#include "thread.h"            /* thread_destroy_all_vcpus */
+#include "thread.h"            /* synchronized vCPU ownership */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -595,13 +595,22 @@ int guest_host_to_gpa(const guest_t *g, const void *ptr, uint64_t *out_gpa) {
 }
 
 void guest_destroy(guest_t *g) {
-    /* Destroy all worker vCPUs (thread table) before tearing down the VM.
-     * This prevents hv_vm_destroy from racing with active vCPUs that may
-     * still be running if thread join timed out during exit_group. */
-    thread_destroy_all_vcpus();
-    if (g->vcpu) {
-        hv_vcpu_destroy(g->vcpu);
+    /* Never tear down a VM beneath a worker that missed the bounded join in
+     * exit_group. Returning lets normal process exit reclaim the address
+     * space without cross-thread HVF destruction or guest-memory UAF. */
+    if (thread_has_active_workers()) {
+        fprintf(stderr, "hl: worker teardown incomplete; leaving VM cleanup "
+                        "to process exit\n");
+        return;
+    }
+    if (g->vcpu_valid) {
+        thread_entry_t *main_thread = current_thread;
+        if (!thread_retire_vcpu(main_thread))
+            hv_vcpu_destroy(g->vcpu);
+        g->vcpu_valid = 0;
         g->vcpu = 0;
+        if (main_thread)
+            thread_deactivate(main_thread);
     }
     /* Unmap overflow segments before VM teardown (hv_vm_unmap requires
      * the VM to still exist). Host munmap is safe regardless. */

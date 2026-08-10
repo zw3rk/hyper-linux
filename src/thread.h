@@ -29,6 +29,7 @@ typedef struct {
     int64_t       guest_tid;       /* Linux TID (unique per thread) */
     hv_vcpu_t     vcpu;            /* HVF vCPU handle for this thread */
     hv_vcpu_exit_t *vexit;         /* vCPU exit info pointer */
+    int           vcpu_valid;      /* Handle is published; zero is valid */
     pthread_t     host_thread;     /* macOS host thread running this vCPU */
     uint64_t      clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
     uint64_t      sp_el1;          /* Per-thread EL1 stack top (IPA) */
@@ -108,6 +109,18 @@ thread_entry_t *thread_alloc(int64_t tid);
 /* Mark a thread as inactive and release its table slot. */
 void thread_deactivate(thread_entry_t *t);
 
+/* Publish a newly created vCPU under the table lock. A handle value of zero is
+ * valid, so ownership is tracked separately by vcpu_valid. */
+void thread_publish_vcpu(thread_entry_t *t, hv_vcpu_t vcpu,
+                         hv_vcpu_exit_t *vexit);
+
+/* Remove a published vCPU from the shared table and destroy it while holding
+ * the table lock. Returns non-zero when it retired a live handle. */
+int thread_retire_vcpu(thread_entry_t *t);
+
+/* Interrupt a live thread by guest TID under the ownership lock. */
+int thread_interrupt_tid(int64_t tid);
+
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);
 /* Lock-safe tid lookup: returns tid if live, else 0. Prefer this when only
@@ -144,9 +157,8 @@ int thread_count_active_vm_clones(void);
  * Threads still alive after ~50ms are detached (process is exiting). */
 void thread_join_workers(void);
 
-/* Destroy all active worker vCPUs. Called during guest_destroy to
- * ensure no vCPUs remain active before hv_vm_destroy(). */
-void thread_destroy_all_vcpus(void);
+/* True while any non-main thread-table slot remains active. */
+int thread_has_active_workers(void);
 
 /* Interrupt all active vCPUs by calling hv_vcpus_exit().
  * Used for signal preemption: when a signal is queued while a vCPU

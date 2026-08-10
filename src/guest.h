@@ -221,6 +221,7 @@ typedef struct guest {
     int         need_tlbi;    /* Signal shim to flush TLB after page table changes */
     hv_vcpu_t   vcpu;         /* vCPU handle */
     hv_vcpu_exit_t *exit;     /* vCPU exit info */
+    int         vcpu_valid;   /* vCPU was created; handle zero is valid */
     /* VA alias mappings for non-identity regions (e.g., rosetta at 128TB
      * mapped to low GPA in primary buffer). Used by gva_resolve() for
      * syscall handlers that need to access guest memory by VA. */
