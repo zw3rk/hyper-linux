@@ -129,8 +129,16 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
 
 static inline long raw_clone(unsigned long flags, void *child_stack,
                              int *ptid, unsigned long tls, int *ctid) {
+#if defined(__aarch64__)
     return raw_syscall6(__NR_clone, (long)flags, (long)child_stack,
                         (long)ptid, (long)tls, (long)ctid, 0);
+#elif defined(__x86_64__)
+    /* x86_64 orders clone's final two arguments as ctid, tls. */
+    return raw_syscall6(__NR_clone, (long)flags, (long)child_stack,
+                        (long)ptid, (long)ctid, (long)tls, 0);
+#else
+#error "Unsupported architecture"
+#endif
 }
 
 static inline long raw_futex_wait(int *addr, int val) {
