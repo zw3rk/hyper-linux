@@ -57,10 +57,8 @@ find_bin() {
 # The HL_ARGS variable can be set per-section (e.g. "--sysroot /path") and
 # is expanded into the hl command line before the binary path.
 #
-# If the process is killed by timeout but produced matching output, the
-# test still passes (with a "timeout" note). This handles programs like
-# pandoc under rosetta that produce correct output but hang on GHC RTS
-# shutdown due to JIT timing issues.
+# Successful output is not enough: the guest must also exit with status 0.
+# In particular, a timeout after producing output is a shutdown failure.
 run_check() {
     local label="$1"; shift
     local bin="$1"; shift
@@ -81,12 +79,8 @@ run_check() {
         rc=$?
     fi
 
-    if echo "$output" | grep -qE "$pattern"; then
-        if [ "$rc" = "124" ]; then
-            printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET} (timeout, output ok)\n" "$name"
-        else
-            printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
-        fi
+    if [ "$rc" = "0" ] && echo "$output" | grep -qE "$pattern"; then
+        printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
         pass=$((pass + 1))
     elif [ "$rc" = "124" ]; then
         printf "${YELLOW}▸${RESET} %s ${RED}✗ FAIL${RESET} (timeout after %ds)\n" "$name" "$TEST_TIMEOUT"
@@ -98,8 +92,7 @@ run_check() {
     fi
 }
 
-# Run a test with piped stdin. Same timeout-with-output-match logic
-# as run_check: passes if output matches even if killed by timeout.
+# Run a test with piped stdin. The guest must exit with status 0.
 run_pipe() {
     local label="$1"; shift
     local bin="$1"; shift
@@ -121,12 +114,8 @@ run_pipe() {
         rc=$?
     fi
 
-    if echo "$output" | grep -qE "$pattern"; then
-        if [ "$rc" = "124" ]; then
-            printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET} (timeout, output ok)\n" "$name"
-        else
-            printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
-        fi
+    if [ "$rc" = "0" ] && echo "$output" | grep -qE "$pattern"; then
+        printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
         pass=$((pass + 1))
     elif [ "$rc" = "124" ]; then
         printf "${YELLOW}▸${RESET} %s ${RED}✗ FAIL${RESET} (timeout after %ds)\n" "$name" "$TEST_TIMEOUT"

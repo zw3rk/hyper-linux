@@ -49,6 +49,19 @@ check_file_contains() {
     fi
 }
 
+check_file_not_contains() {
+    name=$1
+    file=$2
+    needle=$3
+    if grep -Fq -- "$needle" "$file"; then
+        printf '  FAIL %s: %s contains %s\n' \
+            "$name" "$file" "$needle" >&2
+        failures=$((failures + 1))
+    else
+        printf '  PASS %s\n' "$name"
+    fi
+}
+
 release_parse_version v0.2.4
 check_eq 'stable major' 0 "$RELEASE_MAJOR"
 check_eq 'stable minor' 2 "$RELEASE_MINOR"
@@ -116,6 +129,8 @@ check_file_contains 'release host gate uses full guest shell' \
     'timeout 900 nix develop -c make clean hl test-host-units'
 check_file_contains 'clean removes cloexec regular fixture' \
     "$ROOT/Makefile" 'rm -f cloexec-plain'
+check_file_not_contains 'Haskell tests reject timed-out output' \
+    "$ROOT/test/test-haskell-bins.sh" 'timeout, output ok'
 
 # Build a disposable project plus deterministic gh/git mocks.  This runs the
 # real publisher end-to-end without touching a repository, network, or tap.
