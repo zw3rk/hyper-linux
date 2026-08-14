@@ -71,6 +71,8 @@
   instead of silently succeeding
 - Redact every sensitive-path occurrence in traces/crash reports and preserve
   the host environment on allocation failure
+- Hand off contended PI-futex ownership directly and retain the waiter flag,
+  preventing Rosetta/GHC shutdown from stranding a second queued waiter
 
 ### Notes
 - CLI defaults: `--fs-mode=rooted`, bind `$HOME:/home/user`, `--guest-cwd /home/user`,
