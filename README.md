@@ -1,13 +1,13 @@
 # hl — Run Linux ELF Binaries on macOS Apple Silicon
 
-`hl` core only. AppKit X is in its public sibling repository. The examples
-repository is still being prepared for public release:
+`hl` core only. AppKit X and runnable applications live in public sibling
+repositories:
 
 | Repo | Role |
 |------|------|
 | [zw3rk/hyper-linux](https://github.com/zw3rk/hyper-linux) | **This** — runtime |
 | [zw3rk/hyper-linux-x11](https://github.com/zw3rk/hyper-linux-x11) | AppKit-origin X |
-| `zw3rk/hyper-linux-examples` (publication pending) | XMMS demo |
+| [zw3rk/hyper-linux-examples](https://github.com/zw3rk/hyper-linux-examples) | XMMS demo |
 
 The pre-split monorepo is preserved by tag `split-base-2026-07-30`.
 
