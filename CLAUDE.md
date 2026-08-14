@@ -164,24 +164,33 @@ and a Haskell hello-hyper test — per mode.
 Quick unit-only tests (subset of the full matrix):
 ```
 nix develop -c make test-all       # aarch64 unit tests (40 tests)
-nix develop -c make test-x64-all   # x86_64 unit tests (35+5 xfail)
+nix develop -c make test-x64-all   # x86_64 unit tests + 5 bounded XFAIL probes
 ```
 
-### Expected Results (M2, as of commit 9b6505a)
+### Expected matrix policy
 
-| Mode | Pass | Fail | Timeout | Notes |
-|------|------|------|---------|-------|
-| hl-aarch64 | 204 | 0 | 0 | Clean |
-| hl-x64 | 200 | 1 | 2 | Known rosetta limitations |
-| lima-aarch64 | 201 | 1 | 2 | lima-specific test-poll |
-| lima-x64 | 199 | 2 | 2 | rosetta + lima test-poll |
+No current full-matrix pass totals are recorded. Run the matrix before quoting
+new totals; do not reuse the old M2 counts. The stable policy is:
 
-### Known Failures (not regressions)
+| Mode | Expected failures |
+|------|-------------------|
+| hl-aarch64 | none |
+| lima-aarch64 | none |
+| hl-x64 | the five Rosetta XFAILs below |
+| lima-x64 | the same five Rosetta XFAILs below |
 
-- **test-signal-thread** (x64): SA_RESETHAND not reset — rosetta shadows
-  signal state internally. Also fails in Lima VM.
-- **test-thread, test-stress** (x64): TLS=0 hang — rosetta limitation.
-- **test-poll** (lima only): lima-specific, passes in hl modes.
+The shared policy is `test/rosetta-xfails.sh`. It records:
+
+- `test-signal` and `test-signal-thread`: Rosetta does not reset
+  `SA_RESETHAND` state as these Linux tests expect.
+- `test-thread`, `test-stress`, and `test-futex-pi`: the raw
+  `clone(CLONE_THREAD)` paths hang under Rosetta.
+
+The x64 runners execute these tests under a short bound. The expected exit 1
+exit or guest timeout is XFAIL. A passing test is XPASS and fails the gate so
+the policy must be reviewed. All other failures, guest timeouts, transport
+timeouts, and XPASS results make the matrix exit nonzero. Aarch64 modes execute
+all five as normal tests, and `test-pthread` is a normal test in every mode.
 
 ## Dynamic Linking
 

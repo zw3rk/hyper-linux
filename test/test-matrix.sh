@@ -9,7 +9,10 @@
 
 set -euo pipefail
 
-MODE="${1:?Usage: $0 <hl-aarch64|hl-x64|lima-aarch64|lima-x64|all>}"
+MODE="${1:-}"
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=rosetta-xfails.sh
+source "$SCRIPT_DIR/rosetta-xfails.sh"
 
 # ── Paths (all from environment, typically set by flake.nix) ──────
 HL="${HL:-_build/hl}"
@@ -56,7 +59,12 @@ pass=0
 fail=0
 skip=0
 timeout_count=0
+xfail=0
+xpass=0
+CURRENT_MODE=""
 HL_MATRIX_FLAGS=${HL_MATRIX_FLAGS:---fs-mode=legacy --audio-backend null}
+SIGNAL_SUCCESS_PATTERN='^test-signal: all tests passed — PASS$'
+LIMA_GUEST_TIMEOUT_RC=125
 
 # Test fixture directory — must be accessible from the runner's context.
 # For hl modes, a local macOS temp dir works fine.
@@ -70,13 +78,34 @@ setup_fixtures() {
     case "$mode" in
         lima-*)
             # Create temp dir inside the Lima VM and populate fixtures there.
-            _lima_tmpdir=$("$LIMACTL" shell "$LIMA_VM" -- mktemp -d /tmp/test-matrix.XXXXXX 2>/dev/null)
+            if ! _lima_tmpdir=$(run_lima_control mktemp -d \
+                /tmp/test-matrix.XXXXXX 2>/dev/null); then
+                printf 'error: could not create Lima fixture directory\n' >&2
+                return 1
+            fi
+            case "$_lima_tmpdir" in
+                /tmp/test-matrix.*) ;;
+                *)
+                    printf 'error: invalid Lima fixture directory: %s\n' \
+                        "${_lima_tmpdir:-<empty>}" >&2
+                    _lima_tmpdir=""
+                    return 1
+                    ;;
+            esac
             TEST_TMPDIR="$_lima_tmpdir"
-            "$LIMACTL" shell "$LIMA_VM" -- sh -c "
-                echo 'hello world' > '$TEST_TMPDIR/hello.txt'
-                printf 'cherry\napple\nbanana\n' > '$TEST_TMPDIR/unsorted.txt'
-                printf 'line1\nline2\nline3\nline4\nline5\n' > '$TEST_TMPDIR/lines.txt'
-            " 2>/dev/null
+            if ! run_lima_control sh -c '
+                dir=$1
+                printf "hello world\n" >"$dir/hello.txt"
+                printf "cherry\napple\nbanana\n" >"$dir/unsorted.txt"
+                printf "line1\nline2\nline3\nline4\nline5\n" >"$dir/lines.txt"
+                test -s "$dir/hello.txt" &&
+                    test -s "$dir/unsorted.txt" &&
+                    test -s "$dir/lines.txt"
+            ' sh "$TEST_TMPDIR" 2>/dev/null; then
+                printf 'error: could not populate Lima fixtures in %s\n' \
+                    "$TEST_TMPDIR" >&2
+                return 1
+            fi
             ;;
         *)
             # Local macOS temp dir — accessible by hl directly.
@@ -90,7 +119,7 @@ setup_fixtures() {
 
 cleanup_fixtures() {
     if [ -n "$_lima_tmpdir" ]; then
-        "$LIMACTL" shell "$LIMA_VM" -- rm -rf "$_lima_tmpdir" 2>/dev/null || true
+        run_lima_control rm -rf "$_lima_tmpdir" 2>/dev/null || true
         _lima_tmpdir=""
     fi
     if [ -n "$TEST_TMPDIR" ] && [ -d "$TEST_TMPDIR" ]; then
@@ -99,20 +128,40 @@ cleanup_fixtures() {
     TEST_TMPDIR=""
 }
 
-trap 'cleanup_fixtures' EXIT
-
 # ── Runners ───────────────────────────────────────────────────────
+
+run_lima_control() {
+    timeout --kill-after=2 "${LIMA_CONTROL_TIMEOUT:-30}" \
+        "$LIMACTL" shell --start "$LIMA_VM" -- "$@"
+}
 
 # Run binary via hl, with timeout (stderr suppressed to avoid hl debug noise)
 run_hl() {
+    local case_timeout="${MATRIX_CASE_TIMEOUT:-30}"
     # Intentional splitting of the operator-supplied flag list.
     # shellcheck disable=SC2086
-    timeout 30 "$HL" $HL_MATRIX_FLAGS "$@" 2>/dev/null
+    timeout --kill-after=2 "$case_timeout" \
+        "$HL" $HL_MATRIX_FLAGS "$@" 2>/dev/null
 }
 
-# Run binary directly in Lima VM (stderr suppressed to avoid limactl warnings)
+# Run inside Lima with a guest timeout and a longer transport timeout. Inner
+# timeout status 125 is distinct from host timeout status 124, so an SSH hang
+# cannot satisfy an expected guest-timeout policy.
 run_lima() {
-    timeout 60 "$LIMACTL" shell "$LIMA_VM" -- "$@" 2>/dev/null
+    local guest_timeout="${MATRIX_CASE_TIMEOUT:-60}"
+    local transport_timeout="${LIMA_TRANSPORT_TIMEOUT:-$((guest_timeout + 15))}"
+    timeout --kill-after=2 "$transport_timeout" \
+        "$LIMACTL" shell --start "$LIMA_VM" -- sh -c '
+            guest_timeout=$1
+            timeout_status=$2
+            shift 2
+            timeout --kill-after=2 "$guest_timeout" "$@"
+            rc=$?
+            if [ "$rc" -eq 124 ]; then
+                exit "$timeout_status"
+            fi
+            exit "$rc"
+        ' sh "$guest_timeout" "$LIMA_GUEST_TIMEOUT_RC" "$@" 2>/dev/null
 }
 
 # Run binary via hl with --sysroot.  Uses global _SYSROOT for the sysroot
@@ -129,8 +178,35 @@ run_hl_sysroot() {
         sysroot_args="--sysroot $_SYSROOT"
     fi
     # shellcheck disable=SC2086
-    timeout "$_HL_TIMEOUT" "$HL" $HL_MATRIX_FLAGS $sysroot_args \
+    timeout --kill-after=2 "$_HL_TIMEOUT" "$HL" $HL_MATRIX_FLAGS $sysroot_args \
         "$bin" $_GUEST_EXTRA "$@" 2>/dev/null
+}
+
+matrix_reset_counts() {
+    pass=0
+    fail=0
+    skip=0
+    timeout_count=0
+    xfail=0
+    xpass=0
+}
+
+matrix_result() {
+    [ "$fail" -eq 0 ] && [ "$timeout_count" -eq 0 ] && [ "$xpass" -eq 0 ]
+}
+
+is_expected_timeout_status() {
+    case "$CURRENT_MODE" in
+        lima-*) [ "$1" -eq "$LIMA_GUEST_TIMEOUT_RC" ] ;;
+        *) [ "$1" -eq 124 ] ;;
+    esac
+}
+
+is_any_timeout_status() {
+    case "$CURRENT_MODE" in
+        lima-*) [ "$1" -eq 124 ] || [ "$1" -eq "$LIMA_GUEST_TIMEOUT_RC" ] ;;
+        *) [ "$1" -eq 124 ] ;;
+    esac
 }
 
 # Generic test: run binary, check output contains pattern
@@ -141,21 +217,64 @@ test_check() {
     local name
     name=$(printf "%-28s" "$label")
 
+    local expected_kind="" reason=""
+    case "$CURRENT_MODE" in
+        *-x64)
+            if expected_kind=$(rosetta_xfail_kind "$label"); then
+                reason=$(rosetta_xfail_reason "$label")
+            fi
+            ;;
+    esac
+
     local output rc
-    if output=$($runner "$@"); then
+    if [ -n "$expected_kind" ]; then
+        if output=$(MATRIX_CASE_TIMEOUT="${MATRIX_XFAIL_TIMEOUT:-10}" \
+            $runner "$@"); then
+            rc=0
+        else
+            rc=$?
+        fi
+    elif output=$($runner "$@"); then
         rc=0
     else
         rc=$?
     fi
 
-    # timeout returns 124
-    if [ "$rc" = "124" ]; then
+    local output_matches=0
+    if grep -qE "$pattern" <<<"$output"; then
+        output_matches=1
+    fi
+
+    if [ -n "$expected_kind" ]; then
+        if [ "$rc" -eq 0 ] && [ "$output_matches" -eq 1 ]; then
+            printf "${YELLOW}▸${RESET} %s ${RED}✗ XPASS${RESET} (%s)\n" \
+                "$name" "$reason"
+            xpass=$((xpass + 1))
+            fail=$((fail + 1))
+            return
+        fi
+        if [ "$expected_kind" = failure ] && [ "$rc" -eq 1 ]; then
+            printf "${YELLOW}▸${RESET} %s ${BLUE}⊘ XFAIL${RESET} (%s)\n" \
+                "$name" "$reason"
+            xfail=$((xfail + 1))
+            return
+        fi
+        if [ "$expected_kind" = timeout ] &&
+            is_expected_timeout_status "$rc"; then
+            printf "${YELLOW}▸${RESET} %s ${BLUE}⊘ XFAIL${RESET} (%s)\n" \
+                "$name" "$reason"
+            xfail=$((xfail + 1))
+            return
+        fi
+    fi
+
+    if is_any_timeout_status "$rc"; then
         printf "${YELLOW}▸${RESET} %s ${CYAN}⏱ TIMEOUT${RESET}\n" "$name"
         timeout_count=$((timeout_count + 1))
         return
     fi
 
-    if echo "$output" | grep -qE "$pattern"; then
+    if [ "$rc" -eq 0 ] && [ "$output_matches" -eq 1 ]; then
         printf "${YELLOW}▸${RESET} %s ${GREEN}✓ PASS${RESET}\n" "$name"
         pass=$((pass + 1))
     else
@@ -180,7 +299,7 @@ test_rc() {
         rc=$?
     fi
 
-    if [ "$rc" = "124" ]; then
+    if is_any_timeout_status "$rc"; then
         printf "${YELLOW}▸${RESET} %s ${CYAN}⏱ TIMEOUT${RESET}\n" "$name"
         timeout_count=$((timeout_count + 1))
         return
@@ -212,7 +331,7 @@ test_pipe() {
         rc=$?
     fi
 
-    if [ "$rc" = "124" ]; then
+    if is_any_timeout_status "$rc"; then
         printf "${YELLOW}▸${RESET} %s ${CYAN}⏱ TIMEOUT${RESET}\n" "$name"
         timeout_count=$((timeout_count + 1))
         return
@@ -257,7 +376,7 @@ run_unit_tests() {
     test_check "$runner" "test-cloexec"       "PASS"            "$bindir/test-cloexec"
 
     printf "\n${BLUE}── Signal tests ──${RESET}\n"
-    test_check "$runner" "test-signal"        "PASS|0 failed"   "$bindir/test-signal"
+    test_check "$runner" "test-signal"        "$SIGNAL_SUCCESS_PATTERN" "$bindir/test-signal"
     test_check "$runner" "test-signal-thread" "PASS|0 failed"   "$bindir/test-signal-thread"
     test_check "$runner" "test-sigill"        "0 failed"        "$bindir/test-sigill"
 
@@ -495,14 +614,14 @@ run_suite() {
 
     # Create test fixtures in a location accessible to the runner.
     cleanup_fixtures
-    setup_fixtures "$mode"
+    setup_fixtures "$mode" || return 1
 
     case "$mode" in
         hl-aarch64|lima-aarch64)
-            [ -z "$AARCH64_TEST_BIN" ] && { echo "error: set GUEST_TEST_BINARIES, GUEST_COREUTILS, GUEST_BUSYBOX, GUEST_STATIC_BINS"; exit 1; }
+            [ -z "$AARCH64_TEST_BIN" ] && { echo "error: set GUEST_TEST_BINARIES, GUEST_COREUTILS, GUEST_BUSYBOX, GUEST_STATIC_BINS"; return 1; }
             ;;&
         hl-x64|lima-x64)
-            [ -z "$X64_TEST_BIN" ] && { echo "error: set GUEST_X64_TEST_BINARIES, GUEST_X64_COREUTILS, GUEST_X64_BUSYBOX, GUEST_X64_STATIC_BINS"; exit 1; }
+            [ -z "$X64_TEST_BIN" ] && { echo "error: set GUEST_X64_TEST_BINARIES, GUEST_X64_COREUTILS, GUEST_X64_BUSYBOX, GUEST_X64_STATIC_BINS"; return 1; }
             ;;&
         hl-aarch64)
             runner="run_hl"
@@ -566,7 +685,7 @@ run_suite() {
             ;;
         *)
             echo "Unknown mode: $mode"
-            exit 1
+            return 1
             ;;
     esac
 
@@ -574,7 +693,8 @@ run_suite() {
     printf "${CYAN}  Testing: %s${RESET}\n" "$mode"
     printf "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n\n"
 
-    pass=0; fail=0; skip=0; timeout_count=0
+    CURRENT_MODE="$mode"
+    matrix_reset_counts
 
     printf "${BLUE}═══ Unit tests ═══${RESET}\n"
     run_unit_tests "$runner" "$test_bin"
@@ -629,20 +749,32 @@ run_suite() {
     # Reset runner globals
     _SYSROOT=""; _HL_TIMEOUT=30; _GUEST_EXTRA=""
 
-    printf "\n${CYAN}━━━ %s Results: %d passed, %d failed, %d timeout, %d skipped ━━━${RESET}\n\n" \
-        "$mode" "$pass" "$fail" "$timeout_count" "$skip"
+    printf "\n${CYAN}━━━ %s Results: %d passed, %d failed, %d timeout, %d xfail, %d xpass, %d skipped ━━━${RESET}\n\n" \
+        "$mode" "$pass" "$fail" "$timeout_count" "$xfail" "$xpass" "$skip"
 
-    return "$fail"
+    matrix_result
 }
 
 # ── Main ──────────────────────────────────────────────────────────
-total_fail=0
+main() {
+    if [ -z "$MODE" ]; then
+        printf 'Usage: %s <hl-aarch64|hl-x64|lima-aarch64|lima-x64|all>\n' \
+            "$0" >&2
+        return 2
+    fi
 
-if [ "$MODE" = "all" ]; then
-    for m in hl-aarch64 hl-x64 lima-aarch64 lima-x64; do
-        run_suite "$m" || total_fail=$((total_fail + $?))
-    done
-    exit "$total_fail"
-else
+    trap 'cleanup_fixtures' EXIT
+
+    local total_fail=0
+    if [ "$MODE" = all ]; then
+        for m in hl-aarch64 hl-x64 lima-aarch64 lima-x64; do
+            run_suite "$m" || total_fail=1
+        done
+        return "$total_fail"
+    fi
     run_suite "$MODE"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

@@ -22,7 +22,7 @@
        test-full \
        test-matrix test-matrix-hl-aarch64 test-matrix-hl-x64 \
        test-matrix-lima-aarch64 test-matrix-lima-x64 \
-       test-host-units test-page-table-pool test-release-plumbing \
+       test-host-units test-page-table-pool test-release-plumbing test-matrix-policy \
        lint analyze format shellcheck lint-actions \
        site site-serve release-interactive help
 
@@ -449,8 +449,12 @@ test-page-table-pool: | $(BUILD_DIR)
 		-framework Hypervisor -lpthread
 	$(BUILD_DIR)/test-page-table-pool
 
+## Run fast matrix policy and Lima runner regression tests
+test-matrix-policy:
+	@bash test/test-matrix-policy.sh
+
 ## Run deterministic release version/artifact regression tests
-test-release-plumbing:
+test-release-plumbing: test-matrix-policy
 	@sh test/test-release-plumbing.sh
 
 # ── Coreutils integration test ───────────────────────────────────
@@ -615,6 +619,7 @@ X64_TEST_DIR ?= $(GUEST_X64_TEST_BINARIES)/bin
 X64_COREUTILS_BIN ?= $(GUEST_X64_COREUTILS)/bin
 X64_BUSYBOX_BIN ?= $(GUEST_X64_BUSYBOX)/bin/busybox
 X64_TEST_FLAGS ?= --fs-mode=legacy --audio-backend null
+X64_XFAIL_TIMEOUT ?= 10
 X64_HL = $(BUILD_DIR)/hl $(X64_TEST_FLAGS)
 
 ## Run x86_64 assembly hello world via rosetta
@@ -633,7 +638,8 @@ test-x64-all: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@printf "\n$(BLUE)━━━ Running x86_64 test suite (via rosetta) ━━━$(RESET)\n\n"
-	@pass=0; fail=0; xfail=0; \
+	@. test/rosetta-xfails.sh; \
+	pass=0; fail=0; xfail=0; xpass=0; \
 	run_test() { \
 		name=""; \
 		for a in "$$@"; do \
@@ -662,10 +668,29 @@ test-x64-all: $(BUILD_DIR)/hl
 			fi; \
 		fi; \
 	}; \
-	run_xfail() { \
-		name=$$1; reason=$$2; \
-		printf "$(YELLOW)▸ %-20s$(RESET) $(BLUE)⊘ XFAIL$(RESET) (%s)\n" "$$name" "$$reason"; \
-		xfail=$$((xfail + 1)); \
+	run_rosetta_test() { \
+		name=$$1; shift; \
+		kind=$$(rosetta_xfail_kind "$$name") || { run_test "$$@"; return; }; \
+		reason=$$(rosetta_xfail_reason "$$name"); \
+		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
+		if output=$$(timeout --kill-after=2 $(X64_XFAIL_TIMEOUT) "$$@" 2>&1); then \
+			printf "$(RED)✗ XPASS$(RESET) (%s)\n" "$$reason"; \
+			xpass=$$((xpass + 1)); fail=$$((fail + 1)); \
+		else \
+			rc=$$?; \
+			if { [ "$$kind" = failure ] && [ "$$rc" -eq 1 ]; } || \
+			   { [ "$$kind" = timeout ] && [ "$$rc" -eq 124 ]; }; then \
+				printf "$(BLUE)⊘ XFAIL$(RESET) (%s)\n" "$$reason"; \
+				xfail=$$((xfail + 1)); \
+			elif [ "$$rc" -eq 124 ]; then \
+				printf "$(RED)✗ FAIL$(RESET) (unexpected timeout; expected %s)\n" "$$kind"; \
+				fail=$$((fail + 1)); \
+			else \
+				printf "$(RED)✗ FAIL$(RESET) (exit $$rc; expected %s)\n" "$$kind"; \
+				printf "  %s\n" "$$output" | head -5; \
+				fail=$$((fail + 1)); \
+			fi; \
+		fi; \
 	}; \
 	printf "$(BLUE)── Assembly tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-hello; \
@@ -687,7 +712,7 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork-exec $(X64_TEST_DIR)/echo-test exec-works; \
 	printf "\n$(BLUE)── Signal tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-signal "rosetta: SA_RESETHAND not reset (also fails in Lima, 3/4 subtests pass)"; \
+	run_rosetta_test test-signal $(X64_HL) $(X64_TEST_DIR)/test-signal; \
 	printf "\n$(BLUE)── Socket tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests (x86_64) ──$(RESET)\n"; \
@@ -705,14 +730,14 @@ test-x64-all: $(BUILD_DIR)/hl
 	printf "\n$(BLUE)── Network tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-thread "rosetta: raw clone(CLONE_THREAD) hangs (also hangs in Lima)"; \
+	run_rosetta_test test-thread $(X64_HL) $(X64_TEST_DIR)/test-thread; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)── Stress tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-stress "rosetta: raw clone hangs (also hangs in Lima)"; \
+	run_rosetta_test test-stress $(X64_HL) $(X64_TEST_DIR)/test-stress; \
 	printf "\n$(BLUE)── Negative / error-path tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-negative; \
 	printf "\n$(BLUE)── Signal + thread tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-signal-thread "rosetta: SA_RESETHAND not reset (also fails in Lima, 4/5 subtests pass)"; \
+	run_rosetta_test test-signal-thread $(X64_HL) $(X64_TEST_DIR)/test-signal-thread; \
 	printf "\n$(BLUE)── O_CLOEXEC tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-cloexec; \
 	printf "\n$(BLUE)── Guard page / mmap edge cases (x86_64) ──$(RESET)\n"; \
@@ -724,14 +749,14 @@ test-x64-all: $(BUILD_DIR)/hl
 	printf "\n$(BLUE)── COW fork isolation tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── PI futex + EINTR regression tests (x86_64) ──$(RESET)\n"; \
-	run_xfail test-futex-pi "rosetta: raw clone(CLONE_THREAD) in dead-owner test hangs"; \
+	run_rosetta_test test-futex-pi $(X64_HL) $(X64_TEST_DIR)/test-futex-pi; \
 	printf "\n$(BLUE)── Directed signal (tkill/tgkill) tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-sigill; \
 	printf "\n$(BLUE)── X11 raw protocol tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-x11; \
-	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail ━━━$(RESET)\n"; \
+	printf "\n$(BLUE)━━━ x86_64 Results: $$pass passed, $$fail failed, $$xfail xfail, $$xpass xpass ━━━$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
 ## Run the x86_64 suite in the shipped default rooted filesystem mode

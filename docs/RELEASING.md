@@ -20,6 +20,11 @@ identical. Push only the reviewed branch and the explicit new tag.
    timeout 900 nix build
    ```
 
+   The matrix permits only the five bounded Rosetta outcomes declared in
+   `test/rosetta-xfails.sh`. Any other failure or timeout, or an XPASS that
+   makes the policy stale, fails the gate. Current full-matrix pass totals must
+   come from the release run; no current total is asserted in this document.
+
 4. Push the reviewed commit without a release tag and require green public CI.
 
 ## Build a draft
