@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 int passes = 0, fails = 0;
 
@@ -147,6 +148,8 @@ static void test_many_regions(void) {
 static void test_fd_exhaustion(void) {
     TEST("FD exhaustion (EMFILE)");
 
+    struct rlimit nofile = {0};
+    int have_limit = getrlimit(RLIMIT_NOFILE, &nofile) == 0;
     int fds[1024];
     int opened = 0;
 
@@ -179,15 +182,29 @@ static void test_fd_exhaustion(void) {
     /* Clean up all FDs */
     for (int i = 0; i < opened; i++) close(fds[i]);
 
-    /* We expect to have opened at least 500 FDs and eventually
-     * hit the limit (EMFILE). If the table is 1024 entries, then
-     * 512 pipe() calls = 1024 FDs, minus stdin/stdout/stderr. */
-    if (opened >= 500 && got_error)
-        PASS();
-    else if (opened >= 500)
-        PASS(); /* Opened many even if didn't hit exact limit */
-    else
-        FAIL("too few FDs opened before exhaustion");
+    /* The guest table has 1024 entries, while hosted execution can have a
+     * lower RLIMIT_NOFILE (macOS commonly supplies 256). Allow a small number
+     * of descriptors already held by the process, but require allocation to
+     * approach the smaller real boundary. A high-limit native Linux run is
+     * intentionally capped by this fixture's 1024-entry fds array. */
+    unsigned long long effective_limit = 1024;
+    if (have_limit && nofile.rlim_cur != RLIM_INFINITY &&
+        nofile.rlim_cur < effective_limit)
+        effective_limit = (unsigned long long)nofile.rlim_cur;
+    unsigned long long minimum = effective_limit > 16
+                               ? effective_limit - 16 : 0;
+
+    if ((unsigned long long)opened >= minimum) {
+        printf("OK (%d FDs opened; soft limit %llu%s)\n", opened,
+               have_limit ? (unsigned long long)nofile.rlim_cur : 0,
+               got_error ? "; exhausted" : "");
+        passes++;
+    } else {
+        printf("FAIL: opened %d FDs; expected at least %llu "
+               "(soft limit %llu)\n", opened, minimum,
+               have_limit ? (unsigned long long)nofile.rlim_cur : 0);
+        fails++;
+    }
 }
 
 /* ---------- Test 5: Rapid mprotect cycling ---------- */
