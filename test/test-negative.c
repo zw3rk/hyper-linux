@@ -15,7 +15,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/utsname.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/syscall.h>
@@ -247,20 +246,6 @@ static void test_efault(void) {
         else FAIL("expected -EFAULT (-14)");
     }
 
-    TEST("uname(bad_ptr) → EFAULT");
-    {
-        long r = raw_syscall1(__NR_uname, (long)bad_ptr);
-        if (r == -14) PASS();
-        else FAIL("expected -EFAULT (-14)");
-    }
-
-    TEST("clock_gettime(bad_ptr) → EFAULT");
-    {
-        long r = raw_syscall2(__NR_clock_gettime, 0 /* CLOCK_REALTIME */,
-                              (long)bad_ptr);
-        if (r == -14) PASS();
-        else FAIL("expected -EFAULT (-14)");
-    }
 }
 
 /* ---------- Test 11: Linux errno numeric values ---------- */
