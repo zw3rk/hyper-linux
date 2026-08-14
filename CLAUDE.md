@@ -164,7 +164,7 @@ and a Haskell hello-hyper test — per mode.
 Quick unit-only tests (subset of the full matrix):
 ```
 nix develop -c make test-all       # aarch64 unit tests (42 tests)
-nix develop -c make test-x64-all   # x86_64 unit tests + 4 bounded XFAIL probes
+nix develop -c make test-x64-all   # x86_64 unit tests + 2 bounded XFAIL probes
 ```
 
 ### Expected matrix policy
@@ -176,15 +176,13 @@ new totals; do not reuse the old M2 counts. The stable policy is:
 |------|-------------------|
 | hl-aarch64 | none |
 | lima-aarch64 | none |
-| hl-x64 | four Rosetta XFAILs: signal, signal-thread, thread, stress |
-| lima-x64 | the same four, plus `test-clock-gettime-efault` exiting 139 |
+| hl-x64 | two Rosetta XFAILs: signal and signal-thread |
+| lima-x64 | the same two, plus `test-clock-gettime-efault` exiting 139 |
 
 The mode-aware policy is `test/matrix-xfails.sh`. It records:
 
 - `test-signal` and `test-signal-thread`: Rosetta does not reset
   `SA_RESETHAND` state as these Linux tests expect.
-- `test-thread` and `test-stress`: the raw `clone(CLONE_THREAD)` paths hang
-  under Rosetta.
 - `test-clock-gettime-efault` exits 139 only under Lima x64, where Linux
   Rosetta raises SIGSEGV instead of returning EFAULT for that isolated
   invalid-pointer syscall. `test-uname-efault` is a normal test in all modes.

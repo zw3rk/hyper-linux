@@ -1261,12 +1261,10 @@ static void *thread_create_and_run(void *arg) {
     /* When all CLONE_THREAD workers have exited and only the main
      * thread remains, interrupt its futex_wait. Under rosetta, the
      * main thread (JIT tracer) may hang forever in an internal
-     * futex_wait. In real Linux, child exit delivers SIGCHLD which
-     * interrupts futex_wait with -EINTR. We simulate this via the
-     * futex_interrupt_requested flag — it interrupts futex_wait
-     * without triggering a full exit_group, allowing the main thread
-     * to continue processing and call exit_group with the correct
-     * exit code naturally. */
+     * futex_wait. CLONE_THREAD exits do not deliver SIGCHLD; this is
+     * an hl/Rosetta compatibility wake. The interrupt epoch makes the
+     * futex wait return EINTR without requesting exit_group, so the
+     * main thread can continue and report the correct process status. */
     if (thread_active_count() == 1) {
         if (verbose)
             fprintf(stderr, "hl: last worker exited, interrupting "

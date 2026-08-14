@@ -9,12 +9,8 @@
 matrix_xfail_entries() {
     printf '%s\n' \
         'hl-x64|test-signal|rc:1|rosetta: SA_RESETHAND is not reset (3/4 subtests pass)' \
-        'hl-x64|test-thread|timeout|rosetta: raw clone(CLONE_THREAD) hangs' \
-        'hl-x64|test-stress|timeout|rosetta: raw clone(CLONE_THREAD) hangs' \
         'hl-x64|test-signal-thread|rc:1|rosetta: SA_RESETHAND is not reset (4/5 subtests pass)' \
         'lima-x64|test-signal|rc:1|rosetta: SA_RESETHAND is not reset (3/4 subtests pass)' \
-        'lima-x64|test-thread|timeout|rosetta: raw clone(CLONE_THREAD) hangs' \
-        'lima-x64|test-stress|timeout|rosetta: raw clone(CLONE_THREAD) hangs' \
         'lima-x64|test-signal-thread|rc:1|rosetta: SA_RESETHAND is not reset (4/5 subtests pass)' \
         'lima-x64|test-clock-gettime-efault|rc:139|rosetta: clock_gettime with an invalid pointer raises SIGSEGV'
 }

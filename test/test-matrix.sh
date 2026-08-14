@@ -197,10 +197,7 @@ matrix_result() {
 }
 
 matrix_haskell_timeout() {
-    case "$1" in
-        *-x64) printf '%s\n' 600 ;;
-        *) printf '%s\n' 120 ;;
-    esac
+    printf '%s\n' 120
 }
 
 is_expected_timeout_status() {

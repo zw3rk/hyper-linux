@@ -21,8 +21,8 @@ identical. Push only the reviewed branch and the explicit new tag.
    ```
 
    The matrix permits only the mode-specific bounded outcomes declared in
-   `test/matrix-xfails.sh`: four Rosetta signal/thread outcomes in each x64
-   mode, plus the `test-clock-gettime-efault` exit 139 outcome in `lima-x64`.
+   `test/matrix-xfails.sh`: two Rosetta signal outcomes in each x64 mode,
+   plus the `test-clock-gettime-efault` exit 139 outcome in `lima-x64`.
    Any other failure or timeout, or an XPASS that makes the policy stale,
    fails the gate. Current full-matrix pass totals must come from the release
    run; no current total is asserted in this document.

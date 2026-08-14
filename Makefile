@@ -734,10 +734,10 @@ test-x64-all: $(BUILD_DIR)/hl
 	printf "\n$(BLUE)── Network tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
-	run_policy_test test-thread $(X64_HL) $(X64_TEST_DIR)/test-thread; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-thread; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)── Stress tests (x86_64) ──$(RESET)\n"; \
-	run_policy_test test-stress $(X64_HL) $(X64_TEST_DIR)/test-stress; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-stress; \
 	printf "\n$(BLUE)── Negative / error-path tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-negative; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-uname-efault; \

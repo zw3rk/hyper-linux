@@ -48,7 +48,7 @@ source "$ROOT/test/matrix-xfails.sh"
 # shellcheck source=test-matrix.sh
 source "$ROOT/test/test-matrix.sh"
 
-expected_x64_names=$'test-signal\ntest-thread\ntest-stress\ntest-signal-thread'
+expected_x64_names=$'test-signal\ntest-signal-thread'
 expected_lima_x64_names="${expected_x64_names}"$'\ntest-clock-gettime-efault'
 assert_eq '' "$(matrix_xfail_names hl-aarch64)" "hl-aarch64 XFAIL names"
 assert_eq '' "$(matrix_xfail_names lima-aarch64)" "lima-aarch64 XFAIL names"
@@ -62,17 +62,14 @@ assert_eq "$expected_x64_names" "$make_names" "Makefile hl-x64 XFAIL call sites"
 assert_eq rc:1 "$(matrix_xfail_kind hl-x64 test-signal)" "test-signal kind"
 assert_eq rc:1 "$(matrix_xfail_kind lima-x64 test-signal-thread)" \
     "test-signal-thread kind"
-assert_eq timeout "$(matrix_xfail_kind hl-x64 test-thread)" "test-thread kind"
-assert_eq timeout "$(matrix_xfail_kind lima-x64 test-stress)" "test-stress kind"
 assert_eq rc:139 "$(matrix_xfail_kind lima-x64 test-clock-gettime-efault)" \
     "test-clock-gettime-efault kind"
 for mode in hl-aarch64 hl-x64 lima-aarch64 lima-x64; do
-    if matrix_xfail_kind "$mode" test-pthread >/dev/null 2>&1; then
-        fail_test "test-pthread must not be an XFAIL in $mode"
-    fi
-    if matrix_xfail_kind "$mode" test-futex-pi >/dev/null 2>&1; then
-        fail_test "test-futex-pi must not be an XFAIL in $mode"
-    fi
+    for test_name in test-thread test-stress test-pthread test-futex-pi; do
+        if matrix_xfail_kind "$mode" "$test_name" >/dev/null 2>&1; then
+            fail_test "$test_name must not be an XFAIL in $mode"
+        fi
+    done
 done
 assert_eq 4 "$(grep -c 'run_test .*test-.*-efault' "$ROOT/Makefile")" \
     "Makefile focused EFAULT unit lanes"
@@ -80,8 +77,8 @@ assert_eq 2 "$(grep -c 'test_check .*test-.*-efault' \
     "$ROOT/test/test-matrix.sh")" "matrix focused EFAULT unit lane"
 assert_eq 120 "$(matrix_haskell_timeout hl-aarch64)" \
     "aarch64 Haskell timeout"
-assert_eq 600 "$(matrix_haskell_timeout hl-x64)" "hl-x64 Haskell timeout"
-assert_eq 600 "$(matrix_haskell_timeout lima-x64)" "lima-x64 Haskell timeout"
+assert_eq 120 "$(matrix_haskell_timeout hl-x64)" "hl-x64 Haskell timeout"
+assert_eq 120 "$(matrix_haskell_timeout lima-x64)" "lima-x64 Haskell timeout"
 
 runner_ok() {
     printf '%s\n' "${1:-0 failed}"
@@ -122,17 +119,6 @@ assert_eq 0 "$xfail" "unexpected signal crash XFAIL count"
 assert_eq 1 "$fail" "unexpected signal crash failure count"
 
 matrix_reset_counts
-CURRENT_MODE=hl-x64
-test_check runner_timeout test-thread '0 failed' >"$TEST_TMP/result"
-assert_eq 1 "$xfail" "known hl clone timeout classification"
-assert_eq 0 "$timeout_count" "known hl clone timeout count"
-
-matrix_reset_counts
-CURRENT_MODE=lima-x64
-test_check runner_guest_timeout test-thread '0 failed' >"$TEST_TMP/result"
-assert_eq 1 "$xfail" "known Lima clone timeout classification"
-
-matrix_reset_counts
 CURRENT_MODE=lima-x64
 test_check runner_ok test-uname-efault '0 failed' '0 failed' \
     >"$TEST_TMP/result"
@@ -154,12 +140,20 @@ assert_eq 1 "$fail" "Lima uname crash failure count"
 
 matrix_reset_counts
 CURRENT_MODE=hl-x64
-test_check runner_ok test-thread '0 failed' '0 failed' >"$TEST_TMP/result"
+test_check runner_ok test-signal "$SIGNAL_SUCCESS_PATTERN" \
+    'test-signal: all tests passed — PASS' >"$TEST_TMP/result"
 assert_eq 1 "$xpass" "XPASS count"
 assert_eq 1 "$fail" "XPASS failure count"
 if matrix_result; then
     fail_test "XPASS must make the matrix result nonzero"
 fi
+
+matrix_reset_counts
+CURRENT_MODE=hl-x64
+test_check runner_ok test-thread '0 failed' '0 failed' >"$TEST_TMP/result"
+test_check runner_ok test-stress '0 failed' '0 failed' >"$TEST_TMP/result"
+assert_eq 2 "$pass" "fixed clone/stress normal pass count"
+assert_eq 0 "$xfail" "fixed clone/stress XFAIL count"
 
 matrix_reset_counts
 CURRENT_MODE=hl-x64

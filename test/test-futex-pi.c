@@ -15,6 +15,10 @@
  *      no timeout returns -EINTR within ~1-2 seconds when no waker
  *      exists (simulated periodic signal delivery).
  *
+ *   4. PI futex multi-waiter handoff: two queued contenders must both
+ *      acquire the lock.  The first contender uses the userspace fast
+ *      unlock path when the kernel does not preserve FUTEX_WAITERS.
+ *
  * Pass --linux-reference when running directly on Linux.  That mode skips
  * hl's synthetic EINTR expectation and accepts Linux's native -ESRCH result
  * when a PI futex owner exits without registering a robust list.
@@ -49,6 +53,14 @@ static volatile uint32_t pi_lock __attribute__((aligned(4))) = 0;
 
 /* Sync flag: child signals it has acquired the lock */
 static volatile int child_ready = 0;
+
+/* Multi-waiter handoff state. */
+#define PI_CONTENDERS 2
+static volatile int handoff_ready = 0;
+static volatile int handoff_acquired = 0;
+static volatile int handoff_errors = 0;
+static volatile int handoff_tids[PI_CONTENDERS];
+static char handoff_stacks[PI_CONTENDERS][8192] __attribute__((aligned(16)));
 
 /* ---------- PI futex syscall wrappers ---------- */
 
@@ -88,6 +100,36 @@ static void child_acquire_and_die(void) {
     /* Exit WITHOUT calling FUTEX_UNLOCK_PI — this is the bug scenario.
      * hl's futex_lock_pi must detect our TID is dead and recover. */
     raw_exit(0);
+}
+
+static void child_contend_and_exit(void) {
+    __atomic_add_fetch(&handoff_ready, 1, __ATOMIC_SEQ_CST);
+    raw_futex_wake((int *)&handoff_ready, PI_CONTENDERS);
+
+    if (raw_futex_lock_pi((uint32_t *)&pi_lock) != 0) {
+        __atomic_add_fetch(&handoff_errors, 1, __ATOMIC_SEQ_CST);
+        raw_exit(1);
+    }
+
+    __atomic_add_fetch(&handoff_acquired, 1, __ATOMIC_SEQ_CST);
+
+    /* Linux PI mutexes use a userspace CAS when FUTEX_WAITERS is clear.
+     * A kernel handoff must therefore retain that bit while another
+     * contender remains queued. */
+    uint32_t tid = (uint32_t)raw_gettid();
+    uint32_t value = __atomic_load_n(&pi_lock, __ATOMIC_SEQ_CST);
+    if (value & FUTEX_WAITERS) {
+        if (raw_futex_unlock_pi((uint32_t *)&pi_lock) != 0)
+            __atomic_add_fetch(&handoff_errors, 1, __ATOMIC_SEQ_CST);
+    } else {
+        uint32_t expected = tid;
+        if (!__atomic_compare_exchange_n(&pi_lock, &expected, 0,
+                                          0, __ATOMIC_SEQ_CST,
+                                          __ATOMIC_SEQ_CST))
+            __atomic_add_fetch(&handoff_errors, 1, __ATOMIC_SEQ_CST);
+    }
+
+    raw_exit(handoff_errors ? 1 : 0);
 }
 
 /* ---------- Test 1: PI lock/unlock round-trip ---------- */
@@ -194,7 +236,76 @@ static void test_pi_dead_owner(int linux_reference) {
     PASS();
 }
 
-/* ---------- Test 3: EINTR injection after ~1s ---------- */
+/* ---------- Test 3: Multiple queued PI waiters ---------- */
+
+static void test_pi_multi_waiter_handoff(void) {
+    TEST("PI multi-waiter handoff");
+
+    pi_lock = 0;
+    handoff_ready = 0;
+    handoff_acquired = 0;
+    handoff_errors = 0;
+    memset((void *)handoff_tids, 0, sizeof(handoff_tids));
+
+    if (raw_futex_lock_pi((uint32_t *)&pi_lock) != 0) {
+        FAIL("owner LOCK_PI failed");
+        return;
+    }
+
+    int spawned = 0;
+    for (int i = 0; i < PI_CONTENDERS; i++) {
+        void *stack_top = handoff_stacks[i] + sizeof(handoff_stacks[i]);
+        long ret = raw_clone(0x7d0f00, stack_top,
+                             (int *)&handoff_tids[i], 0,
+                             (int *)&handoff_tids[i]);
+        if (ret == 0) {
+            child_contend_and_exit();
+            __builtin_unreachable();
+        }
+        if (ret > 0)
+            spawned++;
+    }
+
+    for (int i = 0; i < 100 && handoff_ready < PI_CONTENDERS; i++)
+        usleep(1000);
+
+    /* Let both contenders enter FUTEX_LOCK_PI before releasing the owner. */
+    usleep(100000);
+    if (raw_futex_unlock_pi((uint32_t *)&pi_lock) != 0) {
+        FAIL("owner UNLOCK_PI failed");
+        return;
+    }
+
+    for (int i = 0; i < 200; i++) {
+        int exited = 0;
+        for (int j = 0; j < PI_CONTENDERS; j++) {
+            if (__atomic_load_n(&handoff_tids[j], __ATOMIC_SEQ_CST) == 0)
+                exited++;
+        }
+        if (exited == PI_CONTENDERS)
+            break;
+        usleep(10000);
+    }
+
+    int exited = 0;
+    for (int i = 0; i < PI_CONTENDERS; i++) {
+        if (__atomic_load_n(&handoff_tids[i], __ATOMIC_SEQ_CST) == 0)
+            exited++;
+    }
+
+    if (spawned == PI_CONTENDERS && handoff_ready == PI_CONTENDERS &&
+        handoff_acquired == PI_CONTENDERS && exited == PI_CONTENDERS &&
+        handoff_errors == 0) {
+        PASS();
+    } else {
+        printf("FAIL: spawned=%d ready=%d acquired=%d exited=%d errors=%d\n",
+               spawned, handoff_ready, handoff_acquired, exited,
+               handoff_errors);
+        fails++;
+    }
+}
+
+/* ---------- Test 4: EINTR injection after ~1s ---------- */
 
 static void test_futex_eintr(void) {
     TEST("futex_wait EINTR after ~1s");
@@ -253,6 +364,7 @@ int main(int argc, char **argv) {
         test_futex_eintr();
     }
     test_pi_dead_owner(linux_reference);
+    test_pi_multi_waiter_handoff();
 
     SUMMARY("test-futex-pi");
     return fails > 0 ? 1 : 0;
