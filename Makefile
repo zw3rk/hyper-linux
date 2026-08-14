@@ -1059,6 +1059,7 @@ lint-actions:
 ## Remove all build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -f cloexec-plain
 	rmdir cloexec-dir 2>/dev/null || true
 
 # ── Distribution ─────────────────────────────────────────────────

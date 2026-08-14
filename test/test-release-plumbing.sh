@@ -114,6 +114,8 @@ check_file_contains 'CI fallback marks RC prerelease' \
 check_file_contains 'release host gate uses full guest shell' \
     "$ROOT/docs/RELEASING.md" \
     'timeout 900 nix develop -c make clean hl test-host-units'
+check_file_contains 'clean removes cloexec regular fixture' \
+    "$ROOT/Makefile" 'rm -f cloexec-plain'
 
 # Build a disposable project plus deterministic gh/git mocks.  This runs the
 # real publisher end-to-end without touching a repository, network, or tap.
