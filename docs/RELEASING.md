@@ -11,7 +11,7 @@ identical. Push only the reviewed branch and the explicit new tag.
 3. Run the bounded qualification gates:
 
    ```sh
-   timeout 900 nix develop .#ci -c make clean hl test-host-units
+   timeout 900 nix develop -c make clean hl test-host-units
    timeout 1800 nix develop -c make test-both-modes
    timeout 1800 nix develop -c make test-x64-both-modes
    timeout 1800 nix develop -c make test-matrix

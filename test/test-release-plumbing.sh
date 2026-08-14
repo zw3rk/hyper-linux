@@ -111,6 +111,9 @@ check_file_contains 'interactive draft marks RC prerelease' \
 check_file_contains 'CI fallback marks RC prerelease' \
     "$ROOT/.github/workflows/ci.yml" \
     "prerelease: \${{ contains(github.ref_name, '-rc') }}"
+check_file_contains 'release host gate uses full guest shell' \
+    "$ROOT/docs/RELEASING.md" \
+    'timeout 900 nix develop -c make clean hl test-host-units'
 
 # Build a disposable project plus deterministic gh/git mocks.  This runs the
 # real publisher end-to-end without touching a repository, network, or tap.
