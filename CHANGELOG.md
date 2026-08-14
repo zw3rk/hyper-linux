@@ -76,8 +76,9 @@
 - CLI defaults: `--fs-mode=rooted`, bind `$HOME:/home/user`, `--guest-cwd /home/user`,
   `--audio-backend coreaudio`; `--isolated` skips auto home bind
 - OSS fork policy v1: recreate-empty independent streams (no AQ pointer IPC)
-- AppKit X and XMMS are being prepared in sibling repos (see
-  `docs/SIBLING-REPOS.md`); their public releases follow this runtime RC
+- AppKit X is public in `zw3rk/hyper-linux-x11`; the XMMS examples repository
+  is still being release-hardened (see `docs/SIBLING-REPOS.md`). Their tagged
+  public releases follow this runtime RC
 - Rooted AF_UNIX `connect()` can still follow an outward symlink at the final
   leaf on Darwin; parent traversal remains confined
 
