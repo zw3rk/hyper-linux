@@ -139,6 +139,14 @@ static inline long raw_futex_wait(int *addr, int val) {
                         (long)val, 0, 0, 0);
 }
 
+/* CLONE_CHILD_CLEARTID uses FUTEX_WAKE without FUTEX_PRIVATE_FLAG when the
+ * child exits.  Waiters for that kernel-owned wake must use the same shared
+ * futex key rather than the process-private fast path above. */
+static inline long raw_futex_wait_shared(int *addr, int val) {
+    return raw_syscall6(__NR_futex, (long)addr,
+                        FUTEX_WAIT, (long)val, 0, 0, 0);
+}
+
 static inline long raw_futex_wake(int *addr, int count) {
     return raw_syscall6(__NR_futex, (long)addr,
                         FUTEX_WAKE | FUTEX_PRIVATE_FLAG,

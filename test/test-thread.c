@@ -116,8 +116,11 @@ static void test_parent_settid(void) {
 
     /* child_tid was set by CLONE_PARENT_SETTID in test_clone_thread */
     /* Wait for child to fully exit (CLONE_CHILD_CLEARTID clears it) */
-    while (child_tid != 0) {
-        raw_futex_wait((int *)&child_tid, child_tid);
+    for (;;) {
+        int tid = __atomic_load_n(&child_tid, __ATOMIC_SEQ_CST);
+        if (tid == 0)
+            break;
+        raw_futex_wait_shared((int *)&child_tid, tid);
     }
 
     /* If we get here, CHILD_CLEARTID cleared it and FUTEX_WAKE woke us.
@@ -155,8 +158,11 @@ static void test_multi_thread(void) {
 
     /* Wait for all children to complete (CHILD_CLEARTID clears tids) */
     for (int i = 0; i < NUM_THREADS; i++) {
-        while (tids[i] != 0) {
-            raw_futex_wait((int *)&tids[i], tids[i]);
+        for (;;) {
+            int tid = __atomic_load_n(&tids[i], __ATOMIC_SEQ_CST);
+            if (tid == 0)
+                break;
+            raw_futex_wait_shared((int *)&tids[i], tid);
         }
     }
 

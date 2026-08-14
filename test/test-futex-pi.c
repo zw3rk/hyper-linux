@@ -15,6 +15,10 @@
  *      no timeout returns -EINTR within ~1-2 seconds when no waker
  *      exists (simulated periodic signal delivery).
  *
+ * Pass --linux-reference when running directly on Linux.  That mode skips
+ * hl's synthetic EINTR expectation and accepts Linux's native -ESRCH result
+ * when a PI futex owner exits without registering a robust list.
+ *
  * Syscalls exercised: futex(98), clone(220), gettid(178), exit(93)
  */
 #include "test-harness.h"
@@ -29,7 +33,9 @@
 int passes = 0, fails = 0;
 
 /* Linux PI futex word layout */
+#ifndef FUTEX_TID_MASK
 #define FUTEX_TID_MASK   0x3FFFFFFF
+#endif
 #define FUTEX_WAITERS    0x80000000
 
 /* Linux futex ops */
@@ -119,7 +125,7 @@ static void test_pi_lock_unlock(void) {
 
 /* ---------- Test 2: Dead-owner recovery ---------- */
 
-static void test_pi_dead_owner(void) {
+static void test_pi_dead_owner(int linux_reference) {
     TEST("PI dead-owner recovery");
 
     /* Reset shared state */
@@ -174,6 +180,11 @@ static void test_pi_dead_owner(void) {
      * owner and let us acquire. */
     long r = raw_futex_lock_pi((uint32_t *)&pi_lock);
     if (r != 0) {
+        if (linux_reference && r == -ESRCH) {
+            printf("OK (native Linux returned ESRCH)\n");
+            passes++;
+            return;
+        }
         FAIL("LOCK_PI failed (dead-owner not recovered)");
         return;
     }
@@ -219,12 +230,29 @@ static void test_futex_eintr(void) {
 
 /* ---------- Main ---------- */
 
-int main(void) {
+int main(int argc, char **argv) {
+    int linux_reference = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--linux-reference") == 0) {
+            linux_reference = 1;
+            continue;
+        }
+        fprintf(stderr, "unknown argument: %s\n", argv[i]);
+        fprintf(stderr, "usage: %s [--linux-reference]\n", argv[0]);
+        return 2;
+    }
+
     printf("test-futex-pi: PI futex and EINTR regression tests\n");
 
     test_pi_lock_unlock();
-    test_futex_eintr();
-    test_pi_dead_owner();  /* Last: uses CLONE_THREAD which may hang on x64 */
+    if (linux_reference) {
+        printf("  %-30s SKIP (hl-specific; Linux reference)\n",
+               "futex_wait EINTR after ~1s");
+    } else {
+        test_futex_eintr();
+    }
+    test_pi_dead_owner(linux_reference);
 
     SUMMARY("test-futex-pi");
     return fails > 0 ? 1 : 0;
