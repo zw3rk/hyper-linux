@@ -163,8 +163,8 @@ and a Haskell hello-hyper test — per mode.
 
 Quick unit-only tests (subset of the full matrix):
 ```
-nix develop -c make test-all       # aarch64 unit tests (40 tests)
-nix develop -c make test-x64-all   # x86_64 unit tests + 5 bounded XFAIL probes
+nix develop -c make test-all       # aarch64 unit tests (42 tests)
+nix develop -c make test-x64-all   # x86_64 unit tests + 4 bounded XFAIL probes
 ```
 
 ### Expected matrix policy
@@ -176,21 +176,26 @@ new totals; do not reuse the old M2 counts. The stable policy is:
 |------|-------------------|
 | hl-aarch64 | none |
 | lima-aarch64 | none |
-| hl-x64 | the five Rosetta XFAILs below |
-| lima-x64 | the same five Rosetta XFAILs below |
+| hl-x64 | four Rosetta XFAILs: signal, signal-thread, thread, stress |
+| lima-x64 | the same four, plus `test-clock-gettime-efault` exiting 139 |
 
-The shared policy is `test/rosetta-xfails.sh`. It records:
+The mode-aware policy is `test/matrix-xfails.sh`. It records:
 
 - `test-signal` and `test-signal-thread`: Rosetta does not reset
   `SA_RESETHAND` state as these Linux tests expect.
-- `test-thread`, `test-stress`, and `test-futex-pi`: the raw
-  `clone(CLONE_THREAD)` paths hang under Rosetta.
+- `test-thread` and `test-stress`: the raw `clone(CLONE_THREAD)` paths hang
+  under Rosetta.
+- `test-clock-gettime-efault` exits 139 only under Lima x64, where Linux
+  Rosetta raises SIGSEGV instead of returning EFAULT for that isolated
+  invalid-pointer syscall. `test-uname-efault` is a normal test in all modes.
 
-The x64 runners execute these tests under a short bound. The expected exit 1
-exit or guest timeout is XFAIL. A passing test is XPASS and fails the gate so
-the policy must be reviewed. All other failures, guest timeouts, transport
-timeouts, and XPASS results make the matrix exit nonzero. Aarch64 modes execute
-all five as normal tests, and `test-pthread` is a normal test in every mode.
+The x64 runners execute these tests under a short bound. The expected exit 1,
+guest timeout, or Lima-only exit 139 is XFAIL. A passing test is XPASS
+and fails the gate so the policy must be reviewed. All other failures, guest
+timeouts, transport timeouts, and XPASS results make the matrix exit nonzero.
+Aarch64 modes have no XFAILs. `test-pthread` and `test-futex-pi` are normal
+tests in every mode. Lima runs `test-futex-pi --linux-reference`; this omits
+hl's synthetic EINTR case and accepts the native Linux dead-owner result.
 
 ## Dynamic Linking
 

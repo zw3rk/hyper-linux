@@ -11,8 +11,8 @@ set -euo pipefail
 
 MODE="${1:-}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=rosetta-xfails.sh
-source "$SCRIPT_DIR/rosetta-xfails.sh"
+# shellcheck source=matrix-xfails.sh
+source "$SCRIPT_DIR/matrix-xfails.sh"
 
 # ── Paths (all from environment, typically set by flake.nix) ──────
 HL="${HL:-_build/hl}"
@@ -65,6 +65,7 @@ CURRENT_MODE=""
 HL_MATRIX_FLAGS=${HL_MATRIX_FLAGS:---fs-mode=legacy --audio-backend null}
 SIGNAL_SUCCESS_PATTERN='^test-signal: all tests passed — PASS$'
 LIMA_GUEST_TIMEOUT_RC=125
+MATRIX_RUN_TIMEOUT=""
 
 # Test fixture directory — must be accessible from the runner's context.
 # For hl modes, a local macOS temp dir works fine.
@@ -148,14 +149,14 @@ run_hl() {
 # timeout status 125 is distinct from host timeout status 124, so an SSH hang
 # cannot satisfy an expected guest-timeout policy.
 run_lima() {
-    local guest_timeout="${MATRIX_CASE_TIMEOUT:-60}"
+    local guest_timeout="${MATRIX_CASE_TIMEOUT:-${MATRIX_RUN_TIMEOUT:-60}}"
     local transport_timeout="${LIMA_TRANSPORT_TIMEOUT:-$((guest_timeout + 15))}"
     timeout --kill-after=2 "$transport_timeout" \
         "$LIMACTL" shell --start "$LIMA_VM" -- sh -c '
             guest_timeout=$1
             timeout_status=$2
             shift 2
-            timeout --kill-after=2 "$guest_timeout" "$@"
+            timeout "$guest_timeout" "$@"
             rc=$?
             if [ "$rc" -eq 124 ]; then
                 exit "$timeout_status"
@@ -195,6 +196,13 @@ matrix_result() {
     [ "$fail" -eq 0 ] && [ "$timeout_count" -eq 0 ] && [ "$xpass" -eq 0 ]
 }
 
+matrix_haskell_timeout() {
+    case "$1" in
+        *-x64) printf '%s\n' 600 ;;
+        *) printf '%s\n' 120 ;;
+    esac
+}
+
 is_expected_timeout_status() {
     case "$CURRENT_MODE" in
         lima-*) [ "$1" -eq "$LIMA_GUEST_TIMEOUT_RC" ] ;;
@@ -218,13 +226,9 @@ test_check() {
     name=$(printf "%-28s" "$label")
 
     local expected_kind="" reason=""
-    case "$CURRENT_MODE" in
-        *-x64)
-            if expected_kind=$(rosetta_xfail_kind "$label"); then
-                reason=$(rosetta_xfail_reason "$label")
-            fi
-            ;;
-    esac
+    if expected_kind=$(matrix_xfail_kind "$CURRENT_MODE" "$label"); then
+        reason=$(matrix_xfail_reason "$CURRENT_MODE" "$label")
+    fi
 
     local output rc
     if [ -n "$expected_kind" ]; then
@@ -253,14 +257,13 @@ test_check() {
             fail=$((fail + 1))
             return
         fi
-        if [ "$expected_kind" = failure ] && [ "$rc" -eq 1 ]; then
-            printf "${YELLOW}▸${RESET} %s ${BLUE}⊘ XFAIL${RESET} (%s)\n" \
-                "$name" "$reason"
-            xfail=$((xfail + 1))
-            return
-        fi
-        if [ "$expected_kind" = timeout ] &&
-            is_expected_timeout_status "$rc"; then
+        local expected_rc=""
+        case "$expected_kind" in
+            rc:*) expected_rc=${expected_kind#rc:} ;;
+        esac
+        if { [ -n "$expected_rc" ] && [ "$rc" -eq "$expected_rc" ]; } ||
+            { [ "$expected_kind" = timeout ] &&
+              is_expected_timeout_status "$rc"; }; then
             printf "${YELLOW}▸${RESET} %s ${BLUE}⊘ XFAIL${RESET} (%s)\n" \
                 "$name" "$reason"
             xfail=$((xfail + 1))
@@ -282,6 +285,22 @@ test_check() {
         printf "  %.120s\n" "$output" | head -3
         fail=$((fail + 1))
     fi
+}
+
+run_futex_pi_test() {
+    local runner="$1"
+    local bindir="$2"
+
+    case "$CURRENT_MODE" in
+        lima-*)
+            test_check "$runner" "test-futex-pi" "0 failed" \
+                "$bindir/test-futex-pi" --linux-reference
+            ;;
+        *)
+            test_check "$runner" "test-futex-pi" "0 failed" \
+                "$bindir/test-futex-pi"
+            ;;
+    esac
 }
 
 # Generic test: run binary, check exit code
@@ -408,6 +427,8 @@ run_unit_tests() {
 
     printf "\n${BLUE}── Negative tests ──${RESET}\n"
     test_check "$runner" "test-negative"      "0 failed"        "$bindir/test-negative"
+    test_check "$runner" "test-uname-efault"  "0 failed"        "$bindir/test-uname-efault"
+    test_check "$runner" "test-clock-gettime-efault" "0 failed"  "$bindir/test-clock-gettime-efault"
 
     printf "\n${BLUE}── COW fork isolation ──${RESET}\n"
     test_check "$runner" "test-cow-fork"      "PASS"            "$bindir/test-cow-fork"
@@ -422,7 +443,7 @@ run_unit_tests() {
     test_check "$runner" "test-inotify"       "PASS"            "$bindir/test-inotify"
 
     printf "\n${BLUE}── PI futex + EINTR regression ──${RESET}\n"
-    test_check "$runner" "test-futex-pi"      "0 failed"        "$bindir/test-futex-pi"
+    run_futex_pi_test "$runner" "$bindir"
 
     printf "\n${BLUE}── X11 raw protocol ──${RESET}\n"
     test_check "$runner" "test-x11"           "0 failed"        "$bindir/test-x11"
@@ -742,12 +763,13 @@ run_suite() {
     # Haskell bins (pandoc, shellcheck — nix interpreter, no sysroot needed)
     if [ -d "$haskell_bins" ]; then
         printf "\n${BLUE}═══ Haskell bins ═══${RESET}\n"
-        _SYSROOT=""; _HL_TIMEOUT=120; _GUEST_EXTRA=""
+        _SYSROOT=""; _HL_TIMEOUT=$(matrix_haskell_timeout "$mode")
+        MATRIX_RUN_TIMEOUT="$_HL_TIMEOUT"; _GUEST_EXTRA=""
         run_haskell_bins_tests "$dyn_runner" "$haskell_bins"
     fi
 
     # Reset runner globals
-    _SYSROOT=""; _HL_TIMEOUT=30; _GUEST_EXTRA=""
+    _SYSROOT=""; _HL_TIMEOUT=30; MATRIX_RUN_TIMEOUT=""; _GUEST_EXTRA=""
 
     printf "\n${CYAN}━━━ %s Results: %d passed, %d failed, %d timeout, %d xfail, %d xpass, %d skipped ━━━${RESET}\n\n" \
         "$mode" "$pass" "$fail" "$timeout_count" "$xfail" "$xpass" "$skip"

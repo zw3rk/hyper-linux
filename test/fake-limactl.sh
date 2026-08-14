@@ -23,6 +23,11 @@ shift
 [ "${1:-}" = -- ] || exit 67
 shift
 
+if [ "${1:-}" = sh ] && [ "${2:-}" = -c ] &&
+    [ -n "${FAKE_LIMACTL_REMOTE_SCRIPT_LOG:-}" ]; then
+    printf '%s\n' "${3:-}" >>"$FAKE_LIMACTL_REMOTE_SCRIPT_LOG"
+fi
+
 if [ "${1:-}" = mktemp ]; then
     case "${FAKE_LIMACTL_MKTEMP:-normal}" in
         empty)

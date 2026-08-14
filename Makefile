@@ -294,6 +294,8 @@ test-all: $(BUILD_DIR)/hl $(TEST_DEPS)
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-stress; \
 	printf "\n$(BLUE)── Negative / error-path tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-negative; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-uname-efault; \
+	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-clock-gettime-efault; \
 	printf "\n$(BLUE)── Signal + thread tests ──$(RESET)\n"; \
 	run_test $(BUILD_DIR)/hl $(HL_TEST_FLAGS) $(TEST_DIR)/test-signal-thread; \
 	printf "\n$(BLUE)── Fork edge cases ──$(RESET)\n"; \
@@ -638,7 +640,7 @@ test-x64-all: $(BUILD_DIR)/hl
 		exit 1; \
 	fi
 	@printf "\n$(BLUE)━━━ Running x86_64 test suite (via rosetta) ━━━$(RESET)\n\n"
-	@. test/rosetta-xfails.sh; \
+	@. test/matrix-xfails.sh; \
 	pass=0; fail=0; xfail=0; xpass=0; \
 	run_test() { \
 		name=""; \
@@ -668,17 +670,19 @@ test-x64-all: $(BUILD_DIR)/hl
 			fi; \
 		fi; \
 	}; \
-	run_rosetta_test() { \
+	run_policy_test() { \
 		name=$$1; shift; \
-		kind=$$(rosetta_xfail_kind "$$name") || { run_test "$$@"; return; }; \
-		reason=$$(rosetta_xfail_reason "$$name"); \
+		kind=$$(matrix_xfail_kind hl-x64 "$$name") || { run_test "$$@"; return; }; \
+		reason=$$(matrix_xfail_reason hl-x64 "$$name"); \
 		printf "$(YELLOW)▸ %-20s$(RESET) " "$$name"; \
 		if output=$$(timeout --kill-after=2 $(X64_XFAIL_TIMEOUT) "$$@" 2>&1); then \
 			printf "$(RED)✗ XPASS$(RESET) (%s)\n" "$$reason"; \
 			xpass=$$((xpass + 1)); fail=$$((fail + 1)); \
 		else \
 			rc=$$?; \
-			if { [ "$$kind" = failure ] && [ "$$rc" -eq 1 ]; } || \
+			expected_rc=""; \
+			case "$$kind" in rc:*) expected_rc=$${kind#rc:};; esac; \
+			if { [ -n "$$expected_rc" ] && [ "$$rc" -eq "$$expected_rc" ]; } || \
 			   { [ "$$kind" = timeout ] && [ "$$rc" -eq 124 ]; }; then \
 				printf "$(BLUE)⊘ XFAIL$(RESET) (%s)\n" "$$reason"; \
 				xfail=$$((xfail + 1)); \
@@ -712,7 +716,7 @@ test-x64-all: $(BUILD_DIR)/hl
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-fork-exec $(X64_TEST_DIR)/echo-test exec-works; \
 	printf "\n$(BLUE)── Signal tests (x86_64) ──$(RESET)\n"; \
-	run_rosetta_test test-signal $(X64_HL) $(X64_TEST_DIR)/test-signal; \
+	run_policy_test test-signal $(X64_HL) $(X64_TEST_DIR)/test-signal; \
 	printf "\n$(BLUE)── Socket tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-socket; \
 	printf "\n$(BLUE)── Syscall coverage tests (x86_64) ──$(RESET)\n"; \
@@ -730,14 +734,16 @@ test-x64-all: $(BUILD_DIR)/hl
 	printf "\n$(BLUE)── Network tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-net; \
 	printf "\n$(BLUE)── Threading tests (x86_64) ──$(RESET)\n"; \
-	run_rosetta_test test-thread $(X64_HL) $(X64_TEST_DIR)/test-thread; \
+	run_policy_test test-thread $(X64_HL) $(X64_TEST_DIR)/test-thread; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-pthread; \
 	printf "\n$(BLUE)── Stress tests (x86_64) ──$(RESET)\n"; \
-	run_rosetta_test test-stress $(X64_HL) $(X64_TEST_DIR)/test-stress; \
+	run_policy_test test-stress $(X64_HL) $(X64_TEST_DIR)/test-stress; \
 	printf "\n$(BLUE)── Negative / error-path tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-negative; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-uname-efault; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-clock-gettime-efault; \
 	printf "\n$(BLUE)── Signal + thread tests (x86_64) ──$(RESET)\n"; \
-	run_rosetta_test test-signal-thread $(X64_HL) $(X64_TEST_DIR)/test-signal-thread; \
+	run_policy_test test-signal-thread $(X64_HL) $(X64_TEST_DIR)/test-signal-thread; \
 	printf "\n$(BLUE)── O_CLOEXEC tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-cloexec; \
 	printf "\n$(BLUE)── Guard page / mmap edge cases (x86_64) ──$(RESET)\n"; \
@@ -749,7 +755,7 @@ test-x64-all: $(BUILD_DIR)/hl
 	printf "\n$(BLUE)── COW fork isolation tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-cow-fork; \
 	printf "\n$(BLUE)── PI futex + EINTR regression tests (x86_64) ──$(RESET)\n"; \
-	run_rosetta_test test-futex-pi $(X64_HL) $(X64_TEST_DIR)/test-futex-pi; \
+	run_test $(X64_HL) $(X64_TEST_DIR)/test-futex-pi; \
 	printf "\n$(BLUE)── Directed signal (tkill/tgkill) tests (x86_64) ──$(RESET)\n"; \
 	run_test $(X64_HL) $(X64_TEST_DIR)/test-tgkill-target; \
 	printf "\n$(BLUE)── SIGILL / null guard tests (x86_64) ──$(RESET)\n"; \

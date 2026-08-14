@@ -37,30 +37,51 @@ assert_eq() {
 }
 
 export FAKE_LIMACTL_LOG="$TEST_TMP/limactl.log"
+export FAKE_LIMACTL_REMOTE_SCRIPT_LOG="$TEST_TMP/remote-script.log"
 export FAKE_LIMA_VM=test-matrix-policy
 export LIMACTL="$ROOT/test/fake-limactl.sh"
 export LIMA_VM="$FAKE_LIMA_VM"
 
 # Both files are libraries when sourced. The matrix main must not run here.
-# shellcheck source=rosetta-xfails.sh
-source "$ROOT/test/rosetta-xfails.sh"
+# shellcheck source=matrix-xfails.sh
+source "$ROOT/test/matrix-xfails.sh"
 # shellcheck source=test-matrix.sh
 source "$ROOT/test/test-matrix.sh"
 
-expected_names=$'test-signal\ntest-thread\ntest-stress\ntest-signal-thread\ntest-futex-pi'
-actual_names=$(rosetta_xfail_entries | cut -d '|' -f 1)
-assert_eq "$expected_names" "$actual_names" "Rosetta XFAIL names"
-make_names=$(awk '$1 == "run_rosetta_test" { print $2 }' "$ROOT/Makefile" |
+expected_x64_names=$'test-signal\ntest-thread\ntest-stress\ntest-signal-thread'
+expected_lima_x64_names="${expected_x64_names}"$'\ntest-clock-gettime-efault'
+assert_eq '' "$(matrix_xfail_names hl-aarch64)" "hl-aarch64 XFAIL names"
+assert_eq '' "$(matrix_xfail_names lima-aarch64)" "lima-aarch64 XFAIL names"
+assert_eq "$expected_x64_names" "$(matrix_xfail_names hl-x64)" \
+    "hl-x64 XFAIL names"
+assert_eq "$expected_lima_x64_names" "$(matrix_xfail_names lima-x64)" \
+    "lima-x64 XFAIL names"
+make_names=$(awk '$1 == "run_policy_test" { print $2 }' "$ROOT/Makefile" |
     sed 's/;//')
-assert_eq "$expected_names" "$make_names" "Makefile Rosetta XFAIL call sites"
-assert_eq failure "$(rosetta_xfail_kind test-signal)" "test-signal kind"
-assert_eq failure "$(rosetta_xfail_kind test-signal-thread)" "test-signal-thread kind"
-assert_eq timeout "$(rosetta_xfail_kind test-thread)" "test-thread kind"
-assert_eq timeout "$(rosetta_xfail_kind test-stress)" "test-stress kind"
-assert_eq timeout "$(rosetta_xfail_kind test-futex-pi)" "test-futex-pi kind"
-if rosetta_xfail_kind test-pthread >/dev/null 2>&1; then
-    fail_test "test-pthread must not be a Rosetta XFAIL"
-fi
+assert_eq "$expected_x64_names" "$make_names" "Makefile hl-x64 XFAIL call sites"
+assert_eq rc:1 "$(matrix_xfail_kind hl-x64 test-signal)" "test-signal kind"
+assert_eq rc:1 "$(matrix_xfail_kind lima-x64 test-signal-thread)" \
+    "test-signal-thread kind"
+assert_eq timeout "$(matrix_xfail_kind hl-x64 test-thread)" "test-thread kind"
+assert_eq timeout "$(matrix_xfail_kind lima-x64 test-stress)" "test-stress kind"
+assert_eq rc:139 "$(matrix_xfail_kind lima-x64 test-clock-gettime-efault)" \
+    "test-clock-gettime-efault kind"
+for mode in hl-aarch64 hl-x64 lima-aarch64 lima-x64; do
+    if matrix_xfail_kind "$mode" test-pthread >/dev/null 2>&1; then
+        fail_test "test-pthread must not be an XFAIL in $mode"
+    fi
+    if matrix_xfail_kind "$mode" test-futex-pi >/dev/null 2>&1; then
+        fail_test "test-futex-pi must not be an XFAIL in $mode"
+    fi
+done
+assert_eq 4 "$(grep -c 'run_test .*test-.*-efault' "$ROOT/Makefile")" \
+    "Makefile focused EFAULT unit lanes"
+assert_eq 2 "$(grep -c 'test_check .*test-.*-efault' \
+    "$ROOT/test/test-matrix.sh")" "matrix focused EFAULT unit lane"
+assert_eq 120 "$(matrix_haskell_timeout hl-aarch64)" \
+    "aarch64 Haskell timeout"
+assert_eq 600 "$(matrix_haskell_timeout hl-x64)" "hl-x64 Haskell timeout"
+assert_eq 600 "$(matrix_haskell_timeout lima-x64)" "lima-x64 Haskell timeout"
 
 runner_ok() {
     printf '%s\n' "${1:-0 failed}"
@@ -81,6 +102,11 @@ runner_crash() {
 
 runner_guest_timeout() {
     return 125
+}
+
+runner_capture() {
+    printf '%s\n' "$*" >"$TEST_TMP/runner-args"
+    printf '%s\n' '0 failed'
 }
 
 matrix_reset_counts
@@ -107,6 +133,26 @@ test_check runner_guest_timeout test-thread '0 failed' >"$TEST_TMP/result"
 assert_eq 1 "$xfail" "known Lima clone timeout classification"
 
 matrix_reset_counts
+CURRENT_MODE=lima-x64
+test_check runner_ok test-uname-efault '0 failed' '0 failed' \
+    >"$TEST_TMP/result"
+assert_eq 1 "$pass" "Lima uname EFAULT normal pass"
+assert_eq 0 "$xfail" "Lima uname EFAULT XFAIL count"
+
+matrix_reset_counts
+CURRENT_MODE=lima-x64
+test_check runner_crash test-clock-gettime-efault '0 failed' \
+    >"$TEST_TMP/result"
+assert_eq 1 "$xfail" "known Lima clock_gettime SIGSEGV classification"
+assert_eq 0 "$fail" "known Lima clock_gettime SIGSEGV failure count"
+
+matrix_reset_counts
+CURRENT_MODE=lima-x64
+test_check runner_crash test-uname-efault '0 failed' >"$TEST_TMP/result"
+assert_eq 0 "$xfail" "Lima uname crash XFAIL count"
+assert_eq 1 "$fail" "Lima uname crash failure count"
+
+matrix_reset_counts
 CURRENT_MODE=hl-x64
 test_check runner_ok test-thread '0 failed' '0 failed' >"$TEST_TMP/result"
 assert_eq 1 "$xpass" "XPASS count"
@@ -120,6 +166,26 @@ CURRENT_MODE=hl-x64
 test_check runner_ok test-pthread '0 failed' '0 failed' >"$TEST_TMP/result"
 assert_eq 1 "$pass" "test-pthread normal pass"
 assert_eq 0 "$xfail" "test-pthread XFAIL count"
+
+matrix_reset_counts
+CURRENT_MODE=hl-x64
+test_check runner_ok test-futex-pi '0 failed' '0 failed' >"$TEST_TMP/result"
+assert_eq 1 "$pass" "test-futex-pi normal pass"
+assert_eq 0 "$xfail" "test-futex-pi XFAIL count"
+
+matrix_reset_counts
+CURRENT_MODE=lima-aarch64
+run_futex_pi_test runner_capture /guest/bin >"$TEST_TMP/result"
+assert_eq '/guest/bin/test-futex-pi --linux-reference' \
+    "$(cat "$TEST_TMP/runner-args")" "Lima futex-pi arguments"
+assert_eq 1 "$pass" "Lima futex-pi normal pass"
+
+matrix_reset_counts
+CURRENT_MODE=hl-aarch64
+run_futex_pi_test runner_capture /guest/bin >"$TEST_TMP/result"
+assert_eq '/guest/bin/test-futex-pi' "$(cat "$TEST_TMP/runner-args")" \
+    "hl futex-pi arguments"
+assert_eq 1 "$pass" "hl futex-pi normal pass"
 
 matrix_reset_counts
 CURRENT_MODE=hl-aarch64
@@ -176,6 +242,13 @@ else
     rc=$?
 fi
 assert_eq 125 "$rc" "inner guest timeout status"
+if ! grep -Fq "timeout \"\$guest_timeout\" \"\$@\"" \
+    "$FAKE_LIMACTL_REMOTE_SCRIPT_LOG"; then
+    fail_test "guest command must use plain timeout"
+fi
+if grep -Fq 'timeout --kill-after' "$FAKE_LIMACTL_REMOTE_SCRIPT_LOG"; then
+    fail_test "guest command must not use timeout --kill-after"
+fi
 
 export FAKE_LIMACTL_HANG=1
 if MATRIX_CASE_TIMEOUT=1 LIMA_TRANSPORT_TIMEOUT=2 run_lima true; then
